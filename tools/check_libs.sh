@@ -405,6 +405,46 @@ MKN=$(python3 "$ROOT/Client/lib/node.py" subscription "$TMP/mksub.txt" 2>/dev/nu
 assert_eq "$MKN" "2" "预置建出的节点 Client 全部接受"
 bash -n "$ROOT/conf/mknode.sh" 2>/dev/null && ok "mknode.sh 语法" || bad "mknode.sh 语法"
 
+# ---------------------------------------------------------------- 预置批量
+group "预置批量 (preset_batch.sh)"
+PB="$TMP/pb"; mkdir -p "$PB"
+XRAY_CONF_DIR="$PB/conf" XRAY_SHARE_DIR="$PB/share" X_BATCH_DOMAIN=a.example.com \
+  bash "$ROOT/tools/preset_batch.sh" vless:2 trojan:3 >/dev/null 2>&1
+assert_eq "$(ls "$PB/conf"/*.json 2>/dev/null | wc -l)" "2" "批量落盘 2 个片段"
+assert_eq "$(ls "$PB/share"/*.json 2>/dev/null | wc -l)" "2" "批量落盘 2 份元数据"
+PD=$(python3 -c "
+import json,glob
+d=json.load(open(sorted(glob.glob('$PB/conf/*.json'))[0]))
+print(d['inbounds'][0]['listen'])")
+assert_eq "$PD" "0.0.0.0" "默认 CDN 档位: Xray 听 0.0.0.0"
+# 基础域名 + 序号: 每个 TLS 节点一个不同域名
+PB2="$TMP/pb2"; mkdir -p "$PB2"
+XRAY_CONF_DIR="$PB2/conf" XRAY_SHARE_DIR="$PB2/share" X_BATCH_DOMAIN_BASE=b.example.com \
+  bash "$ROOT/tools/preset_batch.sh" vless:2 trojan:3 >/dev/null 2>&1
+HOSTS=$(python3 -c "
+import json,glob
+hs=sorted(json.load(open(f))['host'] for f in glob.glob('$PB2/share/*.json'))
+print(','.join(hs))")
+assert_eq "$HOSTS" "b.example.com-1,b.example.com-2" "基础域名按序号递增"
+# nginx 档位
+PB3="$TMP/pb3"; mkdir -p "$PB3"
+XRAY_CONF_DIR="$PB3/conf" XRAY_SHARE_DIR="$PB3/share" X_BATCH_DOMAIN=a.com \
+  bash "$ROOT/tools/preset_batch.sh" vless:2:nginx >/dev/null 2>&1
+NG=$(python3 -c "
+import json,glob
+d=json.load(open(sorted(glob.glob('$PB3/conf/*.json'))[0], encoding='utf-8'))
+m=json.load(open(sorted(glob.glob('$PB3/share/*.json'))[0], encoding='utf-8'))
+print(d['inbounds'][0]['listen'], m['port'])")
+assert_eq "$NG" "127.0.0.1 443" "nginx 档: 听本机, 对外 443"
+# TLS 缺域名必须明确报错
+PB4="$TMP/pb4"; mkdir -p "$PB4"
+E=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" vless:2 2>&1 | grep -c '没给域名')
+assert_eq "$E" "1" "TLS 缺域名明确报错 (不静默跳过)"
+# 非法预置序号
+E2=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" vless:99 2>&1 | grep -c '预置序号')
+assert_eq "$E2" "1" "非法预置序号明确报错"
+bash -n "$ROOT/tools/preset_batch.sh" 2>/dev/null && ok "preset_batch.sh 语法" || bad "preset_batch.sh 语法"
+
 # ---------------------------------------------------------------- 端口归属
 group "端口归属 (ports.sh)"
 # x_port_holder 的 /proc 回退: 本容器 /proc/net/tcp 是空的 (网络命名空间未暴露),
