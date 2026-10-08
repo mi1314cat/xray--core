@@ -597,8 +597,22 @@ def main():
     p.add_argument("--docker", help="nginx 所在容器名")
     args = p.parse_args()
 
-    if not args.docker:
+    # 容器自动探测只在"需要自己去找站点文件"时才做。
+    #
+    # 显式给了 --file 的路径是调用方手上的路径, 默认按宿主机路径处理。曾经这里
+    # 无条件探测, 于是 nginx 跑在容器里时, --file /etc/nginx/conf.d/x.conf 会
+    # 被拿到容器里去找 —— 宿主机上明明有这个文件, 却报"站点文件不存在"。
+    # 连带的是 --block / --path 这些新参数在容器机器上一个都用不了, 因为卡在
+    # 这道存在性检查上。
+    #
+    # NGINX_CONF_ROOTS 同理: 调用方已经明确指定了在哪找配置, 就不要再自作主张
+    # 去容器里找。自检脚本就是靠它把测试钉在夹具目录上, 而在这之前探测会覆盖它
+    # —— 于是在 nginx 跑在容器里的机器上, 自检改的是真实站点配置。
+    explicit_roots = bool(os.environ.get("NGINX_CONF_ROOTS"))
+    if not args.docker and not args.file and not explicit_roots:
         args.docker = probe_docker()
+    if args.file and not args.docker:
+        args.docker = None
 
     if not args.file:
         found = find_site(args.domain, args.docker)

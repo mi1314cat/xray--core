@@ -32,6 +32,41 @@ for f in "$ROOT"/conf/*.sh "$ROOT"/*.sh; do
     bash -n "$f" 2>/dev/null && ok "bash 语法: $(basename "$f")" || bad "bash 语法: $(basename "$f")"
 done
 
+# ---------------------------------------------------------------- 协议 E2E
+# 预置生成器过 `xray run -test` 只说明配置被内核接受, 不说明流量真能通。完整
+# 链路验证要两个 Xray 进程加一个源站, 没有内核时跑不了; 这里能离线做的部分是
+# 挡住"配置生成"这一层的错 —— 那层一旦坏了要等实机才暴露, 而内核报的错
+# (缺 decryption / 证书要 PEM / Trojan 要 servers) 与真正原因相距很远。
+group "协议 E2E (e2e_configs.py / e2e_protocols.sh)"
+bash -n "$ROOT/tools/e2e_protocols.sh" 2>/dev/null \
+    && ok "harness bash 语法" || bad "harness bash 语法"
+python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$ROOT/tools/e2e_configs.py" 2>/dev/null \
+    && ok "配置生成模块 python 语法" || bad "配置生成模块 python 语法"
+
+SHAPE=$(python3 "$ROOT/tools/e2e_configs.py" --selftest 2>&1)
+while IFS= read -r ln; do
+    case "$ln" in
+        "OK "*) ok "${ln#OK }" ;;
+        "NO "*) bad "${ln#NO }" ;;
+    esac
+done <<< "$SHAPE"
+
+# 有内核就跑完整链路; 没有就说明白跳过原因, 不静默当过
+X=""
+command -v xray >/dev/null 2>&1 && X=$(command -v xray)
+[[ -z "$X" && -x /root/catmi/xray/xrayls ]] && X=/root/catmi/xray/xrayls
+if [[ -n "$X" ]]; then
+    if out=$(XRAY_BIN="$X" WORK="$TMP/e2e" bash "$ROOT/tools/e2e_protocols.sh" 2>&1); then
+        n=$(printf '%s' "$out" | grep -c '链路打通')
+        ok "完整链路 $n 种协议/传输全部打通"
+    else
+        bad "完整链路未全通过"
+        printf '%s\n' "$out" | grep '✗' | head -6 | sed 's/^/        /'
+    fi
+else
+    printf '  - 完整链路验证需要 Xray 内核 (本机没有, 已在实机跑过)\n'
+fi
+
 # ---------------------------------------------------------------- 节点注册表
 group "节点注册表 (nodes.py)"
 CONF="$TMP/nodes"; mkdir -p "$CONF"
@@ -574,8 +609,21 @@ if diff -q "$RB.orig" "$RB" >/dev/null 2>&1; then ok "--block 摘除后逐字节
 else bad "--block 摘除后有残留"; fi
 
 # 没装 nginx 时不该抛 traceback —— 只跳过校验并说明
-OUT=$(python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --port 8443 \
-      --nginx /nonexistent-nginx 2>&1)
+# "没装 nginx" 要靠 PATH 去掉它来模拟, 不能靠传一个不存在的参数 —— 后者在装了
+# nginx 的机器上会真的执行 nginx, 于是走进另一条分支, 断言跟着变。
+OUT=$(NGINX_CONF_ROOTS="$TMP/rbroot" PATH="/usr/bin:/bin" python3 -c "
+import os, shutil, subprocess, sys
+env = dict(os.environ); env['PATH'] = '$TMP/nopath'
+os.makedirs('$TMP/nopath', exist_ok=True)
+for t in ('python3', 'sh', 'grep', 'sed', 'cat', 'base64'):
+    p = shutil.which(t, path='/usr/bin:/bin')
+    if p:
+        d = os.path.join('$TMP/nopath', t)
+        if not os.path.exists(d): os.symlink(p, d)
+r = subprocess.run([sys.executable, '$LIB/nginx_apply.py', '--file', '$RB',
+                    '--domain', 'r.example', '--port', '8443'],
+                   capture_output=True, text=True, env=env)
+sys.stdout.write(r.stdout + r.stderr)")
 case "$OUT" in
   *Traceback*) bad "nginx 二进制缺失时抛了 traceback" ;;
   *已写入*)    ok "nginx 二进制缺失时干净报错并说明" ;;
@@ -767,12 +815,15 @@ assert_eq "$CK" "1" "容器模式摘除不动用户自己写的 location"
 DD="$TMP/ddup"; mkdir -p "$DD/sites-enabled" "$DD/sites-available"
 printf 'server {\n    server_name d.example;\n}\n' > "$DD/sites-available/d.conf"
 printf 'server {\n    server_name e.example;\n}\n' > "$DD/sites-enabled/e.conf"
-DDUP=$(NGINX_CONF_ROOTS="$DD:/etc/nginx" python3 -c "
+# 只挂夹具目录, 不挂真实的 /etc/nginx —— 否则在真的装了 nginx 的机器上
+# (比如实机) 会把真站点一起数进来, 断言从"验证去重"变成"验证本机装了什么"。
+DDUP=$(NGINX_CONF_ROOTS="$DD:$DD/none" python3 -c "
 import sys; sys.path.insert(0,'$LIB'); import nginx_apply as N
 fs=N.site_files(); print('%d %d' % (len(fs), len(set(fs))))")
 assert_eq "$DDUP" "2 2" "site_files 去重 (递归根不重复列)"
 
 group "容器感知 (cert.sh / nginx_apply.py)"
+mkdir -p "$TMP/nodocker" "$TMP/nopath"   # 模拟"本机没装 docker/nginx"
 DK="$TMP/dk"; mkdir -p "$DK/hostcerts" "$DK/bin" "$DK/fakeconf"
 touch "$DK/hostcerts/contained.crt"
 cat > "$DK/fakeconf/nginx.conf" <<'EOF'
@@ -796,8 +847,14 @@ OUT=$(PATH="$DK/bin:$PATH" bash -c "source '$LIB/cert.sh'; x_cert_container_cert
 assert_eq "$(echo "$OUT" | grep -c 'contained.crt')" "1" "发现容器内证书"
 assert_eq "$(echo "$OUT" | grep -cE '\.key |_key\.pem')" "0" "容器内私钥被排除 (.key 与 _key.pem 两种后缀)"
 assert_eq "$(PATH="$DK/bin:$PATH" bash -c "source '$LIB/cert.sh'; x_cert_search_dirs" 2>/dev/null | grep -c "$DK/hostcerts")" "1" "容器挂载路径进入扫描目录"
-# 无 docker 时不得挂死
-timeout 10 bash -c "source '$LIB/cert.sh'; x_cert_container_certs >/dev/null 2>&1"
+# 无 docker 时不得挂死。
+# 用清空的 PATH 来模拟"没装 docker", 而不是指望本机没装 —— 在装了 docker 的机器
+# (比如实机) 上这条会真的去问 docker, 拿到的是另一个返回值, 断言就变成测环境了。
+# PATH 要在 bash 起来之后才改。写成 `PATH=... timeout ...` 或 `env PATH=... bash`
+# 时, 连 timeout / bash 自身都用新 PATH 去找, 返回 127 —— 那测的是"命令找不到",
+# 不是"没有 docker"。
+timeout 10 bash -c "PATH='$TMP/nodocker'; source '$LIB/cert.sh'; x_cert_container_certs" \
+    >/dev/null 2>&1
 assert_eq "$?" "1" "无 docker 时返回非 0 而非挂死"
 
 # ---------------------------------------------------------------- 预置

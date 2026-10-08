@@ -91,3 +91,69 @@ for f in $XRAY_CONF_DIR/*.json; do xray run -test -c "$f"; done
 
 验证套件 `tools/check_libs.sh`（176 项）不需要真机，本地容器即可跑完；上面
 这些是套件覆盖不到、必须真内核才能发现的部分。
+
+## 全协议链路验证
+
+`xray run -test` 只能证明内核接受了配置, 证明不了流量真能通。`tools/e2e_protocols.sh`
+对每种协议/传输搭一条完整链路:
+
+```
+源站 (本地 HTTP)  <-  Xray 客户端 (socks5 入口)  <-  Xray 服务端 (测试入站)
+```
+
+两端必须起在**两个进程**里。同一个进程同时装入站和出站时, 两端会直接握手,
+配置写错也可能通 —— 那样测的就不是链路而是进程内的捷径。
+
+curl 通过 socks 访问源站, 拿到源站预先放好的 token 才算过。
+
+### 实机结果 (Xray 26.3.27, d2758a0)
+
+| 组合 | 结果 |
+|---|---|
+| vless + tcp | 通过 |
+| vmess + tcp | 通过 |
+| shadowsocks2022 + aes-128-gcm | 通过 |
+| vless + tcp + tls (xtls-rprx-vision) | 通过 |
+| vless + ws + tls | 通过 |
+| vless + grpc + tls | 通过 |
+| vless + xhttp + tls | 通过 |
+| trojan + tcp + tls | 通过 |
+| trojan + ws + tls | 通过 |
+| trojan + grpc + tls | 通过 |
+| vmess + ws + tls | 通过 |
+| vless + tcp + reality | 通过 |
+
+12 种全部打通。此前记为"REALITY 握手受阻"的那一项, 在本机自环 + 直连出网
+的条件下可以通过 —— 之前的失败是链路条件不具备, 不是 REALITY 本身不通。
+
+### 搭这条链路时踩到的内核行为
+
+这些都是"配置看起来对、内核却不接受"或"接受了却不通"的一类, 值得单独记:
+
+- **服务端只写 inbounds 不写出站**, 隧道请求其实已经正确到达 (日志里有
+  `received request for ...`), 但没有出站去连目标地址, 内核报的是
+  `default outbound handler not exist`。看起来像协议配错, 实际是少了 freedom。
+- **VLESS 入站必须显式 `"decryption": "none"`**, 26.x 缺了直接拒绝启动。
+- **`tlsSettings.certificates[].certificate` 与 `.key` 是数组**, 且放 PEM
+  原文而非 base64。写成标量会报 `cannot unmarshal string into []string`,
+  写成 base64 会报 `failed to find any PEM data`。
+- **`pinnedPeerCertSha256` 是字符串**, 与上面的 `certificate` 不是一个形状。
+  `allowInsecure` 已在 26.x 移除, 内核直接拒绝这种配置。
+- **Trojan 出站用 `settings.servers`, 不是 `vnext`**。写成 vnext 时内核报的是
+  `Trojan settings: "servers" is required`, 错误信息不提 vnext, 容易让人往
+  证书或端口方向找。
+- **`xray x25519` 把公钥那行标成 `Password (PublicKey)`**。只匹配
+  `^PublicKey:` 取不到值, 于是密钥对判空、REALITY 用例被静默跳过。
+- **SS2022 密钥长度必须精确对应算法** (aes-128 要 16 字节)。长度不对时报
+  `decode psk: illegal base64 data`, 长度"碰巧合法"时更糟 —— 不报错, 静默不通。
+
+配置由 `tools/e2e_configs.py` 生成而不是 shell 拼字符串: TLS 证书要塞含换行的
+PEM, 拼字符串必然要在转义上翻车。这次拼 JSON 先后踩了四个坑 (证书形式、数组
+形状、片段间逗号、空片段多逗号), 每次的表现都是同一句"配置解析失败", 指向的
+却是完全不同的原因。`e2e_configs.py --selftest` 把这些形状检查固化成离线断言。
+
+### 自检在实机上的行为
+
+菜单 12 (自检) 在实机上跑时, 曾把测试配置写进容器里 nginx 的**真实站点** ——
+因为测试用 `NGINX_CONF_ROOTS` 指定夹具目录, 而代码里的容器探测会盖掉这个指定。
+现在调用方显式指定了配置根或文件路径时不再探容器, 实机跑完站点校验和不变。

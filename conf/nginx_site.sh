@@ -63,11 +63,14 @@ _ng_do_list() {
     # 查询走 python -c 而不是给 nginx_apply.py 加子命令 —— 它是库, CLI 只
     # 服务于插入/摘除。列站点、查标记块这些只读操作由菜单自己驱动。
     out=$(python3 - "$_NG_PY" <<'PY'
-import importlib.util, sys
+import importlib.util, os, sys
 spec = importlib.util.spec_from_file_location("na", sys.argv[1])
 na = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(na)
-dk = na.probe_docker()
+# 调用方已经用 NGINX_CONF_ROOTS 指定了在哪找配置时, 不要再探容器 ——
+# 探测会盖掉这个指定, 于是在 nginx 跑在容器里的机器上, 菜单列出来的是容器里
+# 的真实站点而不是调用方指定的那套。自检就靠这个变量把测试钉在夹具目录上。
+dk = None if os.environ.get("NGINX_CONF_ROOTS") else na.probe_docker()
 sites = list(na.list_sites(dk))
 if not sites:
     print("NONE")
@@ -102,15 +105,17 @@ _ng_do_show() {
     echo
     local out
     out=$(python3 - "$_NG_PY" "$dom" <<'PY'
-import importlib.util, sys
+import importlib.util, os, sys
 spec = importlib.util.spec_from_file_location("na", sys.argv[1])
 na = importlib.util.module_from_spec(spec); spec.loader.exec_module(na)
-dk = na.probe_docker()
+dk = None if os.environ.get("NGINX_CONF_ROOTS") else na.probe_docker()
 hit = na.find_site(sys.argv[2], dk)
 if not hit:
     print("NONE"); sys.exit(0)
 print("PATH\t%s" % hit)
-raw = open(hit, "rb").read().decode("utf-8", "replace")
+# 必须经 c_read 读: 容器部署时 hit 是容器内的路径, 直接 open() 宿主机上
+# 没有这个文件 —— 于是"列站点"能看到, "查看站点"却报文件不存在。
+raw = na.c_read(hit, dk).decode("utf-8", "replace")
 lines = raw.split("\n")
 span = na.find_marked_span(lines, sys.argv[2])
 if span:
