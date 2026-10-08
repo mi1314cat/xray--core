@@ -1068,6 +1068,44 @@ D4=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"trojan","transport":"w
 assert_eq "$D4" "1" "无加密+WS+CDN: 无需域名即可生成"
 
 # ---------------------------------------------------------------- 预置批量
+# ---------------------------------------------------------------- 从零安装
+# 菜单 1 (安装/更新) 此前只在"已经装好的机器"上跑过, 真正的从零路径没验证过:
+# 新机器上没有内核, 没有 conf/, 没有 systemd 条目, 全靠这段脚本建起来。
+# 用 XRAY_INSTALL_DIR 指到临时目录, 不碰真实安装, 也不装 systemd。
+group "从零安装 (bin/xray_install.sh)"
+INST="$ROOT/bin/xray_install.sh"
+bash -n "$INST" 2>/dev/null && ok "安装脚本语法" || bad "安装脚本语法"
+grep -q 'XRAY_INSTALL_DIR' "$INST" && ok "支持自定义安装目录 (可在临时目录里测)" \
+    || bad "不支持自定义安装目录, 无法在不影响生产的前提下测试"
+grep -q '测试模式' "$INST" && ok "临时目录下会跳过 systemd 安装" \
+    || bad "临时目录下仍会装 systemd"
+
+X=""
+command -v xray >/dev/null 2>&1 && X=$(command -v xray)
+[[ -z "$X" && -x /root/catmi/xray/xrayls ]] && X=/root/catmi/xray/xrayls
+if [[ -z "$X" ]]; then
+    printf '  - 从零安装需要 Xray 内核 (本机没有, 已在实机跑过)\n'
+else
+    IT="$TMP/inst"; rm -rf "$IT"; mkdir -p "$IT"
+    # 把内核先放好, 让脚本跳过下载 —— 测试要能离线重跑, 每次联网拉一遍内核既慢
+    # 又会在 GitHub API 限流时变成随机失败
+    cp "$X" "$IT/xrayls" 2>/dev/null || true
+    OUT=$(XRAY_INSTALL_DIR="$IT" timeout 300 bash "$INST" 2>&1)
+    [[ -f "$IT/conf/00-base.json" ]] && ok "从零安装建出了基础配置" \
+        || bad "从零安装没建出基础配置"
+    if "$IT/xrayls" run -test -confdir "$IT/conf" >/dev/null 2>&1; then
+        ok "基础配置通过内核校验 (零节点即可运行)"
+    else
+        bad "基础配置未通过内核校验"
+    fi
+    # 幂等: 再装一次不应重复下载, 也不应把已有节点文件清掉
+    printf 'keepme' > "$IT/conf/10-user-node.json"
+    XRAY_INSTALL_DIR="$IT" timeout 300 bash "$INST" >/dev/null 2>&1
+    [[ -f "$IT/conf/10-user-node.json" ]] && ok "重装不删除已有节点文件" \
+        || bad "重装把已有节点文件删了"
+    NC=$(ls "$IT/conf"/*.json 2>/dev/null | wc -l)
+    [[ "$NC" -ge 2 ]] && ok "重装后配置目录没有重复生成" || bad "重装后配置目录只剩 $NC 个文件"
+fi
 group "预置批量 (preset_batch.sh)"
 PB="$TMP/pb"; mkdir -p "$PB"
 XRAY_CONF_DIR="$PB/conf" XRAY_SHARE_DIR="$PB/share" X_BATCH_DOMAIN=a.example.com \
