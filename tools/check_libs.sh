@@ -298,6 +298,42 @@ assert_eq "$P1" "1" "预览插入: 标明是 dry-run"
 P2=$(printf '5\nt.example\n23456\nws\n0\n' | ngmenu | grep -c 'proxy_pass')
 assert_eq "$P2" "1" "预览插入: 能看到将插入的内容"
 
+# ---------------------------------------------------------------- 面板入口
+# 目标里的能力清单要求每项都有用户能摸到的入口。之前 cert / nginx_site /
+# share_service 都只有库没有入口, 用户要从源码里翻才知道它们存在。
+group "面板入口 (目标清单逐项核对)"
+PAN="$ROOT/xray-panel.sh"
+# Server / Client / UI 由面板本身与 Client/ 目录承担, 不是独立菜单项
+entry_ok() { grep -q "conf/$1" "$PAN" && ok "$2 有菜单入口" || bad "$2 无菜单入口"; }
+entry_ok share.sh          "Share"
+entry_ok share_service.sh  "Pull (分享服务)"
+entry_ok node.sh           "Node 管理"
+entry_ok nginx_site.sh     "Nginx"
+entry_ok cert.sh           "Cert"
+entry_ok dns.sh            "DNS"
+entry_ok logs.sh           "Logs"
+entry_ok verify.sh         "Port (校验/自动改端口)"
+grep -q 'systemctl status xrayls' "$PAN" && ok "Service 有菜单入口" || bad "Service 无菜单入口"
+grep -q 'check_libs.sh' "$PAN" && ok "Validation 有菜单入口" || bad "Validation 无菜单入口"
+grep -q 'run_xray_install' "$PAN" && ok "Install/Update 有菜单入口" || bad "Install 无菜单入口"
+grep -q 'uninstall_xray.sh' "$PAN" && ok "Uninstall 有菜单入口" || bad "Uninstall 无菜单入口"
+# Docker 能力不是独立菜单, 而是通过 cert/nginx 的容器感知暴露 —— 检查它真的在
+grep -q 'docker' "$ROOT/conf/lib/cert.sh" && ok "Docker 能力: cert.sh 有容器感知" || bad "Docker: cert.sh 无容器感知"
+grep -q 'docker' "$ROOT/conf/lib/nginx_apply.py" && ok "Docker 能力: nginx_apply.py 有容器感知" || bad "Docker: nginx_apply.py 无容器感知"
+# 面板里每个菜单号都要有对应 case, 否则显示得出、按下去没反应
+MISSING=""
+for n in $(grep -oE '^\s+[0-9]+\)' "$PAN" | grep -oE '[0-9]+' | sort -n -u); do
+  grep -qE "^\s+$n\)" "$PAN" || MISSING="$MISSING $n"
+done
+[[ -z "$MISSING" ]] && ok "面板菜单号连续无缺" || bad "面板菜单号缺失:$MISSING"
+# 面板引用的每个远端脚本都要真实存在 (拼错 URL 的话运行时才 404)
+BADURL=""
+for u in $(grep -oE 'https://github.com/mi1314cat/xray--core/raw/refs/heads/main/[A-Za-z0-9_/.-]+' "$PAN" | sort -u); do
+  p="${u#*main/}"
+  [[ -f "$ROOT/$p" ]] || BADURL="$BADURL $p"
+done
+[[ -z "$BADURL" ]] && ok "面板引用的脚本都存在" || bad "面板引用了不存在的文件:$BADURL"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。

@@ -51,6 +51,7 @@ ${GREEN}15.${PLAIN} 预置建节点（mknode）
 ${GREEN}16.${PLAIN} 预置批量生成（preset_batch）
 ${GREEN}17.${PLAIN} 证书管理（cert）
 ${GREEN}18.${PLAIN} Nginx 站点管理（nginx_site）
+${GREEN}19.${PLAIN} 分享服务（share_service）
 ${GREEN}0.${PLAIN} 退出脚本
 ----------------------
 xrayls 服务状态: ${xrayls_server_status_text}
@@ -78,6 +79,7 @@ xrayls 服务状态: ${xrayls_server_status_text}
         16) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/tools/preset_batch.sh) --help ;;
         17) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cert.sh) ;;
         18) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/nginx_site.sh) ;;
+        19) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/share_service.sh) menu ;;
 
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac
