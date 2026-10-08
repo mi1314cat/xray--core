@@ -82,6 +82,35 @@ tag 引用。漏掉任何一处，表现都是"改名后分享链接指向一个
 / hysteria2 / socks / http。REALITY 组合在选完当场校验——表是手维护的，加错
 一行不该等到生成配置时才炸，更不该等到用户连不上。
 
+## 预置批量生成
+
+菜单 16。一次生成多种协议 × 预置的节点。
+
+```bash
+# 全部走 CDN 直连
+bash <(curl -Ls .../tools/preset_batch.sh) vless:2 trojan:3
+
+# 逐节点指定档位（CDN / nginx）
+bash <(curl -Ls .../tools/preset_batch.sh) vless:2 trojan:2:nginx
+
+# 看可用组合
+bash <(curl -Ls .../tools/preset_batch.sh) --list
+```
+
+与菜单 7（批量生成）的区别：那条路径逐个调用各协议脚本的交互式流程、各自走
+"最高配置"，且不区分接入场景；这里走统一预置，可按节点指定档位。两条路径
+并存。
+
+TLS 节点要域名，两种给法：
+
+```bash
+X_BATCH_DOMAIN=b.example.com       # 全部 TLS 节点共用一个 SNI
+X_BATCH_DOMAIN_BASE=b.example.com  # 每个节点一个 b.example.com-1、-2
+```
+
+都不给会明确报错并跳过该节点——不会静默跳过，否则用户以为建好了而实际一个
+都没生成。
+
 ## 协议与接入
 
 `conf/lib/node_build.py` 把 inbound 拆成协议 / 传输 / 加密三段组合，加新
