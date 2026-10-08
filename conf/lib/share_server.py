@@ -36,6 +36,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -160,10 +161,35 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_HEAD(self):
-        self._route(head_only=True)
+        self._guard(head_only=True)
 
     def do_GET(self):
-        self._route(head_only=False)
+        self._guard(head_only=False)
+
+    def _guard(self, head_only):
+        """兜底。
+
+        _route 里没有 try/except, 而这是常驻服务: 任何一个未捕获的异常
+        (配置目录权限变了、某个片段在校验前被删、磁盘满) 都会让
+        BaseHTTPRequestHandler 回 500 并往 stderr 打一整段栈。订阅客户端
+        看到的是 500 而不是可判定的状态码, 排查还得去翻服务日志。
+
+        这里兜住并给出 500 + X-Xray-Error 头。诊断信息不进 body —— body 是
+        纯 base64, 多一行就整个订阅解析失败。
+        """
+        try:
+            self._route(head_only)
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端自己断开。不算错误, 也不该往日志里刷栈。
+            pass
+        except Exception as e:  # noqa: BLE001 —— 兜底就该兜所有
+            sys.stderr.write("[share] 请求处理异常: %r\n" % (e,))
+            traceback.print_exc()
+            try:
+                self._send(500, b"internal error\n", head_only=head_only,
+                           extra={"X-Xray-Error": "internal"})
+            except Exception:
+                pass
 
     def _route(self, head_only):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"

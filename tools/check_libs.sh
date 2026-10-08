@@ -54,6 +54,83 @@ n,_=N.collect('$CONF')
 print(next((x['method'] for x in n if x['tag']=='ss-02'),''))")
 assert_eq "$SS" "2022-blake3-aes-128-gcm" "Shadowsocks 单用户形态也能抽出 method"
 
+# ---------------------------------------------------------------- 分享服务兜底
+# 常驻服务里一个未捕获异常的代价, 不是那一个请求失败:
+#   有兜底 → HTTP 500 + X-Xray-Error, 客户端能判定, 服务继续服务
+#   无兜底 → RemoteDisconnected, 客户端收到的是连接错误而非状态码,
+#            且同一条连接上后续请求也一起断 (实测)
+group "分享服务兜底 (share_server._guard)"
+SG="$TMP/guard"; mkdir -p "$SG/conf" "$SG/share/tokens"
+python3 - "$LIB" "$SG" <<'PY'
+import json, sys, os
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+import token_store as T, share_meta as M
+with open(os.path.join(d, "conf", "t.json"), "w") as f:
+    json.dump({"inbounds": [{"tag": "t", "port": 20001, "protocol": "vless",
+      "settings": {"clients": [{"id": "u"}]},
+      "streamSettings": {"network": "tcp", "security": "none"}}]}, f)
+T.write(os.path.join(d, "share"), "tok1", {"enabled": True, "max_uses": 0,
+  "used_count": 0, "expires_at": 0, "tags": ["t"]})
+M.save(os.path.join(d, "share"), "t", {"host": "h.com", "port": 20001, "name": "t"})
+PY
+GRD=$(python3 - "$LIB" "$SG" 19461 <<'PY'
+import sys, os, threading, time, urllib.request, urllib.error
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]; port = int(sys.argv[3])
+os.environ.update(XRAY_CONF_DIR=os.path.join(d, "conf"),
+                  XRAY_SHARE_DIR=os.path.join(d, "share"),
+                  XRAY_SHARE_PORT=str(port))
+import share_server as S
+real = S.Handler._route
+def selective(self, head_only):
+    # 只让 /status 炸, 其余路径正常 —— 这样能验证"一个请求的异常不会
+    # 连累服务其它功能"
+    if self.path.startswith("/status"):
+        raise OSError("注入: 配置目录权限变了")
+    return real(self, head_only)
+S.Handler._route = selective
+os.makedirs(os.path.join(S.SHARE_DIR, "tokens"), exist_ok=True)
+srv = S.Server(("127.0.0.1", port), S.Handler)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+time.sleep(0.6)
+B = "http://127.0.0.1:%d" % port
+
+def hit(p):
+    try:
+        r = urllib.request.urlopen(B + p, timeout=4)
+        return str(r.status), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return str(e.code), dict(e.headers)
+    except Exception as e:
+        return "ERR:" + type(e).__name__, {}
+
+code, hdr = hit("/status")
+print("boom_code=%s" % code)
+print("boom_hdr=%s" % hdr.get("X-Xray-Error", "无"))
+c2, _ = hit("/sub/tok1")
+print("other_code=%s" % c2)
+c3, _ = hit("/status")
+print("boom_again=%s" % c3)
+PY
+)
+echo "$GRD" | grep -q 'boom_code=500' && ok "异常请求返回 500 (不是断连)" || bad "异常请求未返回 500: $(echo "$GRD" | grep boom_code)"
+echo "$GRD" | grep -q 'boom_hdr=internal' && ok "带 X-Xray-Error 诊断头" || bad "缺 X-Xray-Error 头"
+echo "$GRD" | grep -q 'other_code=200' && ok "异常不影响其它路径" || bad "异常连累了其它路径"
+echo "$GRD" | grep -q 'boom_again=500' && ok "重复异常仍稳定返回 500" || bad "重复异常行为不一致"
+# body 必须仍是纯 base64 —— 多一行诊断就整个订阅解析失败
+B64=$(python3 - "$LIB" "$SG" <<'PY'
+import sys, os, threading, time, urllib.request
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+os.environ.update(XRAY_CONF_DIR=os.path.join(d,"conf"), XRAY_SHARE_DIR=os.path.join(d,"share"), XRAY_SHARE_PORT="19462")
+import share_server as S
+os.makedirs(os.path.join(S.SHARE_DIR,"tokens"), exist_ok=True)
+srv = S.Server(("127.0.0.1", 19462), S.Handler)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+time.sleep(0.6)
+print(urllib.request.urlopen("http://127.0.0.1:19462/sub/tok1", timeout=4).read().decode().strip())
+PY
+)
+echo "$B64" | grep -qE '^[A-Za-z0-9+/=]+$' && ok "订阅 body 是纯 base64" || bad "订阅 body 混入非 base64 内容"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。
