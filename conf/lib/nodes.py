@@ -176,12 +176,25 @@ def build_share_link(n, meta=None):
     port = meta.get("port") or n.get("port")
     name = meta.get("name") or n.get("tag") or ""
 
+    # 显示名不能为空。Client 的解析器是 `name = fragment or hostname`
+    # (Client/lib/node.py:121) —— 没有 fragment 就退化成域名, 于是同一域名
+    # 下的所有节点在列表里名字完全一样, 用户分不清谁是谁。
+    # 兜底到端口, 保证任何情况下 fragment 都非空。
+    if not name:
+        name = f"{proto or 'node'}-{port or 'x'}"
+
     if not host or not port:
         # 没有对外地址就没法生成分享链接 —— 但不静默返回 None 让上层
         # 以为"节点不存在", 这里显式区分。
         return None
 
     if proto == "vless":
+        # REALITY 缺公钥的链接是残缺的。Client 的能力检查会判
+        # "security=reality 但缺少 pbk" 而静默丢弃该节点 (compat.py),
+        # 表现是"分享了 4 个节点客户端只收到 3 个"且没有任何报错。
+        # 生成一条连不上的链接比不生成更糟 —— 用户会以为已经分享成功了。
+        if n.get("security") == "reality" and not meta.get("public_key"):
+            return None
         q = {
             "encryption": meta.get("encryption", "none"),
             "security": n.get("security") or "none",
@@ -209,6 +222,8 @@ def build_share_link(n, meta=None):
         return f"vless://{n.get('id') or ''}@{_q(host)}:{port}?{qs}#{_q(name)}"
 
     if proto == "trojan":
+        if n.get("security") == "reality" and not meta.get("public_key"):
+            return None
         q = {"security": n.get("security") or "none", "type": n.get("network") or "tcp"}
         if n.get("security") == "reality":
             if n.get("server_names"):

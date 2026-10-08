@@ -286,8 +286,9 @@ cmd_node() {
     browser|bd)  cmd_node_browser "$@" ;;
     probe|test)  cmd_node_probe "$@" ;;
     sub|subscription) cmd_node_subscription "$@" ;;
+      sub-refresh|refresh) cmd_node_sub_refresh "$@" ;;
     import-file) cmd_node_import_file "$@" ;;
-    -h|--help|"") info "用法: xbd node <add|list|use|remove|check|browser|probe|sub|import-file>" ;;
+    -h|--help|"") info "用法: xbd node <add|list|use|remove|check|browser|probe|sub|sub-refresh|import-file>" ;;
     *) die "未知子命令: $sub" ;;
   esac
 }
@@ -507,14 +508,63 @@ import json, sys
 for node in json.load(open(sys.argv[1])):
     print(json.dumps(node, ensure_ascii=False))
 PY
+  # 过滤: 去掉内核不支持的和已存在的。少了这一步, 每拉一次订阅节点就翻倍。
+  _sub_keep=0
+  [ "${XBD_KEEP_UNSUPPORTED:-0}" = "1" ] && _sub_keep=1
+  if ! _sub_filter "$tmp" "$_sub_keep" > /tmp/.xbd_sub_kept.jsonl 2>/dev/null; then
+    rm -f "$tmp" /tmp/.xbd_sub_lines
+    die "节点过滤失败"
+  fi
   local c=0 line
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     cmd_node_import_one "$line" >/dev/null && c=$((c+1))
-  done < /tmp/.xbd_sub_lines
-  rm -f "$tmp" /tmp/.xbd_sub_lines
-  ok "已导入 $c 个节点"
-}
+    done < /tmp/.xbd_sub_kept.jsonl
+    rm -f "$tmp" /tmp/.xbd_sub_lines /tmp/.xbd_sub_kept.jsonl
+    ok "已导入 $c 个节点"
+  }
+
+  # 订阅必须过 nodefilter。粘贴路径走的是它 (见 cmd_node_add), 订阅路径
+  # 以前直接逐条落盘 —— 而订阅天然会重复拉取, 于是每刷新一次节点数就翻
+  # 一倍, 列表被灌满。去重依据是 protocol|address|port|uuid|password|
+  # transport, 与已落盘节点比对。
+  _sub_filter() {   # $1=解析结果文件  $2=保留不支持项(0/1)
+    python3 "$XBD_LIBDIR/nodefilter.py" "$1" "$XBD_LIBDIR" "$2" "$XBD_NODES"
+  }
+
+  # 刷新订阅: 拉取 → 去重 → 增量落盘。
+  #
+  # 失败时保留全部旧节点, 并且只在"拉到且解析出节点"之后才动磁盘。
+  # 先删后拉的话, 一次性链接 (限 1 次) 拉废之后就再也拉不回来, 节点全灭且
+  # 无法恢复 —— sing-box 与 mihomo 的更新路径都专门为此做了备份还原。
+  cmd_node_sub_refresh() {
+    local url="${1:-}"
+    [ -n "$url" ] || die "用法: xbd node sub-refresh <订阅URL>"
+    step "刷新订阅"
+    local body
+    body=$(curl -sL --max-time 60 "$url") || { err "下载失败, 保留现有节点"; return 1; }
+    [ -n "$body" ] || { err "订阅内容为空, 保留现有节点"; return 1; }
+
+    local tmp; tmp=$(mktemp)
+    printf '%s' "$body" | python3 "$XBD_LIBDIR/node.py" subscription - > "$tmp" 2>/dev/null || true
+    local n; n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "$tmp" 2>/dev/null || echo 0)
+    if [ "$n" -le 0 ]; then
+      rm -f "$tmp"
+      err "订阅里没有解析出节点, 保留现有节点"
+      return 1
+    fi
+    ok "解析出 $n 个节点"
+
+    _sub_filter "$tmp" 0 > /tmp/.xbd_ref_kept.jsonl 2>/dev/null || true
+    local c=0 line
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      cmd_node_import_one "$line" >/dev/null && c=$((c+1))
+    done < /tmp/.xbd_ref_kept.jsonl
+    rm -f "$tmp" /tmp/.xbd_ref_kept.jsonl
+    ok "新增 $c 个节点 (已存在的跳过)"
+    return 0
+  }
 
 cmd_node_list() {
   XBD_PREFIX="$XBD_PREFIX" python3 "$XBD_LIBDIR/nodelist.py"
