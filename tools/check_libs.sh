@@ -250,6 +250,37 @@ GC=$(CONF_DIR="$TMP/cc/conf" X_CERT_NGINX_DIRS="$TMP/cc/nginx" bash -c \
 [[ -f "$TMP/cc/ng.crt" ]] && ok "GC 未删被 nginx 引用的证书" || bad "GC 未删被 nginx 引用的证书"
 [[ ! -f "$TMP/cc/old.crt" ]] && ok "GC 删除了无人引用的证书" || bad "GC 删除了无人引用的证书"
 
+# ---------------------------------------------------------------- DNS
+group "DNS (dns_edit.py)"
+DNSF="$TMP/dn"; mkdir -p "$DNSF"
+printf '{"log":{"loglevel":"warning"},"inbounds":[{"tag":"keep-me","port":443}],"outbounds":[{"tag":"direct"}]}' > "$DNSF/config.json"
+python3 "$LIB/dns_edit.py" --config "$DNSF/config.json" --add-server --server-address 1.1.1.1 --no-reload >/dev/null 2>&1
+S1=$(python3 "$LIB/dns_edit.py" --config "$DNSF/config.json" --get 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("servers",[])))')
+assert_eq "$S1" "1" "追加 DNS 服务器"
+python3 "$LIB/dns_edit.py" --config "$DNSF/config.json" --del-server 1.1.1.1 --no-reload >/dev/null 2>&1
+# 删完最后一条后 --get 输出一行提示而不是 JSON, 所以直接查文件而不是解析输出
+S2=$(python3 -c "
+import json
+try: d=json.load(open('$DNSF/config.json'))
+except Exception: d={}
+print('servers' in (d.get('dns') or {}))")
+assert_eq "$S2" "False" "删除最后一条后 servers 键消失 (不留空数组)"
+D1=$(python3 -c "
+import json;d=json.load(open('$DNSF/config.json'))
+print('ok' if d['inbounds'][0]['tag']=='keep-me' and 'outbounds' in d else 'lost')")
+assert_eq "$D1" "ok" "编辑 dns 不动其余键"
+BAD=0
+for b in '{"queryStrategy":"UseIPv5"}' '{"servers":[{"noAddress":1}]}' '{"unknownField":1}' '{"servers":"x"}' '{"disableCache":"yes"}'; do
+    python3 "$LIB/dns_edit.py" --config "$DNSF/config.json" --set-json "$b" --no-reload >/dev/null 2>&1 || BAD=$((BAD+1))
+done
+assert_eq "$BAD" "5" "5 类非法 schema 全部被拦下"
+# 校验失败必须回滚且不留备份
+cp "$DNSF/config.json" "$DNSF/before.json"
+mkdir -p "$TMP/bin2"; printf '#!/bin/sh\nexit 1\n' > "$TMP/bin2/xray"; chmod +x "$TMP/bin2/xray"
+PATH="$TMP/bin2:$PATH" python3 "$LIB/dns_edit.py" --config "$DNSF/config.json" --set-json '{"queryStrategy":"UseIPv6"}' --test --no-reload >/dev/null 2>&1
+if diff -q "$DNSF/before.json" "$DNSF/config.json" >/dev/null 2>&1; then ok "xray -test 失败已回滚"; else bad "xray -test 失败已回滚"; fi
+if compgen -G "$DNSF/*.dns-bak" >/dev/null; then bad "回滚后无备份残留"; else ok "回滚后无备份残留"; fi
+
 # ---------------------------------------------------------------- 服务
 group "服务管理 (service.sh)"
 RC=$(bash -c "source '$LIB/service.sh'; x_svc_resolve >/dev/null; echo \$X_SVC_RESOLVED" 2>/dev/null)
