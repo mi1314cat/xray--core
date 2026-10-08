@@ -58,10 +58,16 @@ mkdir -p "$CONF_DIR" "$OUT_DIR"
 # 副本时代改一处漏一处 —— 批量区间分配只进了 4 个脚本, 另外 5 个的批量
 # 生成仍在用随机端口, 同一批节点端口散落在 10000-60000。
 _x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+_x_lib_base="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib"
+if [[ -r "$_x_lib_dir/lib/cert.sh" ]]; then
+    source "$_x_lib_dir/lib/cert.sh"
+else
+    source <(curl -fsSL "$_x_lib_base/cert.sh") || { print_error "证书库加载失败"; exit 1; }
+fi
 if [[ -r "$_x_lib_dir/lib/ports.sh" ]]; then
     source "$_x_lib_dir/lib/ports.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/ports.sh") \
+    source <(curl -fsSL "$_x_lib_base/ports.sh") \
         || { print_error "端口库加载失败"; exit 1; }
 fi
 # ================================
@@ -240,17 +246,8 @@ generate_ech() {
 
 extract_cert_domain() {
     local crt="$1"
-    local dom=""
-    if command -v openssl >/dev/null 2>&1 && [[ -f "$crt" ]]; then
-        dom=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null |
-            grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2 | tr '[:upper:]' '[:lower:]')
-        [[ -z "$dom" ]] && dom=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null |
-            grep -oE "CN *= *[^,]+" | head -1 | sed 's/.*CN *= *//' | tr -d '"' | tr '[:upper:]' '[:lower:]')
-    fi
-    if [[ -z "$dom" ]]; then
-        dom=$(basename "$crt" | sed -E 's/\.(crt|pem)$//; s/_cert$//' | sed 's/^cert-//')
-    fi
-    echo "$dom"
+    if [[ -z "$crt" ]]; then echo ""; return 0; fi
+    x_cert_domain "$crt"
 }
 
 # ================================
@@ -420,6 +417,27 @@ generate_cert() {
         exit 1
     fi
 }
+
+  # ================================
+  # 证书复核
+  #
+  # 上面选证书时已经检查过路径存不存在, 这里再查一遍"是不是真能用的证书":
+  # 过期 / crt 与 key 不配对 / 证书域名和实际要用���域名对不上 —— 这三类
+  # 配置校验 (xray run -test) 都可能放过去, 现场表现是"节点配好了但连不上",
+  # 而用户要等到客户端握手失败才发现。
+  # ================================
+  check_cert_final() {
+      # REALITY 不挂证书文件 (走 dest server), 不适用
+      [[ "$CERT_FILE" && "$CERT_FILE" != *"-selfsigned"* ]] || return 0
+      [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || return 0
+      if x_cert_check "$CERT_FILE" "$KEY_FILE" "$CERT_DOMAIN"; then
+          return 0
+      fi
+      print_error "证书不可用, 已停止生成"
+      print_info "修好之后重新运行本脚本; 或改用自签证书兜底"
+      return 1
+  }
+  check_cert_final || exit 1
 
 # ================================
 # 特性询问: 传输 / 接入 / ECH 形态
@@ -840,17 +858,8 @@ PY
 # ================================
 extract_cert_domain() {
     local crt="$1"
-    local dom=""
-    if command -v openssl >/dev/null 2>&1 && [[ -f "$crt" ]]; then
-        dom=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null |
-            grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2 | tr '[:upper:]' '[:lower:]')
-        [[ -z "$dom" ]] && dom=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null |
-            grep -oE "CN *= *[^,]+" | head -1 | sed 's/.*CN *= *//' | tr -d '"' | tr '[:upper:]' '[:lower:]')
-    fi
-    if [[ -z "$dom" ]]; then
-        dom=$(basename "$crt" | sed -E 's/\.(crt|pem)$//; s/_cert$//' | sed 's/^cert-//')
-    fi
-    echo "$dom"
+    if [[ -z "$crt" ]]; then echo ""; return 0; fi
+    x_cert_domain "$crt"
 }
 
 # ================================

@@ -195,19 +195,19 @@ choose_listen_ip() {
 # 从证书中提取域名（借鉴 vlessxhttpecn.sh extract_cert_domain）
 # 三级回退: SAN 第一个 DNS → subject CN → 文件名
 # ================================
+# 证书校验公共库: x_cert_domain / x_cert_check
+_x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+if [[ -r "$_x_lib_dir/lib/cert.sh" ]]; then
+    source "$_x_lib_dir/lib/cert.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/cert.sh") \
+        || { print_error "证书库加载失败"; exit 1; }
+fi
+
 extract_cert_domain() {
     local crt="$1"
-    local dom=""
-    if command -v openssl >/dev/null 2>&1 && [[ -f "$crt" ]]; then
-        dom=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null |
-            grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2 | tr '[:upper:]' '[:lower:]')
-        [[ -z "$dom" ]] && dom=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null |
-            grep -oE "CN *= *[^,]+" | head -1 | sed 's/.*CN *= *//' | tr -d '"' | tr '[:upper:]' '[:lower:]')
-    fi
-    if [[ -z "$dom" ]]; then
-        dom=$(basename "$crt" | sed -E 's/\.(crt|pem)$//; s/_cert$//' | sed 's/^cert-//')
-    fi
-    echo "$dom"
+    if [[ -z "$crt" ]]; then echo ""; return 0; fi
+    x_cert_domain "$crt"
 }
 
 # 证书有效期检查: 未过期返回 0
