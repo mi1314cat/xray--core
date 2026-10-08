@@ -83,19 +83,140 @@ def config_roots(docker=None):
     return [c for c in cands if os.path.isdir(c)]
 
 
+# ---------------------------------------------------------------- 容器内的文件
+#
+# 为什么需要这一层
+# ----------------
+# nginx 跑在容器里时, 宿主机的 /etc/nginx/conf.d 和容器里的 /etc/nginx/conf.d
+# 是两个互不相干的目录。之前 config_roots(docker) 收了 docker 参数却从没用过,
+# 于是所有查找与写入都落在宿主机上 —— 而容器里的 nginx 从不读那些文件。
+#
+# 后果不是报错, 是"成功"地改了一个 nginx 永远不会加载的文件: 用户插入完看到
+# "已写入", reload 也成功, 但站点毫无变化, 排查起来毫无线索。
+#
+# 所以读写都要落到真正跑 nginx 的那一侧。
+
+_CONF_DIRS_CONTAINER = ["/etc/nginx/conf.d", "/etc/nginx/sites-enabled",
+                        "/usr/local/nginx/conf", "/usr/local/openresty/nginx/conf"]
+
+
+def _dexec(docker, argv, stdin=None):
+    """在容器里跑一条命令, 返回 (rc, stdout_bytes)。"""
+    cmd = ["docker", "exec"]
+    if stdin is not None:
+        cmd.append("-i")
+    cmd += [docker] + argv
+    r = subprocess.run(cmd, input=stdin, capture_output=True)
+    return r.returncode, r.stdout
+
+
+def c_file_exists(path, docker=None):
+    if not docker:
+        return os.path.exists(path)
+    rc, _ = _dexec(docker, ["sh", "-c", 'test -f "$1"', "sh", path])
+    return rc == 0
+
+
+def c_read(path, docker=None):
+    """读一个文件的内容 (bytes)。"""
+    if not docker:
+        with open(path, "rb") as f:
+            return f.read()
+    rc, out = _dexec(docker, ["cat", path])
+    if rc != 0:
+        raise OSError(f"读取容器内 {path} 失败 (rc={rc})")
+    return out
+
+
+def c_write(path, data, docker=None):
+    """原子地写一个文件。容器里没有 bind 挂载时走 stdin 管道。"""
+    if not docker:
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return
+    # 容器侧没有宿主的原子 replace 可用, 退化成先写临时文件再 mv。mv 在容器
+    # 同一文件系统内是原子的, 所以中途断电不会留下半个配置文件。
+    rc, _ = _dexec(docker, ["sh", "-c", 'cat > "$1.tmp" && mv "$1.tmp" "$1"',
+                            "sh", path], stdin=data)
+    if rc != 0:
+        raise OSError(f"写入容器内 {path} 失败 (rc={rc})")
+
+
+def c_copy(src, dst, docker=None):
+    if not docker:
+        shutil.copy2(src, dst)
+        return
+    rc, _ = _dexec(docker, ["cp", src, dst])
+    if rc != 0:
+        raise OSError(f"容器内备份失败: {src} -> {dst} (rc={rc})")
+
+
+def container_site_files(docker):
+    """容器里实际存在的站点配置文件。"""
+    seen = {}
+    roots = []
+    # 末尾显式 exit 0: for 循环最后一次 [ -d ] 对不存在的目录返回 1, 整条命令
+    # 的退出码就会是 1 —— 输出明明是对的, 却因为退出码被当成失败。这里判的是
+    # 输出, 不是退出码。
+    rc, out = _dexec(docker, ["sh", "-c",
+                              'for d in %s; do [ -d "$d" ] && echo "$d"; done; exit 0'
+                              % " ".join(_CONF_DIRS_CONTAINER)])
+    if rc == 0:
+        roots = [d for d in out.decode().split() if d]
+    if not roots:
+        return []
+    pat = " ".join(f'"{d}"' for d in roots)
+    # find 在部分路径不存在时返回非 0 但仍会输出已找到的部分, 所以同样只看输出。
+    rc, out = _dexec(docker, ["sh", "-c",
+                              f'find {pat} -name "*.conf" -type f 2>/dev/null; exit 0'])
+    for line in out.decode(errors="replace").split("\n"):
+        line = line.strip()
+        if line:
+            seen.setdefault(line, line)
+    return sorted(seen.values())
+
+
 def site_files(docker=None):
-    out = []
+    """站点配置文件, 去重且跟随符号链接。
+
+    必须去重的两个原因:
+
+    1. config_roots 里既有 /etc/nginx/sites-enabled 也有 /etc/nginx, 而
+       os.walk 是递归的 —— /etc/nginx 那一遍会把 conf.d、sites-available、
+       sites-enabled 整个再走一遍, 同一个站点文件被列出两三次。实测过
+       torrent-tool.conf 在列出的站点里出现两次。
+
+    2. sites-enabled 里的文件通常是指向 sites-available 的符号链接, 按路径
+       去重不够, 要按 realpath 去重。
+
+    不去重的后果不只是难看: find_site 按顺序取第一个命中, 用户看到的站点
+    列表和实际改的文件对不上, 而"我明明有 5 个站点"会数出 8 个。
+    """
+    if docker:
+        return container_site_files(docker)
+    seen = {}
     for root in config_roots(docker):
         for dirpath, _dirs, files in os.walk(root):
             for f in files:
-                if f.endswith(".conf"):
-                    out.append(os.path.join(dirpath, f))
-    return sorted(out)
+                if not f.endswith(".conf"):
+                    continue
+                p = os.path.join(dirpath, f)
+                try:
+                    key = os.path.realpath(p)
+                except OSError:
+                    key = p
+                # 保留首次出现的路径 (通常来自更具体的根, 而不是 /etc/nginx)
+                seen.setdefault(key, p)
+    return sorted(seen.values())
 
 
-def server_name_of(path):
+def server_name_of(path, docker=None):
     try:
-        raw = open(path, encoding="utf-8", errors="replace").read()
+        raw = c_read(path, docker).decode("utf-8", errors="replace")
     except OSError:
         return None
     m = re.search(r"^\s*server_name\s+([^;]+);", raw, re.M)
@@ -105,7 +226,7 @@ def server_name_of(path):
 def list_sites(docker=None):
     out = []
     for f in site_files(docker):
-        sn = server_name_of(f)
+        sn = server_name_of(f, docker)
         if sn:
             out.append((f, sn))
     return out
@@ -280,22 +401,36 @@ def commit(path, lines, nl, had_bom, dry_run, nginx, docker, remove_only):
         return 0
 
     bak = f"{path}.{MARK}-bak"
-    shutil.copy2(path, bak)
-
-    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
-                                   prefix=f".{MARK}.")
-        os.close(fd)
-        with open(tmp, "wb") as f:
-            f.write(data)
-        shutil.copymode(path, tmp)     # 权限必须跟上, 否则 nginx 读不到
-        os.replace(tmp, path)
-        tmp = None
+        c_copy(path, bak, docker)
+        if docker:
+            # 容器里走 stdin 管道 + 容器内 mv。权限随原文件, mv 在同一文件系统
+            # 内是原子的, 断电不会留下半个配置文件。
+            rc, _ = _dexec(docker, ["sh", "-c",
+                                    'cat > "$1.tmp" && chmod --reference="$1" "$1.tmp" '
+                                    '2>/dev/null; mv "$1.tmp" "$1"',
+                                    "sh", path], stdin=data)
+            if rc != 0:
+                print(f"[错误] 写入容器内文件失败 (rc={rc}): {path}", file=sys.stderr)
+                return 2
+        else:
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                           prefix=f".{MARK}.")
+                os.close(fd)
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                shutil.copymode(path, tmp)     # 权限必须跟上, 否则 nginx 读不到
+                os.replace(tmp, path)
+                tmp = None
+            except OSError as e:
+                print(f"[错误] 写入失败: {e}", file=sys.stderr)
+                if tmp and os.path.exists(tmp):
+                    os.unlink(tmp)
+                return 2
     except OSError as e:
-        print(f"[错误] 写入失败: {e}", file=sys.stderr)
-        if tmp and os.path.exists(tmp):
-            os.unlink(tmp)
+        print(f"[错误] 备份失败: {e}", file=sys.stderr)
         return 2
 
     if remove_only:
@@ -317,8 +452,8 @@ def reload(nginx, docker, bak, path):
         print("[错误] nginx 配置校验不通过, 已回滚:", file=sys.stderr)
         for ln in (t.stderr or "").strip().splitlines()[:8]:
             print("    " + ln, file=sys.stderr)
-        if bak and os.path.exists(bak):
-            shutil.copy2(bak, path)
+        if bak and (c_file_exists(bak, docker) if docker else os.path.exists(bak)):
+            c_copy(bak, path, docker)
             print(f"[信息] 已恢复到 {path}", file=sys.stderr)
         return 1
 
@@ -326,8 +461,8 @@ def reload(nginx, docker, bak, path):
                        capture_output=True, text=True)
     if r.returncode != 0:
         print("[错误] reload 失败, 已回滚:", file=sys.stderr)
-        if bak and os.path.exists(bak):
-            shutil.copy2(bak, path)
+        if bak and (c_file_exists(bak, docker) if docker else os.path.exists(bak)):
+            c_copy(bak, path, docker)
         return 1
 
     print("[OK] 已写入并 reload 成功")
@@ -337,11 +472,13 @@ def reload(nginx, docker, bak, path):
 # ---------------------------------------------------------------- 主流程
 def apply(args):
     path = args.file
-    if not os.path.isfile(path):
+    # 容器部署时 path 指的是容器内的路径, 用宿主机的 os.path.isfile 判断必然
+    # 报"文件不存在" —— 所以存在性检查也要落到容器那一侧。
+    if not c_file_exists(path, args.docker):
         print(f"[错误] 站点文件不存在: {path}", file=sys.stderr)
         return 2
 
-    raw = open(path, "rb").read()
+    raw = c_read(path, args.docker)
     nl = newline_style(raw)
     had_bom = raw.startswith(b"\xef\xbb\xbf")
     text = raw.decode("utf-8-sig" if had_bom else "utf-8", errors="replace")

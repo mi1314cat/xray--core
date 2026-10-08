@@ -642,6 +642,74 @@ for fn in log_lines log_explain log_follow log_status log_menu; do
 done
 
 # ---------------------------------------------------------------- 容器共处
+# nginx 跑在容器里时, 站点的查找与写入必须落到容器内部。之前 config_roots(docker)
+# 收了参数却从没用过, 于是改的是宿主机的文件 —— 而容器里的 nginx 从不读它们。
+# 表现不是报错, 是"已写入"之后站点毫无变化, 排查起来毫无线索。
+CD="$TMP/cdk"; mkdir -p "$CD/ctr/conf.d" "$CD/bin"
+cat > "$CD/ctr/conf.d/c.example.conf" <<'SITE'
+server {
+    listen 443 ssl;
+    server_name c.example;
+    location / {
+        return 444;
+    }
+}
+SITE
+printf 'server {\n    listen 443 ssl;\n    server_name host.example;\n}\n' > "$CD/host-only.conf"
+# 假的 docker: 把容器内 /etc/nginx 映射到 $CD/ctr
+#
+# 三个细节都是踩出来的, 少一个测试就会假绿:
+#   · 映射目标不能含 "/etc/nginx" —— 替换结果自身又有这个子串, 再扫一遍会套两层
+#   · sh -c 后面的 $@ 必须一起传下去, 否则 'test -f "$1"' 里的 $1 是空的
+#   · exec -i (stdin 透传) 必须先摘掉, 否则后面的参数全部错位
+cat > "$CD/bin/docker" <<EOF
+#!/bin/bash
+[[ "\$1" == "exec" ]] || exit 1
+shift
+while [[ "\$1" == "-i" ]]; do shift; done
+ctr="\$1"; shift
+if [[ "\$1" == "sh" && "\$2" == "-c" ]]; then
+  script="\$3"; shift 3
+  exec sh -c "\$(printf '%s' "\$script" | sed 's#/etc/nginx#$CD/ctr#g')" "\$@"
+fi
+if [[ "\$1" == "cat" ]]; then exec cat "\${2//\/etc\/nginx/$CD/ctr}"; fi
+if [[ "\$1" == "cp" ]]; then cp "\${2//\/etc\/nginx/$CD/ctr}" "\${3//\/etc\/nginx/$CD/ctr}"; exit \$?; fi
+exec "\$@"
+EOF
+chmod +x "$CD/bin/docker"
+
+SF=$(PATH="$CD/bin:$PATH" python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import nginx_apply as N
+print('|'.join(N.site_files('nginx')))")
+case "$SF" in
+  *c.example.conf*) ok "容器模式的 site_files 找到容器里的站点" ;;
+  *) bad "容器模式的 site_files 找不到容器站点 (得到 $SF)" ;;
+esac
+LS=$(PATH="$CD/bin:$PATH" python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import nginx_apply as N
+print(len(N.list_sites('nginx')))")
+assert_eq "$LS" "1" "容器模式能读出 server_name"
+
+PATH="$CD/bin:$PATH" python3 "$LIB/nginx_apply.py" --docker nginx \
+  --domain c.example --port 34567 --transport ws --nginx none >/dev/null 2>&1
+CB=$(grep -c 'xray-core BEGIN' "$CD/ctr/conf.d/c.example.conf")
+assert_eq "$CB" "1" "容器模式插入写到了容器里的文件"
+PATH="$CD/bin:$PATH" python3 "$LIB/nginx_apply.py" --docker nginx \
+  --domain c.example --remove --nginx none >/dev/null 2>&1
+CB2=$(grep -c 'xray-core BEGIN' "$CD/ctr/conf.d/c.example.conf" || true)
+assert_eq "$CB2" "0" "容器模式摘除干净"
+CK=$(grep -c 'return 444' "$CD/ctr/conf.d/c.example.conf")
+assert_eq "$CK" "1" "容器模式摘除不动用户自己写的 location"
+
+# 去重: /etc/nginx 与它的子目录都在搜索根里时不能重复列
+DD="$TMP/ddup"; mkdir -p "$DD/sites-enabled" "$DD/sites-available"
+printf 'server {\n    server_name d.example;\n}\n' > "$DD/sites-available/d.conf"
+printf 'server {\n    server_name e.example;\n}\n' > "$DD/sites-enabled/e.conf"
+DDUP=$(NGINX_CONF_ROOTS="$DD:/etc/nginx" python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import nginx_apply as N
+fs=N.site_files(); print('%d %d' % (len(fs), len(set(fs))))")
+assert_eq "$DDUP" "2 2" "site_files 去重 (递归根不重复列)"
+
 group "容器感知 (cert.sh / nginx_apply.py)"
 DK="$TMP/dk"; mkdir -p "$DK/hostcerts" "$DK/bin" "$DK/fakeconf"
 touch "$DK/hostcerts/contained.crt"
