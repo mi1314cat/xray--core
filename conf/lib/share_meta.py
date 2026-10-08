@@ -16,11 +16,41 @@
 两边靠 tag 关联。
 """
 
+import contextlib
+import fcntl
 import json
 import os
+import threading
 import time
 
 SCHEMA = 1
+
+# 同进程内的并发保护。os.replace 是原子的, 但 save() 是 read-modify-write ——
+# 两个线程各自 load 到旧值、各自改一个字段、先后 replace, 后一个会把前一个
+# 的改动整个覆盖掉。实测表现是"刚改的 TTL 又变回去了", 而没有任何报错。
+_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def locked(meta_dir):
+    """跨进程 + 同进程 两层锁。
+
+    同进程那层必须是因为 flock 锁的是打开的文件描述符而不是进程: 同一进程
+    里两个线程各自 open 同一个文件再 flock, 不会互相阻塞 (同一个 ofd)。
+    两层都要, 少哪层都有并发窗口。
+    """
+    os.makedirs(meta_dir, exist_ok=True)
+    with _THREAD_LOCK:
+        lock_path = os.path.join(meta_dir, ".meta.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 # ---------------------------------------------------------------- 原子写
@@ -30,7 +60,10 @@ def _atomic_write(path, obj):
     直接写的话, 写到一半断电/被杀会留下半个 JSON —— 之后每次读都失败,
     表现是"分享全挂了", 而实际只是一个文件的写入被打断。
     """
-    tmp = f"{path}.tmp.{os.getpid()}"
+    # 临时名必须每线程唯一。只用 pid 的话, 同一进程里的两个线程会算出同一个
+    # 临时文件名, 于是互相 os.replace 对方的临时文件 —— 后一个 replace 拿到
+    # FileNotFoundError, 直接抛到用户面前。实测 20 线程并发写就会触发。
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
         f.flush()
@@ -60,7 +93,11 @@ def load(meta_dir, tag):
 def save(meta_dir, tag, data):
     """写分享元数据。已有记录里未提供的字段保留 —— 分享的开关和次数不该
     被一次"改显示名"抹掉。"""
-    os.makedirs(meta_dir, exist_ok=True)
+    with locked(meta_dir):
+        return _save_locked(meta_dir, tag, data)
+
+
+def _save_locked(meta_dir, tag, data):
     cur = load(meta_dir, tag) or {}
     if cur.get("_broken"):
         cur = {}
@@ -79,13 +116,14 @@ def revoke(meta_dir, tag):
     不是删文件 —— 删了就看不出"这个节点分享过又被撤了", 也没法恢复。
     置 enabled=False 并记下撤销时间。
     """
-    cur = load(meta_dir, tag)
-    if not cur or cur.get("_broken"):
-        return False
-    cur["enabled"] = False
-    cur["revoked_at"] = int(time.time())
-    _atomic_write(meta_path(meta_dir, tag), cur)
-    return True
+    with locked(meta_dir):
+        cur = load(meta_dir, tag)
+        if not cur or cur.get("_broken"):
+            return False
+        cur["enabled"] = False
+        cur["revoked_at"] = int(time.time())
+        _atomic_write(meta_path(meta_dir, tag), cur)
+        return True
 
 
 def purge(meta_dir, tag):

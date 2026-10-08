@@ -22,6 +22,7 @@
 
 import json
 import os
+import tempfile
 import uuid as _uuid
 
 # 传输方式 → streamSettings 片段
@@ -218,17 +219,28 @@ def write(path, spec, indent=2):
 
     原子写的原因: 片段文件正被 xray 加载着, 写到一半中断会留下半个 JSON,
     之后每次读都失败 —— 表现是"所有节点管理功能全挂了"。
+
+    临时文件名用 mkstemp 而不是拼 "{path}.tmp.{pid}": 拼的名字在同一进程的
+    多线程里会撞 —— 两个线程算出同一个临时名, 互相 os.replace 对方的文件,
+    后一个拿到 FileNotFoundError。mkstemp 保证唯一, 且落在同目录 (跨目录
+    rename 不保证原子)。
     """
     data = json.dumps(spec, ensure_ascii=False, indent=indent)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(data + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".frag-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return data
-
-
 def describe(protocol, transport, security):
     """一行说明, 给菜单和日志用。"""
     sec = {"none": "无", "tls": "TLS", "reality": "REALITY"}.get(security, security)

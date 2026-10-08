@@ -54,6 +54,59 @@ n,_=N.collect('$CONF')
 print(next((x['method'] for x in n if x['tag']=='ss-02'),''))")
 assert_eq "$SS" "2022-blake3-aes-128-gcm" "Shadowsocks 单用户形态也能抽出 method"
 
+# ---------------------------------------------------------------- 并发写
+# 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
+# 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。
+# 而临时文件名若只带 pid, 同进程多线程会算出同一个名字互相 os.replace 对方的
+# 文件, 后一个直接抛 FileNotFoundError。
+group "并发写 (share_meta / token_store / node_build)"
+RC="$TMP/race"; mkdir -p "$RC"
+CR=$(python3 - "$LIB" "$RC" <<'PY'
+import sys, threading, os, json
+sys.path.insert(0, sys.argv[1])
+import share_meta as M, token_store as T, node_build as B
+d = sys.argv[2]
+out = []
+
+def run(fn, check):
+    errs = []
+    def g(i):
+        try: fn(i)
+        except Exception as e: errs.append(repr(e))
+    ts = [threading.Thread(target=g, args=(i,)) for i in range(30)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    return len(errs), (errs[0] if errs else ""), check()
+
+M.save(d + "/sm", "n1", {})
+e, _, ok = run(lambda i: M.save(d + "/sm", "n1", {"f%d" % i: i}),
+               lambda: all((M.load(d + "/sm", "n1") or {}).get("f%d" % i) == i
+                           for i in range(30)))
+out.append("share_meta %d %s %s" % (e, "OK" if ok else "LOST", "" if not e else e[:40]))
+
+e, _, ok = run(lambda i: T.write(d + "/tk", "tok1",
+               {"tags": ["n%d" % i], "enabled": True, "used_count": 0,
+                "max_uses": 99, "expires_at": 0}),
+               lambda: T.read(d + "/tk", "tok1") is not None)
+out.append("token_store %d %s %s" % (e, "OK" if ok else "BAD", "" if not e else e[:40]))
+
+e, _, ok = run(lambda i: B.write(d + "/frag.json",
+               B.build("vless", "ws", "tls", {"port": 9000 + i, "uuid": "u%d" % i})),
+               lambda: bool(json.load(open(d + "/frag.json", encoding="utf-8"))))
+out.append("node_build %d %s %s" % (e, "OK" if ok else "BAD", "" if not e else e[:40]))
+
+left = [f for f in os.listdir(d) if ".tmp" in f or f.startswith((".frag", ".tok"))]
+out.append("leftover %d" % len(left))
+print("\n".join(out))
+PY
+)
+assert_rc() { [[ "$2" == "0" ]] && ok "$1" || bad "$1 (异常 $2)"; }
+SM=$(echo "$CR" | grep '^share_meta'); assert_rc "share_meta 30 线程并发写" "$(echo "$SM" | awk '{print $2}')"
+[[ "$(echo "$SM" | awk '{print $3}')" == "OK" ]] && ok "share_meta 无改动丢失" || bad "share_meta 无改动丢失: $SM"
+TS=$(echo "$CR" | grep '^token_store'); assert_rc "token_store 30 线程并发写" "$(echo "$TS" | awk '{print $2}')"
+NB=$(echo "$CR" | grep '^node_build'); assert_rc "node_build 30 线程并发写" "$(echo "$NB" | awk '{print $2}')"
+LF=$(echo "$CR" | grep '^leftover' | awk '{print $2}')
+assert_eq "$LF" "0" "无临时文件残留"
+
 # ---------------------------------------------------------------- 分享链接
 group "分享链接生成 (nodes.build_share_link)"
 python3 - "$LIB" "$CONF" <<'PY' > "$TMP/link_results"

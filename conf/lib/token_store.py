@@ -26,6 +26,7 @@ import errno
 import fcntl
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -80,13 +81,16 @@ def write(share_dir, token, meta):
     """原子写。tmp + fsync + rename。"""
     os.makedirs(os.path.join(share_dir, "tokens"), exist_ok=True)
     p = token_path(share_dir, token)
-    tmp = f"{p}.tmp.{os.getpid()}"
+    # mkstemp 而不是拼 "{path}.tmp.{pid}": 拼的名字在同一进程的多线程里
+    # 会撞 —— 两个线程算出同一个临时名, 互相 os.replace 对方的文件, 后一个
+    # 拿到 FileNotFoundError 直接抛给用户。mkstemp 保证唯一, 且同目录。
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".tok-", suffix=".tmp")
     # token 字段始终以文件名为准 —— 文件名就是 token 的唯一真源,
     # 内容里的 token 字段写错了不该让列表页认不出这一行。
     meta = dict(meta)
     meta["token"] = token
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
