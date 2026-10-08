@@ -180,7 +180,36 @@ x_svc_explain_errors() {
     while IFS= read -r ln; do
         local why=""
         case "$ln" in
-            *"address already in use"*)  why="端口被占用 —— 换端口或停掉占用进程 (ss -tulnp | grep <端口>)" ;;
+            # 占用者名字从日志行里反解。只说"端口被占用"用户还得自己查是谁,
+            # 而答案通常是 nginx 或另一个节点 —— 知道是谁就知道该停哪个。
+            *[[:space:]]0\.0\.0\.0:*|*"address already in use"*)
+                local busy_port="" who=""
+                # 直接从原行里 grep 出 ip:port。那层 sed 是多余的 ——
+                # s/.*bind: address already in use.*//p 把整行替换成空串再
+                # 打印, 输出恒为空, 于是 busy_port 永远为空, 解释退回最泛的
+                # "端口被占用", 新加的占用者与建议永远不出现。
+                # IPv4 (0.0.0.0:443) 与 IPv6 ([::]:443) 两种都要认 ——
+                # 只监听 v6 的机器上, 内核报的是后一种。
+                busy_port=$(grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+' <<< "$ln" \
+                            | head -1 | cut -d: -f2)
+                [[ -z "$busy_port" ]] && busy_port=$(grep -oE '\]:[0-9]+' <<< "$ln" \
+                            | head -1 | tr -d ']:')
+                # 无括号的 v6 通配 :::9443, 以及 Go 的 *:2087
+                [[ -z "$busy_port" ]] && busy_port=$(grep -oE '(::):+[0-9]+' <<< "$ln" \
+                            | head -1 | sed 's/[^0-9]//g')
+                [[ -z "$busy_port" ]] && busy_port=$(grep -oE '\*:[0-9]+' <<< "$ln" \
+                            | head -1 | tr -d '*:')
+                [[ -z "$busy_port" ]] && busy_port=$(grep -oE '[:.][0-9]{2,5}$' <<< "$ln" | tr -d ':.')
+                if [[ -n "$busy_port" ]]; then
+                    who=$(_X_LIB_PORTS_DIR/x_port_holder "$busy_port" 2>/dev/null)
+                    local sugg; sugg=$(_X_LIB_PORTS_DIR/x_port_suggest "$busy_port" 3 2>/dev/null | paste -sd' ' -)
+                    why="端口 $busy_port 被占用"
+                    [[ -n "$who" ]] && why="$why (占用者: $who)"
+                    [[ -n "$sugg" ]] && why="$why —— 可改用: $sugg"
+                else
+                    why="端口被占用 —— 换端口或停掉占用进程"
+                fi
+                ;;
             *"permission denied"*)        why="权限不足 —— 端口低于 1024 需要 root, 或证书文件不可读" ;;
             *"failed to read certificate"*|*"invalid certificate"*) why="证书有问题 —— 检查路径、有效期、证书私钥是否配对" ;;
             *"no such file or directory"*) why="引用的文件不存在 —— 常见于证书路径写错" ;;
@@ -193,4 +222,5 @@ x_svc_explain_errors() {
     done <<< "$out"
 }
 
+_X_LIB_PORTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _x_lib_dir_svc=""

@@ -337,6 +337,40 @@ assert_eq "$(PATH="$DK/bin:$PATH" bash -c "source '$LIB/cert.sh'; x_cert_search_
 timeout 10 bash -c "source '$LIB/cert.sh'; x_cert_container_certs >/dev/null 2>&1"
 assert_eq "$?" "1" "无 docker 时返回非 0 而非挂死"
 
+# ---------------------------------------------------------------- 端口归属
+group "端口归属 (ports.sh)"
+# x_port_holder 的 /proc 回退: 本容器 /proc/net/tcp 是空的 (网络命名空间未暴露),
+# 所以用夹具验证解析逻辑本身
+mkdir -p "$TMP/pf/net"
+printf '  sl  local_address rem_address   st tx rx tr tm->when retrnsmt uid timeout inode\n' > "$TMP/pf/net/tcp"
+printf '   0: 0100007F:9807 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345 1 0000 100 0 0 10 0\n' >> "$TMP/pf/net/tcp"
+# 覆盖路径要在子 shell 内部设置: VAR=x bash -c "..." 不会让 x 进入
+# 那个 shell (只对简单命令有效, 对 bash -c 里的 source 无效)。
+IN=$(bash -c "_X_PROC_NET='$TMP/pf/net'; source '$LIB/ports.sh'; _x_proc_inodes 38919" 2>/dev/null)
+assert_eq "$IN" "12345" "从 /proc/net 提取出 socket inode"
+# 端口范围: 0 与越界必须拒绝, 否则会建议 1/2/3 这种要特权且已被占的端口
+for bad in 0 70000 -1 abc; do
+    S=$(bash -c "source '$LIB/ports.sh'; x_port_suggest '$bad' 3" 2>/dev/null | tr -d '\n')
+    assert_eq "$S" "" "非法端口 '$bad' 不给建议"
+done
+S=$(bash -c "source '$LIB/ports.sh'; x_port_suggest 443 3" 2>/dev/null | wc -l)
+assert_eq "$S" "3" "合法端口给出 3 个替代"
+H=$(bash -c "source '$LIB/ports.sh'; x_port_holder abc" 2>&1)
+[[ "$H" == *"1-65535"* ]] && ok "非法端口的提示说明范围" || bad "非法端口的提示说明范围"
+# 五种绑定形式的端口提取
+mkdir -p "$TMP/pb"
+cat > "$TMP/pb/journalctl" <<'EOF'
+#!/bin/sh
+echo 'xray: listen tcp 0.0.0.0:8443: bind: address already in use'
+echo 'xray: listen tcp [::]:443: bind: address already in use'
+echo 'xray: listen tcp 127.0.0.1:2052: bind: address already in use'
+echo 'xray: listen tcp :::9443: bind: address already in use'
+echo 'xray: listen tcp *:2087: bind: address already in use'
+EOF
+chmod +x "$TMP/pb/journalctl"
+EXT=$(PATH="$TMP/pb:$PATH" bash -c "source '$LIB/service.sh'; x_svc_explain_errors" 2>&1 | grep -c '→.*端口 [0-9]* 被占用')
+assert_eq "$EXT" "5" "五种绑定形式的端口都能提取 (v4/v6/无括号/Go 通配)"
+
 # ---------------------------------------------------------------- 服务
 group "服务管理 (service.sh)"
 RC=$(bash -c "source '$LIB/service.sh'; x_svc_resolve >/dev/null; echo \$X_SVC_RESOLVED" 2>/dev/null)
