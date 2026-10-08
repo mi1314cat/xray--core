@@ -107,6 +107,10 @@ meta = {
 T.write(share_dir, tok, meta)
 PY
 
+    # 链接生成成功但服务没跑的话, 面板显示一切正常, 客户端一律连不上,
+    # 而且排查会被引向防火墙。所以在这里就确认服务可用。
+    ensure_service || warn "分享服务未就绪, 链接已保存但现在拉不动 —— 服务起来后立刻可用"
+
     ok "分享已生成"
     printf "\n    ${_GRN}%s${_RST}\n\n" "$url" >&2
     printf "    节点: %s\n" "${tags[*]}" >&2
@@ -199,6 +203,35 @@ PY
     ok "已更新 $tok"
 }
 
+# ---------------------------------------------------------------- 服务
+svc_script() {
+    printf '%s' "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_service.sh"
+}
+
+service_running() {
+    local url="http://$SHARE_ADDR:$SHARE_PORT/status"
+    curl -fsS --max-time 3 "$url" >/dev/null 2>&1
+}
+
+# 没在跑就装 + 起。已经是运行的, 什么都不做。
+ensure_service() {
+    service_running && return 0
+    local svc; svc=$(svc_script)
+    if [[ ! -f "$svc" ]]; then
+        warn "找不到 share_service.sh, 分享服务无法自动启动"
+        return 1
+    fi
+    info "分享服务未运行, 正在启动"
+    XRAY_BASE="$XRAY_BASE" XRAY_SHARE_DIR="$SHARE_DIR"         XRAY_SHARE_PORT="$SHARE_PORT" XRAY_SHARE_ADDR="$SHARE_ADDR"         bash "$svc" install >/dev/null 2>&1         || { warn "分享服务启动失败"; return 1; }
+    service_running
+}
+
+share_service_menu() {
+    local svc; svc=$(svc_script)
+    [[ -f "$svc" ]] || { err "找不到 share_service.sh"; return 1; }
+    XRAY_BASE="$XRAY_BASE" XRAY_SHARE_DIR="$SHARE_DIR"         XRAY_SHARE_PORT="$SHARE_PORT" XRAY_SHARE_ADDR="$SHARE_ADDR"         bash "$svc" menu
+}
+
 # ---------------------------------------------------------------- 菜单
 share_menu() {
     while :; do
@@ -209,6 +242,7 @@ share_menu() {
   3) 启停 / 撤销
   4) 改次数上限
   5) 改有效期
+  6) 分享服务管理
   0) 返回
 EOF
         printf "  选择: " >&2
@@ -233,6 +267,7 @@ EOF
                 printf "  新的有效期天数 [0=永久]: " >&2; read -r v || true
                 [[ -n "$t" ]] && share_set "$t" expires_at "$(( $(date +%s) + ${v:-0} * 86400 ))"
                 ;;
+            6) share_service_menu ;;
             0|"") return 0 ;;
             *) warn "无效选择" ;;
         esac

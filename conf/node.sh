@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# 节点管理 —— 列出 / 查看 / 改名 / 删除
+#
+# 删除的顺序是这个脚本存在的理由:
+#
+#     1. 删掉 conf/ 片段
+#     2. 校验整份配置, 重载 xray
+#     3. 重载成功后, 才吊销关联的分享令牌
+#     4. 重载失败 → 回滚片段, 分享令牌原样不动
+#
+# 反过来做 (先吊销再校验) 是 SB/M 都踩过的坑: 配置校验失败会回滚, 节点其实
+# 还在跑, 但分享令牌已经全被吊销, 用户手上的链接无声失效。回滚只恢复
+# 配置, 不恢复令牌 —— 因为没有记录谁被吊销过。
+
+set -uo pipefail
+
+XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
+CONF_DIR="${XRAY_CONF_DIR:-$XRAY_BASE/conf}"
+SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
+XRAY_SERVICE="${XRAY_SERVICE:-xrayls}"
+MAIN_CONFIG="${XRAY_MAIN_CONFIG:-$XRAY_BASE/config.json}"
+
+_RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _DIM=$'\033[2m'; _RST=$'\033[0m'
+[[ -t 2 ]] || { _RED=""; _GRN=""; _YEL=""; _CYN=""; _DIM=""; _RST=""; }
+ok()   { printf "  ${_GRN}[OK]${_RST} %s\n" "$*" >&2; }
+info() { printf "  ${_CYN}[--]${_RST} %s\n" "$*" >&2; }
+warn() { printf "  ${_YEL}[!]${_RST} %s\n" "$*" >&2; }
+err()  { printf "  ${_RED}[X]${_RST} %s\n" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+py() { python3 "$@"; }
+
+# ---------------------------------------------------------------- 辅助
+py_lib() { # 把 lib 目录作为参数传给内嵌脚本, 避免 heredoc 猜 sys.path
+    py -c "import sys; sys.path.insert(0, '$LIB_DIR'); exec(sys.stdin.read())"
+}
+
+node_list() { py "$LIB_DIR/nodes.py" "$CONF_DIR"; }
+
+node_exists() {
+    [[ -n "$1" ]] || return 1
+    py "$LIB_DIR/nodes.py" "$CONF_DIR" json 2>/dev/null \
+        | py -c "import json,sys; d=json.load(sys.stdin); raise SystemExit(0 if any(n.get('tag')==sys.argv[1] for n in d['nodes']) else 1)" "$1"
+}
+
+node_file() { # tag → 片段完整路径
+    # nodes.py 的 source 字段只存文件名 (用于展示), 这里要拼回完整路径 ——
+    # 直接拿 source 当路径用, 相对路径会被当前工作目录解析, 结果是
+    # "找不到片段文件", 而文件明明在那儿。
+    local src
+    src=$(py -c "
+import json,sys
+d=json.load(sys.stdin)
+for n in d['nodes']:
+    if n.get('tag')==sys.argv[1]:
+        print(n.get('source','')); break
+" "$1" < <(py "$LIB_DIR/nodes.py" "$CONF_DIR" json 2>/dev/null))
+    [[ -n "$src" ]] || return 1
+    printf '%s' "$CONF_DIR/$src"
+}
+
+# ---------------------------------------------------------------- 查看
+node_show() {
+    local tag="$1"
+    node_exists "$tag" || { err "没有这个节点: $tag"; return 1; }
+    py "$LIB_DIR/nodes.py" "$CONF_DIR" json 2>/dev/null | TAG="$tag" py -c "
+import json, os, sys
+sys.path.insert(0, os.environ['LIB'] if 'LIB' in os.environ else '.')
+d = json.load(sys.stdin)
+tag = os.environ['TAG']
+n = next(x for x in d['nodes'] if x.get('tag') == tag)
+for k in ('tag','protocol','network','security','port','listen','flow','id','password',
+          'method','decryption','sni','path','source'):
+    v = n.get(k)
+    if v not in (None, '', [], {}):
+        print(f'  {k:<12} {v}')
+if d.get('unreadable'):
+    print(f'  ${_YEL}另有 {len(d[\"unreadable\"])} 个片段解析不了${_RST}')
+"
+}
+
+# ---------------------------------------------------------------- 改名
+# 改 tag 要同时动三处: 片段里的 tag、分享元数据的文件名、令牌里的引用。
+# 漏掉任何一处, 表现都是"改名后分享链接指向一个不存在的节点"。
+node_rename() {
+    local tag="$1" new="$2"
+    node_exists "$tag" || { err "没有这个节点: $tag"; return 1; }
+    [[ -n "$new" ]] || die "新名字不能为空"
+    # tag 会变成 sidecar 文件名和 URL 片段, 限制字符集
+    [[ "$new" =~ ^[A-Za-z0-9._-]+$ ]] || die "新名字只能用字母数字 . _ -"
+    node_exists "$new" && die "已经有一个叫 $new 的节点"
+
+    local f; f=$(node_file "$tag")
+    [[ -f "$f" ]] || die "找不到片段文件: $f"
+
+    local bak="${f}.rename-bak"
+    cp -p "$f" "$bak" || die "无法备份 $f"
+
+    # jq 精确改 tag, 不用正则 —— 正则会连同 password 里的同名子串一起改
+    if ! jq --arg o "$tag" --arg n "$new" '
+        (.inbounds[]? | select(.tag == $o) | .tag) = $n
+    ' "$f" > "${f}.new" 2>/dev/null; then
+        err "jq 处理失败, 已放弃改名"
+        rm -f "${f}.new"; return 1
+    fi
+    [[ -s "${f}.new" ]] || { err "改写结果为空, 已放弃"; rm -f "${f}.new"; return 1; }
+
+    # 文件名也要改。节点注册表用 "tag -> 文件名" 建立索引, 文件名没跟着改的
+    # 话, 列表里显示新名字而磁盘上还是老名字, 后续任何按文件名的操作
+    # (删节点、导入、清理) 都会指向一个不存在的文件。
+    local nf="$CONF_DIR/$new.json"
+    if [[ -e "$nf" ]]; then
+        err "已存在同名片段: $nf"
+        rm -f "${f}.new"; return 1
+    fi
+    mv -f "${f}.new" "$nf" || { err "无法重命名片段"; rm -f "${f}.new"; return 1; }
+    # 新片段已就位, 原文件这时才可以删。顺序反过来会出现"两个片段都在"
+    # 的窗口 —— 注册表会把两个都收进去, 同一个节点在列表里出现两次。
+    rm -f "$f" || { err "新片段已写入但旧文件删除失败: $f"; warn "请手动删除, 否则该节点会重复出现"; }
+    rm -f "$bak"
+
+    # 分享侧跟着改: 节点元数据 sidecar 和令牌里的 tag 引用, 两处都要动。
+    SHARE_DIR="$SHARE_DIR" TAG="$tag" NEW="$new" LIB="$LIB_DIR" py -c "
+import os, sys, json, glob
+sys.path.insert(0, os.environ['LIB'])
+import share_meta, token_store as T
+d, tag, new = os.environ['SHARE_DIR'], os.environ['TAG'], os.environ['NEW']
+
+# 1) 节点元数据 sidecar 改名
+src = share_meta.meta_path(d, tag)
+if os.path.exists(src):
+    m = share_meta.load(d, tag) or {}
+    m['tag'] = new
+    m['name'] = m.get('name') or new
+    share_meta.save(d, new, m)
+    os.unlink(src)
+
+# 2) 令牌里的 tag 引用跟着改 —— 改漏了, 改名后的分享就少一个节点,
+#    而令牌本身没报错, 客户端只会看到"少了一个"。
+changed = 0
+for t in T.list_all(d):
+    tags = t.get('tags') or ([t['tag']] if t.get('tag') else [])
+    if isinstance(tags, str): tags = [tags]
+    if tag in tags:
+        nt = [new if x == tag else x for x in tags]
+        def _set(m):
+            m['tags'] = nt
+            if 'tag' in m: m['tag'] = new
+        T.update(d, t['token'], _set)
+        changed += 1
+print(f'  令牌更新: {changed} 个')
+"
+    ok "已改名: $tag → $new"
+    info "别忘了重启服务让配置生效"
+}
+
+# ---------------------------------------------------------------- 删除
+# 返回 0 = 节点已删除且服务已重载; 1 = 用户取消; 2 = 失败已回滚
+node_delete() {
+    local tag="$1"
+    node_exists "$tag" || { err "没有这个节点: $tag"; return 1; }
+
+    local f; f=$(node_file "$tag")
+    [[ -f "$f" ]] || { err "找不到片段文件: $f"; return 1; }
+
+    printf "\n  ${_YEL}将删除节点: %s${_RST}\n" "$tag" >&2
+    printf "  片段文件: %s\n" "$f" >&2
+
+    # 提前告知会影响哪些分享 —— 事后才知道链接失效就晚了
+    SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
+import os, sys
+sys.path.insert(0, os.environ['LIB'])
+import token_store as T
+d, tag = os.environ['SHARE_DIR'], os.environ['TAG']
+hit = []
+for t in T.list_all(d):
+    tags = t.get('tags') or ([t['tag']] if t.get('tag') else [])
+    if isinstance(tags, str): tags = [tags]
+    if tag in tags: hit.append(t['token'])
+if hit:
+    print(f'  ${_YEL}受影响分享: {len(hit)} 条 (删除成功后将自动吊销)${_RST}')
+    for h in hit[:5]: print(f'    {h}')
+    if len(hit) > 5: print(f'    ... 还有 {len(hit)-5} 条')
+"
+    printf "  确认删除? 输入节点名确认: " >&2
+    read -r conf || true
+    [[ "$conf" == "$tag" ]] || { info "已取消"; return 1; }
+
+    # --- 第 1 步: 移走片段 (留备份以便回滚) ---
+    local bak="${f}.del-bak"
+    mv "$f" "$bak" || { err "无法移动片段文件"; return 2; }
+
+    # --- 第 2 步: 校验 + 重载 ---
+    if ! validate_and_reload; then
+        err "配置校验或重载失败, 已回滚节点"
+        mv -f "$bak" "$f"
+        info "分享令牌未做任何改动"
+        return 2
+    fi
+    rm -f "$bak"
+
+    # --- 第 3 步: 重载成功后才吊销分享 ---
+    revoke_shares_for "$tag"
+    ok "节点已删除: $tag"
+    return 0
+}
+
+validate_and_reload() {
+    local xb; xb=$(command -v xray || echo /usr/local/bin/xray)
+    if [[ -x "$xb" ]]; then
+        if ! "$xb" run -test -c "$MAIN_CONFIG" >/tmp/xray-validate.log 2>&1; then
+            err "xray 配置校验不通过:"
+            tail -5 /tmp/xray-validate.log | sed 's/^/    /' >&2
+            return 1
+        fi
+    else
+        warn "找不到 xray 二进制, 跳过配置校验"
+    fi
+    if ! systemctl restart "$XRAY_SERVICE" 2>/dev/null; then
+        err "$XRAY_SERVICE 重启失败"
+        return 1
+    fi
+    return 0
+}
+
+# 只停用不删记录 —— 删了就看不出"这个节点分享过又被撤了", 也没法恢复。
+revoke_shares_for() {
+    local tag="$1"
+    SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
+import os, sys
+sys.path.insert(0, os.environ['LIB'])
+import token_store as T, share_meta
+d, tag = os.environ['SHARE_DIR'], os.environ['TAG']
+n = 0
+for t in T.list_all(d):
+    tags = t.get('tags') or ([t['tag']] if t.get('tag') else [])
+    if isinstance(tags, str): tags = [tags]
+    if tag in tags:
+        def _off(m):
+            m['enabled'] = False
+            m['revoked_at'] = int(__import__('time').time())
+            m['revoked_reason'] = 'node deleted'
+        T.update(d, t['token'], _off)
+        n += 1
+share_meta.purge(d, tag)
+print(f'  已吊销 {n} 条分享, 节点分享元数据已清理')
+"
+}
+
+# ---------------------------------------------------------------- 菜单
+node_menu() {
+    while :; do
+        printf "\n${_CYN}===== 节点管理 =====${_RST}\n" >&2
+        node_list >&2
+        printf "\n  1) 查看节点详情\n  2) 改名\n  3) 删除\n  0) 返回\n" >&2
+        printf "  选择: " >&2
+        read -r c || return 0
+        case "$c" in
+            1)
+                printf "  节点名: " >&2; read -r t || true
+                [[ -n "$t" ]] && node_show "$t"
+                ;;
+            2)
+                printf "  节点名: " >&2; read -r t || true
+                printf "  新名字: " >&2; read -r nn || true
+                [[ -n "$t" && -n "$nn" ]] && node_rename "$t" "$nn"
+                ;;
+            3)
+                printf "  节点名: " >&2; read -r t || true
+                [[ -n "$t" ]] && node_delete "$t"
+                ;;
+            0|"") return 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    case "${1:-menu}" in
+        list)   node_list ;;
+        show)   node_show "${2:?用法: node.sh show <tag>}" ;;
+        rename) node_rename "${2:?}" "${3:?}" ;;
+        delete) node_delete "${2:?}" ;;
+        menu)   node_menu ;;
+        *) echo "用法: node.sh [menu|list|show <tag>|rename <tag> <新名>|delete <tag>]" >&2; exit 1 ;;
+    esac
+fi
