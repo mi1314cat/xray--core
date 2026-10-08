@@ -337,6 +337,40 @@ assert_eq "$(PATH="$DK/bin:$PATH" bash -c "source '$LIB/cert.sh'; x_cert_search_
 timeout 10 bash -c "source '$LIB/cert.sh'; x_cert_container_certs >/dev/null 2>&1"
 assert_eq "$?" "1" "无 docker 时返回非 0 而非挂死"
 
+# ---------------------------------------------------------------- 预置
+group "协议预置 (preset.sh)"
+PV=$(bash -c "source '$LIB/preset.sh'; x_preset_validate" 2>&1)
+RV=$?
+assert_eq "$RV" "0" "整表校验通过 (字段数/传输白名单/加密白名单/组合合法性)"
+PS=$(bash -c "source '$LIB/preset.sh'; x_preset_protocols" 2>/dev/null | tr '\n' ' ')
+for p in vless trojan vmess shadowsocks hysteria2 socks http; do
+    [[ "$PS" == *"$p"* ]] && ok "预置覆盖协议: $p" || bad "预置覆盖协议: $p"
+done
+# 逐列提取不得错位: vless 第 2 个应是 ws/tls
+TR=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 2 2" 2>/dev/null)
+SE=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 2 3" 2>/dev/null)
+assert_eq "$TR/$SE" "ws/tls" "逐列提取不错位"
+TR=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 1 2" 2>/dev/null)
+assert_eq "$TR" "tcp" "第一个预置提取正确"
+# 末尾空字段场景 —— read 会少给一个字段, cut 不会
+OUT=$(bash -c "source '$LIB/preset.sh'; echo \"a|b||\" | cut -d'|' -f3" 2>/dev/null)
+assert_eq "$OUT" "" "cut 对末尾空字段返回空串 (read 会少给一个字段)"
+# 预置表里的 REALITY 组合必须与 node_build.py 的限制一致
+NBREAL=$(python3 -c "import sys;sys.path.insert(0,'$LIB');import node_build as B;print('|'.join(sorted(B.SECURITY_TRANSPORTS['reality'])))")
+PBAD=0
+for p in vless trojan vmess shadowsocks hysteria2 socks http; do
+    cnt=$(bash -c "source '$LIB/preset.sh'; x_preset_count $p" 2>/dev/null)
+    for i in $(seq 1 "$cnt" 2>/dev/null); do
+        t=$(bash -c "source '$LIB/preset.sh'; x_preset_field $p $i 2" 2>/dev/null)
+        s2=$(bash -c "source '$LIB/preset.sh'; x_preset_field $p $i 3" 2>/dev/null)
+        if [[ "$s2" == "reality" && "$t" != "tcp" ]]; then PBAD=$((PBAD+1)); fi
+    done
+done
+assert_eq "$PBAD" "0" "预置表与 node_build 的 REALITY 限制一致"
+# 无预置协议必须明确报错而非静默
+NU=$(bash -c "source '$LIB/preset.sh'; x_preset_ask tuic </dev/null" 2>&1 | head -1)
+[[ "$NU" == *"没有预置"* ]] && ok "无预置协议明确报错" || bad "无预置协议明确报错"
+
 # ---------------------------------------------------------------- 端口归属
 group "端口归属 (ports.sh)"
 # x_port_holder 的 /proc 回退: 本容器 /proc/net/tcp 是空的 (网络命名空间未暴露),
