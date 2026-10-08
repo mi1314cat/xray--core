@@ -54,6 +54,58 @@ n,_=N.collect('$CONF')
 print(next((x['method'] for x in n if x['tag']=='ss-02'),''))")
 assert_eq "$SS" "2022-blake3-aes-128-gcm" "Shadowsocks 单用户形态也能抽出 method"
 
+# ---------------------------------------------------------------- 损坏隔离
+# 一个片段文件损坏 (磁盘写坏、被手动改坏、迁移时被截断) 不该让整个订阅挂掉。
+group "损坏隔离 (单个片段损坏不影响其它节点)"
+CX="$TMP/corrupt"; mkdir -p "$CX/conf" "$CX/share/tokens"
+python3 - "$LIB" "$CX" <<'PY'
+import json, sys, os
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+for t, p in (("good1", 20001), ("good2", 20002)):
+    with open(os.path.join(d, "conf", t + ".json"), "w") as f:
+        json.dump({"inbounds": [{"tag": t, "port": p, "protocol": "vless",
+          "settings": {"clients": [{"id": "u"}]},
+          "streamSettings": {"network": "tcp", "security": "none"}}]}, f)
+# 损坏的那一个
+with open(os.path.join(d, "conf", "broken.json"), "w") as f:
+    f.write('{"inbounds": [ THIS IS NOT JSON')
+import token_store as T, share_meta as M
+for t in ("good1", "good2"):
+    T.write(os.path.join(d, "share"), "t" + t, {"enabled": True, "max_uses": 0,
+        "used_count": 0, "expires_at": 0, "tags": [t]})
+    M.save(os.path.join(d, "share"), t, {"host": "h.com", "port": 20001, "name": t})
+PY
+CO=$(python3 - "$LIB" "$CX" 19481 <<'PY'
+import sys, os, threading, time, urllib.request, urllib.error
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]; port = int(sys.argv[3])
+os.environ.update(XRAY_CONF_DIR=os.path.join(d,"conf"), XRAY_SHARE_DIR=os.path.join(d,"share"),
+                  XRAY_SHARE_PORT=str(port))
+import share_server as S
+os.makedirs(os.path.join(S.SHARE_DIR,"tokens"), exist_ok=True)
+srv = S.Server(("127.0.0.1", port), S.Handler)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+time.sleep(0.6)
+B = "http://127.0.0.1:%d" % port
+r = urllib.request.urlopen(B + "/sub/tgood1", timeout=4)
+body = r.read().decode().strip()
+import base64
+try:
+    txt = base64.b64decode(body, validate=True).decode()
+except Exception:
+    txt = "DECODE_FAIL"
+print("code=%s" % r.status)
+print("unreadable=%s" % r.headers.get("X-Xray-Unreadable-Fragments", "无"))
+print("has_good1=%s" % ("good1" in txt))
+print("has_broken=%s" % ("broken" in txt))
+print("body_b64=%s" % all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" for c in body))
+PY
+)
+echo "$CO" | grep -q 'code=200' && ok "损坏片段时订阅仍返回 200" || bad "损坏片段导致订阅失败"
+echo "$CO" | grep -q 'unreadable=1' && ok "损坏数量在诊断头暴露" || bad "缺 Unreadable-Fragments 头"
+echo "$CO" | grep -q 'has_good1=True' && ok "好节点照常返回" || bad "好节点丢失"
+echo "$CO" | grep -q 'has_broken=False' && ok "坏节点被跳过而非混入" || bad "坏节点混进订阅"
+echo "$CO" | grep -q 'body_b64=True' && ok "body 仍是纯 base64" || bad "body 混入非 base64 内容"
+
 # ---------------------------------------------------------------- 分享服务兜底
 # 常驻服务里一个未捕获异常的代价, 不是那一个请求失败:
 #   有兜底 → HTTP 500 + X-Xray-Error, 客户端能判定, 服务继续服务
