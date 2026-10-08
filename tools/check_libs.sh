@@ -521,6 +521,68 @@ assert_eq "$(DP cdn_nginx)" "None" "CDN 档位: 不需要 nginx"
 assert_eq "$(DP tcp_cdn_errors)" "1" "裸TCP+无加密+CDN 在规划阶段被拒"
 
 # ---------------------------------------------------------------- nginx 幂等
+# --block 与 --path: 反向代理要给一条隧道单开 location 前缀, 而不是抢占整个站点。
+# 这两个参数此前一个是死参数(传进去从没被用过), 一个根本不存在。
+RB="$TMP/rb.conf"
+cat > "$RB" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name r.example;
+    location / {
+        return 444;
+    }
+}
+EOF
+cp "$RB" "$RB.orig"
+# 不带 --block 时 --port 是必需的 (自动生成要拿它填 proxy_pass)
+python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --nginx none >/dev/null 2>&1
+assert_eq "$?" "2" "既无 --port 也无 --block 时被拒"
+python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --remove --nginx none >/dev/null 2>&1
+
+# --path: 自定义 location 前缀
+python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --port 8443 \
+    --path /HCaVHO3U --nginx none >/dev/null 2>&1
+grep -q 'location /HCaVHO3U {' "$RB" && ok "--path 写出自定义 location 前缀" \
+    || bad "--path 没生效"
+grep -qE '^    location / \{' "$RB" && ok "--path 不影响用户原有的 location /" \
+    || bad "--path 破坏了原有 location"
+
+# --block: 片段文件必须真的被读进去用, 而不是静默走自动生成
+cat > "$TMP/rb.block" <<'EOF'
+location /custom {
+    proxy_pass http://127.0.0.1:9999;
+    proxy_set_header Connection "upgrade";
+}
+EOF
+python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --remove --nginx none >/dev/null 2>&1
+python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example \
+    --block "$TMP/rb.block" --nginx none >/dev/null 2>&1
+grep -q 'location /custom {' "$RB" && ok "--block 的自定义内容被写入" \
+    || bad "--block 的自定义内容没写进去"
+grep -q '127.0.0.1:9999' "$RB" && ok "--block 覆盖了自动生成的 proxy_pass" \
+    || bad "--block 没覆盖自动生成"
+
+# 片段内部必须保留相对缩进: location 里的指令不能和 location 平级, 否则 nginx -t
+# 会报 unexpected "}"
+IND=$(grep -A1 'location /custom {' "$RB" | sed -n '2p' | sed 's/[^ ].*//' | wc -c)
+LOC=$(grep 'location /custom {' "$RB" | sed 's/[^ ].*//' | wc -c)
+if [[ "$IND" -gt "$LOC" ]]; then ok "--block 保留了片段内部的相对缩进"
+else bad "--block 抹平了相对缩进 (指令与 location 平级, nginx -t 会失败)"; fi
+
+python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --remove --nginx none >/dev/null 2>&1
+if diff -q "$RB.orig" "$RB" >/dev/null 2>&1; then ok "--block 摘除后逐字节还原"
+else bad "--block 摘除后有残留"; fi
+
+# 没装 nginx 时不该抛 traceback —— 只跳过校验并说明
+OUT=$(python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --port 8443 \
+      --nginx /nonexistent-nginx 2>&1)
+case "$OUT" in
+  *Traceback*) bad "nginx 二进制缺失时抛了 traceback" ;;
+  *已写入*)    ok "nginx 二进制缺失时干净报错并说明" ;;
+  *)           bad "nginx 缺失时的输出不符合预期: $OUT" ;;
+esac
+python3 "$LIB/nginx_apply.py" --file "$RB" --domain r.example --remove --nginx none >/dev/null 2>&1
+
 group "nginx 幂等 (nginx_apply.py)"
 SITE="$TMP/site.conf"
 cat > "$SITE" <<'EOF'

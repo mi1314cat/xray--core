@@ -93,6 +93,69 @@ next_id() {
 
 env_file() { echo "$ENV_DIR/tunnel-$(printf '%02d' "$1").env"; }
 
+# ---------------- nginx 联动 ----------------
+#
+# 隧道要能被外面访问, 就得有一条 location 指向它。此前这一步全靠脚本打印一句
+# 提示、用户自己去改 nginx —— 手工 location 没有标记, 于是:
+#   · 改端口时旧的那条还留着, 请求仍然打到老端口
+#   · 删除隧道时 location 不跟着消失, 变成 502
+#   · 重复添加同一条会插出多个 location, nginx 直接起不来
+#
+# 现在走 nginx_apply.py: 带标记、幂等、插入前 nginx -t、失败自动回滚。
+# 和面板里 Nginx 站点管理 (菜单 18) 是同一套逻辑, 不会出现两套行为。
+
+_nginx_apply_py() {
+    # 面板用 bash <(curl ...) 分发, 脚本自身运行时同目录下就有 lib/
+    local f
+    f="$(dirname "${BASH_SOURCE[0]:-$0}")/lib/nginx_apply.py"
+    if [[ -r "$f" ]]; then printf '%s' "$f"; return 0; fi
+    f="$(mktemp -t nginx_apply.XXXXXX.py)"
+    curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/nginx_apply.py" -o "$f" \
+        || { rm -f "$f"; return 1; }
+    printf '%s' "$f"
+}
+
+# nginx_wire <域名> <location路径> <回源端口>
+nginx_wire() {
+    local domain="$1" loc="$2" port="$3"
+    [[ -z "$domain" || -z "$loc" || -z "$port" ]] && return 1
+    local py; py="$(_nginx_apply_py)" || { print_warn "拿不到 nginx_apply.py, 请手工配置"; return 1; }
+    local blk; blk="$(mktemp -t revblock.XXXXXX)"
+    {
+        printf 'location %s {\n' "$loc"
+        printf '    proxy_pass http://127.0.0.1:%s;\n' "$port"
+        printf '    proxy_http_version 1.1;\n'
+        printf '    proxy_set_header Host $host;\n'
+        printf '    proxy_set_header Upgrade $http_upgrade;\n'
+        printf '    proxy_set_header Connection "upgrade";\n'
+        printf '    proxy_set_header X-Real-IP $remote_addr;\n'
+        printf '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+        printf '    proxy_read_timeout 300s;\n'
+        printf '    proxy_buffering off;\n'
+        printf '}\n'
+    } > "$blk"
+
+    print_info "nginx 预览 (--dry-run, 确认无误再写入):"
+    python3 "$py" --domain "$domain" --block "$blk" --dry-run 2>&1 | sed 's/^/    /' >&2
+    local ans
+    read -r -p "把上面这段写入 nginx 配置? [y/N]: " ans >&2
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        python3 "$py" --domain "$domain" --block "$blk" 2>&1 | sed 's/^/    /' >&2
+        print_ok "nginx location $loc -> 127.0.0.1:$port 已写入"
+    else
+        print_info "已跳过。请手工把上面这段加进 nginx 站点配置。"
+    fi
+    rm -f "$blk"
+}
+
+# nginx_unwire <域名>
+nginx_unwire() {
+    local domain="$1"
+    [[ -z "$domain" ]] && return 0
+    local py; py="$(_nginx_apply_py)" || return 0
+    python3 "$py" --domain "$domain" --remove 2>&1 | sed 's/^/    /' >&2
+}
+
 # ---------------- 生成家侧 reverse 配置片段 ----------------
 # 每一个隧道 = control client(UUID) 一个 + portal tunnel 入站一个
 
@@ -283,6 +346,16 @@ EOF
     echo "  UUID: $uuid" >&2
     echo "  Control: 0.0.0.0:$ctl_port (WS path $ctl_path)" >&2
     echo "  Portal: 0.0.0.0:$ptl_port" >&2
+
+    # 有对外路径且用户填了服务端域名, 才谈得上配 nginx —— 两个都缺就没法
+    # 定位站点文件, 这时只提示手工配置。
+    if [[ -n "$server_path" && -n "$server_addr" ]]; then
+        print_info "为 $server_addr 加一条 nginx location $server_path?"
+        nginx_wire "$server_addr" "$server_path" "$ptl_port"
+    elif [[ -n "$server_path" ]]; then
+        print_warn "未填服务端域名, 无法自动定位站点。请手工在 nginx 里加:"
+        echo "  location $server_path {\n      proxy_pass http://127.0.0.1:$ptl_port;\n  }" >&2
+    fi
     echo "" >&2
     print_info "RN 端配置要点 (xrayclient-reverse.sh 用):"
     echo "  回连地址: ${server_addr:-<你家域名>}:443 (若走CF+nginx则 path=$ctl_path)" >&2
@@ -312,7 +385,7 @@ del_tunnel() {
     printf "请输入要删除的编号: " >&2
     read -r num
     num=$(clean_input "$num")
-    local env id2
+    local env id2 old_addr
     env=$(env_file "$num")
     [ -f "$env" ] || { print_error "隧道 #$num 不存在"; return; }
     id2=$(printf '%02d' "$num")
@@ -320,9 +393,16 @@ del_tunnel() {
     [[ "$ans" =~ ^[Yy]$ ]] || { print_info "已取消"; return; }
     # 移除 conf 片段 (无独立进程, 由 xrayls.service 统一管理)
     rm -f "$CONF_DIR/revsrv-$id2.in.json"
-    rm -f "$env"
     merge_routing
     validate_and_restart
+    # location 也要跟着消失: 只删 Xray 片段的话, nginx 那条 location 会留着
+    # 指向一个已经不存在的端口, 外部访问直接 502。
+    if [[ -r "$env" ]]; then
+        # shellcheck disable=SC1090
+        old_addr="$(sed -n 's/^REV_SERVER_ADDR=//p' "$env" 2>/dev/null | tail -1)"
+    fi
+    rm -f "$env"
+    [[ -n "$old_addr" ]] && nginx_unwire "$old_addr"
     print_ok "已删除隧道 #$num"
 }
 

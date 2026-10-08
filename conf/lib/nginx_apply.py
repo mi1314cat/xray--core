@@ -319,18 +319,43 @@ def _trim_blanks(lines, idx):
 
 
 # ---------------------------------------------------------------- 生成片段
-def render_block(domain, port, block, cdn, transport, ind="    ", inner=None):
+def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
+                 path="/"):
     """生成 location 级片段 (带缩进和标记)。
 
     CDN 和传输方式决定要哪些 location —— 没有 CDN 就不写 resolve,
     非 WS 传输就不写 Upgrade/Connection 头。
+
+    path 是 location 的匹配路径。默认 "/" 覆盖整个站点; 反向代理那种"给一条
+    隧道单开一个前缀"的场景要传具体路径 (如 /HCaVHO3U), 否则插进去的
+    location / 会抢占整个站点, 把原有流量全吸走 —— 语法没错, 但线上立刻挂。
+
+    block 是自定义片段文件的内容。给了就用它, 不再自动生成 —— 此前这个参数
+    一路传进来却从没被用过, --block 写了等于没写。
     """
     inner = inner or (ind + "    ")
+    if path and not path.startswith("/"):
+        path = "/" + path
     L = [f"{ind}# >>> {MARK} BEGIN {domain} >>>"]
+
+    if block:
+        # 自定义片段: 仍然由本函数加标记, 保证摘除时找得到边界。
+        #
+        # 必须保留片段内部的相对缩进。直接 ind + ln.strip() 会把嵌套层级抹平,
+        # 于是 location 里的 proxy_pass 和 location 变成同级 —— nginx -t 会
+        # 报 unexpected "}"。正确做法是取非空行的最小缩进当基准, 整段左移后
+        # 再统一加 ind: 片段自身怎么写都不管, 落进 server 块后都是对的层级。
+        raw = block.rstrip("\n").split("\n")
+        widths = [len(l) - len(l.lstrip()) for l in raw if l.strip()]
+        base = min(widths) if widths else 0
+        for ln in raw:
+            L.append(ind + ln[base:].rstrip() if ln.strip() else "")
+        L.append(f"{ind}# <<< {MARK} END {domain} <<<")
+        return L
 
     if cdn:
         L.append(f"{ind}# CDN 接入: 回源到本机, 边缘负责 TLS 与就近接入")
-        L.append(f"{ind}location / {{")
+        L.append(f"{ind}location {path} {{")
         L.append(f"{inner}proxy_pass http://127.0.0.1:{port};")
         L.append(f"{inner}proxy_http_version 1.1;")
         L.append(f"{inner}proxy_set_header Host $host;")
@@ -339,7 +364,7 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None):
         L.append(f"{inner}proxy_set_header X-Forwarded-Proto $scheme;")
         L.append(f"{ind}}}")
     else:
-        L.append(f"{ind}location / {{")
+        L.append(f"{ind}location {path} {{")
         L.append(f"{inner}proxy_pass http://127.0.0.1:{port};")
         L.append(f"{inner}proxy_http_version 1.1;")
         L.append(f"{inner}proxy_set_header Host $host;")
@@ -447,7 +472,15 @@ def reload(nginx, docker, bak, path):
         return 0
 
     argv = nginx_cmd(docker) + [nginx]
-    t = subprocess.run(argv, capture_output=True, text=True)
+    try:
+        t = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        # 没装 nginx / PATH 里找不到: 直接抛会打一整屏 traceback, 而这里要做
+        # 的只是"跳过校验并说明原因"。文件已经写入了, 不回滚 —— 回滚会让用户
+        # 以为什么都没发生, 实际上配置已经生效只是没被校验。
+        print(f"[信息] 已写入, 但无法执行 {' '.join(argv)} ({e}); "
+              f"请手工 nginx -t 确认后再 reload", file=sys.stderr)
+        return 0
     if t.returncode != 0:
         print("[错误] nginx 配置校验不通过, 已回滚:", file=sys.stderr)
         for ln in (t.stderr or "").strip().splitlines()[:8]:
@@ -507,13 +540,16 @@ def apply(args):
     if args.upstream_port:
         block = render_upstream(domain, args.upstream_port)
     else:
-        if not args.port:
-            print("[错误] 需要 --port, 或用 --upstream-port, 或用 --remove",
+        # 自定义片段自带 proxy_pass, 再要求 --port 只会让调用方为了过校验而
+        # 填一个根本没被使用的数字。
+        if not args.port and not args.block:
+            print("[错误] 需要 --port, 或用 --upstream-port, 或用 --block 片段文件, 或用 --remove",
                   file=sys.stderr)
             return 2
         block = render_block(domain, args.port, args.block,
                              args.cdn, args.transport,
-                             ind=" " * (args.indent or 4))
+                             ind=" " * (args.indent or 4),
+                             path=args.path)
 
     # --- 2) 插进 server 块 ---
     sb = find_server_block(lines)
@@ -530,7 +566,8 @@ def apply(args):
 
     if args.indent == 0 and not args.upstream_port:
         block = render_block(domain, args.port, args.block, args.cdn,
-                             args.transport, ind=detect_indent(lines, e))
+                             args.transport, ind=detect_indent(lines, e),
+                             path=args.path)
 
     lines[ins:ins] = block
     print(f"[信息] 已插入 {len(block)} 行 (位置 {ins+1})")
@@ -549,7 +586,10 @@ def main():
                    choices=["ws", "grpc", "h2", "httpupgrade", "tcp", "xhttp"])
     p.add_argument("--cdn", action="store_true", help="CDN 接入模式")
     p.add_argument("--remove", action="store_true", help="移除本工具插入的内容")
-    p.add_argument("--block", help="片段文件")
+    p.add_argument("--block", help="片段文件 (自定义内容, 给了就不自动生成)")
+    p.add_argument("--path", default="/",
+                   help="location 匹配路径, 默认 /。反向代理单开前缀时用, "
+                        "如 --path /HCaVHO3U —— 写成 / 会抢占整个站点")
     p.add_argument("--nginx", default="-t", help="校验命令, none=跳过")
     p.add_argument("--indent", type=int, default=0,
                    help="插入内容的缩进空格数, 0=自动跟随文件风格")
@@ -570,9 +610,19 @@ def main():
         args.file = found
         print(f"[信息] 站点文件: {found}")
 
-    if args.block and not os.path.isfile(args.block):
-        print(f"[错误] 片段文件不存在: {args.block}", file=sys.stderr)
-        return 2
+    if args.block:
+        if not os.path.isfile(args.block):
+            print(f"[错误] 片段文件不存在: {args.block}", file=sys.stderr)
+            return 2
+        # 读成内容再传下去。render_block 拿到的是片段文本, 而 --block 给的是
+        # 路径 —— 之前直接把路径传进去了, 于是每次都被当成"没有自定义片段"
+        # 走自动生成, --block 静默失效, 用的人以为已经换掉了 location。
+        try:
+            args.block = open(args.block, encoding="utf-8",
+                              errors="replace").read()
+        except OSError as e:
+            print(f"[错误] 读取片段文件失败: {e}", file=sys.stderr)
+            return 2
 
     return apply(args)
 
