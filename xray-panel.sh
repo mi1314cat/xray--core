@@ -106,9 +106,9 @@ load_env() {
         echo "env 文件不存在：$ENV_FILE"
     fi
 }
-# 统一安装/更新入口：unused/xray_install.sh
+# 统一安装/更新入口：bin/xray_install.sh
 # 幂等：已安装且为最新版本时跳过下载；旧版本自动升级；并重建基础配置、验证并重启 xrayls
-XRAY_INSTALL_URL="https://github.com/mi1314cat/xary-core/raw/refs/heads/main/unused/xray_install.sh"
+XRAY_INSTALL_URL="https://github.com/mi1314cat/xary-core/raw/refs/heads/main/bin/xray_install.sh"
 
 run_xray_install() {
     bash <(curl -fsSL "$XRAY_INSTALL_URL") || {

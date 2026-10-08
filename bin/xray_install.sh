@@ -1,6 +1,6 @@
 #!/bin/bash
 # =========================================================
-# xary-core · unused/xray_install.sh
+# xray--core · bin/xray_install.sh
 #
 # 职责（仅此而已）：
 #   1. 系统环境检查
