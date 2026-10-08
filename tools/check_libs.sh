@@ -281,6 +281,35 @@ PATH="$TMP/bin2:$PATH" python3 "$LIB/dns_edit.py" --config "$DNSF/config.json" -
 if diff -q "$DNSF/before.json" "$DNSF/config.json" >/dev/null 2>&1; then ok "xray -test 失败已回滚"; else bad "xray -test 失败已回滚"; fi
 if compgen -G "$DNSF/*.dns-bak" >/dev/null; then bad "回滚后无备份残留"; else ok "回滚后无备份残留"; fi
 
+# ---------------------------------------------------------------- 容器共处
+group "容器感知 (cert.sh / nginx_apply.py)"
+DK="$TMP/dk"; mkdir -p "$DK/hostcerts" "$DK/bin" "$DK/fakeconf"
+touch "$DK/hostcerts/contained.crt"
+cat > "$DK/fakeconf/nginx.conf" <<'EOF'
+server {
+    ssl_certificate     /etc/nginx/certs/contained.crt;
+    ssl_certificate_key /etc/nginx/certs/contained.crt.key;
+    ssl_certificate     /etc/nginx/certs/other_key.pem;
+}
+EOF
+cat > "$DK/bin/docker" <<EOF
+#!/bin/bash
+case "\$1 \$2" in
+  "ps --format") echo "nginx-proxy" ;;
+  "inspect nginx-proxy") echo "$DK/hostcerts" ;;
+  "exec nginx-proxy") cat $DK/fakeconf/nginx.conf ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$DK/bin/docker"
+OUT=$(PATH="$DK/bin:$PATH" bash -c "source '$LIB/cert.sh'; x_cert_container_certs" 2>/dev/null)
+assert_eq "$(echo "$OUT" | grep -c 'contained.crt')" "1" "发现容器内证书"
+assert_eq "$(echo "$OUT" | grep -cE '\.key |_key\.pem')" "0" "容器内私钥被排除 (.key 与 _key.pem 两种后缀)"
+assert_eq "$(PATH="$DK/bin:$PATH" bash -c "source '$LIB/cert.sh'; x_cert_search_dirs" 2>/dev/null | grep -c "$DK/hostcerts")" "1" "容器挂载路径进入扫描目录"
+# 无 docker 时不得挂死
+timeout 10 bash -c "source '$LIB/cert.sh'; x_cert_container_certs >/dev/null 2>&1"
+assert_eq "$?" "1" "无 docker 时返回非 0 而非挂死"
+
 # ---------------------------------------------------------------- 服务
 group "服务管理 (service.sh)"
 RC=$(bash -c "source '$LIB/service.sh'; x_svc_resolve >/dev/null; echo \$X_SVC_RESOLVED" 2>/dev/null)

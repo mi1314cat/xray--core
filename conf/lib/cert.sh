@@ -202,3 +202,73 @@ x_cert_gc() {
     printf '  清理完成: 删除 %s 个, 保留 %s 个\n' "$removed" "$kept" >&2
     [[ "$kept" -eq 0 ]]
 }
+
+# ================================================================ 容器感知
+#
+# "Docker 能力"在本项目里不是"把 Xray 部署进容器", 而是与容器共处:
+# 配套服务 (nginx) 跑在容器里时, 命令必须打向容器而不是宿主。
+#
+# 证书这一层最容易踩: 容器化 nginx 常把证书挂进容器, 宿主对应目录是空的。
+# 只扫宿主目录的结果是"一张证书都找不到", 而证书明明就在 nginx 正在用的
+# 地方 —— 表现是续期脚本报告"没有可续期的证书", 实际是扫描路径错了。
+
+# 列出应扫描的证书目录: 宿主的常规路径 + Docker 挂载进来的路径。
+x_cert_search_dirs() {
+    local d
+    for d in /etc/letsencrypt/live /etc/ssl/certs /root/catmi/xray/certs \
+             /root/catmi/certs /usr/local/share/letsencrypt/live; do
+        [[ -d "$d" ]] && printf '%s\n' "$d"
+    done
+
+    command -v docker >/dev/null 2>&1 || return 0
+    # docker ps 在没有守护进程时是瞬时返回的, 但给个超时防止卡住面板 ——
+    # 与 service.sh 同样的理由: 辅助查询不该有能力挂住整个面板。
+    local cid src
+    for cid in $(timeout 5 docker ps --format '{{.Names}}' 2>/dev/null | grep -i nginx); do
+        # 从挂载关系反推宿主路径。只认真的挂进证书目录的, 不猜。
+        src=$(timeout 5 docker inspect "$cid" \
+              --format '{{range .Mounts}}{{if eq .Destination "/etc/nginx/certs"}}{{.Source}}{{end}}{{if eq .Destination "/etc/nginx/ssl"}}{{.Source}}{{end}}{{end}}' \
+              2>/dev/null | head -1)
+        [[ -n "$src" && -d "$src" ]] && printf '%s\n' "$src"
+    done
+}
+
+# 在所有已知目录里找证书文件。
+#
+# 与 mihomo 版一致的排除规则: 私钥不算证书。*_key.pem / *key*.pem 会被
+# 混进 .pem 扫描结果, 而把私钥当成"待续期证书"会导致续期脚本对着一把
+# 私钥申请续期。
+x_cert_list() {
+    local d f
+    while read -r d; do
+        [[ -d "$d" ]] || continue
+        for f in "$d"/*.pem "$d"/*.crt; do
+            [[ -f "$f" ]] || continue
+            [[ "$f" == *_key.pem || "$f" == *key*.pem ]] && continue
+            printf '%s\n' "$f"
+        done
+    done < <(x_cert_search_dirs)
+}
+
+# 列出容器化的 nginx 正��在用的证书 —— 宿主页面上看不到的那一批。
+x_cert_container_certs() {
+    command -v docker >/dev/null 2>&1 || return 1
+    local cid found=0
+    for cid in $(timeout 5 docker ps --format '{{.Names}}' 2>/dev/null | grep -i nginx); do
+        # 容器里 nginx 配置引用的证书路径
+        local refs
+        refs=$(timeout 5 docker exec "$cid" sh -c \
+            'cat /etc/nginx/conf.d/*.conf /etc/nginx/nginx.conf 2>/dev/null' 2>/dev/null \
+            | grep -oE 'ssl_certificate(_key)?[[:space:]]+[^;]+' | awk '{print $2}')
+        while read -r r; do
+            [[ -n "$r" ]] || continue
+            # 私钥排除。nginx 的证书链常见 xxx.crt + xxx.crt.key 两件套,
+            # 只挡 *_key.pem / *key*.pem 会漏掉 .key 后缀, 于是私钥被当成
+            # "待续期证书"列给用户 —— 续期脚本对着一把私钥申请续期。
+            [[ "$r" == *_key.pem || "$r" == *key*.pem || "$r" == *.key ]] && continue
+            printf '%s  (容器 %s)\n' "$r" "$cid"
+            found=1
+        done <<< "$refs"
+    done
+    [[ "$found" == "1" ]]
+}
