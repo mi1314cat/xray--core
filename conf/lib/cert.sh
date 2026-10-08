@@ -8,6 +8,14 @@
 # (xray run -test) 对一个不存在的证书文件并不总是报错 —— 校验通过、启动
 # 失败, 或者更糟, 启动成功但握手永远失败。必须在生成阶段就拦住。
 
+# 依赖外部环境的路径。给默认值不是为了"支持自定义", 而是因为在 set -u
+# 下未定义会**直接终止整个 shell** —— 表现为菜单执行到一半静默退出, 没有任何
+# 报错。库不该指望调用方一定先设好这些。
+: "${XRAY_BASE:=/root/catmi/xray}"
+: "${CONF_DIR:=$XRAY_BASE/conf}"
+: "${MAIN_CONFIG:=$XRAY_BASE/config.json}"
+: "${SHARE_DIR:=$XRAY_BASE/out/share}"
+
 # x_cert_check <crt> <key> [期望域名]
 #
 # 返回 0 可用; 非 0 时错误信息已打到 stderr。
@@ -133,12 +141,18 @@ x_cert_in_use() {
     local pat="(^|[^A-Za-z0-9._-])${esc}([^A-Za-z0-9._-]|$)"
 
     # 1) Xray 片段与主配置
-    local -a roots=("$CONF_DIR")
-    [[ -n "${MAIN_CONFIG:-}" ]] && roots+=("$(dirname "$MAIN_CONFIG")")
-    for f in "${roots[@]}"/*.json; do
-        [[ -f "$f" ]] || continue
-        grep -qF -- "$want" "$f" 2>/dev/null && return 0
-        grep -qE -- "$pat" "$f" 2>/dev/null && return 0
+    # 逐个目录处理, 不用 "${roots[@]}"/"$pat" 这种"数组 + 带引号的通配"写法。
+    # 那写法里引号会把 * 变成字面量, 于是循环体拿到的是目录本身而不是
+    # 目录里的文件 —— grep 目录永远不命中, 每张证书都被判成"没人引用",
+    # GC 于是把正在用的证书删掉。方向反过来: 先让通配展开, 再逐个比对。
+    local d
+    for d in "$CONF_DIR" "$(dirname "${MAIN_CONFIG:-$CONF_DIR/config.json}")"; do
+        local f
+        for f in "$d"/*.json; do
+            [[ -f "$f" ]] || continue
+            grep -qF -- "$want" "$f" 2>/dev/null && return 0
+            grep -qE -- "$pat" "$f" 2>/dev/null && return 0
+        done
     done
 
     # 2) nginx 站点 —— Xray 部署里证书常常也签给 nginx 用
@@ -215,8 +229,13 @@ x_cert_gc() {
 # 列出应扫描的证书目录: 宿主的常规路径 + Docker 挂载进来的路径。
 x_cert_search_dirs() {
     local d
-    for d in /etc/letsencrypt/live /etc/ssl/certs /root/catmi/xray/certs \
-             /root/catmi/certs /usr/local/share/letsencrypt/live; do
+    # 注意: 不含 /etc/ssl/certs —— 那是系统信任库, 里面一百多张全是 CA,
+    # 没有一张是用户的证书。把它当搜索范围, "列出我的证书"会列出 120 个
+    # 无关文件, 把用户自己那两三张淹掉。用户的证书在 letsencrypt 的 live/
+    # 或项目自己的 certs 目录。
+    for d in /etc/letsencrypt/live /root/catmi/xray/certs \
+             /root/catmi/certs /usr/local/share/letsencrypt/live \
+             ${X_CERT_EXTRA_DIRS:-/nonexistent}; do
         [[ -d "$d" ]] && printf '%s\n' "$d"
     done
 
@@ -238,6 +257,19 @@ x_cert_search_dirs() {
 # 与 mihomo 版一致的排除规则: 私钥不算证书。*_key.pem / *key*.pem 会被
 # 混进 .pem 扫描结果, 而把私钥当成"待续期证书"会导致续期脚本对着一把
 # 私钥申请续期。
+# 系统信任库不算"用户的证书"。判据看内容: 装的是 CA 集合而不是一张叶子
+# 证书。按文件名排除不保险 —— ca-certificates.crt 在 /etc/pki/tls/certs
+# (RHEL 系) 和 /usr/local/share/certs (FreeBSD) 里名字都不一样, 而用户
+# 也可能把自己的证书就叫 ca.crt。
+_x_skip_bundle() {
+    local f="$1" n
+    n=$(grep -c 'BEGIN CERTIFICATE' "$f" 2>/dev/null) || return 1
+    # 一张叶子证书 vs 一整包 CA。16 是个凭经验取的界: 自签根证书包里
+    # 通常十几到几十个, 单张证书加一两条中间链不会到这个量。
+    (( n > 16 ))
+}
+
+
 x_cert_list() {
     local d f
     while read -r d; do
@@ -245,6 +277,10 @@ x_cert_list() {
         for f in "$d"/*.pem "$d"/*.crt; do
             [[ -f "$f" ]] || continue
             [[ "$f" == *_key.pem || "$f" == *key*.pem ]] && continue
+              # 系统 CA 包要排除。/etc/ssl/certs 里有一百多个, 全列出来
+              # 会把用户自己那两三张证书淹掉 —— 而"列出我的证书"这个
+              # 需求里 ca-certificates.crt 显然不是用户的证书。
+              _x_skip_bundle "$f" && continue
             printf '%s\n' "$f"
         done
     done < <(x_cert_search_dirs)

@@ -49,6 +49,7 @@ ${GREEN}13.${PLAIN} DNS 管理（dns）
 ${GREEN}14.${PLAIN} 日志（logs）
 ${GREEN}15.${PLAIN} 预置建节点（mknode）
 ${GREEN}16.${PLAIN} 预置批量生成（preset_batch）
+${GREEN}17.${PLAIN} 证书管理（cert）
 ${GREEN}0.${PLAIN} 退出脚本
 ----------------------
 xrayls 服务状态: ${xrayls_server_status_text}
@@ -74,6 +75,7 @@ xrayls 服务状态: ${xrayls_server_status_text}
         14) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/logs.sh) ;;
         15) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/mknode.sh) ;;
         16) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/tools/preset_batch.sh) --help ;;
+        17) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cert.sh) ;;
 
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac

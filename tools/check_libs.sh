@@ -183,6 +183,69 @@ PY
 )
 echo "$B64" | grep -qE '^[A-Za-z0-9+/=]+$' && ok "订阅 body 是纯 base64" || bad "订阅 body 混入非 base64 内容"
 
+# ---------------------------------------------------------------- 证书管理
+# cert.sh 此前只有库没有用户入口。证书问题在现场的表现恰恰最难自查:
+# 配好了但连不上, 而配置看着完全正常。
+group "证书管理 (conf/cert.sh 菜单)"
+CE="$TMP/cert"; mkdir -p "$CE/a"
+openssl req -x509 -newkey rsa:2048 -keyout "$CE/a/ok.key" -out "$CE/a/ok.crt" \
+  -days 30 -nodes -subj '/CN=good.example.com' >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -keyout "$CE/a/other.key" -out "$CE/a/other.crt" \
+  -days 30 -nodes -subj '/CN=other.com' >/dev/null 2>&1
+openssl genrsa -out "$CE/a/unrelated.key" 2048 >/dev/null 2>&1
+cp "$CE/a/ok.crt" "$CE/a/nokey.crt"
+cp "$CE/a/ok.crt" "$CE/a/fc_fullchain.pem"; cp "$CE/a/ok.key" "$CE/a/fc_privkey.pem"
+cp "$CE/a/ok.crt" "$CE/a/mismatch.crt"; cp "$CE/a/unrelated.key" "$CE/a/mismatch.key"
+cp /etc/ssl/certs/ca-certificates.crt "$CE/a/sys-bundle.crt" 2>/dev/null
+
+bash -n "$ROOT/conf/cert.sh" 2>/dev/null && ok "cert.sh 语法" || bad "cert.sh 语法"
+
+# source 不该弹菜单 —— 库被 source 就自己弹会把调用方的 stdin 吃掉
+CS=$(timeout 20 bash -c "source '$ROOT/conf/cert.sh'; echo DONE" 2>&1 | grep -c '════')
+assert_eq "$CS" "0" "source cert.sh 不弹菜单"
+
+# 系统 CA 包不该出现在"我的证书"里
+CL=$(bash -c "source '$ROOT/conf/lib/cert.sh'
+  export X_CERT_NGINX_DIRS='$CE/a' XRAY_BASE='$CE' X_CERT_EXTRA_DIRS='$CE/a'
+  x_cert_list | wc -l")
+[[ "$CL" -le 8 ]] && ok "系统 CA 包已过滤 (剩 $CL 个)" || bad "证书列表被系统 CA 淹没: $CL 个"
+
+# 未定义 CONF_DIR 时不能静默退出 (set -u 下会终止整个 shell)
+GU=$(env -u CONF_DIR -u MAIN_CONFIG -u XRAY_BASE timeout 20 bash -c "
+  source '$ROOT/conf/lib/cert.sh'
+  export X_CERT_EXTRA_DIRS='$CE/a'
+  x_cert_list >/dev/null && echo OK" 2>&1 | tail -1)
+case "$GU" in *unbound*) bad "cert.sh 依赖未定义变量, set -u 下致命" ;; *OK*) ok "未定义 CONF_DIR 时兜住默认值" ;; *) bad "未定义变量行为异常: $GU" ;; esac
+
+cmenu() { X_CERT_NGINX_DIRS="$CE/a" X_CERT_EXTRA_DIRS="$CE/a" XRAY_BASE="$CE" \
+          timeout 40 bash "$ROOT/conf/cert.sh" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
+# 用编号选候选 (直接给路径时同一行要过两处解析, 容易测错)
+# 用绝对路径选, 不用编号 —— 编号依赖 x_cert_list 的枚举顺序, 那是目录扫描
+# 决定的, 换台机器顺序就可能不同, 测试会莫名其妙地时对时错。
+V1=$(printf '1\n%s\ngood.example.com\n0\n' "$CE/a/ok.crt" | cmenu | grep -c '✓ 可用')
+assert_eq "$V1" "1" "校验: 域名相符 → 可用"
+V2=$(printf '1\n%s\nwrong.com\n0\n' "$CE/a/ok.crt" | cmenu | grep -c '不一致')
+assert_eq "$V2" "1" "校验: 域名不符 → 报出不一致"
+V3=$(printf '1\n%s\n0\n' "$CE/a/mismatch.crt" | cmenu | grep -c '不配对')
+assert_eq "$V3" "1" "校验: crt/key 不配对 → 报出"
+V4=$(printf '1\n%s\n0\n' "$CE/a/nokey.crt" | cmenu | grep -c '证书本身可用')
+assert_eq "$V4" "1" "缺私钥 → 报证书本身可用 (而非报 私钥不存在: 0)"
+V5=$(printf '1\n%s\n\n0\n' "$CE/a/fc_fullchain.pem" | cmenu | grep -c '✓ 可用')
+assert_eq "$V5" "1" "fullchain+privkey 命名能推到私钥"
+G1=$(printf '4\nn\n' | cmenu | grep -c '已取消')
+assert_eq "$G1" "1" "GC: 取消时不删"
+B4=$(ls "$CE"/a/*.crt 2>/dev/null | wc -l)
+printf '4\nyes\n' | cmenu >/dev/null
+A4=$(ls "$CE"/a/*.crt 2>/dev/null | wc -l)
+assert_eq "$A4" "$B4" "GC: 非 DELETE 一律不删"
+printf '4\nDELETE\n' | cmenu >/dev/null
+A4b=$(ls "$CE"/a/*.crt 2>/dev/null | wc -l)
+[[ "$A4b" -lt "$A4" ]] && ok "GC: 输入 DELETE 才删 ($A4 → $A4b)" || bad "GC: DELETE 后未删除"
+cmenu2=$(printf '2\n0\n' | cmenu | grep -c '未引用\|使用中')
+[[ "$cmenu2" -ge 1 ]] && ok "列出全部证书带使用状态" || bad "列出功能异常"
+W1=$(printf '6\n0\n' | cmenu | grep -c '证书搜索范围')
+assert_eq "$W1" "1" "搜索范围可查看"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。
