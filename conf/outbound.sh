@@ -1860,17 +1860,18 @@ validate_config() {
     fi
 }
 
+# 服务名解析 (xrayls / xray 双代兼容) 与重启逻辑收敛到 conf/lib/service.sh。
+# 这里曾各写一份 if/elif, 新脚本再写一份, 改一处漏两处的概率很高。
+_x_svc_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
+if [[ -r "$_x_svc_lib_dir/service.sh" ]]; then
+    source "$_x_svc_lib_dir/service.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/service.sh") \
+        || { print_error "服务库加载失败"; return 1; }
+fi
+
 restart_xrayls() {
-    if systemctl list-unit-files 2>/dev/null | grep -qw "xrayls.service"; then
-        systemctl restart xrayls
-        sleep 1
-        systemctl is-active --quiet xrayls && print_ok "xrayls 已重启" || print_error "xrayls 重启失败"
-    elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -qw "xray.service"; then
-        systemctl restart xray
-        print_ok "xray 已重启"
-    else
-        print_error "未找到 xray 服务，请手动重启"
-    fi
+    x_svc_restart
 }
 
 # ================================
@@ -1985,8 +1986,8 @@ diag_landing() {
     # 3) 服务状态 + 二进制
     echo "[3] 服务 / 二进制:" >&2
     printf "    xrayls 服务: " >&2
-    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -qw "xrayls.service"; then
-        echo "$(systemctl is-active xrayls)" >&2
+    if declare -F x_svc_installed >/dev/null 2>&1 && x_svc_installed; then
+        echo "$(x_svc_status_text)" >&2
     elif pgrep -f "xrayls|xray " >/dev/null 2>&1; then
         echo "运行中(pgrep)" >&2
     else
