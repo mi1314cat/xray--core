@@ -49,6 +49,26 @@ x_collect_used_ports() {
     X_USED_PORTS="$tmp"
 }
 
+# x_ss_works —— ss 是否真的能给出监听列表
+#
+# 只判 "[[ -n $dump ]]" 是不够的: 某些环境(容器里没有 NETLINK)下 ss 会
+# 报 "Cannot open netlink socket"。目前这个错误走 stderr, 被 2>/dev/null
+# 吃掉后 dump 为空, 守卫能生效 —— 但守卫的正确性依赖 ss 的实现细节。
+# 所以这里判的是"内容像不像监听列表", 不是"有没有输出"。
+X_SS_OK=""
+x_ss_works() {
+    [[ -n "$X_SS_OK" ]] && { [[ "$X_SS_OK" == "1" ]]; return; }
+    local out; out=$(ss -tulnH 2>/dev/null)
+    if [[ "$out" =~ [:.]\?[0-9]{2,5}[[:space:]] ]]; then
+        X_SS_OK=1; return 0
+    fi
+    # 只有一行输出时那行可能是 "Netid State Recv-Q Send-Q Local Peer" 表头
+    if (( $(wc -l <<< "$out") > 1 )) && grep -qE 'LISTEN|UNCONN' <<< "$out"; then
+        X_SS_OK=1; return 0
+    fi
+    X_SS_OK=0; return 1
+}
+
 # x_port_in_use <端口>
 #
 # 只查实时监听 —— 判断"这个端口此刻能不能立刻 bind"。

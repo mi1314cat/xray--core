@@ -113,14 +113,37 @@ ask_port_range() {
 choose_port_range() {
     local r="$1"
     if [[ -z "$r" ]]; then
+        # 随机起点 + 2000 宽。随机是为了让多台机器/多批次分布不同,
+        # 撞车概率比固定 20000 起低。
         X_BATCH_PORT_START=$(( 20000 + RANDOM % 20000 ))
         X_BATCH_PORT_END=$(( X_BATCH_PORT_START + 2000 ))
-        print_ok "批量自动端口区间: $X_BATCH_PORT_START-$X_BATCH_PORT_END"
+    elif [[ "$r" =~ ^[0-9]+$ ]]; then
+        # 只给起点 -> 往后 2000 个
+        X_BATCH_PORT_START="$r"
+        X_BATCH_PORT_END=$(( r + 2000 ))
+    elif [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        X_BATCH_PORT_START="${BASH_REMATCH[1]}"
+        X_BATCH_PORT_END="${BASH_REMATCH[2]}"
     else
-        X_BATCH_PORT_START="${r%%-*}"; X_BATCH_PORT_END="${r##*-}"
-        [[ "$X_BATCH_PORT_START" =~ ^[0-9]+$ && "$X_BATCH_PORT_END" =~ ^[0-9]+$ ]] || { print_error "格式: 起始-结束"; return 1; }
-        (( X_BATCH_PORT_START < X_BATCH_PORT_END && X_BATCH_PORT_START >= 1 && X_BATCH_PORT_END <= 65535 )) || { print_error "范围无效 (要求 起始 < 结束, 1-65535)"; return 1; }
+        print_error "无法识别: $r  (格式: 20000-25000, 或只写起点 30000)" >&2
+        return 1
     fi
+    # 用户可能写成 25000-20000
+    if (( X_BATCH_PORT_END < X_BATCH_PORT_START )); then
+        local t=$X_BATCH_PORT_START
+        X_BATCH_PORT_START=$X_BATCH_PORT_END
+        X_BATCH_PORT_END=$t
+    fi
+    # 两端都要钳 —— 只钳 END 会出现 99999-65535 这种倒挂区间,
+    # 区间循环一次都不进, 于是悄悄回落到随机端口, 用户选什么都是随机。
+    if (( X_BATCH_PORT_START < 1 ));      then X_BATCH_PORT_START=1; fi
+    if (( X_BATCH_PORT_START > 65535 ));   then X_BATCH_PORT_START=65535; fi
+    if (( X_BATCH_PORT_END   > 65535 ));   then X_BATCH_PORT_END=65535; fi
+    if (( X_BATCH_PORT_END   < X_BATCH_PORT_START )); then X_BATCH_PORT_END=65535; fi
+    # 回显实际选中的结果。只说"回车=自动"而不回显, 用户不知道到底挑了哪段
+    # —— 而这段区间后面要写进防火墙规则, 是要能对得上的。
+    print_ok "批量端口区间: $X_BATCH_PORT_START - $X_BATCH_PORT_END" \
+             "($(( X_BATCH_PORT_END - X_BATCH_PORT_START + 1 )) 个, 每个节点一个)" >&2
     return 0
 }
 

@@ -42,6 +42,14 @@ CONF_DIR="$INSTALL_DIR/conf"
 SERVICE_NAME="xrayls"
 
 XRAY_BIN="${XRAY_BIN:-}"
+
+# 端口绑定核对依赖 ports.sh 的 x_port_in_use, 两个库一起加载。
+_x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+_x_lib_base="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib"
+[[ -r "$_x_lib_dir/lib/ports.sh" ]] && source "$_x_lib_dir/lib/ports.sh" \
+    || source <(curl -fsSL "$_x_lib_base/ports.sh") || true
+[[ -r "$_x_lib_dir/lib/verify.sh" ]] && source "$_x_lib_dir/lib/verify.sh" \
+    || source <(curl -fsSL "$_x_lib_base/verify.sh") || true
 if [[ -z "$XRAY_BIN" ]]; then
     for c in "$INSTALL_DIR/xrayls" /usr/local/bin/xray xrayls; do
         command -v "$c" >/dev/null 2>&1 && { XRAY_BIN=$(command -v "$c"); break; }
@@ -108,6 +116,11 @@ restart_xrayls() {
         sleep 2
         if systemctl is-active --quiet "$SERVICE_NAME"; then
             print_ok "$SERVICE_NAME 已重启 (active)"
+              # active 只说明进程起来了, listener 是异步绑的 ——
+              # 不核对就报成功, 等于把"没绑上"留给用户在客户端发现。
+              XRAY_SERVICE="$SERVICE_NAME" XRAY_BIN="$XRAY_BIN" \
+                  XRAY_BASE="$INSTALL_DIR" \
+                  x_verify_bound || print_warn "有端口没绑上, 详见上方内核报错"
             return 0
         else
             print_error "$SERVICE_NAME 重启失败"
