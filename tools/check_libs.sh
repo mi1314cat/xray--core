@@ -246,6 +246,58 @@ cmenu2=$(printf '2\n0\n' | cmenu | grep -c '未引用\|使用中')
 W1=$(printf '6\n0\n' | cmenu | grep -c '证书搜索范围')
 assert_eq "$W1" "1" "搜索范围可查看"
 
+# ---------------------------------------------------------------- Nginx 站点管理
+# nginx_apply.py 早就做完了 (幂等插入、标记块、Docker 感知), 但一直只有
+# 建节点那条路径能间接触发。用户想看一眼有哪些站点、或单独摘掉一个域名的
+# 反代, 此前没有任何入口。
+group "Nginx 站点管理 (conf/nginx_site.sh 菜单)"
+bash -n "$ROOT/conf/nginx_site.sh" 2>/dev/null && ok "nginx_site.sh 语法" || bad "nginx_site.sh 语法"
+
+# source 不该弹菜单
+NS=$(timeout 20 bash -c "source '$ROOT/conf/nginx_site.sh'; echo DONE" 2>&1 | grep -c '════')
+assert_eq "$NS" "0" "source nginx_site.sh 不弹菜单"
+
+NG="$TMP/ng"; mkdir -p "$NG"
+printf 'server {\n    listen 443 ssl;\n    server_name t.example;\n    location / { return 444; }\n}\n' > "$NG/t.example.conf"
+export NGINX_CONF_ROOTS="$NG"
+ngmenu() { timeout 40 bash "$ROOT/conf/nginx_site.sh" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
+
+# config_roots 可被环境变量覆盖, 否则没法测, 非标准安装路径也找不到站点
+CR=$(NGINX_CONF_ROOTS="$NG" python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import nginx_apply as N
+print('|'.join(N.config_roots()))")
+assert_eq "$CR" "$NG" "NGINX_CONF_ROOTS 覆盖配置根"
+
+L1=$(printf '1\n0\n' | ngmenu | grep -c 't.example')
+assert_eq "$L1" "1" "列出站点: 显示 server_name 与文件名"
+
+# 插入 → 查看 → 幂等 → 摘除 的完整链路
+python3 "$LIB/nginx_apply.py" --domain t.example --port 23456 --transport ws --nginx none >/dev/null 2>&1
+NB=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf")
+assert_eq "$NB" "1" "插入反代: 生成一个标记块"
+python3 "$LIB/nginx_apply.py" --domain t.example --port 23456 --transport ws --nginx none >/dev/null 2>&1
+NB2=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf")
+assert_eq "$NB2" "1" "重复插入仍只有一个标记块 (幂等)"
+
+V2=$(printf '2\nt.example\n0\n' | ngmenu | grep -c 'proxy_pass')
+assert_eq "$V2" "1" "查看站点: 显示插入的正文"
+
+R1=$(printf '4\nt.example\nnope\n0\n' | ngmenu | grep -c '已取消')
+assert_eq "$R1" "1" "摘除: 确认词不对则不动手"
+NB3=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf")
+assert_eq "$NB3" "1" "摘除: 取消后标记块还在"
+
+printf '4\nt.example\nyes\n0\n' | ngmenu >/dev/null 2>&1
+NB4=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf" || true)
+assert_eq "$NB4" "0" "摘除: 确认后标记块消失"
+KEEP=$(grep -c 'return 444' "$NG/t.example.conf")
+assert_eq "$KEEP" "1" "摘除: 用户自己写的 location 未被动过"
+
+P1=$(printf '5\nt.example\n23456\nws\n0\n' | ngmenu | grep -c 'dry-run, 不落盘')
+assert_eq "$P1" "1" "预览插入: 标明是 dry-run"
+P2=$(printf '5\nt.example\n23456\nws\n0\n' | ngmenu | grep -c 'proxy_pass')
+assert_eq "$P2" "1" "预览插入: 能看到将插入的内容"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。

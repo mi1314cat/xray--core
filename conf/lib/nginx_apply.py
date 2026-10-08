@@ -67,9 +67,19 @@ def nginx_cmd(docker=None):
 
 
 def config_roots(docker=None):
-    """可能存在站点配置的目录。"""
-    cands = ["/etc/nginx/conf.d", "/etc/nginx/sites-enabled",
-             "/usr/local/nginx/conf", "/etc/nginx"]
+    """可能存在站点配置的目录。
+
+    NGINX_CONF_ROOTS 可以覆盖 (冒号分隔), 用途有两个: 测试时指向临时目录,
+    以及非标准安装路径 —— openresty 装在 /usr/local/openresty/nginx 时那几
+    个默认值一个都不存在, 站点文件自然一张都找不到。
+    """
+    env = os.environ.get("NGINX_CONF_ROOTS")
+    if env:
+        cands = [d for d in env.split(":") if d]
+    else:
+        cands = ["/etc/nginx/conf.d", "/etc/nginx/sites-enabled",
+                 "/usr/local/nginx/conf", "/usr/local/openresty/nginx/conf",
+                 "/etc/nginx"]
     return [c for c in cands if os.path.isdir(c)]
 
 
