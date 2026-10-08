@@ -54,6 +54,7 @@ GEN_ARGS=(
   --api-port "${XBD_API_PORT:-18085}"
   --logs "$PREFIX/logs" --loglevel "${XBD_LOGLEVEL:-warning}"
   --dns "$DNS_MODE"
+  --validate-with "$XRAY"
 )
 if [ "$WANT_BD" = "yes" ]; then
   GEN_ARGS+=(--node "$NODE")

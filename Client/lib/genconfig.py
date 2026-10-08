@@ -22,6 +22,8 @@ import argparse
 import json
 import os
 import re
+import subprocess
+import tempfile
 import sys
 
 NORMAL, DIALER = "normal", "dialer"
@@ -444,6 +446,80 @@ def _apply_dns(cfg: dict, args) -> None:
         cfg["routing"]["rules"] = rules + cfg["routing"]["rules"]
 
 
+def tag_for(node: dict) -> str:
+    """节点文件 → 多出站配置里的出站 tag。
+
+    单独抽出来是因为面板和这里都要算同一个值。两边各算一次的话，
+    迟早有一边算出 "node-node-001" 这种双前缀，而症状是"切换没反应"。
+    """
+    base = os.path.basename(node["__file"]).rsplit(".", 1)[0]
+    if base.startswith(OUTBOUND_PREFIX):
+        base = base[len(OUTBOUND_PREFIX):]
+    return OUTBOUND_PREFIX + re.sub(r"[^A-Za-z0-9._-]", "_", base)
+
+
+def _tag_of_bad_node(err: str):
+    """从内核报错里认出是哪个出站坏了。
+
+    内核的原话形如：
+        failed to build outbound config with tag node-001-01 >
+        infra/conf: Failed to build REALITY config.
+    认得出 tag 才能只丢掉这一个 —— 直接放弃整份配置的话，订阅里一条
+    写坏的节点就会让整个客户端起不来。
+    """
+    m = re.search(r"outbound config with tag ([A-Za-z0-9._-]+)", err or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"outbound \[([A-Za-z0-9._-]+)\]", err or "")
+    return m.group(1) if m else None
+
+
+def prune_unbuildable(nodes: list, cfg_fn, xray_bin: str, max_rounds: int = 12):
+    """剔掉内核根本构建不出来的节点。
+
+    为什么要做这件事：多出站把所有节点塞进同一份配置，任何一个节点写坏了
+    （订阅里混进来的 REALITY 公钥少一位、uuid 少一横），整份配置就通不过校验，
+    服务直接起不来。单节点模式下坏的只是那一个节点 —— 这是多出站换来的
+    "切换不断线"所付的代价，必须在这里补回来。
+
+    做法是让内核自己当裁判：校验失败 → 从报错里读出坏 tag → 剔掉 → 重生成。
+    绝大多数情况一轮就干净；反复失败的次数封顶，避免内核一直报同一个错时
+    变成死循环。
+    """
+    keep = list(nodes)
+    dropped = []
+    tmp = os.path.join(tempfile.gettempdir(), ".xbd-prune-%d.json" % os.getpid())
+    try:
+        for _ in range(max_rounds):
+            cfg = cfg_fn(keep)
+            # 必须落成文件再喂给内核：`xray run -test -c -` 不认 stdin，
+            # 报的是 "Failed to get format of -"。已实测。
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, ensure_ascii=False)
+            p = subprocess.run([xray_bin, "run", "-test", "-c", tmp],
+                               capture_output=True, text=True, timeout=60)
+            if p.returncode == 0:
+                return keep, dropped, None
+            err = (p.stderr or "") + (p.stdout or "")
+            tag = _tag_of_bad_node(err)
+            if not tag:
+                return keep, dropped, err.strip()[:400]
+            idx = next((i for i, n in enumerate(keep)
+                        if tag_for(n) == tag), None)
+            if idx is None:
+                return keep, dropped, err.strip()[:400]
+            dropped.append({"file": os.path.basename(keep[idx]["__file"]),
+                            "tag": tag})
+            keep = keep[:idx] + keep[idx + 1:]
+            if not keep:
+                return keep, dropped, err.strip()[:400]
+        return keep, dropped, "剔除次数用尽，仍未通过校验"
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
 def collect_direct_exemptions(nodes: list) -> tuple:
     """汇总所有节点的直连豁免项，返回 (域名列表, IP 列表)。
 
@@ -494,10 +570,7 @@ def build_multi(nodes: list, current: dict, args) -> dict:
         # 先把文件名自带的 node- 前缀剥掉再补一个 —— 节点文件本来就叫
         # node-001-a.json，不剥就会生成 node-node-001-a；而 node-a.json 和
         # a.json 这两个不同文件会撞成同一个 tag，后者静默顶掉前者。
-        base = os.path.basename(node["__file"]).rsplit(".", 1)[0]
-        if base.startswith(OUTBOUND_PREFIX):
-            base = base[len(OUTBOUND_PREFIX):]
-        tag = OUTBOUND_PREFIX + re.sub(r"[^A-Za-z0-9._-]", "_", base)
+        tag = tag_for(node)
         node_tag_by_id[node["__id"]] = tag
         outbounds.append(build_outbound(node, mode, args.mux, tag=tag))
     outbounds.append({"tag": "direct", "protocol": "freedom",
@@ -628,6 +701,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=None, help="覆盖端口")
     ap.add_argument("--port-normal", type=int, default=1080)
     ap.add_argument("--port-dialer", type=int, default=1081)
+    ap.add_argument("--validate-with", default="",
+                    help="xray 二进制路径。给了就先用它剔掉构建不出来的节点 —— "
+                         "多出站模式下订阅里一条坏节点会让整份配置起不来")
     ap.add_argument("--dns", choices=list(DNS_MODES), default="off",
                     help="off=不接管 DNS；standard=境外加密 DNS + 国内加密 DNS；"
                          "strict=全部加密 DNS 并强制经代理（防泄漏最严）")
@@ -650,6 +726,19 @@ def main() -> int:
         nodes, cur = load_nodes(args.nodes_dir, args.node)
         if not nodes:
             fail(f"节点目录里没有可用节点: {args.nodes_dir}")
+        xbin = getattr(args, "validate_with", "") or ""
+        if xbin and os.access(xbin, os.X_OK):
+            def _mk(ns):
+                return build_multi(ns, cur, args)[0]
+            nodes, dropped, perr = prune_unbuildable(nodes, _mk, xbin)
+            if dropped:
+                for d in dropped:
+                    print(f"genconfig: 已剔除无法构建的节点 {d['file']} (tag {d['tag']})",
+                          file=sys.stderr)
+            if perr and not nodes:
+                fail(f"所有节点都无法构建: {perr}")
+        if not nodes:
+            fail("剔除后没有可用节点")
         cfg, tags = build_multi(nodes, cur, args)
         cur_id = cur["__id"] if cur else None
     else:

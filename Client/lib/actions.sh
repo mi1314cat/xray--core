@@ -56,7 +56,11 @@ cmd_install() {
   chmod 0755 "$XBD_PREFIX/bin/xbd" 2>/dev/null || true
 
   menu_xray_ensure
-  menu_browser_ensure
+  # 浏览器是可选的：缺它只是用不了依赖浏览器拨号的节点，其余功能不受影响。
+  # 这里必须吞掉它的返回值 —— core.sh 开着 `set -e`，一个裸函数调用返回 1
+  # 会让整个安装中断在"浏览器"这一步，后面的 systemd 单元根本没装上，
+  # 结果是客户端装完了却起不来。实测踩过：RN 上就是这么变成半装状态的。
+  menu_browser_ensure || dim "未装浏览器，Browser Dialer 相关节点暂不可用（可随时补装）"
 
   step "写入配置（幂等，不覆盖已有内容）"
   xbd_write_default_configs
@@ -936,6 +940,7 @@ cmd_apply() {
     --http-port "$XBD_PORT_HTTP" --lan-http-port "$XBD_PORT_LAN_HTTP"
     --api-port "${XBD_API_PORT:-18085}" --logs "$XBD_LOGS"
     --dns "${XBD_DNS_MODE:-off}"
+    --validate-with "$XBD_XRAY"
   )
   if [ "$want_bd" = "yes" ]; then
     gen_args+=(--node "$XBD_NODES/current")

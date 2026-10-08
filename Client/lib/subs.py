@@ -260,11 +260,13 @@ def group_nodes(prefix_dir: str, nodes: list) -> list:
         for f in (s.get("nodes") or []):
             file_to_sub.setdefault(f, (i, s))
 
-    # 前缀推断只在"有节点没归属"时才跑：全部都有 group 时它是白算的，
-    # 而且会对没关系的节点编出些看起来像分组的假象。
-    need_infer = [n for n in nodes
-                  if not n.get("group") and n["file"] not in file_to_sub]
-    inferred = infer_groups(need_infer) if need_infer else {}
+    # 不再按名字前缀推断分组。
+    #
+    # 订阅节点现在都有真分组，剩下没归属的就是历史遗留节点和手动节点 ——
+    # 而它们的节点名基本互不相同（CC 上实测 8 个节点推出 8 个组，每组 1 个）。
+    # 左栏被八个单节点条目占满，比不分还难用。这正是 metacubexd 和 zashboard
+    # 都踩过并改掉的那件事：单节点各成一组不叫分组，叫噪音。
+    # 统一收进「其它」，想整理的用户可以自己建组往里放。
 
     buckets: dict = {}
     for n in nodes:
@@ -277,13 +279,7 @@ def group_nodes(prefix_dir: str, nodes: list) -> list:
             key, name, order, origin = s.get("id"), s.get("name") or s.get("prefix"), i, "registry"
         else:
             # 推断出来的组排在注册表组之后，按名字字母序互相排；「其它」垫底。
-            name = inferred.get(f) or "其它"
-            key = "pfx:" + name
-            if name == "其它":
-                order = 99999
-            else:
-                order = 9000 + sorted(set(inferred.values())).index(name)
-            origin = "other" if name == "其它" else "prefix"
+          key, name, order, origin = "other", "其它", 99999, "other"
         b = buckets.setdefault(key, {"key": key, "name": name, "order": order,
                                     "origin": origin, "nodes": []})
         b["nodes"].append(n)

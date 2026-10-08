@@ -36,7 +36,7 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 #   点「接管本机」→ 界面毫无变化（动作其实失败了）→
 #   日志里报 "/etc/profile.d/proxy.sh: Read-only file system"。
 # 排查了很久才定位到是单元加固，不是功能没做。
-ReadWritePaths=/opt/xray-browser-dialer/runtime /opt/xray-browser-dialer/logs /opt/xray-browser-dialer/config /opt/xray-browser-dialer/nodes /opt/xray-browser-dialer/generated /etc/profile.d /etc/systemd/system/docker.service.d /etc/environment
+ReadWritePaths=/opt/xray-browser-dialer/runtime /opt/xray-browser-dialer/logs /opt/xray-browser-dialer/config /opt/xray-browser-dialer/nodes /opt/xray-browser-dialer/generated /etc/profile.d -/etc/systemd/system/docker.service.d /etc/environment
 
 [Install]
 WantedBy=multi-user.target

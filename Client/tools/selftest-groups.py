@@ -101,10 +101,11 @@ def test_group_nodes(subs, tmp):
         {"file": "n4.json", "name": "手动-东京"},
     ]
     gs = subs.group_nodes(d, nodes)
-    eq([g["name"] for g in gs], ["A", "B", "手动"], "分组顺序 = 注册顺序，推断组在后")
+    eq([g["name"] for g in gs], ["A", "B", "其它"], "分组顺序 = 注册顺序, 无归属的在最后")
     eq(sum(len(g["nodes"]) for g in gs), 4, "没有节点在分组过程中丢失")
     ok(nodes[0]["group_key"] == s1["id"], "节点上带回 group_key")
-    ok(gs[-1]["name"] == "手动" and gs[-1]["origin"] == "prefix", "无归属节点按名字推断")
+    ok(gs[-1]["name"] == "其它" and gs[-1]["origin"] == "other",
+       "无归属节点统一进「其它」, 不再一节点一组")
 
 
 # ------------------------------------------------------------- 配置生成 ----
