@@ -160,8 +160,20 @@ x_svc_explain_errors() {
     x_svc_resolve >/dev/null
     local n="$X_SVC_NAME"
     local out
+    # 预过滤只用来压掉启动成功的那些行。但它的关键词必须覆盖下面 case 里
+    # 能识别的每一条 —— 否则映射认识的那行被这里先滤掉, 解释永远不会出现。
+    # 之前就漏了 unknown field 与 no such file or directory: 这两个短语
+    # 不含任何通用关键词, 于是"配置字段不被版本接受"和"引用的文件不存在"
+    # 两条解释是死代码。
+    # 用单个交替式而不是两个 grep 串联: 串联是求交集, 而这两组关键词是并集 ——
+    # "unknown field" 行不含任何通用关键词, 第一个 grep 就把它滤掉了, 第二个
+    # grep 再滤一遍只会得到空集, 于是所有解释都不出现。
+    local pat
+    pat='error|failed|emerg|panic|warn'
+    pat+='|address already in use|permission denied|certificate'
+    pat+='|no such file|unknown field|invalid character'
     out=$(timeout 10 journalctl -u "$n" -n 200 --no-pager 2>/dev/null \
-          | grep -iE 'error|failed|emerg|panic|address already in use|permission denied|invalid|certificate' || true)
+          | grep -iE "$pat" || true)
     [[ -n "$out" ]] || { x_svc_print_ok "日志里没有错误"; return 0; }
 
     printf '\n' >&2

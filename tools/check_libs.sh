@@ -281,6 +281,33 @@ PATH="$TMP/bin2:$PATH" python3 "$LIB/dns_edit.py" --config "$DNSF/config.json" -
 if diff -q "$DNSF/before.json" "$DNSF/config.json" >/dev/null 2>&1; then ok "xray -test 失败已回滚"; else bad "xray -test 失败已回滚"; fi
 if compgen -G "$DNSF/*.dns-bak" >/dev/null; then bad "回滚后无备份残留"; else ok "回滚后无备份残留"; fi
 
+# ---------------------------------------------------------------- 日志
+group "日志 (logs.sh / service.sh)"
+# 用假 journalctl 验证 x_svc_explain_errors 真的把内核报错翻成人话
+mkdir -p "$TMP/jbin"
+cat > "$TMP/jbin/journalctl" <<'EOF'
+#!/bin/sh
+cat <<'LOG'
+xray: failed to read config file: /root/catmi/xray/config.json
+xray: unknown field "sockopt" in streamSettings
+xray: listen tcp 0.0.0.0:443: bind: address already in use
+LOG
+EOF
+chmod +x "$TMP/jbin/journalctl"
+EX=$(PATH="$TMP/jbin:$PATH" bash -c "source '$LIB/service.sh'; x_svc_explain_errors" 2>&1)
+[[ -n "$EX" ]] && ok "报错解释有输出" || bad "报错解释有输出"
+echo "$EX" | grep -qi 'port\|端口' && ok "识别出端口冲突" || bad "识别出端口冲突"
+echo "$EX" | grep -qi 'unknown field\|字段' && ok "识别出未知字段" || bad "识别出未知字段"
+echo "$EX" | grep -qi 'config' && ok "识别出配置文件问题" || bad "识别出配置文件问题"
+# logs.sh 各入口在无 systemd 时不得挂死
+T0=$(date +%s%N)
+timeout 15 bash -c "source '$ROOT/conf/logs.sh'; log_status >/dev/null 2>&1; log_explain >/dev/null 2>&1; log_lines 5 >/dev/null 2>&1"
+RC=$?; MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+[[ "$RC" != "124" ]] && ok "无 systemd 时三个入口均正常返回 (${MS}ms)" || bad "日志入口挂死 (${MS}ms)"
+for fn in log_lines log_explain log_follow log_status log_menu; do
+    grep -q "^${fn}()" "$ROOT/conf/logs.sh" && ok "日志入口存在: $fn" || bad "日志入口存在: $fn"
+done
+
 # ---------------------------------------------------------------- 容器共处
 group "容器感知 (cert.sh / nginx_apply.py)"
 DK="$TMP/dk"; mkdir -p "$DK/hostcerts" "$DK/bin" "$DK/fakeconf"
