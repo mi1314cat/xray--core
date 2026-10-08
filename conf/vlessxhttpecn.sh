@@ -36,84 +36,9 @@ print_title() {
 }
 
 # ================================
-# cf-manager 定位 (Cloudflare API 管理器短链)
-# 优先级: /root/catmi/cloudflare/cf-manager.sh > PATH > 询问自动安装
-# 成功: 设置全局 CFMGR 并 echo 出路径; 失败: CFMGR 为空, 无 stdout
-# ================================
-# ================================
-# cf-manager 定位 (设置全局 CFMGR 并 echo 路径; 空 = 不可用)
-# 注意: 必须直接调用 cfmgr (当前 shell 设置 CFMGR), 禁止 $(cfmgr) 命令替换 (子 shell 丢全局变量)
-# Bug2 fix: _cfmgr_asked 防重复询问安装
-# ================================
-CFMGR=""
-_cfmgr_asked=""
-cfmgr() {
-    local path=""
-    CFMGR=""
-
-    local candidate="/root/catmi/cloudflare/cf-manager.sh"
-    if [[ -x "$candidate" ]]; then
-        path="$candidate"
-    elif command -v cf-manager.sh >/dev/null 2>&1; then
-        path="$(command -v cf-manager.sh)"
-    else
-        if [[ -z "$_cfmgr_asked" ]]; then
-            echo "  未找到 cf-manager.sh (Cloudflare API 管理器)" >&2
-            printf "  是否自动从 GitHub 安装到 %s？(y/N): " "$(dirname "$candidate")" >&2
-            read -r yn
-            case "$(clean_input "$yn")" in
-                y|Y)
-                    if install_cfmgr; then
-                        path="$candidate"
-                    else
-                        _cfmgr_asked="yes"
-                        return 1
-                    fi
-                    ;;
-                *) _cfmgr_asked="yes"; return 1 ;;
-            esac
-        else
-            return 1
-        fi
-    fi
-
-    CFMGR="$path"
-    echo "$CFMGR"
-}
-
-# 从 GitHub 安装 cf-manager.sh + modules/ 到 /root/catmi/cloudflare/
-# 注意: GitHub cfapi/ 目前只有 cf-manager.sh, 缺 modules/ 目录, 下载后必须校验
-install_cfmgr() {
-    local dest="/root/catmi/cloudflare"
-    local base="https://raw.githubusercontent.com/mi1314cat/One-click-script/main/cfapi"
-    local mods=(common.sh context.sh account.sh zone.sh dns.sh ech.sh ssl.sh origin.sh cert.sh)
-    local f
-
-    mkdir -p "$dest/modules"
-    print_info "正在从 GitHub 下载 cf-manager.sh 到 $dest ..."
-
-    if ! curl -fsSL -o "$dest/cf-manager.sh" "$base/cf-manager.sh"; then
-        print_error "下载 cf-manager.sh 失败 (网络/URL 错误)"
-        return 1
-    fi
-    chmod +x "$dest/cf-manager.sh"
-
-    for f in "${mods[@]}"; do
-        if ! curl -fsSL -o "$dest/modules/$f" "$base/modules/$f"; then
-            print_warn "下载 modules/$f 失败"
-        fi
-    done
-
-    # 校验 modules/common.sh (GitHub cfapi/ 目前缺 modules/ 目录)
-    if [[ ! -f "$dest/modules/common.sh" ]]; then
-        print_warn "GitHub cfapi/ 缺少 modules/ 目录, 请手动上传 modules/ 或本地安装 cf-manager"
-        return 1
-    fi
-
-    print_ok "cf-manager.sh 安装完成: $dest/cf-manager.sh"
-}
-
-# ================================
+# 本脚本不调用 Cloudflare API。证书签发 / zone ECH / DNS 绑定都由独立的
+# Cloudflare 管理工具负责；这里只负责检测已有证书、生成自签证书，
+# 并在需要用户动手时把要填的记录打印出来。
 # 基础变量
 # ================================
 PROTO="vless-xhttp"                     # 用于文件名/tag
@@ -358,10 +283,9 @@ ask_cert() {
     local yn domain
 
     echo "  证书来源:" >&2
-    echo "  1) 已有证书 (自动检测: cf-manager Origin CA / /root/catmi / Nginx 容器)" >&2
+    echo "  1) 已有证书 (自动检测: /root/catmi/cloudflare/certs / /root/catmi / Nginx 容器)" >&2
     echo "  2) 手动输入证书路径" >&2
-    echo "  3) 现在申请 (cf-manager Origin CA, 需 CF API)" >&2
-    echo "  4) 自签证书 (内测/无域名兜底)" >&2
+    echo "  3) 自签证书 (内测/无域名兜底)" >&2
     printf "  选择 (默认1): " >&2
     read -r yn
     case "$(clean_input "$yn")" in
@@ -380,31 +304,13 @@ ask_cert() {
             generate_cert
             ;;
         3)
-            # cf-manager 申请 Origin CA (需要 CF API 配置)
-            printf "  请输入要申请证书的域名: " >&2; read -r domain
-            domain=$(clean_input "$domain" | tr '[:upper:]' '[:lower:]')
-            [[ -z "$domain" ]] && { print_error "域名不能为空, 退回自签"; generate_cert; return; }
-            print_info "通过 cf-manager 申请 Origin CA 证书: $domain ..."
-            if cfmgr && "$CFMGR" cert issue "$domain" 2>/dev/null; then
-                local ocrt="/root/catmi/cloudflare/certs/$domain.crt"
-                local okey="/root/catmi/cloudflare/certs/$domain.key"
-                if [[ -f "$ocrt" && -f "$okey" ]]; then
-                    CERT_FILE="$ocrt"; KEY_FILE="$okey"; CERT_DOMAIN="$domain"
-                    print_ok "Origin CA 证书已就绪: $domain"
-                    return 0
-                fi
-            fi
-            print_warn "cf-manager 申请失败, 退回自签"
-            generate_cert
-            ;;
-        4)
             generate_cert
             ;;
         *)
             # 默认1: 已有证书 (多路径检测)
             local found=() i=1 choice f key
             shopt -s nullglob
-            # 路径1: cf-manager Origin CA
+            # 路径1: 独立 Cloudflare 管理工具签发的证书 (若它输出到这里)
             for f in /root/catmi/cloudflare/certs/*.crt; do [[ -f "$f" ]] && found+=("$f"); done
             # 路径2: /root/catmi 根目录
             for f in /root/catmi/*.crt; do [[ -f "$f" ]] && found+=("$f"); done
@@ -450,8 +356,7 @@ ask_cert() {
                     ((i++))
                 done
                 echo "    $i) 手动输入路径" >&2
-                echo "    $((i+1))) 现在申请 (cf-manager Origin CA)" >&2
-                echo "    $((i+2))) 生成自签证书" >&2
+                echo "    $((i+1))) 生成自签证书" >&2
                 printf "  选择证书 (默认 $first_ok): " >&2
                 read -r choice
                 choice=$(clean_input "$choice")
@@ -489,33 +394,19 @@ ask_cert() {
                     generate_cert
                     return 0
                 fi
-                # 用户选了现在申请
-                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice == i+1 )); then
-                    printf "  请输入要申请证书的域名: " >&2; read -r domain
-                    domain=$(clean_input "$domain" | tr '[:upper:]' '[:lower:]')
-                    [[ -z "$domain" ]] && { print_error "域名不能为空, 退回自签"; generate_cert; return 0; }
-                    print_info "通过 cf-manager 申请 Origin CA 证书: $domain ..."
-                    if cfmgr && "$CFMGR" cert issue "$domain" 2>/dev/null; then
-                        local ocrt="/root/catmi/cloudflare/certs/$domain.crt"
-                        local okey="/root/catmi/cloudflare/certs/$domain.key"
-                        if [[ -f "$ocrt" && -f "$okey" ]]; then
-                            CERT_FILE="$ocrt"; KEY_FILE="$okey"; CERT_DOMAIN="$domain"
-                            print_ok "Origin CA 证书已就绪: $domain"
-                            return 0
-                        fi
-                    fi
-                    print_warn "cf-manager 申请失败, 退回自签"
-                    generate_cert
-                    return 0
-                fi
-                # 用户选了自签
-                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice == i+2 )); then
-                    generate_cert
-                    return 0
+                # 选自签时顺带说明证书该放哪: 用户若打算用独立的 Cloudflare
+                # 管理工具签证书, 放到 cloudflare/certs/ 下能被上面的自动检测
+                # 找到, 否则下次还得再手输一遍路径。
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= i+1 )); then
+                    print_info "若要用独立 Cloudflare 管理工具签发的证书, 放到:"
+                    print_info "  /root/catmi/cloudflare/certs/<域名>.crt 和 <域名>.key"
+                    print_info "放好后重新运行本脚本, 自动检测会直接认到。"
                 fi
             fi
 
+            # 走到这里说明没有可用证书 —— 兜底自签
             generate_cert
+            return 0
             ;;
     esac
 }
@@ -759,25 +650,16 @@ add_config() {
             print_warn "ECH 生成失败, 继续但不启用服务端 ECH"
         fi
     else
-        # CDN-ECH: Cloudflare 边缘处理, 需 zone ECH 已开启
-        # 优化: 先检测域名是否已开启 ECH; 已开启则跳过开启步骤 (cf-manager ech status)
-        print_info "CDN-ECH: 检查 Cloudflare zone ECH 状态..."
-        if cfmgr && "$CFMGR" ech status "$CERT_DOMAIN" --json 2>/dev/null | grep -q '"ech":"on"'; then
-            print_ok "域名 $CERT_DOMAIN 已开启 ECH (检测确认), 跳过开启步骤"
-        elif cfmgr; then
-            print_info "ECH 未开启, 通过 cf-manager 开启: $CERT_DOMAIN"
-            if "$CFMGR" -E "$CERT_DOMAIN"; then
-                print_ok "Cloudflare ECH 已开启"
-            else
-                print_warn "ECH 开启失败 (请检查 API 权限或到 CF 后台确认), 节点仍会生成"
-            fi
-        else
-            print_warn "未找到 cf-manager, 请手动确认 Cloudflare zone ECH 已开启"
-        fi
+        # CDN-ECH: Cloudflare 边缘处理, 需 zone 侧已开启 ECH。
+        # 这里不再调 Cloudflare API —— ECH 由独立的 CF 管理工具负责。
+        # 本脚本只负责生成带 ech= 参数的节点; zone 没开的话表现是
+        # "CDN 节点连不上", 而且不会在这里报错, 所以显式提醒一次。
+        print_info "CDN-ECH 模式: 请确认 Cloudflare zone 已为 $CERT_DOMAIN 开启 ECH"
+        print_info "  (用独立的 Cloudflare 管理工具开启; 本脚本不再调 CF API)"
     fi
 
-    # 7.5 DNS 绑定 (经 cf-manager 短链 -A: 域名 A/AAAA 记录 -> 本机 IP)
-    #     橙云(--proxy on) = CDN 代理回源; 灰云(--proxy off) = 直连端口
+    # 7.5 DNS 绑定提示 (不再调 CF API, 只输出需要添加的记录)
+    #     橙云 = CDN 代理回源; 灰云 = 直连端口
     if [[ -n "$CERT_DOMAIN" ]] && [[ "$ACCESS_MODE" = "cdn" ]]; then
         echo "  是否将域名 $CERT_DOMAIN 的 DNS 绑定到本机 IP ($PUBLIC_IP)？（y/N）" >&2
         local yn=""
@@ -786,22 +668,23 @@ add_config() {
             y|Y)
                 local yn2=""
                 local proxy_flag="on"
-                # Bug1 fix: 用 if cfmgr; then 统一 (直接调用, 全局 CFMGR 可见)
-                if cfmgr; then
-                    printf "  代理模式: 1) 橙云 (CDN, 推荐, 默认)  2) 灰云 (直连): " >&2
-                    read -r yn2
-                    case "$(clean_input "$yn2")" in
-                        2) proxy_flag="off" ;;
-                    esac
-                    print_info "执行: $CFMGR -A $CERT_DOMAIN $PUBLIC_IP --proxy $proxy_flag"
-                    if "$CFMGR" -A "$CERT_DOMAIN" "$PUBLIC_IP" --proxy "$proxy_flag"; then
-                        print_ok "DNS 绑定成功: $CERT_DOMAIN -> $PUBLIC_IP (proxy: $proxy_flag)"
-                    else
-                        print_warn "DNS 绑定失败, 可稍后手动在 Cloudflare 后台添加 A 记录指向 $PUBLIC_IP"
-                    fi
+                # 本脚本不再调 Cloudflare API, 只把需要做的事写清楚。
+                # 橙云/灰云填错的表现是"CDN 节点连不上", 没有任何报错,
+                # 所以这里把两条记录和含义都列出来。
+                printf "  代理模式: 1) 橙云 (CDN, 推荐, 默认)  2) 灰云 (直连): " >&2
+                read -r yn2
+                case "$(clean_input "$yn2")" in
+                    2) proxy_flag="off" ;;
+                esac
+                print_ok "请在 Cloudflare 管理工具里添加以下记录:"
+                print_ok "  A     $CERT_DOMAIN  ->  $PUBLIC_IP"
+                print_ok "  AAAA  $CERT_DOMAIN  ->  $PUBLIC_IP   (本机有 IPv6 时)"
+                if [[ "$proxy_flag" == "on" ]]; then
+                    print_ok "  代理状态: 橙云 (CDN 回源)"
                 else
-                    print_warn "cf-manager.sh 不可用, 已跳过 DNS 绑定; 请手动在 Cloudflare 后台添加 A 记录指向 $PUBLIC_IP"
+                    print_ok "  代理状态: 灰云 (直连, 不走 CDN)"
                 fi
+                print_info "加完后确认 DNS 已生效再继续"
                 ;;
         esac
     fi
