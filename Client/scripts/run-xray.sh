@@ -30,6 +30,10 @@ PORT_HTTP=$(cfg PORT_HTTP);         PORT_HTTP=${PORT_HTTP:-10808}
 PORT_LAN_HTTP=$(cfg PORT_LAN_HTTP); PORT_LAN_HTTP=${PORT_LAN_HTTP:-10809}
 LISTEN_ADDR=$(cfg LISTEN_ADDR);     LISTEN_ADDR=${LISTEN_ADDR:-127.0.0.1}
 DIALER_ADDR=$(cfg DIALER_ADDR);     DIALER_ADDR=${DIALER_ADDR:-127.0.0.1:18081}
+# DNS 模式存独立文件，面板上能改。读不到就当 off（=不接管，行为等同改造前），
+# 不能默认给一个"更安全"的模式然后让用户以为自己已经防泄露了。
+DNS_MODE=$(awk -F= '$1=="DNS_MODE" {print $2; exit}' "$PREFIX/config/dns.env" 2>/dev/null || true)
+case "$DNS_MODE" in off|standard|strict) ;; *) DNS_MODE=off ;; esac
 
 # 这个节点是否要用浏览器 —— 判定只有 compat.py 一个来源，三处（本脚本、
 # health-check.sh、actions.sh）共用，避免各判各的导致"该不该跑 Chromium"打架。
@@ -39,13 +43,30 @@ WANT_BD=$(python3 "$DIST/lib/compat.py" want-bd "$NODE" 2>/dev/null || echo no)
 mkdir -p "$PREFIX/runtime" "$PREFIX/logs"
 OUT="$PREFIX/runtime/xray-client.json"
 
-python3 "$DIST/lib/genconfig.py" \
-  --node "$NODE" --output "$OUT" --mode normal \
-  --listen "$LISTEN_ADDR" \
-  --port-normal "$PORT_NORMAL" \
-  --http-port "$PORT_HTTP" --lan-http-port "$PORT_LAN_HTTP" \
-  --api-port "${XBD_API_PORT:-18085}" \
-  --logs "$PREFIX/logs" --loglevel "${XBD_LOGLEVEL:-warning}" >/dev/null
+# 普通模式用多出站配置：所有节点常驻，切换只改 balancer 的选择，不重启。
+# 浏览器拨号模式保持单节点 —— XRAY_BROWSER_DIALER 是进程级的，一个 env 会让
+# 所有出站都去抢浏览器的连接额度，而观测器一探测就把额度耗光。
+GEN_ARGS=(
+  --output "$OUT" --mode normal
+  --listen "$LISTEN_ADDR"
+  --port-normal "$PORT_NORMAL"
+  --http-port "$PORT_HTTP" --lan-http-port "$PORT_LAN_HTTP"
+  --api-port "${XBD_API_PORT:-18085}"
+  --logs "$PREFIX/logs" --loglevel "${XBD_LOGLEVEL:-warning}"
+  --dns "$DNS_MODE"
+)
+if [ "$WANT_BD" = "yes" ]; then
+  GEN_ARGS+=(--node "$NODE")
+else
+  GEN_ARGS+=(--all-nodes --nodes-dir "$PREFIX/nodes" --node "$NODE")
+fi
+
+python3 "$DIST/lib/genconfig.py" "${GEN_ARGS[@]}" >/tmp/.xbd_gen.$$ 2>&1
+GEN_RC=$?
+if [ "$GEN_RC" -ne 0 ]; then
+  echo "配置生成失败:" >&2; cat /tmp/.xbd_gen.$$ >&2; rm -f /tmp/.xbd_gen.$$; exit 1
+fi
+rm -f /tmp/.xbd_gen.$$
 
 # 校验失败绝不启动：宁可起不来，也不带着坏配置上线
 "$XRAY" run -test -config "$OUT" >/dev/null 2>&1 \
@@ -54,7 +75,36 @@ python3 "$DIST/lib/genconfig.py" \
 if [ "$WANT_BD" = "yes" ]; then
   export XRAY_BROWSER_DIALER="$DIALER_ADDR"
   echo "browser-dialer: 启用（该节点使用浏览器完成 TLS）" >&2
-else
-  echo "browser-dialer: 关闭（该节点由 Xray 自己完成 TLS）" >&2
+  exec "$XRAY" run -config "$OUT"
 fi
-exec "$XRAY" run -config "$OUT"
+
+echo "browser-dialer: 关闭（该节点由 Xray 自己完成 TLS）" >&2
+
+# 多出站模式要在起来之后把 balancer 钉到用户选的那个节点。
+# 观测器会按健康度自动选，而"用户明确选了哪个"必须优先于"哪个看起来更快"。
+# 这里不能再 exec —— API 得先起来才能调，所以起后台、等 API、把选择钉上、再 wait。
+# 信号转发不能省: systemd stop 发的是 SIGTERM 给本脚本, 不转发的话 Xray 会
+# 变成孤儿进程, 端口一直被占住, 下次启动报 address already in use。
+"$XRAY" run -config "$OUT" &
+XPID=$!
+trap 'kill -TERM "$XPID" 2>/dev/null' TERM INT
+trap 'kill -KILL "$XPID" 2>/dev/null' EXIT
+
+API="127.0.0.1:${XBD_API_PORT:-18085}"
+for _ in $(seq 1 40); do          # 最多等 4 秒, 一步 100ms
+  if "$XRAY" api lso --server="$API" >/dev/null 2>&1; then
+    # 从生成结果里取 current_tag; 取不到就跳过 —— 此时行为退回"自动选",
+    # 总比等不到 API 就不敢启动强。
+    CTAG=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("current_tag") or "")' \
+           "$PREFIX/runtime/xray-gen.json" 2>/dev/null)
+    if [ -n "$CTAG" ]; then
+      "$XRAY" api bo --server="$API" -b xbd-bal "$CTAG" >/dev/null 2>&1 \
+        && echo "已选中节点: $CTAG" >&2
+    fi
+    break
+  fi
+  kill -0 "$XPID" 2>/dev/null || break
+  sleep 0.1
+done
+
+wait "$XPID"

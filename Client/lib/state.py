@@ -146,6 +146,10 @@ def nodes_dir():
             files.append({
                 "file": name,
                 "name": data.get("name") or data.get("address") or name,
+                # 所属分组（订阅 id）。必须带出去: 这里是节点信息的唯一出口,
+                # 少带一个字段, 下游的分组就只能退回按名字猜 —— 机场改了节点
+                # 命名, 用户昨天记住的分组今天就对不上。
+                "group": data.get("group", ""),
                 "protocol": data.get("protocol", ""),
                 "transport": data.get("transport", ""),
                 "security": data.get("security", "none"),

@@ -736,6 +736,91 @@ def selftest() -> int:
     return 1 if failed else 0
 
 
+# 内部规范名 → 分享链接里通用的短名。
+# 规范名 websocket/mkcp 是给内部用的，v2rayN、Shadowrocket、Clash 收链接时
+# 认的是 ws/kcp。发错名的后果很隐蔽：链接能存进订阅，但实际连不上。
+_LINK_TRANSPORT = {"websocket": "ws", "mkcp": "kcp", "http": "h2", "h2": "h2",
+                   "gun": "grpc", "raw": "tcp"}
+
+
+def build_link(node: dict) -> str:
+    """把统一模型节点拼成分享链接。
+
+    为什么是"拼链接"而不是"直接写节点 JSON"：导入只有一套解析器
+    （parse_node），拼链接再喂给它，校验、归一化、能力检查全都复用。
+    再写一套结构化导入，就等于多一个解析器，将来字段行为不一致时，
+    用户看到的是"手动建的能用、粘贴的不能用"这种最难查的问题。
+
+    参数按各协议的实际写法给，不是想当然：
+      · flow 只在 vless+tcp+reality 组合下有意义
+      · 浏览器拨号要求 SNI == host == address，这里如实填，容错交给导入端
+    """
+    proto = (node.get("protocol") or "").lower()
+    addr = node.get("address") or ""
+    port = int(node.get("port") or 443)
+    name = node.get("name") or ""
+    transport = _LINK_TRANSPORT.get(_norm_transport(node.get("transport") or "tcp"),
+                                   _norm_transport(node.get("transport") or "tcp"))
+    security = (node.get("security") or "none").lower()
+    sni = node.get("sni") or ""
+    host = node.get("host") or ""
+    path = node.get("path") or ""
+    frag = "#" + urllib.parse.quote(name, safe="")
+
+    if proto == "vmess":
+        payload = {
+            "v": "2", "ps": name, "add": addr, "port": str(port), "id": node.get("uuid") or "",
+            "aid": "0", "scy": "auto", "net": transport, "type": "none", "host": host,
+            "path": path, "tls": "tls" if security in ("tls", "reality") else "",
+            "sni": sni,
+        }
+        return "vmess://" + base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+
+    q = []
+    if transport and transport != "tcp":
+        q.append(("type", transport))
+    if security in ("tls", "reality"):
+        q.append(("security", security))
+    if sni:
+        q.append(("sni", sni))
+    if host:
+        q.append(("host", host))
+    if path:
+        q.append(("path", path))
+    if transport in ("grpc", "xhttp") and node.get("service_name"):
+        q.append(("serviceName", node["service_name"]))
+    if proto == "vless":
+        if node.get("flow"):
+            q.append(("flow", node["flow"]))
+        if node.get("reality_public_key"):
+            q.append(("pbk", node["reality_public_key"]))
+        if node.get("reality_short_id"):
+            q.append(("sid", node["reality_short_id"]))
+        if node.get("reality_spider_x"):
+            q.append(("spx", node["reality_spider_x"]))
+    qs = urllib.parse.urlencode(q)
+    tail = ("?" + qs) if qs else ""
+
+    if proto == "vless":
+        user = node.get("uuid") or ""
+    elif proto == "trojan":
+        user = urllib.parse.quote(node.get("password") or "", safe="")
+    elif proto == "shadowsocks":
+        method, pw = node.get("method") or "", node.get("password") or ""
+        if pw.endswith("=") or pw.endswith("=="):
+            user = urllib.parse.quote(pw, safe="")
+        else:
+            user = urllib.parse.quote(
+                base64.b64encode(("%s:%s" % (method, pw)).encode()).decode(), safe="")
+    elif proto == "hysteria2":
+        user = urllib.parse.quote(node.get("password") or "", safe="")
+    else:
+        raise ValueError(f"不支持生成链接的协议: {proto}")
+
+    return f"{proto}://{user}@{addr}:{port}{tail}{frag}"
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__)
@@ -769,6 +854,10 @@ def main(argv: list[str]) -> int:
             print(node.get(argv[3], "") if len(argv) > 3 else "")
         elif cmd == "detect":
             print(detect_format(raw))
+        elif cmd == "build":
+            # 输入是统一模型的 JSON，输出是分享链接。面板的手动添加表单走这里，
+            # 再把链接喂给 parse —— 导入只有一套解析器。
+            print(build_link(json.loads(raw)))
         else:
             print(f"未知子命令: {cmd}", file=sys.stderr)
             return 2

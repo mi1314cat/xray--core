@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 NORMAL, DIALER = "normal", "dialer"
@@ -31,6 +32,13 @@ WS_ED_DEFAULT = 2048
 
 # TLS 交给浏览器的模式只支持这些传输（浏览器只能发 HTTP(S)）
 DIALER_TRANSPORTS = {"xhttp", "websocket"}
+
+# 多出站模式下的命名约定。
+# 观测器和 balancer 都用**前缀**匹配出站，所以 OUTBOUND_PREFIX 既是它们的选择器，
+# 也是"哪些出站算节点"的唯一判据。新增节点出站必须沿用这个前缀，否则那个节点
+# 既不会被观测、也进不了 balancer —— 而配置照样能起，只是那个节点永远选不上。
+BALANCER = "xbd-bal"
+OUTBOUND_PREFIX = "node-"
 
 
 
@@ -166,7 +174,7 @@ def build_stream(node: dict, mode: str) -> dict:
     return stream
 
 
-def build_outbound(node: dict, mode: str, mux: bool) -> dict:
+def build_outbound(node: dict, mode: str, mux: bool, tag: str = "proxy") -> dict:
     proto = (node.get("protocol") or "").lower()
     settings: dict
 
@@ -211,7 +219,7 @@ def build_outbound(node: dict, mode: str, mux: bool) -> dict:
     # Xray 侧协议名是 hysteria（version 2 即 hysteria2）
     proto_out = "hysteria" if proto == "hysteria2" else proto
     ob: dict = {
-        "tag": "proxy",
+        "tag": tag,
         "protocol": proto_out,
         "settings": settings,
         "streamSettings": build_stream(node, mode),
@@ -331,18 +339,298 @@ def build(node: dict, args) -> dict:
         "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": routing_rules},
     }
+    _apply_dns(cfg, args)
     return cfg
+
+
+# DNS: 防泄漏靠的不是"用了加密 DNS"，而是"没有任何一条路径能落到明文"。
+#
+# 下面这套配置里，每一处选择都对应一个具体的泄漏路径：
+#
+#   1. 服务器地址写 IP 字面量（https://1.1.1.1/dns-query 而不是
+#      https://one.one.one.one/dns-query）。域名形式的 DoH 需要先解析那个域名，
+#      而解析它用的又是一次 DNS 查询 —— 这一次走的是系统默认解析器，
+#      等于把最关键的一跳明文发了出去。已实测：Xray 接受 IP 字面量，且
+#      `run -test` 直接输出 "created DOH client for https://1.1.1.1/dns-query"。
+#
+#   2. 顶层 disableFallback=True。这是防泄漏的核心开关。配了域名分流之后，
+#      只要有一条规则没盖住的查询，Xray 就会回落到系统默认 DNS —— 那是明文
+#      UDP 53，运营商一眼看得见。关掉它之后，漏网的查询会失败而不是泄漏。
+#      宁可"某个域名解析不出来"，也不要"解析出去了"。
+#
+#   3. 末尾挂 localhost（本机 hosts / 系统缓存）。它只回答本机已知的东西，
+#      不产生网络流量；放在最后是当兜底，防止前几条全挂时整个 DNS 瘫掉。
+#
+#   4. 不写任何 UDP 53 的明文服务器。这是最容易犯的错：为了"国内域名解析快"
+#      加一条 {"address":"223.5.5.5"}，泄漏就从这里开始了。
+DNS_MODES = ("off", "standard", "strict")
+
+
+def build_dns(mode: str) -> dict:
+    """生成 dns 段。off 返回空字典（表示不写这个 key）。"""
+    if mode not in DNS_MODES:
+        mode = "standard"
+    if mode == "off":
+        # 完全不接管 DNS。此时 Xray 走系统解析器，明文 UDP 53 是会出去的 ——
+        # 所以 off 是明确的取舍，不是"更安全的默认"。
+        return {}
+
+    if mode == "strict":
+        # 严格模式：境外和国内都只走加密 DNS，且全部经代理出口。
+        # 牺牲是国内域名的解析速度，换的是"系统里不存在任何明文 DNS 出口"。
+        servers = [
+            {"address": "https://1.1.1.1/dns-query",
+             "domains": ["geosite:geolocation-!cn"], "skipFallback": True},
+            {"address": "https://8.8.8.8/dns-query",
+             "domains": ["geosite:geolocation-!cn"], "skipFallback": True},
+            {"address": "https://9.9.9.9/dns-query",
+             "domains": ["geosite:geolocation-!cn"], "skipFallback": True},
+        ]
+    else:
+        # 标准模式：境外走加密 DNS（可直连，也可经代理），国内走国内加密 DNS
+        # 以免绕远路。两条都是加密的，明文一样不会出去。
+        servers = [
+            {"address": "https://1.1.1.1/dns-query",
+             "domains": ["geosite:geolocation-!cn"], "skipFallback": True},
+            {"address": "https://8.8.8.8/dns-query",
+             "domains": ["geosite:geolocation-!cn"], "skipFallback": True},
+            {"address": "https://223.5.5.5/dns-query",
+             "domains": ["geosite:cn"], "expectIPs": ["geoip:cn"], "skipFallback": True},
+        ]
+
+    # 本机 hosts 兜底：不产生任何网络流量，放最后。
+    servers.append({"address": "localhost", "skipFallback": True})
+
+    return {
+        "servers": servers,
+        # UseIP 而不是 UseIPv4/IPv6：交给上层按实际连通性选，兼容性最好。
+        "queryStrategy": "UseIP",
+        "tag": "dns-out",
+        # 核心防泄漏开关，见文件头第 2 条。
+        "disableFallback": True,
+        # 缓存保留：既是性能也是隐私 —— 反复查同一个域名不发包，
+        # 旁观者看到的信息量更少。
+        "disableCache": False,
+    }
+
+
+def dns_routing_rules(mode: str, proxy_tag: str) -> list:
+    """把 DNS 自身的流量也钉到代理上（仅严格模式）。
+
+    Xray 里 DNS 模块发出的查询带一个虚拟入站标记，路由规则能匹配到它。
+    不加这条，严格模式的"经代理"就只停留在配置意图上 —— 实际查询仍从本机
+    直连出去，只是不再是明文。
+    """
+    if mode != "strict":
+        return []
+    return [{"type": "field", "inboundTag": ["dns-in"], "outboundTag": proxy_tag}]
+
+
+def _apply_dns(cfg: dict, args) -> None:
+    """按 --dns 模式补 dns 段和对应的路由规则。
+
+    单节点和多出站都要调，所以抽出来 —— 两边各写一遍的话，早晚只改一处，
+    然后用户在某一种模式下发现 DNS 又开始漏。
+    """
+    mode = getattr(args, "dns", "off")
+    dns = build_dns(mode)
+    if not dns:
+        return
+    cfg["dns"] = dns
+    rules = dns_routing_rules(mode, BALANCER if cfg.get("balancers") else "proxy")
+    if rules:
+        # 插在最前面：DNS 的出口要压过后面所有规则，否则会被某条宽泛规则抢先。
+        cfg["routing"].setdefault("rules", [])
+        cfg["routing"]["rules"] = rules + cfg["routing"]["rules"]
+
+
+def collect_direct_exemptions(nodes: list) -> tuple:
+    """汇总所有节点的直连豁免项，返回 (域名列表, IP 列表)。
+
+    环路防护必须覆盖**全部**节点，不只是当前那个。将来开了 TUN/透明代理，
+    经由非当前节点连接的流量一样会回到本机；只豁免当前节点的域名，等于
+    给其它节点留了环路。
+    """
+    domains, ips = set(), set()
+    for node in nodes:
+        for key in ("address", "host", "sni"):
+            v = (node.get(key) or "").strip()
+            if not v:
+                continue
+            if ":" in v or v.replace(".", "").isdigit():
+                ips.add(v)
+            else:
+                domains.add(v)
+    if ips:
+        ips.add("geoip:private")
+    return sorted(domains), sorted(ips)
+
+
+def build_multi(nodes: list, current: dict, args) -> dict:
+    """多出站配置：全部节点常驻，运行时用 API 切换。
+
+    为什么值得这么做：
+    每次换节点都要重新生成配置 + 重启进程，重启期间连接全断，而且节点多了
+    之后"逐个试延迟"会变成 N 次重启。全部节点作为出站常驻、交给 balancer
+    选，换节点就退化成一次 `xray api bo` —— 不重启、不掉连接。
+
+    实测过的三个硬约束（缺一个就起不来）：
+      · balancer 必须配 observatory，否则启动报 not all dependencies are resolved；
+      · bo / bi 走 RoutingService，api.services 里少了它调用直接失败；
+      · 简单 api 模式（只给 listen）不再需要 dokodemo 入站和那条 api 路由规则。
+
+    Browser Dialer 不走这条路：那个 env 是整个进程级的，所有出站都会去抢浏览器
+    的连接额度，而且观测器一探测就把额度耗光了。dialer 模式仍然是单节点配置，
+    与改造前逐字节一致。
+    """
+    mode = args.mode
+    port = args.port if args.port is not None else args.port_normal
+
+    outbounds = []
+    node_tag_by_id = {}
+    for node in nodes:
+        # tag 取文件名去扩展名：稳定、可读，且天然不撞。
+        # 观测器和 balancer 用前缀匹配 selector=[OUTBOUND_PREFIX]，所以这里必须
+        # 先把文件名自带的 node- 前缀剥掉再补一个 —— 节点文件本来就叫
+        # node-001-a.json，不剥就会生成 node-node-001-a；而 node-a.json 和
+        # a.json 这两个不同文件会撞成同一个 tag，后者静默顶掉前者。
+        base = os.path.basename(node["__file"]).rsplit(".", 1)[0]
+        if base.startswith(OUTBOUND_PREFIX):
+            base = base[len(OUTBOUND_PREFIX):]
+        tag = OUTBOUND_PREFIX + re.sub(r"[^A-Za-z0-9._-]", "_", base)
+        node_tag_by_id[node["__id"]] = tag
+        outbounds.append(build_outbound(node, mode, args.mux, tag=tag))
+    outbounds.append({"tag": "direct", "protocol": "freedom",
+                      "settings": {"domainStrategy": "UseIPv4"}})
+    outbounds.append({"tag": "block", "protocol": "blackhole"})
+
+    direct_domains, direct_ips = collect_direct_exemptions(nodes)
+
+    inbounds = [{
+        "tag": f"socks-{mode}",
+        "listen": args.listen,
+        "port": port,
+        "protocol": "socks",
+        "settings": {"auth": "noauth", "udp": True, "address": args.listen},
+        "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False},
+    }]
+    if args.http_port:
+        inbounds.append({
+            "tag": f"http-{mode}", "listen": "127.0.0.1", "port": args.http_port,
+            "protocol": "http", "settings": {"auth": "noauth", "allowTransparent": False},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False},
+        })
+    if args.lan_http_port:
+        inbounds.append({
+            "tag": f"http-lan-{mode}", "listen": args.listen, "port": args.lan_http_port,
+            "protocol": "http", "settings": {"auth": "noauth", "allowTransparent": False},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False},
+        })
+
+    cfg = {
+        "log": {
+            "loglevel": args.loglevel,
+            "access": f"{args.logs}/access-{mode}.log",
+            "error": f"{args.logs}/error-{mode}.log",
+        },
+        "stats": {},
+        # 简单 api 模式：只要给 listen 就行，不用再自己配 dokodemo 入站和路由规则。
+        # 代价是 API 入站流量不计入统计 —— 对本项目无影响，那点流量没人看。
+        "api": {
+            "tag": "api",
+            "listen": f"127.0.0.1:{args.api_port}",
+            "services": ["StatsService", "HandlerService", "RoutingService"],
+        },
+        "policy": {
+            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            "system": {"statsInboundUplink": True, "statsInboundDownlink": True,
+                       "statsOutboundUplink": True, "statsOutboundDownlink": True},
+        },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                *([{"type": "field", "outboundTag": "direct",
+                    "domain": direct_domains}] if direct_domains else []),
+                *([{"type": "field", "outboundTag": "direct",
+                    "ip": direct_ips}] if direct_ips
+                  else [{"type": "field", "outboundTag": "direct", "ip": ["geoip:private"]}]),
+                {"type": "field", "network": "tcp,udp", "balancerTag": BALANCER},
+            ],
+            "balancers": [{
+                "tag": BALANCER,
+                "selector": [OUTBOUND_PREFIX],
+                "fallbackTag": "direct",
+            }],
+        },
+        # 观测器不是可选项：balancer 没有它就选不出出站。
+        # 用突发观测而非普通观测——探测时间点随机，更不容易形成固定特征。
+        "burstObservatory": {
+            "subjectSelector": [OUTBOUND_PREFIX],
+            "pingConfig": {"interval": "1m", "sampling": 3, "timeout": "5s"},
+        },
+    }
+    _apply_dns(cfg, args)
+    return cfg, node_tag_by_id
+
+
+def load_nodes(nodes_dir: str, current_file: str) -> tuple:
+    """读节点目录，返回 (节点列表, 当前节点)。
+
+    两个刻意的取舍：
+
+    · `current` 软链不算节点。节点目录里那个软链指向当前节点，把它也当节点收进来
+      就会生成一个和真节点配置完全一样的出站，于是列表里凭空多一个重复项。
+    · 单个节点解析失败只跳过、不中止。一个订阅里混入一条格式不对的分享链接是
+      常事，为此让整个配置生成失败、改不了任何节点，代价太大。跳过的会在
+      stderr 上留一行。
+    """
+    nodes, current = [], None
+    # current 是指向真实文件的软链，比对的是**解析后的**文件名。直接拿
+    # basename 会拿到 "current"，跟任何真实节点都对不上，current_tag 恒为 null。
+    cur_name = os.path.basename(os.path.realpath(current_file)) if current_file else ""
+    try:
+        names = sorted(os.listdir(nodes_dir))
+    except OSError as e:
+        fail(f"读不到节点目录 {nodes_dir}: {e}")
+    for name in names:
+        if not name.endswith(".json") or name == "current":
+            continue
+        path = os.path.join(nodes_dir, name)
+        if os.path.islink(path):
+            continue
+        try:
+            with open(path) as fh:
+                node = json.load(fh)
+        except (OSError, ValueError) as e:
+            print(f"genconfig: 跳过 {name}: {e}", file=sys.stderr)
+            continue
+        if not all(node.get(k) for k in ("address", "port", "protocol")):
+            continue
+        node["__file"] = name
+        node["__id"] = name
+        nodes.append(node)
+        if name == cur_name:
+            current = node
+    return nodes, current
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--node", required=True, help="统一模型的节点 JSON")
+    ap.add_argument("--node", help="统一模型的节点 JSON（单节点模式）")
+    ap.add_argument("--all-nodes", action="store_true",
+                    help="多出站模式：把 --nodes-dir 下所有节点写成常驻出站，运行时用 API 切换")
+    ap.add_argument("--nodes-dir", default="", help="多出站模式的节点目录")
     ap.add_argument("--output", required=True)
     ap.add_argument("--mode", choices=[NORMAL, DIALER], required=True)
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=None, help="覆盖端口")
     ap.add_argument("--port-normal", type=int, default=1080)
     ap.add_argument("--port-dialer", type=int, default=1081)
+    ap.add_argument("--dns", choices=list(DNS_MODES), default="off",
+                    help="off=不接管 DNS；standard=境外加密 DNS + 国内加密 DNS；"
+                         "strict=全部加密 DNS 并强制经代理（防泄漏最严）")
     ap.add_argument("--api-port", type=int, default=18085)
     ap.add_argument("--http-port", type=int, default=0,
                     help="本机回环 HTTP 代理端口（0=不启用）。docker 等只认 HTTP 代理")
@@ -353,12 +641,27 @@ def main() -> int:
     ap.add_argument("--no-mux", dest="mux", action="store_false", default=True)
     args = ap.parse_args()
 
-    node = json.load(open(args.node))
-    for key in ("address", "port", "protocol"):
-        if not node.get(key):
-            fail(f"节点缺少字段 {key!r}")
-
-    cfg = build(node, args)
+    if args.all_nodes:
+        if args.mode != NORMAL:
+            # 浏览器转发是进程级的：一个 env 让**所有**出站都去抢浏览器的连接额度，
+            # 而观测器一开就会自动探测、瞬间把额度耗光。这里不静默降级成单节点，
+            # 直接报错让调用方看清原因。
+            fail("多出站模式不支持 dialer：Browser Dialer 必须单节点运行")
+        nodes, cur = load_nodes(args.nodes_dir, args.node)
+        if not nodes:
+            fail(f"节点目录里没有可用节点: {args.nodes_dir}")
+        cfg, tags = build_multi(nodes, cur, args)
+        cur_id = cur["__id"] if cur else None
+    else:
+        if not args.node:
+            fail("必须给 --node，或给 --all-nodes --nodes-dir")
+        node = json.load(open(args.node))
+        for key in ("address", "port", "protocol"):
+            if not node.get(key):
+                fail(f"节点缺少字段 {key!r}")
+        cfg = build(node, args)
+        tags = {}
+        cur_id = None
     # 输出目录自己建：这里是所有调用路径的公共落点（RUN.sh 建的布局、xbd apply、
     # 服务启动脚本 run-xray.sh），目录缺失时不能指望调用方自觉。
     # 实测踩过：全新安装漏建 runtime/ 时这里直接 FileNotFoundError，
@@ -369,10 +672,31 @@ def main() -> int:
     with open(args.output, "w") as fh:
         json.dump(cfg, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
-    print(json.dumps({"ok": True, "mode": args.mode, "output": args.output,
-                      "port": cfg["inbounds"][0]["port"],
-                      "http_port": args.http_port,
-                      "lan_http_port": args.lan_http_port}, ensure_ascii=False))
+    out = {"ok": True, "mode": args.mode, "output": args.output,
+           "port": cfg["inbounds"][0]["port"],
+           "http_port": args.http_port,
+           "lan_http_port": args.lan_http_port}
+    if tags:
+        # 把"节点 → 出站 tag"的映射交出去。切换节点靠的是这个 tag，调用方自己
+        # 去猜文件名和 tag 的对应关系，早晚猜错一次。
+        out["balancer"] = BALANCER
+        out["tags"] = tags
+        out["current_tag"] = tags.get(cur_id) if cur_id else None
+    # 多出站模式额外落一份 sidecar。启动脚本要在 Xray 起来**之后**才把 balancer
+    # 钉到用户选的那个节点，那时已经拿不到本函数的返回值了，只能读文件。
+    # 只在多出站模式写: 单节点模式没有 balancer，钉了也没有意义。
+    if tags:
+        side = os.path.join(out_dir, "xray-gen.json")
+        try:
+            with open(side, "w") as fh:
+                json.dump({k: out[k] for k in
+                           ("balancer", "tags", "current_tag")}, fh, ensure_ascii=False)
+        except OSError:
+            # 落不了 sidecar 不影响启动: 退化成"观测器自动选"。
+            # 但要说明白, 否则用户会以为是自己选的那个在跑。
+            print(f"genconfig: 写不了 {side}，启动后无法自动选中当前节点",
+                  file=sys.stderr)
+    print(json.dumps(out, ensure_ascii=False))
     return 0
 
 

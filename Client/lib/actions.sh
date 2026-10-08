@@ -309,12 +309,12 @@ cmd_node_add() {
   fi
   [ -n "$raw" ] || die "没有输入"
 
-  # 订阅 URL：先下载再解析
+  # 订阅 URL：先下载再解析。第二个参数是组名，必须透传 ——
+  # 漏掉的话面板上填的名字会静默失效，节点改按名字推断出一个别的组。
   if printf '%s' "$raw" | grep -qE '^https?://'; then
-    cmd_node_subscription "$raw"
+    cmd_node_subscription "$raw" "${2:-}"
     return $?
   fi
-
   # 关键：整段交给 parse_many。
   # 之前是按行拆开逐行解析 —— 那样多行 YAML 会被拆散，
   # 一段含多个 "- name:" 的 mihomo 配置只能碰巧识别出个别字段。
@@ -491,8 +491,8 @@ cmd_node_import_file() {
 }
 
 cmd_node_subscription() {
-  local url="${1:-}"
-  [ -n "$url" ] || die "用法: xbd node sub <订阅URL>"
+  local url="${1:-}" sub_name="${2:-}"
+  [ -n "$url" ] || die "用法: xbd node sub <订阅URL> [组名]"
   step "下载订阅"
   local body; body=$(curl -sL --max-time 60 "$url") || die "下载失败"
   [ -n "$body" ] || die "订阅内容为空"
@@ -502,6 +502,20 @@ cmd_node_subscription() {
   local n; n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "$tmp" 2>/dev/null || echo 0)
   [ "$n" -gt 0 ] || { rm -f "$tmp"; die "订阅里没有解析出节点"; }
   ok "解析出 $n 个节点"
+
+  # 先记下已有哪些节点文件，后面据此判断"哪些是这次新增的"。
+  # 必须先记再导：反过来记，导入过程中根本分不清新旧。
+  local before; before=$(mktemp)
+  ls -1 "$XBD_NODES" 2>/dev/null | grep '\.json$' > "$before" || true
+
+  # 先注册订阅、再导入节点。顺序不能反：先导后注册的话，中途失败会留下一批
+  # 没有任何归属的节点，它们下次分组只能靠名字猜，落到「其它」里找不回来了。
+  local gid="" gname="" reg=""
+  if [ -n "$sub_name" ]; then
+    reg=$(python3 "$XBD_LIBDIR/subs.py" add "$XBD_PREFIX" "$url" "$sub_name" 2>/dev/null)
+    gid=$(printf '%s' "$reg"   | python3 -c 'import json,sys;print((json.load(sys.stdin) or {}).get("id",""))'   2>/dev/null)
+    gname=$(printf '%s' "$reg" | python3 -c 'import json,sys;print((json.load(sys.stdin) or {}).get("name",""))' 2>/dev/null)
+  fi
 
   python3 - "$tmp" <<'PY' > /tmp/.xbd_sub_lines
 import json, sys
@@ -521,8 +535,23 @@ PY
     cmd_node_import_one "$line" >/dev/null && c=$((c+1))
     done < /tmp/.xbd_sub_kept.jsonl
     rm -f "$tmp" /tmp/.xbd_sub_lines /tmp/.xbd_sub_kept.jsonl
+
+  if [ -n "$gid" ]; then
+    # 分组盖在节点文件里，不是每次现推。机场改了节点命名，现推出来的组会整个
+    # 变掉，用户昨天记住的分组今天对不上。
+    #
+    # 比对的是"导入开始前已有的文件"，所以走的是 nodefilter 之后真正落盘的那
+    # 几个 —— 被过滤掉的重复节点不会混进来。
+    local bound
+    bound=$(python3 "$XBD_LIBDIR/subs.py" bind-latest "$XBD_PREFIX" "$gid" \
+            $(cat "$before" 2>/dev/null | tr '\n' ' ') 2>/dev/null \
+            | python3 -c 'import json,sys;print((json.load(sys.stdin) or {}).get("stamped",0))' 2>/dev/null)
+    ok "已导入 $c 个节点，归入分组「${gname:-$sub_name}」(${bound:-0} 个)"
+  else
     ok "已导入 $c 个节点"
-  }
+  fi
+  rm -f "$before"
+}
 
   # 订阅必须过 nodefilter。粘贴路径走的是它 (见 cmd_node_add), 订阅路径
   # 以前直接逐条落盘 —— 而订阅天然会重复拉取, 于是每刷新一次节点数就翻
@@ -882,19 +911,48 @@ cmd_node_check() {
 # ---------------------------------------------------------------------------
 # 生命周期：Xray 常驻 与 Browser Dialer 完全解耦
 # ---------------------------------------------------------------------------
+_xbd_dns_mode() {  # 读 config/dns.env，认不出的值一律当 off
+  local m
+  m=$(cfg_get "$XBD_CONF/dns.env" "DNS_MODE" "off")
+  case "$m" in off|standard|strict) printf '%s' "$m" ;; *) printf 'off' ;; esac
+}
+
 cmd_apply() {
   need_root
   require_current_node >/dev/null
   step "生成运行配置"
   xbd_load_ports
-  # 唯一实例：一份配置同时提供 SOCKS + HTTP，并且始终带 XRAY_BROWSER_DIALER。
-  # 因此换节点**不需要**重新生成配置，也不需要启停任何服务。
-  if python3 "$XBD_LIBDIR/genconfig.py" \
-      --node "$XBD_NODES/current" --output "$XBD_RUNTIME/xray-client.json" --mode normal \
-      --listen "$XBD_LISTEN_ADDR" --port-normal "$XBD_PORT_NORMAL" \
-      --http-port "$XBD_PORT_HTTP" --lan-http-port "$XBD_PORT_LAN_HTTP" \
-      --api-port "${XBD_API_PORT:-18085}" --logs "$XBD_LOGS" 2>&1 | grep -q '"ok": true'; then
-    ok "xray-client.json（SOCKS :$XBD_PORT_NORMAL / HTTP :$XBD_PORT_LAN_HTTP）"
+  XBD_DNS_MODE=$(_xbd_dns_mode); export XBD_DNS_MODE
+  # 走多出站还是单节点，判据只有一个来源：compat.py want-bd，和 run-xray.sh 用的是
+  # 同一个判定。两边各判各的就会出现"配置按多出站生成、启动时却按单节点起"，
+  # 而症状是 balancer 选中的节点根本不在配置里。
+  local want_bd
+  want_bd=$(python3 "$XBD_LIBDIR/compat.py" want-bd "$XBD_NODES/current" 2>/dev/null || echo no)
+  [ "$want_bd" = "yes" ] || want_bd=no
+
+  local -a gen_args=(
+    --output "$XBD_RUNTIME/xray-client.json" --mode normal
+    --listen "$XBD_LISTEN_ADDR" --port-normal "$XBD_PORT_NORMAL"
+    --http-port "$XBD_PORT_HTTP" --lan-http-port "$XBD_PORT_LAN_HTTP"
+    --api-port "${XBD_API_PORT:-18085}" --logs "$XBD_LOGS"
+    --dns "${XBD_DNS_MODE:-off}"
+  )
+  if [ "$want_bd" = "yes" ]; then
+    gen_args+=(--node "$XBD_NODES/current")
+  else
+    gen_args+=(--all-nodes --nodes-dir "$XBD_NODES" --node "$XBD_NODES/current")
+  fi
+
+  if python3 "$XBD_LIBDIR/genconfig.py" "${gen_args[@]}" 2>&1 | grep -q '"ok": true'; then
+    if [ "$want_bd" = "yes" ]; then
+      ok "xray-client.json（单节点 · 浏览器拨号）"
+    else
+      local n
+      n=$(python3 -c 'import json,sys
+try: print(len(json.load(open(sys.argv[1]))["tags"]))
+except Exception: print(0)' "$XBD_RUNTIME/xray-gen.json" 2>/dev/null || echo 0)
+      ok "xray-client.json（$n 个节点常驻出站，切换不重启）"
+    fi
   else
     die "xray-client.json 生成失败，这是致命的"
   fi
@@ -2163,7 +2221,20 @@ cmd_selftest() {
   else
     echo "SKIP（缺少 tools/selftest-arch.sh）"
   fi
-  rm -f /tmp/.xbd_arch
+  # 分组 / 多出站自检。重点是那条"单节点配置逐字节不变" —— Browser Dialer 走的
+  # 就是单节点路径，多出站改造动的是同一个文件，这条断言是不让它被改掉的护栏。
+  printf '  %-10s ' "groups"
+  if [ -f "$XBD_PREFIX/tools/selftest-groups.py" ]; then
+    if python3 "$XBD_PREFIX/tools/selftest-groups.py" \
+         --lib "$XBD_LIBDIR" >/tmp/.xbd_grp 2>&1; then
+      echo "PASS"; grep -E '结果:' /tmp/.xbd_grp | sed 's/^/             /'
+    else
+      echo "FAIL"; grep -E '✗|结果:' /tmp/.xbd_grp | sed 's/^/             /'; failed=$((failed+1))
+    fi
+  else
+    echo "SKIP（缺少 tools/selftest-groups.py）"
+  fi
+  rm -f /tmp/.xbd_grp
   echo
   [ "$failed" -eq 0 ] && { echo "自检: PASS"; return 0; } || { echo "自检: $failed 项失败"; return 1; }
 }
