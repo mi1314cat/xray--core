@@ -42,7 +42,7 @@ generate_port() {
     done
 }
 scuid() {
-  bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/XRevise.sh)
+  bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/XRevise.sh)
   bash <(curl -fsSL https://github.com/mi1314cat/One-click-script/raw/refs/heads/main/domains.sh)
 }
 
@@ -62,8 +62,8 @@ if [ "$WEB_CHOICE" = "2" ]; then
    update_env $xrayconf NDOMAIN_LOWER "$NDOMAIN_LOWER"
    update_env $CATMIENV_FILE DOMAIN_LOWER "$DOMAIN_LOWER"
 
-    bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/nconf.sh)
-    bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/nginx.sh)
+    bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/nconf.sh)
+    bash <(curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/nginx.sh)
 elif [ "$WEB_CHOICE" = "1" ] || [ "$WEB_CHOICE" = "3" ]; then
 
     read -p "请输入监听端口 (默认 443): " CRPORT
@@ -75,8 +75,8 @@ elif [ "$WEB_CHOICE" = "1" ] || [ "$WEB_CHOICE" = "3" ]; then
     update_env $CATMIENV_FILE DOMAIN_LOWER "$CDOMAIN_LOWER"
     update_env $xrayconf RDOMAIN_LOWE "$RDOMAIN_LOWE"
 
-    bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/cconf.sh)
-    bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/caddy.sh)
+    bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cconf.sh)
+    bash <(curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/caddy.sh)
 fi
 }
 start_xray() {

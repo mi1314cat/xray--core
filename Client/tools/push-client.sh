@@ -19,7 +19,7 @@
 set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO="${XBD_REPO:-mi1314cat/xary-core}"
+REPO="${XBD_REPO:-mi1314cat/xray--core}"
 BRANCH="${XBD_BRANCH:-main}"
 export XBD_BRANCH="$BRANCH"      # 下面的 Python 片段要用它拼 commit body，必须导出
 PREFIX_PATH="Client"                     # 唯一允许写入的路径前缀

@@ -73,10 +73,10 @@ generate_port() {
 update_env "$CATMIENV_FILE" mode xray
 # ================= 安装 Xray =================
 xray_install() {
-bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/bin/xray_install.sh)
+bash <(curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/bin/xray_install.sh)
 }
 scuid() {
-  bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/XRevise.sh)
+  bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/XRevise.sh)
   bash <(curl -fsSL https://github.com/mi1314cat/One-click-script/raw/refs/heads/main/domains.sh)
 }
 
@@ -103,7 +103,7 @@ if [ "$WEB_CHOICE" = "1" ] || [ "$WEB_CHOICE" = "3" ]; then
       update_env $xrayconf NDOMAIN_LOWER "$NDOMAIN_LOWER"
       update_env $CATMIENV_FILE DOMAIN_LOWER "$DOMAIN_LOWER"
 
-    bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/nconf.sh)
+    bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/nconf.sh)
 elif [ "$WEB_CHOICE" = "2" ]; then
 
     read -p "请输入监听端口 (默认 443): " CRPORT
@@ -115,7 +115,7 @@ elif [ "$WEB_CHOICE" = "2" ]; then
     update_env $CATMIENV_FILE DOMAIN_LOWER "$CDOMAIN_LOWER"
     update_env $xrayconf RDOMAIN_LOWE "$RDOMAIN_LOWE"
 
-    bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/cconf.sh)
+    bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cconf.sh)
 fi
 }
 
@@ -124,8 +124,8 @@ webxz() {
     if [[ "$WEB_CHOICE" == "1" ]]; then
         print_info "选择安装 Nginx..."
 
-        if curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/nginx.sh >/dev/null 2>&1; then
-            bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/nginx.sh) \
+        if curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/nginx.sh >/dev/null 2>&1; then
+            bash <(curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/nginx.sh) \
             || print_info "nginx.sh 执行结束（非致命）"
         else
             print_info "无法下载 nginx.sh，跳过"
@@ -134,8 +134,8 @@ webxz() {
 
     if [[ "$WEB_CHOICE" == "2" ]]; then
         print_info "选择安装 Caddy..."
-        if curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/caddy.sh >/dev/null 2>&1; then
-            bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/caddy.sh) \
+        if curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/caddy.sh >/dev/null 2>&1; then
+            bash <(curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/caddy.sh) \
             || print_info "caddy.sh 执行结束（非致命）"
         else
             print_info "无法下载 caddy.sh，跳过"

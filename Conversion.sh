@@ -193,8 +193,8 @@ webxn() {
     update_env $xrayconf NPORT "$NPORT"
         bash <(curl -fsSL https://github.com/mi1314cat/One-click-script/raw/refs/heads/main/domains.sh)
         load_env "$CATMIENV_FILE"
-        bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/nconf.sh)
-        bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/nginx.sh)
+        bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/nconf.sh)
+        bash <(curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/nginx.sh)
         ;;
 
     2)
@@ -215,8 +215,8 @@ webxn() {
         read -p "请输入申请证书的域名: " DOMAIN_LOWER   
         update_env $xrayconf DOMAIN_LOWER "$DOMAIN_LOWER"
         
-        bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/cconf.sh)
-        bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/caddy.sh)
+        bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cconf.sh)
+        bash <(curl -fsSL https://github.com/mi1314cat/xray--core/raw/refs/heads/main/caddy.sh)
         ;;
 
     *)
@@ -238,5 +238,5 @@ fi
     
 else
     print_error "目录或文件不存在"
-    bash <(curl -fsSL https://cfgithub.gw2333.workers.dev/https://github.com/mi1314cat/xary-core/raw/refs/heads/main/xray-panel.sh)
+    bash <(curl -fsSL https://cfgithub.gw2333.workers.dev/https://github.com/mi1314cat/xray--core/raw/refs/heads/main/xray-panel.sh)
 fi

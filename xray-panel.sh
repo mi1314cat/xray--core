@@ -52,13 +52,13 @@ xrayls 服务状态: ${xrayls_server_status_text}
     case "${choice}" in
         0) clear; exit 0 ;;
         1) run_xray_install ;;
-        2) bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/uninstall_xray.sh) ;;
+        2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/uninstall_xray.sh) ;;
         3) show_xray_configs ;;
         4) systemctl status xrayls --no-pager ;;
         5) add_node_menu ;;
-        6) bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/verify.sh) ;;
-        7) bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/outbound.sh) ;;
-        8) bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/split.sh) ;;
+        6) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/verify.sh) ;;
+        7) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/outbound.sh) ;;
+        8) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/split.sh) ;;
         9) reverse_menu ;;
 
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
@@ -80,8 +80,8 @@ ${GREEN}0.${PLAIN} 返回主菜单
 ----------------------"
         read -p "请输入选项 [0-2]: " rc
         case "${rc}" in
-            1) bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/fd/xrayserver-reverse.sh) ;;
-            2) bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/fd/xrayclient-reverse.sh) ;;
+            1) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/fd/xrayserver-reverse.sh) ;;
+            2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/fd/xrayclient-reverse.sh) ;;
             0) return ;;
             *) echo -e "${RED}无效的选项 ${rc}${PLAIN}" ;;
         esac
@@ -108,7 +108,7 @@ load_env() {
 }
 # 统一安装/更新入口：bin/xray_install.sh
 # 幂等：已安装且为最新版本时跳过下载；旧版本自动升级；并重建基础配置、验证并重启 xrayls
-XRAY_INSTALL_URL="https://github.com/mi1314cat/xary-core/raw/refs/heads/main/bin/xray_install.sh"
+XRAY_INSTALL_URL="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/bin/xray_install.sh"
 
 run_xray_install() {
     bash <(curl -fsSL "$XRAY_INSTALL_URL") || {
@@ -170,63 +170,63 @@ ${GREEN}0.${PLAIN} 返回主菜单
         0) return ;;
 
         1)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/tunnel.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/tunnel.sh)
             systemctl restart xrayls.service
             ;;
 
         2)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/hysteria2.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/hysteria2.sh)
             systemctl restart xrayls.service
             ;;
 
         3)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/sock5.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/sock5.sh)
             systemctl restart xrayls.service
             ;;
 
         4)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/vlessecn.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/vlessecn.sh)
             systemctl restart xrayls.service
             ;;
 
         5)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/http.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/http.sh)
             systemctl restart xrayls.service
             ;;
 
         6)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/vlessxhttpecn.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/vlessxhttpecn.sh)
             systemctl restart xrayls.service
             ;;
 
         7)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/Reality.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/Reality.sh)
             systemctl restart xrayls.service
             ;;
 
         8)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/Shadowsocks.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/Shadowsocks.sh)
             systemctl restart xrayls.service
             ;;
 
         9)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/Trojan.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/Trojan.sh)
             systemctl restart xrayls.service
             ;;
 
         10)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/GDargo.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/GDargo.sh)
             systemctl restart xrayls.service
             ;;
 
         11)
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/lsargo.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lsargo.sh)
             systemctl restart xrayls.service
             ;;
 
         12)
             # Batch Generator 收尾自带统一校验+一次重启, 这里不再 restart
-            bash <(curl -Ls https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/batch.sh)
+            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/batch.sh)
             ;;
 
         *)

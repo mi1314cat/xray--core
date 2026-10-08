@@ -3,7 +3,7 @@
 #  Xray Client 一键部署
 # ============================================================================
 #  用法（推荐）：
-#      bash <(curl -Ls https://raw.githubusercontent.com/mi1314cat/xary-core/main/Client/l.sh)
+#      bash <(curl -Ls https://raw.githubusercontent.com/mi1314cat/xray--core/main/Client/l.sh)
 #
 #  带节点（非交互）：
 #      bash <(curl -Ls .../Client/l.sh) --vless "vless://..." --yes
@@ -21,7 +21,7 @@
 # ============================================================================
 set -uo pipefail
 
-REPO="mi1314cat/xary-core"
+REPO="mi1314cat/xray--core"
 REF="${XBD_REF:-main}"
 SUBDIR="Client"
 # 归档双格式：优先 .tar.xz（小约 22%），本机没有 xz 命令就回退 .tar.gz。

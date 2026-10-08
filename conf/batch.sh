@@ -32,7 +32,7 @@ print_title() {
 }
 clean_input() { echo "$1" | tr -d '\000-\037'; }
 
-GH_RAW="${X_BATCH_RAW:-https://github.com/mi1314cat/xary-core/raw/refs/heads/main}"
+GH_RAW="${X_BATCH_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
 
 # 协议登记表: 批量协议脚本名 | 服务端碎片前缀(幂等判断) | 展示名
 BATCH_PROTOS=(Reality Trojan Shadowsocks hysteria2)

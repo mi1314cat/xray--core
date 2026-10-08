@@ -69,59 +69,16 @@ mkdir -p "$CONF_DIR" "$OUT_DIR"
 # ================================
 # 随机生成函数
 # ================================
-random_port() { shuf -i 10000-60000 -n 1; }
-random_pass() { tr -dc A-Za-z0-9 </dev/urandom | head -c 20; }
-
-# ================================
-# 端口检测
-# ================================
-port_in_use() {
-    ss -tuln | awk '{print $5}' | grep -E -q "(:|])$1$"
-}
-
-random_free_port() {
-    while true; do
-        port=$(random_port)
-        if ! port_in_use "$port"; then
-            echo "$port"
-            return
-        fi
-    done
-}
-
-# ================================
-# Batch 模式（被全协议一键生成 conf/batch.sh 调用时 X_BATCH=1）
-#   - safe_read/safe_read_port 全部直接采用默认值（各协议"默认最高配置"），不等待交互
-#   - 默认端口改为批量连续分配：X_BATCH_PORT_START-END 内取第一个空闲端口
-#     （跳过本机已监听 + conf/ 碎片已用 + 本批已分配），游标持久化于
-#     $CONF_DIR/.batch-ports，保证同一批内多协议端口互不重复
-#   - 单协议（交互）模式行为完全不变
-# ================================
-X_BATCH_PORT_STATE="$CONF_DIR/.batch-ports"
-
-batch_conf_used_ports() {
-    jq -r '.inbounds[0].port // empty' "$CONF_DIR"/*.json 2>/dev/null | sort -un
-}
-
-batch_alloc_port() {
-    local start="${X_BATCH_PORT_START:-}" end="${X_BATCH_PORT_END:-}" p used
-    if [[ ! "$start" =~ ^[0-9]+$ || ! "$end" =~ ^[0-9]+$ ]]; then
-        random_free_port          # 无批量端口范围时回退原有随机逻辑
-        return
-    fi
-    used=$(batch_conf_used_ports)
-    for (( p=start; p<=end; p++ )); do
-        (( p >= 1 && p <= 65535 )) || continue
-        grep -qx "$p" "$X_BATCH_PORT_STATE" 2>/dev/null && continue
-        grep -qx "$p" <<<"$used" && continue
-        port_in_use "$p" && continue
-        echo "$p" >> "$X_BATCH_PORT_STATE"
-        echo "$p"
-        return
-    done
-    echo ""
-}
-
+# 端口分配: 统一从 conf/lib/ports.sh 取, 本脚本不再自带副本。
+# 副本时代改一处漏一处 —— 批量区间分配只进了 4 个脚本, 另外 5 个的批量
+# 生成仍在用随机端口, 同一批节点端口散落在 10000-60000。
+_x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+if [[ -r "$_x_lib_dir/lib/ports.sh" ]]; then
+    source "$_x_lib_dir/lib/ports.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/ports.sh") \
+        || { print_error "端口库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================

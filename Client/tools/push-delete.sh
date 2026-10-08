@@ -15,7 +15,7 @@
 # ============================================================================
 set -uo pipefail
 
-REPO="${XBD_REPO:-mi1314cat/xary-core}"
+REPO="${XBD_REPO:-mi1314cat/xray--core}"
 BRANCH="${XBD_BRANCH:-main}"
 API="https://api.github.com/repos/$REPO"
 ONLY_PREFIX="Client/"

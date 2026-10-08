@@ -38,27 +38,16 @@ mkdir -p "$CONF_DIR"
 # ================================
 # 随机生成函数
 # ================================
-random_port() { shuf -i 10000-60000 -n 1; }
-random_user() { tr -dc A-Za-z0-9 </dev/urandom | head -c 8; }
-random_pass() { tr -dc A-Za-z0-9 </dev/urandom | head -c 12; }
-
-# ================================
-# 端口检测
-# ================================
-port_in_use() {
-    ss -tuln | awk '{print $5}' | grep -E -q "(:|])$1$"
-}
-
-random_free_port() {
-    while true; do
-        port=$(random_port)
-        if ! port_in_use "$port"; then
-            echo "$port"
-            return
-        fi
-    done
-}
-
+# 端口分配: 统一从 conf/lib/ports.sh 取, 本脚本不再自带副本。
+# 副本时代改一处漏一处 —— 批量区间分配只进了 4 个脚本, 另外 5 个的批量
+# 生成仍在用随机端口, 同一批节点端口散落在 10000-60000。
+_x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+if [[ -r "$_x_lib_dir/lib/ports.sh" ]]; then
+    source "$_x_lib_dir/lib/ports.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/ports.sh") \
+        || { print_error "端口库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
