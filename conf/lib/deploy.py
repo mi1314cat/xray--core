@@ -64,8 +64,13 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
     # ---- 校验: 在生成之前把话说清楚 ----
     if not port:
         errors.append("缺少端口")
-    if not domain:
-        errors.append("缺少域名 (分享链接与 nginx 配置都要用)")
+    # 域名只在两处真正需要: TLS 要证书 (nginx 档则是 nginx 要), nginx 档要
+    # 挂站点。security=none 时两处都不需要 —— 无证书、无反代, 对外地址就是
+    # 公网 IP。之前无条件要求域名, 于是 "shadowsocks + 裸 TCP + 无加密"
+    # 这个完全合法的组合永远建不出来, 而且报错说的是"缺少域名", 与用户
+    # 实际遇到的问题 (他压根不知道要域名) 无关。
+    if not domain and (security == "tls" or tier == ACCESS_NGINX):
+        errors.append("缺少域名 (TLS 要证书, nginx 档要挂站点)")
 
     # CDN 档位要求传输层能被 CDN 代理。
     # 裸 TCP / REALITY 走 CDN 是可行的 (Cloudflare 支持 Spectrum, 但那是

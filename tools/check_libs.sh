@@ -587,6 +587,23 @@ MKN=$(python3 "$ROOT/Client/lib/node.py" subscription "$TMP/mksub.txt" 2>/dev/nu
 assert_eq "$MKN" "2" "预置建出的节点 Client 全部接受"
 bash -n "$ROOT/conf/mknode.sh" 2>/dev/null && ok "mknode.sh 语法" || bad "mknode.sh 语法"
 
+# ---------------------------------------------------------------- 域名按需
+# 域名只在两处真正需要: TLS 要证书, nginx 档要挂站点。之前无条件要求, 于是
+# "无加密 + CDN" 这个组合永远建不出来, 而且报错说的是"缺少域名" —— 与用户
+# 实际遇到的问题无关。
+group "域名按需 (deploy.plan)"
+D0=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"none","tag":"t","port":19001,"tier":"cdn","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c '裸 TCP + 无加密')
+assert_eq "$D0" "1" "无加密+CDN: 报裸 TCP 限制 (不是报缺域名)"
+D1=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"none","tag":"t","port":19001,"tier":"nginx","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c '缺少域名')
+assert_eq "$D1" "1" "无加密+nginx: 仍要求域名 (要挂站点)"
+D2=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"tls","tag":"t","port":19001,"tier":"cdn","domain":"a.com","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c 'SHADOWSOCKS + TCP + TLS')
+assert_eq "$D2" "1" "TLS+CDN: 正常生成"
+D3=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"tls","tag":"t","port":19001,"tier":"nginx","domain":"a.com","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c '监听: 127.0.0.1')
+assert_eq "$D3" "1" "TLS+nginx: 监听本机"
+# 裸 WS 无证书也不该要域名 (无证书 = 不需要 TLS 参数)
+D4=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"trojan","transport":"ws","security":"none","tag":"t","port":19002,"tier":"cdn","password":"p"}' 2>&1 | grep -c 'TROJAN + WebSocket')
+assert_eq "$D4" "1" "无加密+WS+CDN: 无需域名即可生成"
+
 # ---------------------------------------------------------------- 预置批量
 group "预置批量 (preset_batch.sh)"
 PB="$TMP/pb"; mkdir -p "$PB"
@@ -620,7 +637,7 @@ print(d['inbounds'][0]['listen'], m['port'])")
 assert_eq "$NG" "127.0.0.1 443" "nginx 档: 听本机, 对外 443"
 # TLS 缺域名必须明确报错
 PB4="$TMP/pb4"; mkdir -p "$PB4"
-E=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" vless:2 2>&1 | grep -c '没给域名')
+E=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" vless:2 2>&1 | grep -c '需要域名')
 assert_eq "$E" "1" "TLS 缺域名明确报错 (不静默跳过)"
 # 非法预置序号
 E2=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" vless:99 2>&1 | grep -c '预置序号')

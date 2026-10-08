@@ -157,14 +157,16 @@ PY
 
   # TLS 节点要域名。同域名会让所有节点共享 SNI, 不同域名需要分别指向同一
   # 服务器 —— 两种都常见, 所以两种给法都支持, 默认复用同域名。
+  # 域名在两处真正需要: TLS 要证书, nginx 档要挂站点。无加密的 CDN 档
+  # 两处都不需要 (而且那条路本来就被裸 TCP 的 CDN 限制挡掉了)。
   domain=""
-  if [[ "$sec" == "tls" ]]; then
+  if [[ "$sec" == "tls" || "$tier" == "nginx" ]]; then
     if [[ -n "$BATCH_DOMAIN" ]]; then
       domain="$BATCH_DOMAIN"
     elif [[ -n "$BATCH_DOMAIN_BASE" ]]; then
       domain="${BATCH_DOMAIN_BASE}-${node_no}"
     else
-      _e "  $disp 是 TLS 但没给域名 (设 X_BATCH_DOMAIN 或 X_BATCH_DOMAIN_BASE)"
+      _e "  $disp 需要域名 (TLS 要证书 / nginx 档要挂站点)。设 X_BATCH_DOMAIN 或 X_BATCH_DOMAIN_BASE"
       fail=$((fail+1)); continue
     fi
   fi
