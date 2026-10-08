@@ -448,6 +448,47 @@ bash -c "source '$LIB/service.sh'; x_svc_resolve >/dev/null; x_svc_status_text >
 MS=$(( ($(date +%s%N) - T0) / 1000000 ))
 [[ "$MS" -lt 3000 ]] && ok "完整探测耗时 ${MS}ms (<3s, 无 systemd 时不卡死)" || bad "完整探测耗时 ${MS}ms 过长"
 
+# ---------------------------------------------------------------- 幽灵函数
+# 从用户入口出发的可达性分析。只看"文件内出现次数"对库不成立 —— 库里的
+# 函数互相调用是正常的。真正要问的是从任何入口能不能走到它。
+group "幽灵函数 (check_wiring.py)"
+WG=$(timeout 60 python3 "$ROOT/tools/check_wiring.py" 2>&1)
+WRC=$?
+if [[ "$WRC" == "0" ]]; then
+    ok "$(echo "$WG" | head -1)"
+else
+    bad "存在不可达的库函数:"
+    echo "$WG" | sed 's/^/       /'
+fi
+# 检查器本身必须能抓到幽灵 —— 用一棵有两个库的测试树: 一个被 entry source,
+# 一个完全孤立。如果检查器永远返回 0, 它就是个摆设。
+_cw="$TMP/cwtest"; mkdir -p "$_cw/conf/lib" "$_cw/tools"
+cp "$ROOT/tools/check_wiring.py" "$_cw/tools/"
+{
+  printf '#!/bin/bash\n'
+  printf 'x_reachable_fn() { echo ok; }\n'
+} > "$_cw/conf/lib/uselib.sh"
+{
+  printf '#!/bin/bash\n'
+  printf 'x_ghost_fn() { echo ghost; }\n'
+} > "$_cw/conf/lib/orphan.sh"
+{
+  printf '#!/bin/bash\n'
+  printf 'source %s/conf/lib/uselib.sh\n' "$_cw"
+  printf 'x_reachable_fn\n'
+} > "$_cw/conf/entry.sh"
+printf 'bash %s/conf/entry.sh\n' "$_cw" > "$_cw/xray-panel.sh"
+CWO=$(cd "$_cw" && timeout 30 python3 tools/check_wiring.py 2>&1)
+CWR=$(cd "$_cw" && timeout 30 python3 tools/check_wiring.py >/dev/null 2>&1; echo $?)
+assert_eq "$CWR" "1" "检查器能抓到幽灵函数 (不是永远返回 0)"
+echo "$CWO" | grep -q 'x_ghost_fn' && ok "幽灵函数被点名" || bad "幽灵函数被点名"
+# 可达函数绝不能出现在幽灵名单里 —— 误报比漏报更烦人, 会逼人去删活代码
+if echo "$CWO" | grep '幽灵:' | grep -q 'x_reachable_fn'; then
+    bad "可达函数被误报为幽灵"
+else
+    ok "可达函数未被误报"
+fi
+
 # ---------------------------------------------------------------- Client 兼容
 group "Client 兼容性"
 if [[ -f "$ROOT/Client/lib/node.py" ]]; then
