@@ -371,6 +371,40 @@ assert_eq "$PBAD" "0" "预置表与 node_build 的 REALITY 限制一致"
 NU=$(bash -c "source '$LIB/preset.sh'; x_preset_ask tuic </dev/null" 2>&1 | head -1)
 [[ "$NU" == *"没有预置"* ]] && ok "无预置协议明确报错" || bad "无预置协议明确报错"
 
+# ---------------------------------------------------------------- 预置建节点
+group "预置建节点 (mknode → deploy)"
+MK="$TMP/mk"; mkdir -p "$MK/conf" "$MK/share"
+python3 "$LIB/deploy.py" --config-json \
+  '{"protocol":"vless","transport":"ws","security":"tls","tag":"v-ws-1","port":8443,"domain":"a.com","uuid":"u1","tier":"cdn"}' \
+  --conf-dir "$MK/conf" --share-dir "$MK/share" --apply >/dev/null 2>&1
+python3 "$LIB/deploy.py" --config-json \
+  '{"protocol":"trojan","transport":"tcp","security":"reality","tag":"t-re-1","port":8444,"domain":"a.com","password":"PW","private_key":"PK","public_key":"PUB","tier":"cdn"}' \
+  --conf-dir "$MK/conf" --share-dir "$MK/share" --apply >/dev/null 2>&1
+assert_eq "$(ls "$MK/conf"/*.json 2>/dev/null | wc -l)" "2" "JSON 路径落盘片段"
+assert_eq "$(ls "$MK/share"/*.json 2>/dev/null | wc -l)" "2" "JSON 路径落盘分享元数据"
+MK1=$(python3 "$LIB/deploy.py" --protocol trojan --transport ws --security tls --port 8555 --domain b.com --password p 2>/dev/null | grep -c 'TROJAN + WebSocket + TLS')
+assert_eq "$MK1" "1" "命令行路径仍可用"
+MK2=$(python3 "$LIB/deploy.py" --port 8443 2>&1 | grep -c '缺少必填参数')
+assert_eq "$MK2" "1" "缺参数明确报错"
+# 预演与落盘必须给出一致的呈现
+PV=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"vless","transport":"ws","security":"tls","tag":"pv","port":9001,"domain":"c.com","uuid":"u","tier":"cdn"}' 2>/dev/null | grep 'Xray 监听' | sed 's/^ *//')
+assert_eq "$PV" "Xray 监听: 0.0.0.0:9001" "预演呈现与落盘一致"
+# 落盘的节点必须能被注册表与 Client 吃下
+python3 - "$LIB" "$MK" > "$TMP/mksub.txt" <<'PY'
+import sys, base64; sys.path.insert(0, sys.argv[1])
+import nodes as N, share_meta
+nl, _ = N.collect(sys.argv[2] + "/conf")
+links = []
+for n in nl:
+    m = share_meta.load(sys.argv[2] + "/share", n["tag"]) or {}
+    l = N.build_share_link(n, m)
+    if l: links.append(l)
+print(base64.b64encode("\n".join(links).encode()).decode())
+PY
+MKN=$(python3 "$ROOT/Client/lib/node.py" subscription "$TMP/mksub.txt" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))')
+assert_eq "$MKN" "2" "预置建出的节点 Client 全部接受"
+bash -n "$ROOT/conf/mknode.sh" 2>/dev/null && ok "mknode.sh 语法" || bad "mknode.sh 语法"
+
 # ---------------------------------------------------------------- 端口归属
 group "端口归属 (ports.sh)"
 # x_port_holder 的 /proc 回退: 本容器 /proc/net/tcp 是空的 (网络命名空间未暴露),

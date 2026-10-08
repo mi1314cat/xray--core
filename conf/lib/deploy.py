@@ -186,6 +186,22 @@ def apply_plan(result, conf_dir, share_dir, nginx_apply=None, nginx_bin="-t"):
     return True
 
 
+def _print_plan(r, protocol, transport, security, tier):
+    """打印预演结果。两条入口共用, 免得预演和实际落盘的呈现不一致 ——
+    用户在预演里看到的和最后落盘的不是一回事, 那预演就没有意义。"""
+    print(f"  {describe(protocol, transport, security, tier)}")
+    ib = r["fragment"]["inbounds"][0]
+    print(f"  Xray 监听: {ib['listen']}:{ib['port']}")
+    print(f"  对外地址: {r['meta']['host']}:{r['meta']['port']}")
+    if r["nginx"]:
+        print(f"  nginx: 站点 {r['nginx']['domain']} → 127.0.0.1:{r['nginx']['port']}"
+              f" ({r['nginx']['transport']})")
+    else:
+        print("  nginx: 不需要 (CDN 直接回源)")
+    print("  片段:")
+    print(json.dumps(r["fragment"], ensure_ascii=False, indent=4).replace("\n", "\n  "))
+
+
 def describe(protocol, transport, security, tier):
     t = {"cdn": "CDN 直连", "nginx": "Nginx 转发"}.get(tier, tier)
     return f"{node_build.describe(protocol, transport, security)} · {t}"
@@ -197,9 +213,9 @@ if __name__ == "__main__":
     import json
 
     ap = argparse.ArgumentParser(description="节点部署规划预演")
-    ap.add_argument("--protocol", required=True)
-    ap.add_argument("--transport", required=True)
-    ap.add_argument("--security", required=True)
+    ap.add_argument("--protocol")
+    ap.add_argument("--transport")
+    ap.add_argument("--security")
     ap.add_argument("--port", type=int, help="Xray 监听端口")
     ap.add_argument("--public-port", type=int, help="对外端口, nginx 档位默认 443")
     ap.add_argument("--domain")
@@ -209,9 +225,60 @@ if __name__ == "__main__":
     ap.add_argument("--uuid")
     ap.add_argument("--method")
     ap.add_argument("--path")
+    ap.add_argument("--config-json", help="整份 opts 以 JSON 传入 (给 conf/mknode.sh 用, "
+                                          "避免在 bash 里拼 JSON —— 引号地狱)")
+    ap.add_argument("--conf-dir", help="片段输出目录 (默认 /root/catmi/xray/configs)")
+    ap.add_argument("--share-dir", help="分享元数据目录 (默认 .../share/tokens)")
+    ap.add_argument("--apply", action="store_true", help="直接落盘而不只是预演")
     ap.add_argument("--cert-file")
     ap.add_argument("--key-file")
     a = ap.parse_args()
+
+    # 整份 JSON 优先: 字段比一长串命令行参数更不容易出错
+    if a.config_json:
+        raw = a.config_json
+        if raw.startswith("@"):
+            with open(raw[1:], encoding="utf-8") as f:
+                raw = f.read()
+        spec = json.loads(raw)
+        protocol = spec.pop("protocol")
+        transport = spec.pop("transport")
+        security = spec.pop("security")
+        tier = spec.pop("tier", a.tier)
+        opts = {k: v for k, v in spec.items() if v is not None}
+        r = plan(protocol, transport, security, opts, tier)
+        if r["errors"]:
+            print("不可行:", file=sys.stderr)
+            for e in r["errors"]:
+                print("  - " + e, file=sys.stderr)
+            sys.exit(1)
+        if a.apply:
+            conf_dir = a.conf_dir or os.environ.get("XRAY_CONF_DIR", "/root/catmi/xray/configs")
+            share_dir = a.share_dir or os.environ.get("XRAY_SHARE_DIR", "/root/catmi/xray/share/tokens")
+            os.makedirs(conf_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(share_dir) or share_dir, exist_ok=True)
+            tag = r["fragment"]["inbounds"][0]["tag"]
+            node_build.write(os.path.join(conf_dir, f"{tag}.json"), r["fragment"])
+            import share_meta
+            share_meta.save(share_dir, tag, r["meta"])
+            print(f"已写入片段: {conf_dir}/{tag}.json")
+            print(f"已写入分享元数据: {share_dir}/{tag}.json")
+            print(f"监听: {r['fragment']['inbounds'][0]['listen']}:{r['fragment']['inbounds'][0]['port']}")
+            print(f"对外: {r['meta']['host']}:{r['meta']['port']}  ({r['meta']['tier']})")
+            if r["nginx"]:
+                print(f"提示: nginx 档位还需配置反代 "
+                      f"{r['nginx']['domain']} → 127.0.0.1:{r['nginx']['port']}")
+            sys.exit(0)
+        _print_plan(r, protocol, transport, security, tier)
+        sys.exit(0)
+
+    # 走命令行参数时三者仍必填 (argparse 的 required 已放开, 因为 JSON
+    # 路径不需要它们)
+    missing = [n for n, v in (("--protocol", a.protocol),
+                              ("--transport", a.transport),
+                              ("--security", a.security)) if not v]
+    if missing:
+        ap.error(f"缺少必填参数: {', '.join(missing)} (或用 --config-json 整份传入)")
 
     opts = {k: v for k, v in {
         "port": a.port, "public_port": a.public_port, "domain": a.domain, "tag": a.tag, "password": a.password,
@@ -225,13 +292,4 @@ if __name__ == "__main__":
         for e in r["errors"]:
             print("  - " + e, file=sys.stderr)
         sys.exit(1)
-
-    print(f"  {describe(a.protocol, a.transport, a.security, a.tier)}")
-    print(f"  Xray 监听: {r['fragment']['inbounds'][0]['listen']}:{r['fragment']['inbounds'][0]['port']}")
-    print(f"  对外地址: {r['meta']['host']}:{r['meta']['port']}")
-    if r["nginx"]:
-        print(f"  nginx: 站点 {r['nginx']['domain']} → 127.0.0.1:{r['nginx']['port']} ({r['nginx']['transport']})")
-    else:
-        print("  nginx: 不需要 (CDN 直接回源)")
-    print("  片段:")
-    print(json.dumps(r["fragment"], ensure_ascii=False, indent=4).replace("\n", "\n  "))
+    _print_plan(r, a.protocol, a.transport, a.security, a.tier)
