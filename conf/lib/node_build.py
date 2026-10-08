@@ -244,7 +244,7 @@ def _settings(protocol, opts):
         # Xray 的 hysteria2 inbound 用的是 protocol="hysteria" + version=2,
         # 不是 protocol="hysteria2"。写成 "hysteria2" 内核报
         # unknown config id: hysteria2 —— 它根本不认识这个名字。
-        # 凭据字段也�� clients[].auth, 不是 clients[].password。
+        # 凭据字段也是 clients[].auth, 不是 clients[].password。
         return {"version": 2, "clients": [{"auth": opts["password"]}]}
 
     if protocol in ("socks", "http"):

@@ -272,7 +272,7 @@ def build_share_link(n, meta=None):
         scheme = "socks5" if proto == "socks" else "http"
         # settings.auth 是 "noauth"/"password" 这种模式名, 不是用户名。
         # 当成用户名会生成 socks5://noauth@host:443 —— 客户端会拿 "noauth"
-        # 去当密码, 认证必然失败。真正��用户名在 settings.accounts[0].user,
+        # 去当密码, 认证必然失败。真正的用户名在 settings.accounts[0].user,
         # 由 _client_field 取不到, 所以这里只在有真实账号时才写 userinfo。
         accounts = (n.get("_accounts") or [])
         user = accounts[0] if accounts and accounts[0] not in ("noauth", "") else ""

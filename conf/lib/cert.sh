@@ -286,7 +286,7 @@ x_cert_list() {
     done < <(x_cert_search_dirs)
 }
 
-# 列出容器化的 nginx 正��在用的证书 —— 宿主页面上看不到的那一批。
+# 列出容器化的 nginx 正在用的证书 —— 宿主页面上看不到的那一批。
 x_cert_container_certs() {
     command -v docker >/dev/null 2>&1 || return 1
     local cid found=0

@@ -80,12 +80,19 @@ for path, sn in sites:
     print("SITE\t%s\t%s" % (sn or "(无 server_name)", path))
 PY
 )
-    if [[ "$out" == "NONE" ]]; then
-        _yl "  没有找到任何 server 块"
-        _yl "  搜索范围: /etc/nginx/sites-enabled, /etc/nginx/conf.d,"
-        _yl "            /usr/local/nginx/conf, 以及容器里的同名目录"
-        return 0
-    fi
+      if [[ "$out" == "NONE" ]]; then
+          _yl "  没有找到任何 server 块"
+          if [[ -n "${NGINX_CONF_ROOTS:-}" ]]; then
+              # 指定了配置根却没找到, 要说清楚找的是哪里。照常打印默认搜索范围
+              # 会让人以为去那几个目录找过, 而实际一次都没去过 ——
+              # 这种"说了但没做"的提示比不说更容易把人引到错方向。
+              _yl "  搜索范围 (NGINX_CONF_ROOTS 指定): ${NGINX_CONF_ROOTS//:/, }"
+          else
+              _yl "  搜索范围: /etc/nginx/sites-enabled, /etc/nginx/conf.d,"
+              _yl "            /usr/local/nginx/conf, 以及容器里的同名目录"
+          fi
+          return 0
+      fi
     local first=1
     while IFS=$'\t' read -r kind a b; do
         if [[ "$kind" == "DOCKER" ]]; then
