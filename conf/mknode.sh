@@ -108,7 +108,15 @@ mk_ask_credential() {
             read -rp "  加密方式 (默认 2022-blake3-aes-128-gcm): " v1
             [[ -z "$v1" ]] && v1="2022-blake3-aes-128-gcm"
             read -rp "  密码 (回车=自动生成): " v2
-            [[ -z "$v2" ]] && v2="$(head -c 16 /dev/urandom | base64 | tr -d '/+=' | head -c 22)"
+            # SS2022 要精确长度: aes-128 → 16 字节原文 (base64 24 字符),
+            # aes-256/chacha → 32 字节 (44 字符)。截断 tr -d '/+=' 会破坏长度,
+            # 内核报 illegal base64 时完全看不出是这里。
+            local n=16
+            case "$v1" in
+                2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) n=32 ;;
+                aes-256-*|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) n=32 ;;
+            esac
+            [[ -z "$v2" ]] && v2="$(head -c "$n" /dev/urandom | base64 -w0)"
             printf '%s|%s' "$v1" "$v2" ;;
         socks|http)
             _y "    注意: 无认证的本地代理暴露到公网等于开放代理"

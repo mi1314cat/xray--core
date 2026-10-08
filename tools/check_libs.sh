@@ -560,7 +560,7 @@ python3 "$LIB/deploy.py" --config-json \
   '{"protocol":"vless","transport":"ws","security":"tls","tag":"v-ws-1","port":8443,"domain":"a.com","uuid":"u1","tier":"cdn"}' \
   --conf-dir "$MK/conf" --share-dir "$MK/share" --apply >/dev/null 2>&1
 python3 "$LIB/deploy.py" --config-json \
-  '{"protocol":"trojan","transport":"tcp","security":"reality","tag":"t-re-1","port":8444,"domain":"a.com","password":"PW","private_key":"PK","public_key":"PUB","tier":"cdn"}' \
+  '{"protocol":"trojan","transport":"tcp","security":"reality","tag":"t-re-1","port":8444,"domain":"a.com","password":"PW","private_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","public_key":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","tier":"cdn"}' \
   --conf-dir "$MK/conf" --share-dir "$MK/share" --apply >/dev/null 2>&1
 assert_eq "$(ls "$MK/conf"/*.json 2>/dev/null | wc -l)" "2" "JSON 路径落盘片段"
 assert_eq "$(ls "$MK/share"/*.json 2>/dev/null | wc -l)" "2" "JSON 路径落盘分享元数据"
@@ -587,18 +587,143 @@ MKN=$(python3 "$ROOT/Client/lib/node.py" subscription "$TMP/mksub.txt" 2>/dev/nu
 assert_eq "$MKN" "2" "预置建出的节点 Client 全部接受"
 bash -n "$ROOT/conf/mknode.sh" 2>/dev/null && ok "mknode.sh 语法" || bad "mknode.sh 语法"
 
+# ---------------------------------------------------------------- 分享链接覆盖
+# 内核实机跑出 18 个节点, 6 个生成分享链接失败, 两个不同原因:
+#   REALITY (4 个) — meta 里没有 host。REALITY 不要证书, 于是域名没被传进去,
+#                    而分享链接的 host 字段来自那里 —— 节点能跑却分享不出去,
+#                    而分享链接是它唯一的存在理由。
+#   socks/http (2) — Client 的 scheme 白名单里没有它们。这是有意的, 不是缺陷。
+group "分享链接覆盖 (REALITY 也要能分享)"
+PK=$(python3 -c "print('a'*43)"); PB=$(python3 -c "print('b'*43)")
+LN="$TMP/links"; mkdir -p "$LN"
+XRAY_CONF_DIR="$LN/c" XRAY_SHARE_DIR="$LN/s" X_BATCH_DOMAIN=e.com \
+X_BATCH_REALITY_PRIVATE_KEY="$PK" X_BATCH_REALITY_PUBLIC_KEY="$PB" X_BATCH_PORT_START=25000 \
+  bash "$ROOT/tools/preset_batch.sh" vless:1 trojan:1 >/dev/null 2>&1
+RL=$(python3 - "$LIB" "$LN" <<'PYX'
+import sys
+sys.path.insert(0, sys.argv[1])
+import nodes as N, share_meta
+nl, _ = N.collect(sys.argv[2] + "/c")
+ok = 0
+for n in nl:
+    m = share_meta.load(sys.argv[2] + "/s", n["tag"]) or {}
+    if N.build_share_link(n, m):
+        ok += 1
+print("%d/%d" % (ok, len(nl)))
+PYX
+)
+assert_eq "$RL" "2/2" "REALITY 节点也能生成分享链接"
+RHL=$(python3 - "$LIB" "$LN" <<'PYX'
+import sys, glob, os
+sys.path.insert(0, sys.argv[1])
+import share_meta as M
+cands = [x for x in glob.glob(os.path.join(sys.argv[2], "s", "*.json"))
+         if "reality" in x]
+if not cands:
+    print("无")
+else:
+    print(M.load(os.path.join(sys.argv[2], "s"),
+                 os.path.basename(cands[0])[:-5]).get("host") or "")
+PYX
+)
+assert_eq "$RHL" "e.com" "REALITY 的 meta 里带上了 host"
+
+# 内核的 inbound id 是 hysteria (version 2), 分享 scheme 却是 hysteria2://。
+# 匹配时漏了 "hysteria" 的话, 内核实机跑出来的 hysteria2 节点一个都生成不出
+# 分享链接 —— 而 hysteria2 是预置表里唯一的 QUIC 协议。
+AL2="$TMP/all"; mkdir -p "$AL2"
+python3 "$LIB/deploy.py" --config-json '{"protocol":"hysteria2","transport":"hysteria","security":"tls","tag":"hy2","port":28000,"domain":"a.com","password":"AUTH1","tier":"cdn"}' --conf-dir "$AL2/c" --share-dir "$AL2/s" --apply >/dev/null 2>&1
+python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"tls","tag":"ss","port":28001,"domain":"a.com","method":"aes-256-gcm","password":"PW1","tier":"cdn"}' --conf-dir "$AL2/c" --share-dir "$AL2/s" --apply >/dev/null 2>&1
+ALR=$(python3 - "$LIB" "$AL2" <<'PYX'
+import sys
+sys.path.insert(0, sys.argv[1])
+import nodes as N, share_meta
+nl, _ = N.collect(sys.argv[2] + "/c")
+res = {}
+for n in nl:
+    m = share_meta.load(sys.argv[2] + "/s", n["tag"]) or {}
+    res[n["protocol"]] = N.build_share_link(n, m) or ""
+print(res.get("hysteria", "")[:12] + "|" + res.get("shadowsocks", "")[:5])
+PYX
+)
+assert_eq "$ALR" 'hysteria2://|ss://' "hysteria2 与 shadowsocks 都能生成分享链接"
+
+# settings.auth 是 "noauth"/"password" 这种模式名, 不是用户名。当成用户名会
+# 生成 socks5://noauth@host:443, 客户端拿 "noauth" 当密码, 认证必然失败。
+python3 "$LIB/deploy.py" --config-json '{"protocol":"socks","transport":"tcp","security":"none","tag":"sk","port":28002,"domain":"a.com","tier":"nginx"}' --conf-dir "$AL2/c2" --share-dir "$AL2/s2" --apply >/dev/null 2>&1
+SK=$(python3 - "$LIB" "$AL2/c2" "$AL2/s2" <<'PYX'
+import sys
+sys.path.insert(0, sys.argv[1])
+import nodes as N, share_meta
+nl, _ = N.collect(sys.argv[2])
+print((N.build_share_link(nl[0], share_meta.load(sys.argv[3], nl[0]["tag"]) or {}) or "")[:30])
+PYX
+)
+case "$SK" in
+  *"noauth@"*) bad "socks 无认证: 把 noauth 当成了用户名" ;;
+  socks5://*)  ok "socks 无认证: 不带 userinfo" ;;
+  *)           bad "socks 链接异常: $SK" ;;
+esac
+
+# ---------------------------------------------------------------- 实机查出的三处
+# 这一组全部来自 RN 实机跑 21 个预置时内核的真实反馈, 不是推测。
+group "实机反馈 (SS2022 / hysteria2 / REALITY)"
+SS16='eHh4eHh4eHh4eHh4eHh4eA=='; SS32='eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg='
+sschk() { python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import node_build as B
+try:
+    B.build('shadowsocks','tcp','$3',{'port':9000,'method':'$1','password':'$2'}); print('OK')
+except B.NodeError: print('ERR')
+except Exception: print('OTHER')"; }
+assert_eq "$(sschk 2022-blake3-aes-128-gcm "$SS16" none)" "OK" "SS2022 aes-128: 24 字符通过"
+assert_eq "$(sschk 2022-blake3-aes-256-gcm "$SS32" none)" "OK" "SS2022 aes-256: 44 字符通过"
+assert_eq "$(sschk 2022-blake3-aes-128-gcm "$SS32" none)" "ERR" "SS2022 aes-128 收到 44 字符: 拒绝"
+assert_eq "$(sschk 2022-blake3-aes-256-gcm "$SS16" none)" "ERR" "SS2022 aes-256 收到 24 字符: 拒绝"
+assert_eq "$(sschk 2022-blake3-aes-128-gcm 'abcdefghijklmnop' none)" "ERR" "SS2022 非 base64 密码: 拒绝"
+assert_eq "$(sschk aes-256-gcm '任意长度' none)" "OK" "传统 SS 加密不限长度"
+assert_eq "$(sschk bogus-method x none)" "ERR" "未知加密方式: 拒绝"
+
+# hysteria2: 内核的 inbound id 是 "hysteria" + version 2, 不是 "hysteria2"
+HY=$(python3 -c "
+import sys,json; sys.path.insert(0,'$LIB'); import node_build as B
+i=B.build('hysteria2','hysteria','tls',{'port':9000,'password':'pw'})['inbounds'][0]
+print(i['protocol'], i['settings']['version'], 'auth' in i['settings']['clients'][0],
+      (i['streamSettings']['tlsSettings'].get('alpn') or ['-'])[0])")
+assert_eq "$HY" "hysteria 2 True h3" "hysteria2: protocol 名/version/auth 字段/alpn 全对"
+HY2=$(python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import node_build as B
+i=B.build('trojan','ws','tls',{'port':9001,'password':'p','domain':'a.com'})['inbounds'][0]
+print(i['streamSettings']['tlsSettings'].get('alpn','none'))")
+assert_eq "$HY2" "none" "alpn=h3 只对 hysteria 生效"
+
+# REALITY 非交互: read 会读到脏数据, 校验必须拦下来
+RK=$(python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import node_build as B
+try:
+    B.build('vless','tcp','reality',{'port':9000,'private_key':'echo \"  ═══ 校验 ═══\"','public_key':'x'}); print('OK')
+except B.NodeError: print('ERR')
+except Exception: print('OTHER')")
+assert_eq "$RK" "ERR" "REALITY 收到非密钥内容: 拒绝"
+PBN="$TMP/pbn"; mkdir -p "$PBN"
+RT=$(XRAY_CONF_DIR="$PBN/c" XRAY_SHARE_DIR="$PBN/s" bash "$ROOT/tools/preset_batch.sh" vless:1 < /dev/null 2>&1 | grep -c '不是终端')
+assert_eq "$RT" "1" "非交互下 REALITY 明确拒绝 (不读脏数据)"
+RT2=$(XRAY_CONF_DIR="$PBN/c2" XRAY_SHARE_DIR="$PBN/s2" \
+  X_BATCH_REALITY_PRIVATE_KEY="$PBN" X_BATCH_REALITY_PUBLIC_KEY="$PBN" \
+  bash "$ROOT/tools/preset_batch.sh" vless:1 < /dev/null 2>&1 | grep -c '不是终端')
+assert_eq "$RT2" "0" "给了环境变量就不再要求终端"
+
 # ---------------------------------------------------------------- 域名按需
 # 域名只在两处真正需要: TLS 要证书, nginx 档要挂站点。之前无条件要求, 于是
 # "无加密 + CDN" 这个组合永远建不出来, 而且报错说的是"缺少域名" —— 与用户
 # 实际遇到的问题无关。
 group "域名按需 (deploy.plan)"
-D0=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"none","tag":"t","port":19001,"tier":"cdn","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c '裸 TCP + 无加密')
+D0=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"none","tag":"t","port":19001,"tier":"cdn","method":"2022-blake3-aes-128-gcm","password":"eHh4eHh4eHh4eHh4eHh4eA=="}' 2>&1 | grep -c '裸 TCP + 无加密')
 assert_eq "$D0" "1" "无加密+CDN: 报裸 TCP 限制 (不是报缺域名)"
-D1=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"none","tag":"t","port":19001,"tier":"nginx","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c '缺少域名')
+D1=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"none","tag":"t","port":19001,"tier":"nginx","method":"2022-blake3-aes-128-gcm","password":"eHh4eHh4eHh4eHh4eHh4eA=="}' 2>&1 | grep -c '缺少域名')
 assert_eq "$D1" "1" "无加密+nginx: 仍要求域名 (要挂站点)"
-D2=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"tls","tag":"t","port":19001,"tier":"cdn","domain":"a.com","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c 'SHADOWSOCKS + TCP + TLS')
+D2=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"tls","tag":"t","port":19001,"tier":"cdn","domain":"a.com","method":"2022-blake3-aes-128-gcm","password":"eHh4eHh4eHh4eHh4eHh4eA=="}' 2>&1 | grep -c 'SHADOWSOCKS + TCP + TLS')
 assert_eq "$D2" "1" "TLS+CDN: 正常生成"
-D3=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"tls","tag":"t","port":19001,"tier":"nginx","domain":"a.com","method":"2022-blake3-aes-128-gcm","password":"abcdefghijklmnopqrstuvwxyz012345"}' 2>&1 | grep -c '监听: 127.0.0.1')
+D3=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"shadowsocks","transport":"tcp","security":"tls","tag":"t","port":19001,"tier":"nginx","domain":"a.com","method":"2022-blake3-aes-128-gcm","password":"eHh4eHh4eHh4eHh4eHh4eA=="}' 2>&1 | grep -c '监听: 127.0.0.1')
 assert_eq "$D3" "1" "TLS+nginx: 监听本机"
 # 裸 WS 无证书也不该要域名 (无证书 = 不需要 TLS 参数)
 D4=$(python3 "$LIB/deploy.py" --config-json '{"protocol":"trojan","transport":"ws","security":"none","tag":"t","port":19002,"tier":"cdn","password":"p"}' 2>&1 | grep -c 'TROJAN + WebSocket')

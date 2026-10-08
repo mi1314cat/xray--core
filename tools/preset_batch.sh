@@ -131,13 +131,17 @@ for spec in "${SPECS[@]}"; do
 
   # 凭据: 非交互自动生成
   cred_json=$(MK_PROTO="$proto" python3 - <<'PY'
-import json, os, uuid, secrets
+import base64, json, os, uuid, secrets
 p = os.environ["MK_PROTO"]
 o = {}
 if p in ("vless","vmess"): o["uuid"] = str(uuid.uuid4())
 elif p in ("trojan","hysteria2"): o["password"] = secrets.token_urlsafe(16)
 elif p == "shadowsocks":
-    o["method"]="2022-blake3-aes-128-gcm"; o["password"]=secrets.token_urlsafe(16)
+    # SS2022 的密码必须是精确长度的 base64: aes-128 用 16 字节原文,
+    # aes-256/chacha 用 32 字节。随手 token_urlsafe(16) 出来的是 22 个
+    # url-safe 字符, 长度不对 —— 内核要到 run -test 才报 illegal base64。
+    o["method"] = "2022-blake3-aes-128-gcm"
+    o["password"] = base64.b64encode(os.urandom(16)).decode()
 print(json.dumps(o))
 PY
 )
@@ -146,21 +150,50 @@ PY
   # REALITY 走交互: 私钥+公钥必须配对, 批量里无法自动造一对可用密钥
   extra_json="{}"
   if [[ "$sec" == "reality" ]]; then
-    _y "  $disp 需要 REALITY 密钥对 —— 请输入 (留空跳过该节点)"
-    read -rp "    私钥: " pk
-    read -rp "    公钥: " pb
+    # 非交互时 (管道/重定向) read 不会等输入, 而是把脚本自己的 stdin
+    # 剩余内容甚至下一行命令当成答案 —— 实测拿到过 "echo \"  ═══ 校验 ═══\""
+    # 这种东西, 然后原样写进配置。内核报 invalid privateKey, 而配置里躺着
+    # 一句 shell 片段。所以这里先判定能不能交互, 不能就明确拒绝并说清替代。
+    # 环境变量优先 —— 批量场景里最常用的就是同一对密钥反复用, 与其让
+    # 人每次手输, 不如给个变量。
+    pk="${X_BATCH_REALITY_PRIVATE_KEY:-}"
+    pb="${X_BATCH_REALITY_PUBLIC_KEY:-}"
+    if [[ -n "$pk" && -n "$pb" ]]; then
+      _y "  $disp 用 X_BATCH_REALITY_* 提供的密钥对"
+    elif [[ ! -t 0 ]]; then
+      _e "  $disp 是 REALITY, 需要交互输入密钥对, 但当前不是终端"
+      _y "      设 X_BATCH_REALITY_PRIVATE_KEY 与 X_BATCH_REALITY_PUBLIC_KEY;"
+      _y "      或改用菜单 15 (单个建节点) / conf/Reality.sh"
+      fail=$((fail+1)); continue
+    fi
+    if [[ -z "$pk" || -z "$pb" ]]; then
+      _y "  $disp 需要 REALITY 密钥对 —— 请输入 (留空跳过该节点)"
+      read -rp "    私钥: " pk
+      read -rp "    公钥: " pb
+    fi
     if [[ -z "$pk" || -z "$pb" ]]; then
       _y "    跳过 (缺密钥)"; fail=$((fail+1)); continue
+    fi
+    # 长度与字符集先验一遍 —— 内核只说 invalid privateKey, 不会说是哪里不对
+    if [[ ! "$pk" =~ ^[A-Za-z0-9_-]{40,}$ ]]; then
+      _e "      私钥格式不对 (需 base64url, 43-44 字符): $pk"
+      fail=$((fail+1)); continue
+    fi
+    if [[ ! "$pb" =~ ^[A-Za-z0-9_-]{40,}$ ]]; then
+      _e "      公钥格式不对 (需 base64url, 43-44 字符): $pb"
+      fail=$((fail+1)); continue
     fi
     extra_json=$(python3 -c "import json,sys;print(json.dumps({'private_key':sys.argv[1],'public_key':sys.argv[2]}))" "$pk" "$pb")
   fi
 
   # TLS 节点要域名。同域名会让所有节点共享 SNI, 不同域名需要分别指向同一
   # 服务器 —— 两种都常见, 所以两种给法都支持, 默认复用同域名。
-  # 域名在两处真正需要: TLS 要证书, nginx 档要挂站点。无加密的 CDN 档
-  # 两处都不需要 (而且那条路本来就被裸 TCP 的 CDN 限制挡掉了)。
+  # 域名在两处真正需要: TLS 要证书, nginx 档要挂站点。REALITY 是第三处 ——
+  # 它不需要证书, 但分享链接的 host 字段来自这里, 缺了 build_share_link 就
+  # 返回 None, 节点能跑却分享不出去 (分享链接是它唯一的存在理由)。
+  # 无加密的 CDN 档则两处都不需要。
   domain=""
-  if [[ "$sec" == "tls" || "$tier" == "nginx" ]]; then
+  if [[ "$sec" == "tls" || "$tier" == "nginx" || "$sec" == "reality" ]]; then
     if [[ -n "$BATCH_DOMAIN" ]]; then
       domain="$BATCH_DOMAIN"
     elif [[ -n "$BATCH_DOMAIN_BASE" ]]; then

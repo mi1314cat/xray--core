@@ -33,9 +33,13 @@ def _client_field(inbound, field):
     if isinstance(clients, list) and clients:
         c = clients[0]
         if isinstance(c, dict):
-            return c.get(field) or c.get("password") or c.get("id")
+            # hysteria2 的 inbound 是 protocol=hysteria + version=2, 凭据字段
+            # 叫 auth 而不是 password —— 不带这一条的话 hysteria2 节点的
+            # 凭据全是 None, 分享链接生成不出来。
+            return (c.get(field) or c.get("password") or c.get("auth")
+                    or c.get("id"))
     # Shadowsocks / Socks / HTTP 是单用户形态
-    return settings.get("password")
+    return settings.get("password") or settings.get("auth")
 
 
 def extract(inbound, source_file):
@@ -250,12 +254,30 @@ def build_share_link(n, meta=None):
         ).decode().rstrip("=")
         return f"ss://{userinfo}@{_q(host)}:{port}#{_q(name)}"
 
-    if proto in ("hysteria2", "hy2"):
+    if proto in ("hysteria2", "hy2", "hysteria"):
+        # 内核侧的 inbound protocol 是 "hysteria" (配 settings.version=2),
+        # 而分享链接的 scheme 必须写 hysteria2://。所以匹配时要把
+        # "hysteria" 也算进来 —— 漏了它, 内核实机跑出来的 hysteria2 节点
+        # 一个都生成分享链接。
         q = {"sni": meta.get("host") or "", "insecure": "0"}
         if meta.get("alpn"):
             q["alpn"] = meta["alpn"]
         qs = "&".join(f"{k}={_qval(v)}" for k, v in q.items() if v)
         return f"hysteria2://{_q(n.get('password') or n.get('id') or '')}@{_q(host)}:{port}?{qs}#{_q(name)}"
+
+    if proto in ("socks", "http"):
+        # socks5:// 与 http:// 是标准 URI 形态。Client 的 scheme 白名单里
+        # 没有这两个 (它只认 vless/vmess/trojan/ss/hysteria2), 所以生成了
+        # 对方也不收 —— 但它们仍可能有别的客户端用, 不该在这里直接吞掉。
+        scheme = "socks5" if proto == "socks" else "http"
+        # settings.auth 是 "noauth"/"password" 这种模式名, 不是用户名。
+        # 当成用户名会生成 socks5://noauth@host:443 —— 客户端会拿 "noauth"
+        # 去当密码, 认证必然失败。真正��用户名在 settings.accounts[0].user,
+        # 由 _client_field 取不到, 所以这里只在有真实账号时才写 userinfo。
+        accounts = (n.get("_accounts") or [])
+        user = accounts[0] if accounts and accounts[0] not in ("noauth", "") else ""
+        auth = f"{_q(user)}@" if user else ""
+        return f"{scheme}://{auth}{_q(host)}:{port}#{_q(name)}"
 
     if proto in ("vmess",):
         # vmess:// 是 base64 的 JSON, 不是标准 URI

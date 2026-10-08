@@ -76,6 +76,11 @@ def _stream_settings(transport, security, opts):
             }]
         if opts.get("alpn"):
             tls["alpn"] = opts["alpn"]
+        # hysteria2 走 QUIC, ALPN 必须是 h3。不设的话内核不报配置错,
+        # 但握手一定失败 —— 客户端 TCP 连上了却等不到 QUIC 回应。这种
+        # "配置全对但连不上"最难查, 所以直接补上。
+        elif transport == "hysteria":
+            tls["alpn"] = ["h3"]
         if opts.get("allow_insecure"):
             tls["allowInsecure"] = True
         ss["security"] = "tls"
@@ -146,6 +151,75 @@ REQUIRED = {
 }
 
 
+# Shadowsocks 2022 的密码必须是精确长度的 base64。生成时随手截断出来的长度
+# 几乎一定不合法, 而内核要等到 run -test 才报错 —— 那时候用户已经填完一堆
+# 参数、部署完 nginx 了。这里提前拦。
+#   16 字节 → base64 24 字符 (aes-128-gcm)
+#   32 字节 → base64 44 字符 (aes-256-gcm / chacha20-poly1305)
+SS2022_LENGTH = {
+    "2022-blake3-aes-128-gcm": 24,
+    "2022-blake3-aes-256-gcm": 44,
+    "2022-blake3-chacha20-poly1305": 44,
+}
+# 非 2022 的传统加密对密码长度没有硬性要求 (任意长度经 KDF 派生), 但要拦
+# 未知的 method —— 写错了内核会当成不支持的协议, 报错难懂。
+SS_LEGACY_METHODS = ("aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+                     "aes-128-cfb", "aes-192-cfb", "aes-256-cfb",
+                     "chacha20-ietf", "xchacha20-ietf-poly1305",
+                     "none", "plain")
+
+
+def _check_ss(method, password):
+    """校验 Shadowsocks 的 method 与密码是否匹配。"""
+    import base64 as _b64
+    if method in SS2022_LENGTH:
+        need = SS2022_LENGTH[method]
+        got = len(password or "")
+        if got != need:
+            raise NodeError(
+                f"Shadowsocks 2022 的 {method} 要求 {need} 个字符的 base64 密码"
+                f" (原文 16/32 字节经 base64), 当前 {got} 个。"
+            )
+        try:
+            _b64.b64decode(password, validate=True)
+        except Exception:
+            raise NodeError(
+                "Shadowsocks 2022 的密码必须是合法 base64 (A-Za-z0-9+/=), "
+                "当前含非法字符。"
+            )
+    elif method not in SS_LEGACY_METHODS:
+        raise NodeError(
+            f"未知的 Shadowsocks 加密方式: {method}。常用: "
+            f"{', '.join(list(SS2022_LENGTH)[:2])} 或 aes-256-gcm"
+        )
+
+
+def _check_reality(opts):
+    """REALITY 密钥必须是 x25519 生成的 base64url。
+
+    只检查"有没有"不够: 非交互场景下 read 可能把脚本自己的输入读成密钥
+    (实测拿到过 `echo "  ═══ 校验 ═══"` 这种内容), 原样写进配置后内核才报
+    invalid privateKey —— 而配置里躺着的是一句 shell 片段, 排查时很难看出
+    根因。按形状提前拦。
+    """
+    import re as _re
+    pat = _re.compile(r"^[A-Za-z0-9_-]{43,44}$")
+    pk = opts.get("private_key") or ""
+    pb = opts.get("public_key") or ""
+    if not pk:
+        raise NodeError("REALITY 需要私钥 (opts['private_key'])。生成: xray x25519")
+    if not pat.match(pk):
+        raise NodeError(
+            f"REALITY 私钥格式不对: {pk[:40]!r}。x25519 私钥是 43-44 个字符的 "
+            f"base64url (A-Za-z0-9_-)。生成: xray x25519"
+        )
+    if not pb:
+        raise NodeError("REALITY 需要公钥 (opts['public_key'])。分享链接要用 —— "
+                        "缺了客户端会静默丢弃这个节点, 零报错。")
+    if not pat.match(pb):
+        raise NodeError(f"REALITY 公钥格式不对: {pb[:40]!r}。与私钥同格式。")
+
+
 def _settings(protocol, opts):
     """协议级 settings。"""
     if protocol == "vless":
@@ -167,7 +241,11 @@ def _settings(protocol, opts):
         return {"method": opts["method"], "password": opts["password"]}
 
     if protocol == "hysteria2":
-        return {"clients": [{"password": opts["password"]}]}
+        # Xray 的 hysteria2 inbound 用的是 protocol="hysteria" + version=2,
+        # 不是 protocol="hysteria2"。写成 "hysteria2" 内核报
+        # unknown config id: hysteria2 —— 它根本不认识这个名字。
+        # 凭据字段也�� clients[].auth, 不是 clients[].password。
+        return {"version": 2, "clients": [{"auth": opts["password"]}]}
 
     if protocol in ("socks", "http"):
         return {"auth": opts.get("auth", "noauth")}
@@ -199,13 +277,16 @@ def build(protocol, transport, security, opts=None):
     for key, label in REQUIRED[protocol]:
         if not opts.get(key):
             raise NodeError(f"{protocol} 需要{label} (opts['{key}'])")
-    if security == "reality" and not opts.get("private_key"):
-        raise NodeError("REALITY 需要私钥 (opts['private_key'])")
+    if security == "reality":
+        _check_reality(opts)
+    if protocol == "shadowsocks":
+        _check_ss(opts.get("method"), opts.get("password"))
 
     inbound = {
         "listen": opts["listen"],
         "port": int(opts["port"]),
-        "protocol": protocol,
+        # hysteria2 是协议族名, 内核侧的 inbound id 是 "hysteria" + version=2
+        "protocol": ("hysteria" if protocol == "hysteria2" else protocol),
         "settings": _settings(protocol, opts),
         "streamSettings": _stream_settings(transport, security, opts),
     }
