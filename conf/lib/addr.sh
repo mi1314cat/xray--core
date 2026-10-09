@@ -97,8 +97,23 @@ x_addr6_real() {
     return 1
 }
 
-# 本机是否有真实 IPv4 / IPv6
-x_has_v4() { ip -4 addr show scope global 2>/dev/null | grep -q "inet "; }
+# 本机是否有**客户端连得上的** IPv4 / IPv6。
+#
+# ★ 两者必须对称地排除隧道网卡。原来 x_has_v4 是直接
+#   `ip -4 addr show scope global | grep -q "inet "` —— 那台只有 awg0
+#   (10.66.66.1) 的机器会被判成"有 IPv4", 而那个地址客户端根本连不上。
+#   而 x_has_v6 早就排除了隧道, 两者判定口径不一致。
+#   实测场景: 机器只有 WARP 的 IPv6 时, 旧写法说"有 IPv6", 于是向导会
+#   引导用户去建 IPv6 节点 —— 建出来的节点谁也连不上。
+x_has_v4() {
+    local dev cidr
+    while read -r dev cidr; do
+        [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && continue
+        case "$cidr" in *:*) continue ;; esac
+        return 0
+    done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2, $4}' | sed 's|/[0-9]*$||')
+    return 1
+}
 x_has_v6() {
     local dev cidr
     while read -r dev cidr; do

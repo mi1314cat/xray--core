@@ -115,8 +115,11 @@ detect_listen_ip() {
     local has_ipv4=false
     local has_ipv6=false
 
-    ip -4 addr show scope global | grep -q "inet " && has_ipv4=true
-    ip -6 addr show scope global | grep -q "inet6 [2-9a-fA-F]" && has_ipv6=true
+    # 走 addr.sh 的统一判定 —— 它会排除隧道/虚拟网卡。
+    # 旧写法直接看接口, 于是只有 WARP IPv6 的机器会被判成"有 IPv6",
+    # 而那个地址客户端连不上, 向导却会引导用户去建 IPv6 节点。
+    x_has_v4 && has_ipv4=true
+    x_has_v6 && has_ipv6=true
 
     if $has_ipv4 && ! $has_ipv6; then echo "ipv4"
     elif ! $has_ipv4 && $has_ipv6; then echo "ipv6"

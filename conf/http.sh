@@ -49,6 +49,14 @@ else
         || { print_error "端口库加载失败"; exit 1; }
 fi
 
+# 对外地址探测库 (单一实现) —— 本地优先, 否则从仓库取
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
+
 # 随机值库: random_path / random_pass / random_user
 # random_user / random_pass 之前都没有定义, 认证用户名和密码会生成成空。
 if [[ -r "$_x_lib_dir/lib/random.sh" ]]; then
@@ -101,8 +109,11 @@ detect_listen_ip() {
     local has_ipv4=false
     local has_ipv6=false
 
-    ip -4 addr show scope global | grep -q "inet " && has_ipv4=true
-    ip -6 addr show scope global | grep -q "inet6 [2-9a-fA-F]" && has_ipv6=true
+    # 走 addr.sh 的统一判定 —— 它会排除隧道/虚拟网卡。
+    # 旧写法直接看接口, 于是只有 WARP IPv6 的机器会被判成"有 IPv6",
+    # 而那个地址客户端连不上, 向导却会引导用户去建 IPv6 节点。
+    x_has_v4 && has_ipv4=true
+    x_has_v6 && has_ipv6=true
 
     if $has_ipv4 && ! $has_ipv6; then echo "ipv4"
     elif ! $has_ipv4 && $has_ipv6; then echo "ipv6"

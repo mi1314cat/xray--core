@@ -408,6 +408,33 @@ NE=$(XRAY_BASE="$NG_T" bash -c "
   check_orphan_nginx" 2>&1)
 echo "$NE" | grep -q '没有发现' && ok "无片段时如实报告 (不凭空造孤儿)" || bad "无片段时报告不正确"
 
+# ---------------------------------------------------------------- 地址族判定
+# 守的是"向导告诉用户有没有 IPv6"这件事。旧写法两处不对称:
+#   x_has_v4 直接 `ip -4 addr show | grep inet` —— 只有 awg0(10.66.66.1) 的
+#     机器会被判成"有 IPv4", 而那个地址客户端连不上;
+#   x_has_v6 排除了隧道, 两者口径不一致。
+# 实测场景: 机器只有 WARP 的 IPv6 时, 旧写法说"有 IPv6", 向导于是引导用户
+# 去建 IPv6 节点 —— 建出来的节点谁也连不上。
+group "地址族判定 (addr.sh)"
+AD="$ROOT/conf/lib/addr.sh"
+# 两个函数必须都引用隧道正则 —— 防止有人只改一个
+for fn in x_has_v4 x_has_v6; do
+    body=$(sed -n "/^${fn}()/,/^}/p" "$AD")
+    echo "$body" | grep -q 'X_TUNNEL_IFACE_RE' \
+        && ok "$fn 排除隧道接口 (与另一个对称)" \
+        || bad "$fn 没有排除隧道接口 —— 只有 WARP 的机器会被误判成'有'"
+done
+# 也不能只看接口就下结论: 必须逐条按 dev 过滤
+for fn in x_has_v4 x_has_v6; do
+    body=$(sed -n "/^${fn}()/,/^}/p" "$AD")
+    echo "$body" | grep -qE 'read -r dev cidr' \
+        && ok "$fn 逐接口判定 (不是整表 grep 一下就算)" \
+        || bad "$fn 没有逐接口判定"
+done
+# 空/异常输入下不能崩
+got=$(bash -c "source '$AD'; x_has_v4 >/dev/null 2>&1; echo rc=\$?")
+[[ "$got" =~ ^rc=[01]$ ]] && ok "x_has_v4 返回 0/1 而不是崩掉" || bad "x_has_v4 异常: $got"
+
 group "节点命名 (naming.sh)"
 # 协议名规范化: 各处的写法收敛成一种
 for pair in "vless:vless" "VLESS:vless" "SS:ss" "shadowsocks:ss" \
