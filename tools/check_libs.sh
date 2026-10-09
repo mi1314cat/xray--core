@@ -1182,6 +1182,52 @@ chk order-first   True  "上移后确实排在前面"
 chk reorder-oob   False "已经在最前时上移返回 False"
 rm -rf "$GT"
 
+# ---------------------------------------------------------------- 更新后生效
+# 一次真实事故：客户端更新到 2.2.0 之后，浏览器里看到的还是旧界面，而磁盘上的
+# panel.py 已经是新的。原因是 cmd_start 用
+#
+#     systemctl enable --now "$unit" || systemctl start "$unit"
+#
+# 而 `enable --now` 对**已经 active** 的单元是**空操作** —— 不报错也不重启。
+# 面板进程把 PAGE 在启动时读进内存，于是永远服务旧界面。
+# 表现是"装完了但什么都没变"，用户自己基本排查不出来。
+group "更新后生效 (_xbd_up_unit)"
+UP="$(mktemp)"
+sed -n '/^_xbd_up_unit()/,/^}/p' "$ROOT/Client/lib/actions.sh" > "$UP"
+[[ -s "$UP" ]] && ok "取到 _xbd_up_unit" || bad "取不到 _xbd_up_unit"
+
+# 用桩记录 systemctl 被怎么调的
+run_up() { # $1=unit_active 的返回值
+  bash -c "
+    set -uo pipefail
+    CALLS=''
+    systemctl() { CALLS=\"\$CALLS \$*\"; }
+    unit_active() { return $1; }
+    source '$UP'
+    _xbd_up_unit demo.service
+    printf '%s' \"\$CALLS\"
+  " 2>/dev/null || true
+}
+# 注意 shell 惯例：unit_active 返回 **0 表示成功 = 正在运行**。
+# 第一版把这两个值写反了，于是"函数明明是对的、测试报红"。
+got=$(run_up 0)     # 0 = 运行中
+case "$got" in
+  *"restart demo.service"*) ok "已运行的单元 → restart（不是 enable --now 空操作）" ;;
+  *) bad "已运行的单元没有 restart" "实际调用:$got" ;;
+esac
+got=$(run_up 1)     # 1 = 未运行
+case "$got" in
+  *"enable --now demo.service"*) ok "未运行的单元 → enable --now" ;;
+  *) bad "未运行的单元没有 enable --now" "实际调用:$got" ;;
+esac
+rm -f "$UP"
+
+# 静态兜底：更新路径上不该再有裸的 enable --now（Xray / 面板）
+grep -q '_xbd_up_unit "\$XBD_U_XRAY"'  "$ROOT/Client/lib/actions.sh" \
+  && ok "Xray 走 _xbd_up_unit" || bad "Xray 仍是裸 enable --now"
+grep -q '_xbd_up_unit "\$XBD_U_PANEL"' "$ROOT/Client/lib/actions.sh" \
+  && ok "面板走 _xbd_up_unit" || bad "面板仍是裸 enable --now"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。

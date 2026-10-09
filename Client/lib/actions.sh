@@ -1048,6 +1048,24 @@ except Exception: print(0)' "$XBD_RUNTIME/xray-gen.json" 2>/dev/null || echo 0)
   fi
 }
 
+# 让一个单元"跑起来、而且跑的是当前这份配置/代码"。
+#
+# ★ `systemctl enable --now` 对**已经 active** 的单元是**空操作** —— 不报错，
+#   也不重启。所以更新之后走一遍 cmd_start，服务其实还在跑旧代码：
+#   面板进程把 PAGE 在启动时读进内存，不重启就永远服务旧界面。
+#   CC 上实测：更新到 2.2.0 之后浏览器里看到的还是旧界面，而磁盘上的
+#   panel.py 已经是新的 —— 面板服务的启动时间停在更新之前。
+#   用户看到的是"装完了但什么都没变"，这是最难自己排查的一类。
+_xbd_up_unit() {
+  local u="$1"
+  if unit_active "$u"; then
+    # 起着，但要换一份 → restart（不是 start，start 对 active 单元也是空操作）
+    systemctl restart "$u" 2>/dev/null || systemctl start "$u"
+  else
+    systemctl enable --now "$u" >/dev/null 2>&1 || systemctl start "$u"
+  fi
+}
+
 cmd_start() {
   need_root
   require_current_node >/dev/null
@@ -1055,7 +1073,7 @@ cmd_start() {
   cmd_apply
 
   step "启动 Xray（唯一实例：SOCKS + HTTP）"
-  systemctl enable --now "$XBD_U_XRAY" >/dev/null 2>&1 || systemctl start "$XBD_U_XRAY"
+  _xbd_up_unit "$XBD_U_XRAY"
   sleep 4
   unit_active "$XBD_U_XRAY" && ok "$XBD_U_XRAY: RUNNING" || { bad "$XBD_U_XRAY 启动失败"; journalctl -u "$XBD_U_XRAY" -n 15 --no-pager; return 1; }
   # Xray 重启换了 CSRF token，浏览器必须跟着重启（旧 WS 会挂着但已失效）
@@ -1090,7 +1108,7 @@ cmd_start() {
   fi
 
   step "启动面板"
-  systemctl enable --now "$XBD_U_PANEL" >/dev/null 2>&1 || systemctl start "$XBD_U_PANEL"
+  _xbd_up_unit "$XBD_U_PANEL"
   sleep 2
   unit_active "$XBD_U_PANEL" && ok "$XBD_U_PANEL: RUNNING ($(xbd_panel_url))" || warn "面板未启动（不影响代理）"
 
