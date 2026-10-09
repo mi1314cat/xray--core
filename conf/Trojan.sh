@@ -79,6 +79,15 @@ else
     source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/ports.sh") \
         || { print_error "端口库加载失败"; exit 1; }
 fi
+
+# 随机值库: random_path / random_pass / random_user
+# random_pass 之前根本没有定义, 调用得到空串 —— 节点能建能连, 但密码是空的。
+if [[ -r "$_x_lib_dir/lib/random.sh" ]]; then
+    source "$_x_lib_dir/lib/random.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/random.sh") \
+        || { print_error "随机值库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================

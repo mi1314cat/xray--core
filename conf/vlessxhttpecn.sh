@@ -70,6 +70,15 @@ else
     source <(curl -fsSL "$_x_lib_base/ports.sh") \
         || { print_error "端口库加载失败"; exit 1; }
 fi
+
+# 随机值库: random_path / random_pass / random_user
+# random_path 只定义在 conf/fd/legacy/server-reverse.sh, 这里调到的是空 —— XHTTP 路径退化成 "/"。
+if [[ -r "$_x_lib_dir/lib/random.sh" ]]; then
+    source "$_x_lib_dir/lib/random.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/random.sh") \
+        || { print_error "随机值库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
@@ -177,6 +186,13 @@ detect_public_ip() {
         echo "$(clean_input "$ip")"
         return
     fi
+    # XBD_PUBLIC_IP 直通: 双端验证要固定 IP, 否则每次生成都依赖外网探测结果,
+    # 复现不了。
+    if [ -n "${XBD_PUBLIC_IP:-}" ]; then
+        print_info "使用指定 IP: $XBD_PUBLIC_IP"
+        echo "$XBD_PUBLIC_IP"
+        return
+    fi
     print_info "检测到 IP: $ip"
     read -r -p "使用此IP？(回车默认): " user_ip
     user_ip=$(clean_input "$user_ip")
@@ -265,6 +281,18 @@ ask_cert() {
     echo "  1) 已有证书 (自动检测: /root/catmi/cloudflare/certs / /root/catmi / Nginx 容器)" >&2
     echo "  2) 手动输入证书路径" >&2
     echo "  3) 自签证书 (内测/无域名兜底)" >&2
+    # XBD_CERT 指向 crt 路径时直接用它, 跳过整个选择菜单。
+    if [ -n "${XBD_CERT:-}" ] && [ -f "${XBD_CERT}" ]; then
+        print_info "使用指定证书: $XBD_CERT"
+        CERT_FILE="$XBD_CERT"
+        KEY_FILE="${XBD_CERT_KEY:-${XBD_CERT%.crt}.key}"
+        if [ -f "$KEY_FILE" ]; then
+            CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE")
+            print_ok "使用证书: $CERT_DOMAIN"
+            return 0
+        fi
+        print_warn "指定的证书没有对应密钥: $KEY_FILE, 回到选择菜单"
+    fi
     printf "  选择 (默认1): " >&2
     read -r yn
     case "$(clean_input "$yn")" in
@@ -407,8 +435,30 @@ generate_cert() {
         return 0
     fi
 
+    # SAN 是必须的, 不是可选的。
+    #
+    # `openssl req -subj "/CN=$dom"` 出来的证书只有 legacy Common Name,
+    # 没有 Subject Alternative Name。现代 Xray 直接拒:
+    #     tls: failed to verify certificate:
+    #         x509: certificate relies on legacy Common Name field
+    #         use SANs instead
+    #
+    # 而自签证书的默认路径恰恰是"直接交给客户端用"(客户端要 pin 这张
+    # 证书, 不走公网 CA), 所以缺 SAN 等于这条节点必然连不通 —— 而且
+    # 服务端一切正常, run -test 也过, 只有真连才暴露。
+    #
+    # DNS.1 之外补一个 IP:1, 是为了让内网/直连 IP 访问的场景也能过校验。
     openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY_FILE" -out "$CERT_FILE" \
-        -days 3650 -subj "/CN=$dom" >/dev/null 2>&1
+        -days 3650 -subj "/CN=$dom" \
+        -addext "subjectAltName=DNS:$dom,DNS:localhost,IP:127.0.0.1,IP:0.0.0.0" \
+        >/dev/null 2>&1
+    # 老 openssl 不认 -addext (1.1.1 以下), 用 config 兜一次
+    if ! openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep -q "Subject Alternative Name"; then
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -days 3650 -subj "/CN=$dom" -extensions v3_req -config <(printf \
+            '[req]\ndistinguished_name=dn\n[dn]\n[v3_req]\nsubjectAltName=DNS:%s,DNS:localhost,IP:127.0.0.1,IP:0.0.0.0\n' "$dom") \
+            >/dev/null 2>&1
+    fi
 
     if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
         print_ok "自签证书已生成: $dom (有效期 10 年)"
@@ -449,42 +499,72 @@ ask_features() {
     ECH_MODE="cdn"            # cdn(Cloudflare ECH) | direct(xray 原生 ECH)
     MLKEM_ENABLED=true
 
-    echo "  传输方式 (二选一):" >&2
-    echo "  1) WS (WebSocket, CDN 最兼容, 推荐)" >&2
-    echo "  2) XHTTP (XHTTP+CDN, 抗识别更强)" >&2
-    printf "  选择 (默认1): " >&2
-    read -r yn
-    case "$(clean_input "$yn")" in
-        2) VLESS_TRANSPORT="xhttp" ;;
-        *) VLESS_TRANSPORT="ws" ;;
-    esac
+    # 环境变量直通, 让这一段可以脚本化。
+    #
+    # 为什么需要: 双端验证要求"服务端生成 → 客户端连接 → 抓包"整条链可重复。
+    # 纯交互的话, 每次生成节点都得人工按键, 而且没法在验证脚本里断言
+    # "这个组合被覆盖了"。变量没设时行为完全不变, 交互用户不受影响。
+    #
+    #   XBD_FEAT_TRANSPORT=ws|xhttp
+    #   XBD_FEAT_ACCESS=cdn|nginx
+    #   XBD_FEAT_MLKEM=1|0
+    #   XBD_FEAT_ECH=cdn|direct
+    if [ -n "${XBD_FEAT_TRANSPORT:-}" ]; then
+        VLESS_TRANSPORT="$XBD_FEAT_TRANSPORT"
+        echo "  传输: $VLESS_TRANSPORT (来自 XBD_FEAT_TRANSPORT)" >&2
+    else
+        echo "  传输方式 (二选一):" >&2
+        echo "  1) WS (WebSocket, CDN 最兼容, 推荐)" >&2
+        echo "  2) XHTTP (XHTTP+CDN, 抗识别更强)" >&2
+        printf "  选择 (默认1): " >&2
+        read -r yn
+        case "$(clean_input "$yn")" in
+            2) VLESS_TRANSPORT="xhttp" ;;
+            *) VLESS_TRANSPORT="ws" ;;
+        esac
+    fi
 
-    echo "  接入方式:" >&2
-    echo "  1) CDN 直连 (监听 0.0.0.0, Cloudflare 回源到端口, 最直接)" >&2
-    echo "  2) Nginx 转发 (监听 127.0.0.1, 走 nginx 路径匹配统一入口)" >&2
-    printf "  选择 (默认1): " >&2
-    read -r yn
-    case "$(clean_input "$yn")" in
-        2) ACCESS_MODE="nginx" ;;
-        *) ACCESS_MODE="cdn" ;;
-    esac
+    if [ -n "${XBD_FEAT_ACCESS:-}" ]; then
+        ACCESS_MODE="$XBD_FEAT_ACCESS"
+        echo "  接入: $ACCESS_MODE (来自 XBD_FEAT_ACCESS)" >&2
+    else
+        echo "  接入方式:" >&2
+        echo "  1) CDN 直连 (监听 0.0.0.0, Cloudflare 回源到端口, 最直接)" >&2
+        echo "  2) Nginx 转发 (监听 127.0.0.1, 走 nginx 路径匹配统一入口)" >&2
+        printf "  选择 (默认1): " >&2
+        read -r yn
+        case "$(clean_input "$yn")" in
+            2) ACCESS_MODE="nginx" ;;
+            *) ACCESS_MODE="cdn" ;;
+        esac
+    fi
 
-    printf "启用 ML-KEM-768 后量子加密 (vlessenc)? (Y/n): " >&2
-    read -r yn
-    case "$(clean_input "$yn")" in
-        n|N) MLKEM_ENABLED=false ;;
-        *) MLKEM_ENABLED=true ;;
-    esac
+    if [ -n "${XBD_FEAT_MLKEM:-}" ]; then
+        [ "$XBD_FEAT_MLKEM" = "0" ] && MLKEM_ENABLED=false || MLKEM_ENABLED=true
+        echo "  ML-KEM: $MLKEM_ENABLED (来自 XBD_FEAT_MLKEM)" >&2
+    else
+        printf "启用 ML-KEM-768 后量子加密 (vlessenc)? (Y/n): " >&2
+        read -r yn
+        case "$(clean_input "$yn")" in
+            n|N) MLKEM_ENABLED=false ;;
+            *) MLKEM_ENABLED=true ;;
+        esac
+    fi
 
-    echo "  ECH 形态:" >&2
-    echo "  1) CDN-ECH (Cloudflare 边缘处理 ECH, 无需服务器密钥, 推荐)" >&2
-    echo "  2) 直连 ECH (Xray 原生 echServerKeys, 需 TLS1.3)" >&2
-    printf "  选择 (默认1): " >&2
-    read -r yn
-    case "$(clean_input "$yn")" in
-        2) ECH_MODE="direct" ;;
-        *) ECH_MODE="cdn" ;;
-    esac
+    if [ -n "${XBD_FEAT_ECH:-}" ]; then
+        ECH_MODE="$XBD_FEAT_ECH"
+        echo "  ECH: $ECH_MODE (来自 XBD_FEAT_ECH)" >&2
+    else
+        echo "  ECH 形态:" >&2
+        echo "  1) CDN-ECH (Cloudflare 边缘处理 ECH, 无需服务器密钥, 推荐)" >&2
+        echo "  2) 直连 ECH (Xray 原生 echServerKeys, 需 TLS1.3)" >&2
+        printf "  选择 (默认1): " >&2
+        read -r yn
+        case "$(clean_input "$yn")" in
+            2) ECH_MODE="direct" ;;
+            *) ECH_MODE="cdn" ;;
+        esac
+    fi
 }
 
 # ================================
@@ -969,6 +1049,33 @@ EOF
     # Bug: xrayls 26.3.27 要求 VLESS users 必含 encryption 字段 (无 ML-KEM 时须为 none, 否则拒启)
     local xray_enc_conf=", \"encryption\": \"${CLIENT_ENC:-none}\""
 
+    # 自签证书必须 pin, 否则客户端一定连不通。
+    #
+    # 实测 (RN 生成 + CC 连接 + 抓包, 端口 22168): 不 pin 时报
+    #     tls: failed to verify certificate:
+    #         x509: certificate signed by unknown authority
+    # 因为自签证书的签发者不在任何信任链里, 客户端没有理由信任它。
+    #
+    # 字段有两个坑, 都是实测踩出来的:
+    #   1. allowInsecure 在 Xray 26.x 已被移除:
+    #      "The feature \"allowInsecure\" has been removed and migrated to
+    #       pinnedPeerCertSha256"
+    #   2. pinnedPeerCertSha256 收**十六进制**字符串, 不是 base64, 也不是数组。
+    #      给 base64 会报 "encoding/hex: invalid byte", 给数组会报
+    #      "cannot unmarshal array into Go struct field TLSConfig"。
+    #
+    # 用公网 CA 签的证书走正常校验, 不需要 pin —— 那时 pin 反而多余,
+    # 证书换了就得重算指纹。
+    local CLIENT_PIN_FIELD=""
+    local _pin_hex
+    if [ -f "$CERT_FILE" ] && _pin_hex=$(openssl x509 -in "$CERT_FILE" -outform DER 2>/dev/null \
+        | openssl dgst -sha256 -hex 2>/dev/null | awk '{print $NF}') \
+        && [ -n "$_pin_hex" ]; then
+        CLIENT_PIN_FIELD=",
+          \"pinnedPeerCertSha256\": \"$_pin_hex\""
+        print_info "客户端 pin 自签证书 SHA256: ${_pin_hex:0:16}..."
+    fi
+
     if [[ "$VLESS_TRANSPORT" = "xhttp" ]]; then
         xray_net_conf="\"xhttpSettings\": {
               \"path\": \"$XHTTP_PATH\",
@@ -1018,7 +1125,7 @@ EOF
           "serverName": "$CLIENT_SNI",
           "minVersion": "1.3",
           "echConfigList": "$xray_ech",
-          "encryptedClientHelloEnabled": true
+          "encryptedClientHelloEnabled": true$CLIENT_PIN_FIELD
         },
         $xray_net_conf
       }
