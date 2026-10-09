@@ -1092,6 +1092,26 @@ got=$(fam_check v6);   assert_eq "$got" "UseIPv6 UseIPv6" "v6 强制只走 IPv6"
 # auto 必须是默认值，否则不传 --family 的调用方会被改行为
 grep -q 'add_argument("--family".*default="auto"' "$ROOT/Client/lib/genconfig.py" \
   && ok "--family 默认 auto" || bad "--family 默认值不是 auto"
+
+# ★ 回读校验本身必须真的读得到东西。
+#   第一版用的是 `grep -o '"tag": *"direct"[^}]*}'` —— 而配置是**带换行的
+#   格式化 JSON**，[^}]* 跨不了行，永远匹配不到，于是那条"回读校验"变成空跑：
+#   开关看着生效了，其实没有任何东西在验。这类"假门禁"比没有门禁更糟。
+_strategy_of() { # <配置文件>
+  XBD_RUNTIME="$(dirname "$1")" bash -c "
+    source <(sed -n '/^_xbd_direct_strategy()/,/^}/p' '$ROOT/Client/lib/actions.sh')
+    _xbd_direct_strategy" 2>/dev/null || true
+}
+python3 "$ROOT/Client/lib/genconfig.py" --node "$FAMT/n.json" --output "$FAMT/rd6.json" \
+  --mode normal --listen 127.0.0.1 --port-normal 1080 --family v6 --logs "$FAMT" >/dev/null 2>&1
+# 读取器按 $XBD_RUNTIME/xray-client.json 找文件，这里造一个同名的
+mkdir -p "$FAMT/rt" && cp "$FAMT/rd6.json" "$FAMT/rt/xray-client.json"
+got=$(_strategy_of "$FAMT/rt/xray-client.json")
+assert_eq "$got" "UseIPv6" "回读函数能从**格式化 JSON** 里读出 direct 的 domainStrategy"
+# 反证：grep 那种写法在这份文件上确实读不到（保住这条注释的依据）
+g=$(grep -o '"tag": *"direct"[^}]*}' "$FAMT/rt/xray-client.json" 2>/dev/null | head -1 || true)
+[[ -z "$g" ]] && ok "（反证）单纯的 grep 跨行读不到 —— 所以必须用解析" \
+              || bad "（反证）grep 竟然读到了，注释里的理由需要更新"
 rm -rf "$FAMT"
 
 # ---------------------------------------------------------------- 并发写

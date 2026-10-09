@@ -2892,6 +2892,24 @@ cmd_menu() {
   _mmenu
 }
 
+# 读运行配置里 direct 出站的 domainStrategy。
+# ★ 不能用 grep 取：配置是**带换行的格式化 JSON**，`"tag": "direct"[^}]*}`
+#   这种模式跨不了行，永远匹配不到 —— 于是"回读校验"变成空跑，
+#   开关看着生效了其实没人验。用真解析。
+_xbd_direct_strategy() {
+  python3 - "$XBD_RUNTIME/xray-client.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    for o in d.get("outbounds", []):
+        if o.get("tag") == "direct":
+            print((o.get("settings") or {}).get("domainStrategy", ""))
+            break
+except Exception:
+    pass
+PY
+}
+
 cmd_family() {
   local op="${1:-status}"
   case "$op" in
@@ -2925,8 +2943,7 @@ _xbd_family_set() {
   cmd_apply >/dev/null 2>&1 || true   # 它失败会自己 die
   local want now
   case "$v" in v4) want="UseIPv4" ;; v6) want="UseIPv6" ;; *) want="UseIPv4" ;; esac
-  # grep -c 无匹配时返回 1，在 set -euo pipefail 下必须 || true
-  now=$(grep -o '"tag": *"direct"[^}]*}' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | grep -o 'UseIPv[46]' | head -1 || true)
+  now=$(_xbd_direct_strategy)
   if [ -n "$now" ] && [ "$now" != "$want" ]; then
     warn "配置里 direct 出站是 $now，期望 $want —— 开关已保存但可能没生效"
     warn "xbd apply 看详情"
@@ -2945,7 +2962,7 @@ _xbd_family_set() {
 _xbd_family_status() {
   local v now
   v=$(_xbd_family)
-  now=$(grep -o '"tag": *"direct"[^}]*}' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | grep -o 'UseIPv[46]' | head -1 || true)
+  now=$(_xbd_direct_strategy)
   case "$v" in
     v4) printf '  \033[32m强制 IPv4\033[0m   直连出站与 DNS 都只走 IPv4\n' ;;
     v6) printf '  \033[32m强制 IPv6\033[0m   直连出站与 DNS 都只走 IPv6\n' ;;
