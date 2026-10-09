@@ -58,7 +58,7 @@ mkdir -p "$CONF_DIR" "$OUT_DIR"
 # 副本时代改一处漏一处 —— 批量区间分配只进了 4 个脚本, 另外 5 个的批量
 # 生成仍在用随机端口, 同一批节点端口散落在 10000-60000。
 _x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-_x_lib_base="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib"
+_x_lib_base="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib"
 if [[ -r "$_x_lib_dir/lib/cert.sh" ]]; then
     source "$_x_lib_dir/lib/cert.sh"
 else
@@ -76,7 +76,7 @@ fi
 if [[ -r "$_x_lib_dir/lib/random.sh" ]]; then
     source "$_x_lib_dir/lib/random.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/random.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/random.sh") \
         || { print_error "随机值库加载失败"; exit 1; }
 fi
 # ================================

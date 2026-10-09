@@ -18,7 +18,7 @@ if [[ -r "$_LOG_DIR/lib/service.sh" ]]; then
 else
     svc="$(mktemp -t service.XXXXXX.sh)"
     trap 'rm -f "$svc"' RETURN
-    curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/service.sh" \
+    curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/service.sh" \
         -o "$svc" || { printf '\033[31m[错误] 获取 service.sh 失败\033[0m\n'; return 1; }
     source "$svc"
 fi

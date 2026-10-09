@@ -833,6 +833,81 @@ for u in $(grep -oE 'https://github.com/mi1314cat/xray--core/raw/refs/heads/main
 done
 [[ -z "$BADURL" ]] && ok "面板引用的脚本都存在" || bad "面板引用了不存在的文件:$BADURL"
 
+# ---------------------------------------------------------------- 面板取文件
+group "面板取文件 (XRAY_RAW / 铺 lib / 404)"
+PAN="$ROOT/xray-panel.sh"
+
+# ★ 清单漂移守卫: 这个清单本可以提前发现 conf/lib/print.sh 漏登记。
+#   漏一个的症状是"某个菜单项报 库加载失败", 而不是面板打不开 —— 很难查。
+# 清单是数组, 一行里可能并排好几个 —— 必须按"词"取, 不能按行首匹配。
+liblist=$(sed -n '/^_XRAY_LIB_FILES=(/,/^)/p' "$PAN" \
+          | tr ' \t' '\n\n' | grep -oE '^[A-Za-z0-9_.]+\.(sh|py)$')
+missing=""
+for f in $(ls "$ROOT/conf/lib" | grep -v __pycache__); do
+    printf '%s\n' "$liblist" | grep -qx "$f" || missing="$missing $f"
+done
+[[ -z "$missing" ]] && ok "_XRAY_LIB_FILES 覆盖 conf/lib/ 全部文件" \
+    || bad "_XRAY_LIB_FILES 漏了:$missing"
+
+# 清单里写的文件必须真的存在 (反向: 写了仓库里没有的 → 每次都要等 404)
+bogus=""
+for f in $(sed -n '/^_XRAY_LIB_FILES=(/,/^)/p' "$PAN" | grep -oE '[A-Za-z0-9_.]+\.(sh|py)'); do
+    [[ -f "$ROOT/conf/lib/$f" ]] || bogus="$bogus $f"
+done
+[[ -z "$bogus" ]] && ok "_XRAY_LIB_FILES 里没有不存在的文件" || bad "清单里有不存在的文件:$bogus"
+
+# xray_run 必须铺 lib, 否则每个菜单项都会掉进脚本自己的 github 兜底
+grep -q 'xray_ensure_lib' "$PAN" && ok "xray_run 会铺 lib" || bad "xray_run 没调 xray_ensure_lib"
+# 而且要把可用的源交给子脚本
+sed -n '/^xray_run()/,/^}/p' "$PAN" | grep -q 'XRAY_RAW="\$base" bash' \
+    && ok "xray_run 把可用源通过 XRAY_RAW 交给子脚本" \
+    || bad "xray_run 没有把可用源交给子脚本 (兜底仍会走写死的 github)"
+
+# ★ 回归守卫: 这条警告必须在 stderr。打在 stdout 会被 $(xray_pick_source) 一起
+#   捕获, 拼出的 URL 前面挂着一行带 ANSI 码的提示, curl 必然失败。
+sed -n '/^xray_pick_source()/,/^}/p' "$PAN" | grep -q '已选用镜像.*>&2' \
+    && ok "xray_pick_source 的警告走 stderr" \
+    || bad "xray_pick_source 的警告又打到 stdout 了 —— 会污染 \$(...) 捕获"
+
+# ★ 404 短路: 仓库只有一份, 这个源说没有别的源也不会有。
+#   逐个重试既慢, 又把"文件不存在"报成"镜像链全不通"。
+sed -n '/^xray_fetch_to()/,/^}/p' "$PAN" | grep -q '404' \
+    && ok "xray_fetch_to 对 404 短路" || bad "xray_fetch_to 没有 404 短路 (会白试所有镜像)"
+
+# 每个脚本内部的 github 兜底都要能被 XRAY_RAW 覆盖。
+# 未设 XRAY_RAW 时展开结果与原 URL 逐字节相同 —— 独立运行行为不变。
+badfb=""
+for f in $(grep -rl '"https://github.com/mi1314cat/xray--core/raw/refs/heads/main' "$ROOT/conf" 2>/dev/null); do
+    badfb="$badfb $(basename "$f")"
+done
+[[ -z "$badfb" ]] && ok "conf/ 下的兜底全部可被 XRAY_RAW 覆盖" \
+    || bad "仍有写死 github 的兜底:$badfb"
+
+# 展开式必须闭合 (上次漏了 } 直接把一个文件弄成语法错误)
+unbalanced=""
+for f in $(grep -rl 'XRAY_RAW:-https://github.com/mi1314cat' "$ROOT/conf" "$PAN" 2>/dev/null); do
+    # 只数"被替换过的那一种"(默认值是 github.com 那条), 不数
+    # XRAY_RAW="${XRAY_RAW:-https://raw.githubusercontent.com/...}" 这类别的默认值。
+    n1=$(grep -o '\${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main' "$f" | wc -l)
+    n2=$(grep -o '\${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}' "$f" | wc -l)
+    [[ "$n1" = "$n2" ]] || unbalanced="$unbalanced $(basename "$f")($n1/$n2)"
+done
+[[ -z "$unbalanced" ]] && ok "所有 \${XRAY_RAW:-...} 都闭合" \
+    || bad "有未闭合的展开:$unbalanced"
+
+# 未设 XRAY_RAW 时展开必须与原值一致 —— 这是"独立运行行为不变"的依据
+got=$(bash -c 'unset XRAY_RAW; printf "%s" "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh"')
+assert_eq "$got" "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh" \
+    "未设 XRAY_RAW 时展开结果与原 URL 一致"
+
+# 兜底 URL 指向的文件必须真实存在 (拼错的话只在最需要它的那一刻才 404)
+badurl=""
+for u in $(grep -rhoE 'raw/refs/heads/main\}/?[A-Za-z0-9_/.-]+\.(sh|py)' "$ROOT/conf" "$PAN" 2>/dev/null | sort -u); do
+    p="${u#*main\}/}"
+    [[ -f "$ROOT/$p" ]] || badurl="$badurl $p"
+done
+[[ -z "$badurl" ]] && ok "兜底 URL 指向的文件都存在" || bad "兜底 URL 指向不存在的文件:$badurl"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。

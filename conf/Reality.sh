@@ -70,7 +70,7 @@ _x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [[ -r "$_x_lib_dir/lib/ports.sh" ]]; then
     source "$_x_lib_dir/lib/ports.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/ports.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/ports.sh") \
         || { print_error "端口库加载失败"; exit 1; }
 fi
 # ================================

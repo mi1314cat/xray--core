@@ -5,7 +5,7 @@ _x_read_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
 if [[ -r "$_x_read_lib_dir/read.sh" ]]; then
     source "$_x_read_lib_dir/read.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/read.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/read.sh") \
         || { printf '输入库加载失败\n' >&2; exit 1; }
 fi
 
@@ -1174,7 +1174,7 @@ wizard_freedom() {
 if [[ -r "$_lib_dir/lib/naming.sh" ]]; then
     source "$_lib_dir/lib/naming.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/naming.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/naming.sh") \
         || { print_error "命名库加载失败"; exit 1; }
 fi
 
@@ -1183,7 +1183,7 @@ fi
 if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
     source "$_x_lib_dir/lib/addr.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh") \
         || { print_error "地址库加载失败"; exit 1; }
 fi
 
@@ -1896,7 +1896,7 @@ _x_svc_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
 if [[ -r "$_x_svc_lib_dir/service.sh" ]]; then
     source "$_x_svc_lib_dir/service.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/service.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/service.sh") \
         || { print_error "服务库加载失败"; return 1; }
 fi
 

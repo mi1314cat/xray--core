@@ -5,7 +5,7 @@ _x_read_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
 if [[ -r "$_x_read_lib_dir/read.sh" ]]; then
     source "$_x_read_lib_dir/read.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/read.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/read.sh") \
         || { printf '输入库加载失败\n' >&2; exit 1; }
 fi
 
@@ -359,7 +359,7 @@ _x_svc_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
 if [[ -r "$_x_svc_lib_dir/service.sh" ]]; then
     source "$_x_svc_lib_dir/service.sh"
 else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/service.sh") \
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/service.sh") \
         || { print_error "服务库加载失败"; return 1; }
 fi
 

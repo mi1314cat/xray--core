@@ -45,7 +45,7 @@ XRAY_BIN="${XRAY_BIN:-}"
 
 # 端口绑定核对依赖 ports.sh 的 x_port_in_use, 两个库一起加载。
 _x_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-_x_lib_base="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib"
+_x_lib_base="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib"
 [[ -r "$_x_lib_dir/lib/ports.sh" ]] && source "$_x_lib_dir/lib/ports.sh" \
     || source <(curl -fsSL "$_x_lib_base/ports.sh") || true
 [[ -r "$_x_lib_dir/lib/verify.sh" ]] && source "$_x_lib_dir/lib/verify.sh" \

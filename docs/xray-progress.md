@@ -413,42 +413,53 @@ curl -Ls "https://raw.githubusercontent.com/mi1314cat/xray--core/<commit>/conf/s
 按 commit 拉不受分支缓存影响。这条与 §二 记的"本地改了不生效，必须先 push"
 是同一类坑的第二层 —— **push 了也可能还要等几分钟**。
 
-## 九、镜像链只做了一半 —— §八 那些「例外」的续集
+## 九、镜像链只做了一半 —— 已修（2026-10-09 晚）
 
-面板侧的镜像链是完整的：19 个菜单项全部改走 `xray_run` → `xray_fetch`，带
-`XRAY_MIRRORS` 多源回退。`conf/lib/fetch.sh`（`X_REPO_MIRRORS` + `x_fetch`）
-也已经建好，并有 3 条断言守着。
+§八 那句「内联 `source <(curl ...)` 的那几个文件是例外 —— 它们本来就考虑了
+这一点」只对了一半：它们解决了**找得到**依赖，没解决**取得到**依赖 —— 兜底
+分支写死 github.com，而那恰恰是国内网络取不到的那条路。
 
-**但是**：各协议脚本内部的**依赖兜底加载**仍然是直连 github.com：
+复查统计：17 个脚本、**40 处**硬编码兜底；`conf/share.sh` 的 `_x_fetch` 也是
+单源。已修的部分：
 
-```bash
-if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
-    source "$_x_lib_dir/lib/addr.sh"
-else
-    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh") \
-        || die "..."
-fi
-```
+### 1. 面板把 conf/lib 铺到「脚本旁边」（主修）
 
-实测统计（`grep -rn 'source <(curl -fsSL "https://github.com/'`）：
+各协议脚本按 `dirname $BASH_SOURCE/lib` 找依赖，而 `xray_fetch` 把
+`conf/http.sh` 落成 `$CACHE/conf_http.sh` —— 它要的是 `$CACHE/lib/`，
+不存在。于是每个菜单项都掉进兜底分支。
 
-| | |
+**全新安装走的必定是这条**：`install.sh` 只取面板和卸载脚本，`conf/` 树由面板
+按需取。所以这不是边缘情况，是首次安装的主路径。
+
+新增 `xray_ensure_lib()`：本地检出目录优先（快，且就是当前代码），否则按
+`_XRAY_LIB_FILES` 清单沿镜像链补齐。`xray_run` 执行前调用它。
+
+**RN 实测**：全新会话（脚本旁边没有 `conf/lib`）→ 5 秒铺好 18 个文件 →
+脚本命中的本地分支成立 → 真跑 `conf/http.sh` 正常出横幅；
+同一会话第二次调用 0 秒短路。
+
+### 2. 顺带修掉三个真问题
+
+| 问题 | 症状 |
 |---|---|
-| 出现次数 | **40** |
-| 涉及文件 | **17**（`conf/` 下 13 个 + 根目录 `VEVLRE.sh` / `ngcadall.sh` / `nginx.sh` / `caddy.sh`） |
+| `xray_pick_source` 的警告打在 **stdout** | 调用处是 `base=$(xray_pick_source)`，警告被一起捕获 —— 拼出的 URL 前面挂着一行带 ANSI 码的提示。**切到镜像后的第一次取文件必定白等一个 30 秒超时**，靠后面的重试循环才救回来。已改走 stderr |
+| 404 之后仍逐个重试所有镜像 | 既慢（19 个文件里有一个不存在就多等 6 轮），又把**「文件不存在」报成「镜像链全不通」** —— 把人往网络问题上带。现在 404 直接短路并明确报「仓库里没有 X，清单写错了?」 |
+| 子脚本兜底写死 github.com | 33 处改成 `${XRAY_RAW:-<原值>}`，面板把**本次实际可用的源**通过 `XRAY_RAW` 交给子脚本。未设 `XRAY_RAW` 时展开结果与原 URL 逐字节相同，**独立运行行为不变**（有断言守着） |
 
-**为什么这个缺口要紧**：这条 `else` 分支恰恰是"本地没有 lib"时才走的 ——
-也就是 `bash <(curl ...)` 首次运行、以及国内网络连不上 github.com 的时候。
-换句话说，**镜像链存在的唯一理由，正好就是这条没走镜像链的路径**。
-另外 `conf/share.sh` 的 `_x_fetch` 也是单源（`$XRAY_RAW`），没接 `X_REPO_MIRRORS`。
+### 3. 还没做的
 
-### 建议做法（不要在收尾时仓促做）
+还有 7 处兜底是 `bash <(curl ...)` 直接拉别的脚本（`conf/nconf.sh`、
+`nginx.sh`、`caddy.sh` 等，见 `Conversion.sh` / `ngcadall.sh`），属于**手动直跑**
+路径，面板菜单已经全部改走 `xray_run`，不受影响。留着不动。
 
-不要逐个脚本内联一段镜像循环 —— 那是把重复从 40 处换成 17 处。正确做法是
-一个 `conf/lib/deps.sh`，提供 `x_dep <lib 文件名>`（本地三级查找 → 镜像链），
-各脚本的 `else` 分支改成调它。难点在**它自己怎么被加载**（鸡生蛋）：需要一段
-不超过 3 行的引导，且镜像表要能从脚本内部拿到（不能依赖面板的 `XRAY_MIRRORS`）。
+### 4. 门禁
 
-改完必须在 **RN 测试机**上按"模拟 curl 路径"验证：把脚本复制到临时目录再执行、
-并临时把 lib 目录改名，否则这条分支永远不会被测到 —— 这也正是它至今没被发现的
-原因（面板菜单路径被测试覆盖了，脚本内部路径没有）。
+新增 10 条断言（`面板取文件` 分组），其中两条是**防复发**的：
+`xray_pick_source` 的警告必须在 stderr、`xray_fetch_to` 必须有 404 短路；
+还有一条**清单漂移守卫**（`_XRAY_LIB_FILES` 必须覆盖 `conf/lib/` 全部文件）——
+它本来就能提前发现 `conf/lib/print.sh` 漏登记，而不是等到某个菜单项报
+「库加载失败」。
+
+> 教训：`${XRAY_RAW:-` 的收尾 `}` 漏写，会让**整行**的引号被吃进参数展开，
+> 一个文件直接语法错误。第一次替换就是这么把 `conf/Reality.sh` 弄坏的。
+> 所以门禁里专门有一条数「未闭合的展开」。

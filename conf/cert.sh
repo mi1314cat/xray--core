@@ -38,7 +38,7 @@ _cr_source() {
         return 0
     fi
     f="$(mktemp -t "${name}.XXXXXX")"
-    if ! curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/$name" -o "$f"; then
+    if ! curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/$name" -o "$f"; then
         _rd "[错误] 获取 $name 失败"
         rm -f "$f"
         return 1

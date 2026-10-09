@@ -23,7 +23,7 @@ dns_run() {
     if [[ ! -r "$script" ]]; then
         script="$(mktemp -t dns_edit.XXXXXX.py)"
         trap 'rm -f "$script"' RETURN
-        curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/dns_edit.py" \
+        curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/dns_edit.py" \
             -o "$script" || { _e "获取 dns_edit.py 失败"; return 1; }
     fi
     python3 "$script" "$@"

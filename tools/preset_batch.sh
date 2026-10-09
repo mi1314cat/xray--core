@@ -25,7 +25,7 @@ _lib() {
   local n="$1" f="$_XD/conf/lib/$1"
   [[ -r "$f" ]] && { printf '%s' "$f"; return; }
   f="$(mktemp -t "${n}.XXXXXX")"
-  curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/$n" -o "$f" \
+  curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/$n" -o "$f" \
     || { _e "获取 $n 失败"; return 1; }
   printf '%s' "$f"
 }

@@ -110,7 +110,7 @@ _nginx_apply_py() {
     f="$(dirname "${BASH_SOURCE[0]:-$0}")/lib/nginx_apply.py"
     if [[ -r "$f" ]]; then printf '%s' "$f"; return 0; fi
     f="$(mktemp -t nginx_apply.XXXXXX.py)"
-    curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/nginx_apply.py" -o "$f" \
+    curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/nginx_apply.py" -o "$f" \
         || { rm -f "$f"; return 1; }
     printf '%s' "$f"
 }

@@ -21,7 +21,7 @@ _MK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _mk_lib() {
     local name="$1" dest
     dest="$(mktemp -t "${name}.XXXXXX")"
-    if ! curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/$name" \
+    if ! curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/$name" \
          -o "$dest"; then
         printf '\033[31m[错误] 获取 %s 失败\033[0m\n' "$name" >&2
         rm -f "$dest"

@@ -48,10 +48,50 @@ xray_pick_source() {
             # 整条链全废 (两个内核的注释里都记着这一条)
             if curl -fsSL --max-time 25 "$base/$XRAY_PROBE" -o /dev/null 2>/dev/null; then
                 _XRAY_SRC="$base"
-                [[ "$base" == "$XRAY_RAW" ]] || echo -e "${YELLOW}[!] 主站不通, 已选用镜像 $(printf '%s' "$base" | cut -d/ -f3)${PLAIN}"
+                # ★ 这条警告必须走 stderr。调用处是 `base=$(xray_pick_source)`,
+                #   打到 stdout 会被一起捕获 —— 拼出来的 URL 前面挂着一行
+                #   带 ANSI 码的提示, curl 必然失败, 于是"切到镜像后的第一次
+                #   取文件"要白等一个 30 秒超时, 靠后面的重试循环才救回来。
+                [[ "$base" == "$XRAY_RAW" ]] || echo -e "${YELLOW}[!] 主站不通, 已选用镜像 $(printf '%s' "$base" | cut -d/ -f3)${PLAIN}" >&2
                 printf '%s' "$_XRAY_SRC"; return 0
             fi
         done
+    done
+    return 1
+}
+
+# _xray_curl_to <base> <仓库相对路径> <目标文件> —— 打印 HTTP 码
+# 不用 -f: 需要把 404 和"网络不通"分开。二者都让 -f 返回非 0, 但处理方式
+# 完全相反 —— 404 是文件在仓库里不存在, 换多少个镜像都一样; 网络不通才该换源。
+_xray_curl_to() {
+    curl -sSL --max-time 30 -o "$3.tmp" -w '%{http_code}' "$1/$2" 2>/dev/null
+}
+
+# xray_fetch_to <仓库相对路径> <目标文件> —— 按镜像链取到指定位置
+xray_fetch_to() {
+    local rel="$1" dest="$2" base code
+    mkdir -p "$(dirname "$dest")" 2>/dev/null
+    base=$(xray_pick_source) || return 1
+    code=$(_xray_curl_to "$base" "$rel" "$dest")
+    if [[ "$code" = "200" ]]; then
+        mv -f "$dest.tmp" "$dest"; return 0
+    fi
+    rm -f "$dest.tmp"
+    # ★ 404 直接放弃, 不要换源。仓库只有一份, 这个源说没有, 别的源也不会有;
+    #   逐个试一遍既慢, 又会把"文件不存在"报成"镜像链全不通" —— 后者会把
+    #   人往网络问题上带, 而真正的原因是清单里写了个不存在的文件。
+    if [[ "$code" = "404" ]]; then
+        echo -e "${RED}[Error]${PLAIN} 仓库里没有 $rel (404) —— 清单写错了?" >&2
+        return 2
+    fi
+    # 选中的源这次抽风 —— 换一个再试, 别让整条链白探
+    for base in "$XRAY_RAW" "${XRAY_MIRRORS[@]}"; do
+        code=$(_xray_curl_to "$base" "$rel" "$dest")
+        if [[ "$code" = "200" ]]; then
+            mv -f "$dest.tmp" "$dest"; _XRAY_SRC="$base"; return 0
+        fi
+        rm -f "$dest.tmp"
+        [[ "$code" = "404" ]] && return 2
     done
     return 1
 }
@@ -67,30 +107,74 @@ xray_fetch() {
     dest="$_XRAY_CACHE/$(printf '%s' "$rel" | tr '/' '_')"
     [[ -s "$dest" ]] && { printf '%s' "$dest"; return 0; }
     # 3) 镜像链
-    local base; base=$(xray_pick_source) || return 1
-    if curl -fsSL --max-time 30 "$base/$rel" -o "$dest.tmp" 2>/dev/null; then
-        mv -f "$dest.tmp" "$dest"; printf '%s' "$dest"; return 0
+    xray_fetch_to "$rel" "$dest" || return 1
+    printf '%s' "$dest"
+}
+
+# conf/lib/ 下需要在场的东西。改 conf/lib/ 时这里要跟着加 ——
+# 漏一个的症状是"某个菜单项报 库加载失败", 而不是面板打不开。
+_XRAY_LIB_FILES=(
+    addr.sh cert.sh fetch.sh naming.sh ports.sh preset.sh print.sh
+    random.sh read.sh service.sh verify.sh
+    deploy.py dns_edit.py nginx_apply.py node_build.py nodes.py
+    share_meta.py share_payload.py token_store.py
+)
+
+# 把 conf/lib/ 铺到"脚本旁边", 也就是 $_XRAY_CACHE/lib/。
+#
+# ★ 为什么面板要管这件事:
+#   各协议脚本按 `dirname $BASH_SOURCE/lib` 找依赖, 而 xray_fetch 把
+#   conf/http.sh 落成 $CACHE/conf_http.sh —— 那个 dirname 是 $CACHE,
+#   脚本要的是 $CACHE/lib/。不铺这一层, 每个菜单项都会掉进
+#      "本地没有 -> curl github.com"
+#   这条兜底分支, 而它正是国内网络取不到的那条路。全新安装时 install.sh
+#   只取面板和卸载脚本, conf/ 树由面板按需取 —— 也就是说首次安装走的
+#   必定是这条分支。
+#
+# ★ 一律返回 0: 有的菜单项本来就不需要依赖, 不能因为铺不上就让整个菜单点不动;
+#   缺了什么由脚本自己报"库加载失败", 定位更准。
+xray_ensure_lib() {
+    local dest="$_XRAY_CACHE/lib" self
+    [[ -n "$_XRAY_CACHE" ]] || return 0
+    [[ -s "$dest/nodes.py" ]] && return 0
+    mkdir -p "$dest" 2>/dev/null || return 0
+    # 1) 本地检出目录最优先: 快, 而且就是当前这份代码
+    self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    if [[ -d "$self/conf/lib" ]]; then
+        cp -an "$self/conf/lib/." "$dest/" 2>/dev/null
+        [[ -s "$dest/nodes.py" ]] && return 0
     fi
-    rm -f "$dest.tmp"
-    # 选中的源这次抽风 —— 换一个再试, 别让整条链白探
-    for base in "$XRAY_RAW" "${XRAY_MIRRORS[@]}"; do
-        if curl -fsSL --max-time 30 "$base/$rel" -o "$dest.tmp" 2>/dev/null; then
-            mv -f "$dest.tmp" "$dest"; _XRAY_SRC="$base"; printf '%s' "$dest"; return 0
+    # 2) 镜像链补齐 (只补缺的)。rc=2 表示仓库里根本没有这个文件 ——
+    #    那是清单写错了, 不是网络问题, 要分开报, 否则会把人往网络上带。
+    local f rc failed=0 bogus=0
+    for f in "${_XRAY_LIB_FILES[@]}"; do
+        [[ -s "$dest/$f" ]] && continue
+        xray_fetch_to "conf/lib/$f" "$dest/$f"; rc=$?
+        if [[ "$rc" = "2" ]]; then
+            bogus=$((bogus + 1))
+        elif [[ "$rc" != "0" ]]; then
+            failed=$((failed + 1))
         fi
-        rm -f "$dest.tmp"
     done
-    return 1
+    [[ "$bogus" -gt 0 ]] && echo -e "${RED}[Error]${PLAIN} _XRAY_LIB_FILES 里有 $bogus 个文件仓库中不存在 —— 清单要跟着 conf/lib/ 一起改" >&2
+    [[ "$failed" -gt 0 ]] && echo -e "${YELLOW}[!] $failed 个依赖库没取到 —— 相关菜单项可能报「库加载失败」${PLAIN}" >&2
+    return 0
 }
 
 # xray_run <仓库相对路径> [参数...] —— 取到就执行, 取不到给明确原因
 xray_run() {
     local rel="$1"; shift
-    local f
+    local f base
     if ! f=$(xray_fetch "$rel"); then
         echo -e "${RED}[Error]${PLAIN} 取不到 $rel —— 镜像链全不通 (检查网络, 或设 XRAY_REPO_PROXY)"
         return 1
     fi
-    bash "$f" "$@"
+    # 让脚本的 dirname/lib 找得到依赖。不铺的话每个菜单项都会去 curl github.com。
+    xray_ensure_lib
+    # 把**本次实际可用的源**交给子脚本: 它们自己的兜底分支写成
+    # ${XRAY_RAW:-<主站>}, 于是兜底也跟着走这条通的镜像而不是写死的 github.com。
+    base=$(xray_pick_source 2>/dev/null) || base="$XRAY_RAW"
+    XRAY_RAW="$base" bash "$f" "$@"
 }
 
 # 节点增删之后刷新"已发出去的分享链接"的内容。
@@ -249,7 +333,7 @@ load_env() {
 }
 # 统一安装/更新入口：bin/xray_install.sh
 # 幂等：已安装且为最新版本时跳过下载；旧版本自动升级；并重建基础配置、验证并重启 xrayls
-XRAY_INSTALL_URL="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/bin/xray_install.sh"
+XRAY_INSTALL_URL="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/bin/xray_install.sh"
 
 # 回退内核 —— 转给 bin/xray_install.sh 的 rollback 模式。
 # 单独给一个菜单入口的理由: 更新失败时人往往已经连不上服务,

@@ -158,7 +158,7 @@ _ng_apply_py() {
     [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
     local t; t=$(mktemp -t nginx_apply.XXXXXX.py) || return 1
     curl -fsSL --max-time 20 \
-        "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/nginx_apply.py" \
+        "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/nginx_apply.py" \
         -o "$t" 2>/dev/null || { rm -f "$t"; return 1; }
     printf '%s' "$t"
 }
