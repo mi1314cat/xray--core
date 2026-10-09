@@ -112,6 +112,26 @@ x_cert_domain() {
 }
 
 
+# x_cert_trusted <crt> —— 这张证书是不是"有独立签发者的真证书"
+#
+# ★ 为什么不能靠"文件存在"来判断: 自签证书也是两个文件。
+#   判错的后果是**客户端连不上** —— 自签被当成真证书 => 客户端做正常校验
+#   => 校验失败; 反过来真证书被当成自签 => 客户端带着错误的钉扎去连。
+#   两个方向都是"配置全对、服务在跑、就是握手失败"。
+#
+# 判据: subject != issuer。自签证书自己给自己签, 两者相同。
+# 不拿"是不是已知公共 CA"当必要条件 —— 那会漏判小众 CA。
+x_cert_trusted() {
+    local crt="${1:-}" subj issuer
+    [[ -f "$crt" ]] || return 1
+    subj=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null | sed 's/^subject=//')
+    issuer=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+    [[ -z "$subj" || -z "$issuer" ]] && return 1
+    [[ "$subj" == "$issuer" ]] && return 1
+    return 0
+}
+
+
 # 输出用的颜色。cert.sh 是独立库, 不假设宿主脚本定义了 print_ok 之类。
 _CERT_GRN=""; _CERT_YEL=""; _CERT_RED=""; _CERT_RST=""
 if [[ -t 2 ]]; then

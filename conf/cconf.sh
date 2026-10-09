@@ -194,8 +194,8 @@ EOF
 # 生成分享链接（将 pbk 指向 publickey）
 share_link="
 vless://${UUID}@${link_ip}:${CRPORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${CDOMAIN_LOWER}&fp=chrome&pbk=$(cat /usr/local/etc/xray/publickey)&sid=${short_id}&type=tcp&headerType=none#Reality
-vless://${UUID}@${CDOMAIN_LOWER}:443?encryption=none&security=tls&sni=${CDOMAIN_LOWER}&allowInsecure=1&type=ws&host=${CDOMAIN_LOWER}&path=${WS_PATH1}#vless-ws-tls
-vmess://${UUID}@${CDOMAIN_LOWER}:443?encryption=none&security=tls&sni=${CDOMAIN_LOWER}&allowInsecure=1&type=ws&host=${CDOMAIN_LOWER}&path=${WS_PATH}#vmess-ws-tls
+vless://${UUID}@${CDOMAIN_LOWER}:443?encryption=none&security=tls&sni=${CDOMAIN_LOWER}&type=ws&host=${CDOMAIN_LOWER}&path=${WS_PATH1}#vless-ws-tls
+vmess://${UUID}@${CDOMAIN_LOWER}:443?encryption=none&security=tls&sni=${CDOMAIN_LOWER}&type=ws&host=${CDOMAIN_LOWER}&path=${WS_PATH}#vmess-ws-tls
 vless://${UUID}@${CDOMAIN_LOWER}:443?encryption=none&security=tls&sni=${CDOMAIN_LOWER}&type=xhttp&host=${CDOMAIN_LOWER}&path=${WS_PATH2}&mode=auto#vless-xhttp-tls
 "
 echo "${share_link}" > "$ngconfout_DIR/Cv2ray.txt"

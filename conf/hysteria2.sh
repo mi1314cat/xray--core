@@ -217,16 +217,38 @@ cert_not_expired() {
 }
 
 # key 配对: 给定 crt 尽力找到对应 key
+# 证书与私钥是不是**真的**一对 —— 比公钥, 不比文件名。
+_cert_key_match() {
+    local crt="$1" key="$2" a b
+    [[ -f "$crt" && -f "$key" ]] || return 1
+    a=$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null)
+    b=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl md5 2>/dev/null)
+    [[ -n "$a" && -n "$b" && "$a" == "$b" ]]
+}
+
+# ★ 名字对得上**不等于**真是一对。
+#
+#   原来这里只按命名约定取 key, 一次都不验证: 目录里有多张证书、或者换过
+#   证书但旧的 .key 还留着时, 取到的是**别人的私钥**。配置照样"生成成功",
+#   服务端监听也起得来, 只有握手时才炸 —— 而报错 (bad decrypt / key values
+#   mismatch) 离真正原因很远, 面板这边一切正常。
+#   实测过的同类现场: 5 张证书按名字配到 0 对, 于是静默退化成"用第一把 key"。
+#
+#   现在逐个候选**验配对**, 全都不配对就返回空 —— 让调用方按"没有可用证书"
+#   处理, 而不是拿着一对错的往下走。
 find_key_for_cert() {
     local crt="$1" k
-    # 1) 完全同名 .key
-    k="${crt%.crt}.key"; [[ -f "$k" ]] && { echo "$k"; return; }
-    k="${crt%.pem}.key"; [[ -f "$k" ]] && { echo "$k"; return; }
-    # 2) xxx_cert.pem -> xxx_key.pem（nginx/acme 风格）
-    k="${crt%_cert.pem}_key.pem"; [[ -f "$k" ]] && { echo "$k"; return; }
-    # 3) 同目录 server.key
-    k="$(dirname "$crt")/server.key"; [[ -f "$k" ]] && { echo "$k"; return; }
-    # 4) acme.sh 目录: domain.crt 同目录 <domain>.key 由调用方处理
+    local -a cands=(
+        "${crt%.crt}.key"
+        "${crt%.pem}.key"
+        "${crt%_cert.pem}_key.pem"
+        "$(dirname "$crt")/server.key"
+    )
+    for k in "${cands[@]}"; do
+        [[ -f "$k" ]] || continue
+        if _cert_key_match "$crt" "$k"; then echo "$k"; return; fi
+    done
+    # acme.sh 目录: domain.crt 同目录 <domain>.key 由调用方处理
     echo ""
 }
 
@@ -321,6 +343,31 @@ scan_certs() {
 # 生成自签证书（ECDSA P-256，10 年）
 # 输出: CERT_FILE, KEY_FILE, CERT_DOMAIN, CERT_TRUSTED=false
 # ================================
+# 校验用户手填的证书对, 通过则设好 CERT_DOMAIN / CERT_TRUSTED。
+#
+# ★ 以前这里只判断 `[[ -f crt && -f key ]]` —— 文件存在就算通过, 然后把
+#   CERT_TRUSTED 置 true。三个后果, 全是"配置全对但连不上":
+#     1. crt 与 key **不配对**也照用 (握手失败, 而且报错离原因很远)
+#     2. 内容根本不是 PEM (下到了 HTML 错误页) 也照用
+#     3. **自签证书被当成 CA 可信真证书** —— 客户端于是做正常校验, 必然失败;
+#        反过来真证书被当成自签, 客户端带着错误的钉扎去连, 同样失败
+#   现在走公共校验库 x_cert_check (PEM 可解析 / 私钥可解析 / 未过期 /
+#   **配对正确** / 域名对得上) + x_cert_trusted (实测信任, 不靠猜)。
+use_manual_cert() {
+    if ! x_cert_check "$CERT_FILE" "$KEY_FILE" "${CERT_DOMAIN:-}"; then
+        print_error "证书校验不通过 (原因见上), 退回自签"
+        return 1
+    fi
+    CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE")
+    if x_cert_trusted "$CERT_FILE"; then
+        CERT_TRUSTED=true
+    else
+        CERT_TRUSTED=false
+    fi
+    print_ok "使用证书: $CERT_DOMAIN ($([[ "$CERT_TRUSTED" == true ]] && echo CA可信真证书 || echo 自签) crt=$CERT_FILE key=$KEY_FILE)"
+    return 0
+}
+
 generate_cert() {
     local dom
     dom=$(safe_read "自签证书域名(伪装域名)" "$(random_domain)")
@@ -374,14 +421,7 @@ ask_cert() {
             CERT_FILE=$(clean_input "$f")
             printf "  证书 key 路径: " >&2; read -r f
             KEY_FILE=$(clean_input "$f")
-            if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
-                CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE")
-                cert_not_expired "$CERT_FILE" || { print_warn "证书已过期!"; exit 1; }
-                CERT_TRUSTED=true
-                print_ok "使用手动证书: $CERT_DOMAIN (crt=$CERT_FILE key=$KEY_FILE)"
-                return 0
-            fi
-            print_error "证书路径无效, 退回自签"
+            if use_manual_cert; then return 0; fi
             generate_cert
             return 0
             ;;
@@ -429,7 +469,17 @@ ask_cert() {
                     CERT_FILE="${pair#*|}"; CERT_FILE="${CERT_FILE%%|*}"
                     KEY_FILE="${pair##*|}"
                     CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE")
-                    CERT_TRUSTED=true
+                    # ★ 这里原来无条件写 CERT_TRUSTED=true —— 但扫描目录里
+                    #   **包含项目自己的自签证书目录** (/root/catmi/xray/certs),
+                    #   而 scan_certs 只排除 CA 包、不排除自签叶子证书。
+                    #   选中一张自签 => 被当成"CA 可信真证书" => 客户端做正常
+                    #   校验 => 必然连不上。信任必须实测。
+                    if x_cert_trusted "$CERT_FILE"; then
+                        CERT_TRUSTED=true
+                    else
+                        CERT_TRUSTED=false
+                        print_warn "这张是自签证书, 客户端将使用证书钉扎 (不是 CA 校验)"
+                    fi
                     print_ok "使用证书: $CERT_DOMAIN (crt=$CERT_FILE key=$KEY_FILE)"
                     return 0
                 fi
@@ -442,13 +492,7 @@ ask_cert() {
             CERT_FILE=$(clean_input "$f")
             printf "  证书 key 路径: " >&2; read -r f
             KEY_FILE=$(clean_input "$f")
-            if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
-                CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE")
-                CERT_TRUSTED=true
-                print_ok "使用证书: $CERT_DOMAIN (crt=$CERT_FILE key=$KEY_FILE)"
-                return 0
-            fi
-            print_error "证书路径无效, 退回自签"
+            if use_manual_cert; then return 0; fi
             generate_cert
             return 0
         fi
