@@ -2478,8 +2478,20 @@ print(t)")
   info "  链接: http://$host:$port/share/$tok"
   info "  在手机/笔记本的客户端里填这个地址就能拉走全部节点。"
   info "  停用: xbd share off ${tok:0:8}..."
+  # 起来之后必须确认真的在监听, 否则不能把链接交给用户。
+  #
+  # 端口是现找的, in_use() 判断与实际 bind 之间有竞态 —— 尤其本机上还有别的
+  # share_server (mihomo / amneziawg 那边也有), 抢同一个端口是常事。抢不到时
+  # 服务起不来, 而用户拿着一个打不开的链接, 根本无从判断是端口撞了还是自己填错。
+  # 要么验证通过, 要么明说, 不留一个"看起来配好了"的假象。
   systemctl enable --now "$XBD_U_SHARE" >/dev/null 2>&1 \
     || systemctl restart "$XBD_U_SHARE" >/dev/null 2>&1 || true
+  sleep 1
+  if ! ss -tln 2>/dev/null | grep -q ":$port "; then
+    warn "分享服务没起来 —— $host:$port 可能被别的服务抢占了 (本机还有别的 share_server 时常见)"
+    info "  换端口重试: xbd share off ${tok:0:8}...  然后重新 xbd share new"
+    info "  或直接看日志: journalctl -u $XBD_U_SHARE -n 20"
+  fi
 }
 
 share_list() {
