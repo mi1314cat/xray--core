@@ -529,6 +529,90 @@ for proto in vless trojan vmess shadowsocks; do
     assert_eq "$idx" "$n" "$proto 编号连续无重复 (共 $n 档, 末位 $last)"
 done
 
+# ---------------------------------------------------------------- 地址族批量切换
+# 守的是"一键换对外地址时不能漏节点、也不能换成隧道地址"。
+# share_meta.host 是分享链接与客户端配置里"连哪个地址"的唯一来源 ——
+# 漏改一个就是那个节点谁都连不上, 而面板显示一切正常。
+group "地址族批量切换 (share.sh)"
+AF="$TMP/afam"; mkdir -p "$AF/share"
+python3 - "$LIB" "$AF/share" <<'PY'
+import sys, os
+sys.path.insert(0, sys.argv[1])
+import share_meta
+d = sys.argv[2]
+for t, h in (("n1", "1.1.1.1"), ("n2", "1.1.1.1"), ("n3", "2.2.2.2")):
+    share_meta.save(d, t, {"host": h, "port": 443, "name": t, "tier": "cdn"})
+PY
+sed -n '/^x_switch_addr_family()/,/^}/p' "$ROOT/conf/share.sh" > "$AF/fn.sh"
+[[ -s "$AF/fn.sh" ]] && ok "抽到 x_switch_addr_family ($(wc -l < "$AF/fn.sh") 行)" || bad "抽不到函数"
+grep -q 'x_addr6_real' "$AF/fn.sh" && ok "IPv6 走 x_addr6_real (排除隧道)" \
+    || bad "IPv6 没走 addr.sh —— 会拿到 WARP 地址"
+grep -q 'x_iface_public_addr' "$AF/fn.sh" && ok "IPv4 走 x_iface_public_addr" \
+    || bad "IPv4 没走 addr.sh"
+grep -q 'share_refresh_all' "$AF/fn.sh" && ok "切完刷新已发链接 (内容里嵌着地址)" \
+    || bad "切完没刷新 —— 令牌里还是老地址而面板显示正常"
+
+# 实跑: 桩掉地址函数与 addr.sh, 验证真的改了 share_meta。
+# ★ 桩和被测函数都放在独立脚本文件里 —— 别内联进 `bash -c "…"`:
+#   双引号里的 $(...) 与 {} 会被外层 bash 先解析一遍, 结果是
+#   "syntax error near unexpected token" 加上一串 unbound variable,
+#   而且**污染后面的测试** (实测: 分享链接生成那一组因此全部失败)。
+cat > "$AF/drive.sh" <<'DRV'
+set -u
+SHARE_DIR="$1"; LIB_DIR="$2"; FN="$3"; WANT="$4"
+# ★ 被测函数用的是 `python` 而不是 `python3` —— share.sh 顶部有一行
+#   `python() { command python3 "$@"; }` 的包装, 而这里只抽了函数体,
+#   没有那行包装。漏掉它的表现是 python: command not found 被 2>/dev/null
+#   吞掉, 于是"切换 0 个节点"而看不出任何原因。
+python() { command python3 "$@"; }
+err()  { echo "ERR: $*"; }
+info() { :; }
+ok()   { echo "OK: $*"; }
+warn() { :; }
+share_refresh_all() { :; }
+x_addr6_real()        { echo "2001:db8::1"; }
+x_iface_public_addr() { echo "9.9.9.9"; }
+x_addr_family_of()    { case "$1" in *:*) echo IPv6 ;; *) echo IPv4 ;; esac; }
+# shellcheck disable=SC1090
+source "$FN"
+x_switch_addr_family "$WANT"
+SHARE_DIR="$SHARE_DIR" python3 - <<'PYP'
+import glob, json, os
+d = os.environ["SHARE_DIR"]
+hosts = sorted({json.load(open(f)).get("host") for f in glob.glob(os.path.join(d, "*.json"))})
+print("HOSTS=" + ",".join(hosts))
+PYP
+DRV
+AFR=$(bash "$AF/drive.sh" "$AF/share" "$LIB" "$AF/fn.sh" v4 2>&1)
+echo "$AFR" | grep -q 'HOSTS=9.9.9.9' && ok "v4 切换把全部节点改到目标地址" \
+    || bad "v4 切换结果不对: $(echo "$AFR" | grep HOSTS || echo 无输出)"
+echo "$AFR" | grep -q '已切换 3 个节点' && ok "报告了改动的节点数 (3 个)" || bad "没报告改动条数"
+# 全表只有两个旧地址且都指向 1.1.1.1, 切完必须只剩一个值
+echo "$AFR" | grep -q ',' && bad "切换后仍存在多个不同 host —— 有节点被漏改" \
+    || ok "切换后 host 唯一 (没有漏改的节点)"
+
+# 非法参数必须拒绝
+cat > "$AF/drive2.sh" <<'DRV'
+set -u
+SHARE_DIR="$1"; LIB_DIR="$2"; FN="$3"
+python() { command python3 "$@"; }
+err()  { echo "ERR: $*"; }
+info() { :; }
+ok()   { :; }
+warn() { :; }
+share_refresh_all() { :; }
+x_addr6_real()        { echo "2001:db8::1"; }
+x_iface_public_addr() { echo "9.9.9.9"; }
+x_addr_family_of()    { echo IPv4; }
+# shellcheck disable=SC1090
+# shellcheck disable=SC1090
+source "$FN"
+x_switch_addr_family bogus
+echo "rc=$?"
+DRV
+AFB=$(bash "$AF/drive2.sh" "$AF/share" "$LIB" "$AF/fn.sh" 2>&1)
+echo "$AFB" | grep -q 'rc=1' && ok "非法地址族返回非 0" || bad "非法地址族没被拒绝"
+
 group "节点命名 (naming.sh)"
 # 协议名规范化: 各处的写法收敛成一种
 for pair in "vless:vless" "VLESS:vless" "SS:ss" "shadowsocks:ss" \

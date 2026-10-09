@@ -75,6 +75,15 @@ _x_ensure_client() {
 }
 
 LIB_DIR="$(_x_ensure_lib)" || LIB_DIR="$(_x_self_dir)/lib"
+
+# 对外地址探测库 —— 地址族切换要用 (x_addr6_real / x_iface_public_addr)。
+# 与其它脚本同一套三级查找: 脚本旁边 -> 安装目录 -> 现拉。
+if [[ -r "$LIB_DIR/addr.sh" ]]; then
+    source "$LIB_DIR/addr.sh"
+else
+    _x_fetch "conf/lib/addr.sh" "$LIB_DIR/addr.sh" 2>/dev/null && source "$LIB_DIR/addr.sh" \
+        || warn "地址库加载失败 —— 地址族切换不可用"
+fi
 SHARE_ADDR="${XRAY_SHARE_ADDR:-127.0.0.1}"
 
 _RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _DIM=$'\033[2m'; _RST=$'\033[0m'
@@ -517,6 +526,75 @@ share_affected() {
     return 0
 }
 
+# ---------------------------------------------------------------- 地址族切换
+# 把所有节点的"对外地址"在 IPv4 / IPv6 之间批量切换。
+#
+# ★ 为什么需要: 本机可能同时有 IPv4 与 IPv6 (实测 RN: eth0 107.173.154.178
+#   + he-ipv6 2001:470:c:cf::2)。节点建好之后想换一族对外, 原来只能一个一个
+#   改 —— 而 share_meta.host 是分享链接与客户端配置里"连哪个地址"的唯一来源,
+#   漏改一个就是那个节点谁都连不上。
+#
+# ★ 地址一律走 addr.sh 取: 它会排除隧道/虚拟网卡 (warp / docker / awg …)。
+#   直接 `ip -6 addr` 取第一个很容易拿到 WARP 的地址, 而那个地址客户端连不上
+#   —— 这个坑本轮已经在分享链接上踩过一次。
+#
+# ★ 切完**必须刷新已发链接**: 内容里嵌着地址, 不刷新的话令牌还是老地址,
+#   而面板显示一切正常。
+x_switch_addr_family() { # v4|v6
+    local want="${1:-}" newip=""
+    case "$want" in
+        v4|4|ipv4) want=v4 ;;
+        v6|6|ipv6) want=v6 ;;
+        *) err "用法: 切换地址族 v4|v6"; return 1 ;;
+    esac
+
+    if [[ "$want" == v6 ]]; then
+        newip=$(x_addr6_real 2>/dev/null) || newip=""
+        [[ -n "$newip" ]] || { err "本机没有可用的真实 IPv6 (隧道地址已排除)"; return 1; }
+    else
+        newip=$(x_iface_public_addr 2>/dev/null) || newip=""
+        # x_iface_public_addr 优先给 v4, 但机器只有 v6 时它会返回 v6 —— 要拦
+        [[ "$newip" == *:* ]] && newip=""
+        [[ -n "$newip" ]] || { err "本机没有可用的真实 IPv4"; return 1; }
+    fi
+
+    info "目标地址: $newip ($(x_addr_family_of "$newip"))"
+
+    local n=0
+    n=$(SHARE_DIR="$SHARE_DIR" LIB="$LIB_DIR" NEW="$newip" python -c '
+import glob, json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import share_meta
+d, new = os.environ["SHARE_DIR"], os.environ["NEW"]
+n = 0
+for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+    try:
+        m = json.load(open(f, encoding="utf-8"))
+    except Exception:
+        continue
+    tag = m.get("tag") or os.path.basename(f)[:-5]
+    m = share_meta.load(d, tag)
+    if not m or m.get("host") == new:
+        continue
+    # 换 host 后 tag 不变, 所以是原地改; 但旧文件是按旧 tag 命名的, 保险起见
+    # 写新再删旧 (share_meta 的键就是 tag/host 组合)
+    m["host"] = new
+    share_meta.save(d, tag, m)
+    n += 1
+print(n)
+' 2>/dev/null)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+
+    if (( n == 0 )); then
+        info "没有需要改的节点 (可能已经是 $newip)"
+    else
+        ok "已切换 $n 个节点的对外地址 -> $newip"
+    fi
+    # 内容里嵌着地址, 必须刷新 —— 不刷新的后果是令牌还是老地址而面板一切正常
+    share_refresh_all
+    return 0
+}
+
 # ---------------------------------------------------------------- 迁移
 # 本地 token (out/share/tokens/*.json) 搬进公共基础服务。
 #
@@ -668,9 +746,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         list)    share_list ;;
         refresh) share_refresh_all ;;
         migrate) share_migrate ;;
+        switch-family) x_switch_addr_family "${2:-}" ;;
         retag)   share_retag "${2:-}" "${3:-}" ;;
         affected) share_affected "${2:-}" ;;
         menu)    share_menu ;;
-        *) die "用法: share.sh [menu|create|list|refresh|migrate|retag <旧> <新>|affected <tag>]" ;;
+        *) die "用法: share.sh [menu|create|list|refresh|migrate|retag <旧> <新>|affected <tag>|switch-family v4|v6]" ;;
     esac
 fi
