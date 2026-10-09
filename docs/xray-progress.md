@@ -265,3 +265,76 @@ xbd ech
 **影响**：门禁长期红着，人就学会忽略它 —— 真出现幽灵函数时没人看。
 **建议**：让 `sources_of()` 支持 `$VAR/lib/xxx.sh` 与 `source <(curl …)`
 两种形式；或至少在报告里区分"确认不可达"与"路径解析不了，无法判定"。
+
+---
+
+## 八、面板的 curl 路径：所有菜单项都缺依赖（2026-10-09 发现）
+
+### 现象
+
+面板里每一项都是这么跑的：
+
+```bash
+bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/xxx.sh)
+```
+
+于是 `$BASH_SOURCE` 指向 `/dev/fd/63`，而各脚本都这么找依赖：
+
+```bash
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"   # -> /dev/fd/lib
+```
+
+实测（菜单 11，未改过调用方式）：
+
+```
+python3: can't open file '/dev/fd/lib/nodes.py': [Errno 2] No such file or directory
+```
+
+**所以"面板能用"这个结论只在仓库检出目录里成立。** 真实部署路径下，凡是要用
+`lib/` 的菜单项都拿不到依赖。之前 47/47 通过是因为
+`tools/server-interactive-test.sh` 在检出目录里跑脚本。
+
+### 影响（实测）
+
+| 菜单项 | curl 路径下的实际表现 |
+|---|---|
+| 10 分享管理 | 列表报"服务不可达"；状态一律"未运行"（服务其实跑得好好的） |
+| 19 分享服务 | 同上 |
+| 11 节点管理 | `can't open file '/dev/fd/lib/nodes.py'` |
+| 其它（node.sh / mknode.sh / hysteria2.sh / vlessxhttpecn.sh …） | 同类，按 `dirname $BASH_SOURCE/lib` 找依赖 |
+
+内联 `source <(curl ...)` 的那几个文件是例外 —— 它们本来就考虑了这一点。
+
+### 已修（本次）
+
+`conf/share.sh` + `conf/share_service.sh`：依赖三级查找 —— 脚本旁边（仓库里
+直接跑）→ 安装目录 → 现拉。现拉用**本次运行的临时目录**，不做长期缓存：
+脚本本身每次都是新拉的，缓存住的库会和它版本不一致，那种错比"取不到"更难查。
+
+实测（真实 curl 路径）：
+
+```
+菜单 10  list   -> （还没有生成分享）        ← 服务可达，不再是"不可达"
+菜单 19  status -> [OK] proxy-share-service 运行中 / 端口 9443 在监听
+菜单 19  health -> ok (exit 0)
+菜单 10  create -> [OK] 分享已生成 + 链接
+```
+
+### 待办
+
+**其余菜单项仍是坏的。** 建议抽一个公共库（比如 `conf/lib/self.sh`）提供
+`x_lib_dir()` / `x_fetch()`，各脚本改用它；并把
+`server-interactive-test.sh` 改成**模拟 curl 路径**跑一遍（把脚本复制到临时
+目录再执行），否则这个类别的错永远不会被测出来。
+
+### 附带发现：GitHub raw 有 CDN 缓存
+
+`.../raw/refs/heads/main/xxx` 在 push 后 **约 5 分钟内仍返回旧内容**（实测
+拉到的是上一版）。调试"改了不生效"时，第一步应该用 commit 固定 URL 确认：
+
+```bash
+curl -Ls "https://raw.githubusercontent.com/mi1314cat/xray--core/<commit>/conf/share.sh"
+```
+
+按 commit 拉不受分支缓存影响。这条与 §二 记的"本地改了不生效，必须先 push"
+是同一类坑的第二层 —— **push 了也可能还要等几分钟**。
