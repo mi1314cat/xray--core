@@ -8,6 +8,12 @@ BLUE="\033[36m"
 PLAIN="\033[0m"  # 修复缺失的闭合引号
 
 # 主菜单
+# clear 在没有 TERM 的环境（cron、管道、部分 SSH）会报
+# "TERM environment variable not set" 并刷一堆错。
+_srv_clear() {
+  if [ -t 1 ] && [ -n "${TERM:-}" ]; then clear; fi
+}
+
 show_menu() {
     # 获取服务状态
     xrayls_server_status=$(systemctl is-active xrayls.service 2>/dev/null || echo "inactive")
@@ -20,7 +26,7 @@ show_menu() {
     fi
 
     # 使用单引号和here-doc格式避免转义问题
-    clear
+    _srv_clear
     cat << "EOF"
 
                        |\__/,|   (\
@@ -57,10 +63,11 @@ ${GREEN}0.${PLAIN} 退出脚本
 xrayls 服务状态: ${xrayls_server_status_text}
 ----------------------"
 
-    read -p "请输入选项 [0-9]: " choice
+    # 同理: 按键用尽时退出, 不要拿空 choice 反复重画
+    read -r -p "请输入选项 [0-9]: " choice || exit 0
 
     case "${choice}" in
-        0) clear; exit 0 ;;
+        0) _srv_clear; exit 0 ;;
         1) run_xray_install ;;
         2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/uninstall_xray.sh) ;;
         3) show_xray_configs ;;
@@ -84,13 +91,22 @@ xrayls 服务状态: ${xrayls_server_status_text}
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac
 
-    echo && read -p "按回车键返回主菜单..." && echo
+    # 回车返回。**EOF 必须当作退出**。
+    #
+    # read 在 stdin 用尽时返回非 0, 而这一行原来只是 `read ... && echo`,
+    # 后面无条件回到 while 顶部 —— 于是脚本无限重画菜单, 刷屏到天荒地老,
+    # 自动化里表现就是"卡死到超时"。
+    # 触发路径很常见: `bash xray-panel.sh < /dev/null`、管道喂完按键、
+    # 从别的脚本里调用。交互时看不出来, 一进自动化就挂。
+    echo
+    read -r -p "按回车键返回主菜单..." _ || exit 0
+    echo
 }
 
 # 反向代理管理子菜单（reverse）
 reverse_menu() {
     while true; do
-        clear
+        _srv_clear
         echo -e "
 ${GREEN}反向代理管理 (reverse)${PLAIN}
 ----------------------
@@ -98,14 +114,17 @@ ${GREEN}1.${PLAIN} 服务端管理（xrayserver-reverse，运行在家/入口侧
 ${GREEN}2.${PLAIN} 客户端管理（xrayclient-reverse，运行在RN/回连侧）
 ${GREEN}0.${PLAIN} 返回主菜单
 ----------------------"
-        read -p "请输入选项 [0-2]: " rc
+        # EOF 当退出, 否则按键用尽后无限重画子菜单
+        read -r -p "请输入选项 [0-2]: " rc || return
         case "${rc}" in
             1) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/fd/xrayserver-reverse.sh) ;;
             2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/fd/xrayclient-reverse.sh) ;;
             0) return ;;
             *) echo -e "${RED}无效的选项 ${rc}${PLAIN}" ;;
         esac
-        echo && read -p "按回车键返回子菜单..." && echo
+        echo
+        read -r -p "按回车键返回子菜单..." _ || return
+        echo
     done
 }
 
@@ -160,7 +179,7 @@ show_xray_configs() {
 }
 
 add_node_menu() {
-    clear
+    _srv_clear
     echo -e "
 ${GREEN}添加节点${PLAIN}
 ----------------------
@@ -184,7 +203,7 @@ ${GREEN}12.${PLAIN} 全协议一键生成（自动端口，统一校验，仅 re
 ${GREEN}0.${PLAIN} 返回主菜单
 ----------------------"
 
-    read -p "请输入选项 [0-12]: " nchoice
+    read -r -p "请输入选项 [0-12]: " nchoice || return
 
     case "${nchoice}" in
         0) return ;;
@@ -257,7 +276,7 @@ ${GREEN}0.${PLAIN} 返回主菜单
     return
 }
 
-# 主程序循环
+# 主程序循环。show_menu 内部在 EOF 时 exit, 所以不会无限刷屏。
 while true; do
     show_menu
 done

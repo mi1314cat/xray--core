@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# 交互输入统一走 conf/lib/read.sh —— EOF 会被当成退出, 否则会无限刷屏。
+_x_read_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
+if [[ -r "$_x_read_lib_dir/read.sh" ]]; then
+    source "$_x_read_lib_dir/read.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/read.sh") \
+        || { printf '输入库加载失败\n' >&2; exit 1; }
+fi
+
 # ================================
 # outbound.sh — Xray 出站节点管理脚本
 # hysteria2.sh（入站脚本）的孪生版本：
@@ -74,27 +83,10 @@ mkdir -p "$CONF_DIR"
 # ================================
 # 输入清理
 # ================================
-clean_input() {
-    echo "$1" | tr -d '\000-\037'
-}
 
 # ================================
 # 安全输入（不会污染 JSON）
 # ================================
-safe_read() {
-    local prompt="$1"
-    local default="$2"
-    local input
-
-    if [[ -n "$default" ]]; then
-        printf "%s (默认: %s): " "$prompt" "$default" >&2
-    else
-        printf "%s: " "$prompt" >&2
-    fi
-    read input
-    input=$(clean_input "$input")
-    echo "${input:-$default}"
-}
 
 # 数字输入（1-65535，出站端口不检查本机占用）
 safe_read_int() {
@@ -104,7 +96,7 @@ safe_read_int() {
 
     while true; do
         printf "%s (默认: %s): " "$prompt" "$default" >&2
-        read input
+        xr_read "请输入" "" input || exit 0
         input=$(clean_input "$input")
         input="${input:-$default}"
         [[ "$input" =~ ^[0-9]+$ ]] || { print_error "必须是数字"; continue; }
@@ -120,7 +112,7 @@ safe_choose() {
     local default="$2"
     local input
     printf "%s (默认: %s): " "$prompt" "$default" >&2
-    read input
+    xr_read "请输入" "" input || exit 0
     input=$(clean_input "$input")
     echo "${input:-$default}"
 }
@@ -346,7 +338,7 @@ parse_vmess() {
 import_link() {
     print_title "导入分享链接"
     printf "粘贴链接 (hysteria2:// / vless:// / vmess:// / trojan:// / ss://): " >&2
-    read url
+    xr_read "请输入地址" "" url || exit 0
     url=$(clean_input "$url")
     [[ -z "$url" ]] && { print_error "未输入链接"; return 1; }
 
@@ -1114,7 +1106,7 @@ wizard_freedom() {
     echo "  2) 指定 IPv4 源IP" >&2
     echo "  3) 自动分配 IPv6（/64 池）" >&2
     echo "  4) 双栈智能落地（IPv4站走IPv4 + IPv6站走IPv6）" >&2
-    read ftype
+    xr_read "请选择类型" "" ftype || exit 0
     ftype=$(clean_input "$ftype")
     case "$ftype" in
         2)
@@ -1267,7 +1259,7 @@ dual_domains() {
     echo "v4出站=$(jq -r "._meta.splitRules[$idx].outboundTag" "$ROUTING_FILE")" >&2
     printf "新增域名(如 example.com，回车跳过): " >&2
     local nd
-    read nd; nd=$(clean_input "$nd")
+    xr_read "新增域名(如 example.com，回车跳过)" "" nd || exit 0
     if [[ -n "$nd" ]]; then
         nd=${nd#domain:}
         jq --argjson i "$idx" --arg d "domain:$nd" '._meta.splitRules[$i].domain += [$d] | ._meta.splitRules[$i].domain |= unique' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE"
@@ -1276,7 +1268,7 @@ dual_domains() {
     fi
     printf "移除域名(输完整域名，回车跳过): " >&2
     local rm
-    read rm; rm=$(clean_input "$rm")
+    xr_read "移除域名(输完整域名，回车跳过)" "" rm || exit 0
     if [[ -n "$rm" ]]; then
         rm=${rm#domain:}
         jq --argjson i "$idx" --arg d "domain:$rm" '._meta.splitRules[$i].domain |= map(select(. != $d))' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE"
@@ -1310,7 +1302,7 @@ list_outbounds() {
 pick_outbound() {
     local n
     printf "输入出站编号: " >&2
-    read n
+    xr_read "请输入" "" n || exit 0
     n=$(clean_input "$n")
     [[ "$n" =~ ^[0-9]+$ ]] || { print_error "编号无效"; return 1; }
     [[ -f "$(out_file "$n")" ]] || { print_error "出站 $n 不存在"; return 1; }
@@ -1335,7 +1327,7 @@ edit_outbound() {
     echo "  2) 直接编辑原始 JSON（自由定制）" >&2
     echo "  3) 重新分配 IPv6 源地址" >&2
     echo "  0) 返回" >&2
-    read c
+    xr_read "请选择" "" c || exit 0
     c=$(clean_input "$c")
     case "$c" in
         1)
@@ -1481,7 +1473,7 @@ delete_outbound() {
         print_error "警告：$tag 当前被以下入站使用："
         echo "$deps" | sed 's/^/  /' >&2
         printf "删除后这些入站将自动恢复为默认出站(${DEFAULT_OUTBOUND})。是否继续? [y/N]: " >&2
-        read yn
+        xr_read "确认? (y/N)" "" yn || exit 0
         yn=$(clean_input "$yn")
         [[ "$yn" == "y" || "$yn" == "Y" ]] || { print_info "已取消"; return; }
         # 移除绑定
@@ -1490,7 +1482,7 @@ delete_outbound() {
         fi
     else
         printf "确认删除出站 $n ($tag) ? [y/N]: " >&2
-        read yn
+        xr_read "确认? (y/N)" "" yn || exit 0
         yn=$(clean_input "$yn")
         [[ "$yn" == "y" || "$yn" == "Y" ]] || { print_info "已取消"; return; }
     fi
@@ -1614,7 +1606,7 @@ rotate_out6() {
             ot=$(out_tag "$num")
             echo "  $((i+1))) $ot" >&2
         done
-        printf "请选择: " >&2; read sel; sel=$(clean_input "$sel")
+        printf "请选择: " >&2; xr_read "请输入" "" sel || exit 0
         [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#v6n[@]} )) || { print_error "无效选择"; return 1; }
         n=${v6n[$((sel-1))]}
     fi
@@ -1628,7 +1620,7 @@ rotate_out6() {
     [[ -z "$prefix" ]] && { print_error "无法确定 IPv6 池前缀（请先在池菜单设置）"; return 1; }
     print_info "新IP将取自前缀: $prefix"
     printf "确认更换 ${tag} 的落地IPv6 (当前 $old)？y/N: " >&2
-    read c; c=$(clean_input "$c")
+    xr_read "请选择" "" c || exit 0
     [[ "$c" == "y" || "$c" == "Y" ]] || { print_info "已取消"; return 1; }
 
     local addr
@@ -1647,7 +1639,7 @@ rotate_out6() {
     egress_check "$addr"
     # 提示重启使 live 进程加载
     [[ -n "$1" ]] && return 0
-    printf "重启 xrayls 使新IP生效? [y/N]: " >&2; read rr; rr=$(clean_input "$rr")
+    printf "重启 xrayls 使新IP生效? [y/N]: " >&2; xr_read "请输入" "" rr || exit 0
     if [[ "$rr" == "y" || "$rr" == "Y" ]]; then
         restart_xrayls
     else
@@ -1663,7 +1655,7 @@ gen_pool_batch() {
     prefix=$(pool_prefix) || true
     [[ -z "$prefix" ]] && prefix=$(detect_v6_prefix) || true
     [[ -z "$prefix" ]] && { print_error "无法确定前缀（请先在池菜单设置）"; return 1; }
-    printf "前缀 %s；生成数量(默认8): " "$prefix" >&2; read cnt; cnt=$(clean_input "$cnt"); cnt=${cnt:-8}
+    printf "前缀 %s；生成数量(默认8): " "$prefix" >&2; xr_read "请输入" "" cnt || exit 0; cnt=${cnt:-8}
     [[ "$cnt" =~ ^[0-9]+$ ]] || { print_error "数量非法"; return 1; }
     (( cnt > 200 )) && cnt=200
     echo "已生成(已挂载到网卡，可任选一个写进出站):" >&2
@@ -1710,7 +1702,7 @@ bind_menu() {
         done
         printf "  0) 退出\n" >&2
         printf "选择: " >&2
-        read x
+        xr_read "请输入" "" x || exit 0
         x=$(clean_input "$x")
         [[ -z "$x" || "$x" == "0" ]] && break
         if (( x < 1 || x > ${#ins[@]} )); then print_error "无效入站"; continue; fi
@@ -1725,7 +1717,7 @@ bind_menu() {
         done
         printf "  %d) 默认出站 (%s)\n" $(( ${#outs[@]}+1 )) "$DEFAULT_OUTBOUND" >&2
         printf "选择: " >&2
-        read y
+        xr_read "请输入" "" y || exit 0
         y=$(clean_input "$y")
         [[ -z "$y" ]] && continue
         if (( y == ${#outs[@]}+1 )); then
@@ -1750,7 +1742,7 @@ bind_menu() {
         fi
         write_routing
         printf "继续绑定其它入站？回车继续 / 0 结束: " >&2
-        read z
+        xr_read "请输入" "" z || exit 0
         [[ "$z" == "0" ]] && break
     done
     validate_config
@@ -1803,7 +1795,7 @@ pool_menu() {
         echo "  2) 查看已分配地址" >&2
         echo "  3) 分配一个新地址并写入出站" >&2
         echo "  0) 返回" >&2
-        read c
+        xr_read "请选择" "" c || exit 0
         c=$(clean_input "$c")
         case "$c" in
             1)

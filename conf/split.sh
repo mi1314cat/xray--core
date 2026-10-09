@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# 交互输入统一走 conf/lib/read.sh —— EOF 会被当成退出, 否则会无限刷屏。
+_x_read_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
+if [[ -r "$_x_read_lib_dir/read.sh" ]]; then
+    source "$_x_read_lib_dir/read.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/read.sh") \
+        || { printf '输入库加载失败\n' >&2; exit 1; }
+fi
+
 # ================================
 # split.sh — Xray 分流规则管理脚本
 # outbound.sh（出站脚本）的姊妹版本，专管"分流规则"：
@@ -63,27 +72,10 @@ mkdir -p "$CONF_DIR"
 # ================================
 # 输入清理
 # ================================
-clean_input() {
-    echo "$1" | tr -d '\000-\037'
-}
 
 # ================================
 # 安全输入（不会污染 JSON）
 # ================================
-safe_read() {
-    local prompt="$1"
-    local default="$2"
-    local input
-
-    if [[ -n "$default" ]]; then
-        printf "%s (默认: %s): " "$prompt" "$default" >&2
-    else
-        printf "%s: " "$prompt" >&2
-    fi
-    read input
-    input=$(clean_input "$input")
-    echo "${input:-$default}"
-}
 
 # ================================
 # 出站 tag 列表（direct/block + conf/out-NN.json 的 tag）
@@ -390,7 +382,11 @@ main_menu() {
         echo "0) 退出" >&2
 
         printf "请选择: " >&2
-        read c
+        # 同上: EOF 当退出, 不要拿着空值反复问
+        if ! read -r c; then
+            printf '\n' >&2
+            exit 0
+        fi
         c=$(clean_input "$c")
 
         case $c in
