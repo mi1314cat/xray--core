@@ -271,6 +271,10 @@ def cmd_update(a):
         body["ttl"] = a.ttl
     if a.used_count is not None:
         body["used_count"] = a.used_count
+    if getattr(a, "max_uses", None) is not None:
+        body["max_uses"] = a.max_uses
+    if getattr(a, "expires_at", None) is not None:
+        body["expires_at"] = a.expires_at
     data = api_ok("PUT", "/api/v1/shares/%s" % a.token, body)
     print(json.dumps(data, ensure_ascii=False))
     return 0
@@ -315,6 +319,12 @@ def main() -> int:
     p.add_argument("--meta", default="")
     p.add_argument("--ttl", type=int, default=None)
     p.add_argument("--used-count", type=int, default=None, dest="used_count")
+    # ★ 服务端的 PUT 本来就支持这两个字段, 适配器原来只给了 create, update 漏了。
+    #   后果是面板里"改次数上限"和"改有效期"**静默无效**: argparse 报
+    #   "unrecognized arguments" 直接退出, 而调用方把 stderr 丢掉当成成功了
+    #   —— 用户看到的是"已更新", 实际一个字节都没变。
+    p.add_argument("--max-uses", type=int, default=None, dest="max_uses")
+    p.add_argument("--expires-at", type=int, default=None, dest="expires_at")
     p.set_defaults(fn=cmd_update)
 
     a = ap.parse_args()

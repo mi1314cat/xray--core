@@ -213,11 +213,29 @@ print(json.dumps({"name": tags[0], "tags": tags[1:]}, ensure_ascii=False))
     token=$(printf '%s' "$rec" | python -c 'import sys,json;print(json.load(sys.stdin).get("token",""))' 2>/dev/null)
     [[ -n "$token" ]] || die "公共服务没有返回 token"
 
-    local ip="$SHARE_ADDR"
-    if [[ "$SHARE_ADDR" == "0.0.0.0" || "$SHARE_ADDR" == "127.0.0.1" ]]; then
-        ip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "<服务器IP>")
+    # 链接里的主机名必须是**客户端连得上的入站地址**。
+    #
+    # ★ 不能用 api.ipify.org 这类"我的 IP"服务: 它答的是**出站出口**。
+    #   本机走了 WARP / 代理时, 问出来的是 WARP 的 IP —— 实测 RN 上
+    #   WARP 开着, 生成出来是 104.28.201.80, 而服务器入站是 107.173.154.178,
+    #   客户端照着连必然不通, 而且链接看起来完全正常。
+    #
+    #   最可靠的来源是节点自己的 share_meta.host —— 那正是客户端连这个节点
+    #   用的地址 (deploy 时写进去的), 与节点能不能连是同一个事实。
+    local host=""
+    host=$(LIB="$LIB_DIR" SHARE_DIR="$SHARE_DIR" TAG="${tags[0]}" python -c '
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import share_meta
+m = share_meta.load(os.environ["SHARE_DIR"], os.environ["TAG"]) or {}
+print(m.get("host", ""))
+' 2>/dev/null)
+    if [[ -z "$host" ]]; then
+        # 退一步: 本机第一个非回环地址。依然不问外部服务。
+        host=$(hostname -I 2>/dev/null | tr " " "\n" | grep -vE "^(127\.|::1|$)" | head -1)
     fi
-    local url="http://$ip:$port/share/$token"
+    [[ -n "$host" ]] || host="<服务器IP>"
+    local url="http://$host:$port/share/$token"
 
     ok "分享已生成"
     printf "\n    ${_GRN}%s${_RST}\n\n" "$url" >&2
@@ -245,23 +263,26 @@ share_list() {
         printf '\n' >&2
         return 0
     fi
-    python - "$(x_share_port)" <<'PY' < <(printf '%s' "$js")
-import sys, json, time
-port = sys.argv[1]
-recs = json.load(sys.stdin)
-now = int(time.time())
-print(f"  {'编号':<5}{'TOKEN':<20}{'名称':<16}{'已用/上限':<11}{'过期':<12}{'状态':<7}节点", file=sys.stderr)
+    # ★ 数据不能用 `<<'PY'` + `< <(...)` 两条 stdin 重定向同时喂 ——
+    #   后一条会把前一条覆盖掉, 于是 python 拿到的是 **JSON 当脚本**,
+    #   报 `name 'true' is not defined` 这种跟业务毫无关系的错。
+    #   走环境变量最稳。
+    XJS="$js" python -c '
+import os, sys, json, time
+recs = json.loads(os.environ["XJS"])
+fmt = "  %-5s%-20s%-16s%-11s%-12s%-7s%s"
+print(fmt % ("编号", "TOKEN", "名称", "已用/上限", "过期", "状态", "节点"), file=sys.stderr)
 for i, r in enumerate(recs, 1):
     m = r.get("meta") or {}
     exp = int(r.get("expires_at", 0))
     exps = "永久" if not exp else time.strftime("%Y-%m-%d", time.localtime(exp))
-    used, maxu = int(r.get("used_count", 0)), int(r.get("max_uses", 0))
+    used = int(r.get("used_count", 0)); maxu = int(r.get("max_uses", 0))
+    uses = "%d/%s" % (used, maxu if maxu else "∞")
     tags = m.get("tags") or []
     if isinstance(tags, str): tags = [tags]
-    print(f"  {i:<5}{str(r.get('token',''))[:18]:<20}{str(m.get('name',''))[:15]:<16}"
-          f"{f'{used}/{maxu if maxu else chr(8734)}':<11}{exps:<12}{r.get('state',''):<7}"
-          f"{','.join(tags)[:40]}", file=sys.stderr)
-PY
+    print(fmt % (i, str(r.get("token", ""))[:18], str(m.get("name", ""))[:15],
+                 uses, exps, r.get("state", ""), ",".join(tags)[:40]), file=sys.stderr)
+'
     printf '\n' >&2
     info "拉取地址: http://<服务器IP>:$(x_share_port)/share/<token>"
 }
