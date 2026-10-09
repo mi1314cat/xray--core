@@ -247,6 +247,183 @@ assert_eq "$W1" "1" "搜索范围可查看"
 # nginx_apply.py 早就做完了 (幂等插入、标记块、Docker 感知), 但一直只有
 # 建节点那条路径能间接触发。用户想看一眼有哪些站点、或单独摘掉一个域名的
 # 反代, 此前没有任何入口。
+# ---------------------------------------------------------------- 对外地址探测
+# 这一组守的是"下发出去的地址客户端能不能连上"。踩过的现场: 分享链接里是
+# WARP 出口地址 (104.28.201.80), 而服务器入站是 107.173.154.178 —— 链接看起来
+# 完全正常, 客户端照着连必然不通。
+group "对外地址探测 (addr.sh)"
+# 私网/保留段判定 —— 每一段都是实战踩得到的, 不是照抄 RFC 列表
+for pair in "10.0.0.1:Y" "192.168.1.1:Y" "172.16.0.1:Y" "172.32.0.1:N" \
+            "198.18.0.1:Y" "100.64.0.1:Y" "203.0.113.5:Y" "169.254.1.1:Y" \
+            "8.8.8.8:N" "1.1.1.1:N"; do
+    a="${pair%%:*}"; want="${pair##*:}"
+    got=$(bash -c "source '$LIB/addr.sh'; x_addr_is_private '$a' && echo Y || echo N")
+    assert_eq "$got" "$want" "私网判定 $a"
+done
+# 198.18.0.0/15 单独再点一次: 那是 mihomo/Clash 的 fake-ip 段, 跑 TUN 时
+# 网口扫描会挑中 198.18.0.1 —— 排除不掉就会把假地址写进配置
+got=$(bash -c "source '$LIB/addr.sh'; x_addr_is_private 198.18.0.1 && echo Y || echo N")
+assert_eq "$got" "Y" "排除 mihomo fake-ip 段 (198.18/15)"
+
+# 隧道网卡正则: 排除出口, 但**保留** HE 隧道的真实公网地址
+for pair in "warp:Y" "wg0:Y" "awg0:Y" "docker0:Y" "tun0:Y" "br-bfb1497b:Y" \
+            "he-ipv6-tun:Y" "he-ipv6:N" "eth0:N" "ens3:N"; do
+    d="${pair%%:*}"; want="${pair##*:}"
+    got=$(bash -c "source '$LIB/addr.sh'; [[ '$d' =~ \$X_TUNNEL_IFACE_RE ]] && echo Y || echo N")
+    assert_eq "$got" "$want" "隧道网卡判定 $d"
+done
+# ★ he-ipv6 必须保留: 那是 HE 给的真实可路由地址, 正则写成 he-ipv6.* 会把它
+#   一起排掉, 于是明明有 IPv6 却判成"无"
+got=$(bash -c "source '$LIB/addr.sh'; [[ 'he-ipv6' =~ \$X_TUNNEL_IFACE_RE ]] && echo Y || echo N")
+assert_eq "$got" "N" "he-ipv6 是真实地址不排除 (只排除 he-ipv6-tun)"
+
+# 自检: 地址在不在本机接口上
+got=$(bash -c "source '$LIB/addr.sh'; x_addr_is_local 127.0.0.1 && echo Y || echo N")
+assert_eq "$got" "Y" "自检认出本机回环地址"
+got=$(bash -c "source '$LIB/addr.sh'; x_addr_is_local 203.0.113.5 && echo Y || echo N")
+assert_eq "$got" "N" "自检否掉不在本机的地址"
+got=$(bash -c "source '$LIB/addr.sh'; x_addr_is_local '' && echo Y || echo N")
+assert_eq "$got" "N" "空地址判为不在本机"
+
+# URL 主机: IPv6 必须加方括号, 否则端口会被当成地址的一部分
+got=$(bash -c "source '$LIB/addr.sh'; x_url_host 2001:db8::1")
+assert_eq "$got" "[2001:db8::1]" "IPv6 加方括号"
+got=$(bash -c "source '$LIB/addr.sh'; x_url_host 1.2.3.4")
+assert_eq "$got" "1.2.3.4" "IPv4 不加方括号"
+got=$(bash -c "source '$LIB/addr.sh'; x_url_host '[2001:db8::1]'")
+assert_eq "$got" "[2001:db8::1]" "已加括号的不重复加"
+
+# 主入口: 已保存的地址**必须过自检**才沿用 (否则修复前存进去的 WARP 地址会一直被沿用)
+got=$(bash -c "source '$LIB/addr.sh'; x_public_addr '' 203.0.113.5")
+[[ "$got" != "203.0.113.5" ]] && ok "已保存的地址不过自检时不沿用" \
+    || bad "已保存的地址不过自检却仍被沿用 ($got)"
+got=$(bash -c "source '$LIB/addr.sh'; x_public_addr 9.9.9.9")
+assert_eq "$got" "9.9.9.9" "显式传参优先"
+
+# 地址族标签
+got=$(bash -c "source '$LIB/addr.sh'; x_addr_family_of 1.2.3.4")
+assert_eq "$got" "IPv4" "地址族 IPv4"
+got=$(bash -c "source '$LIB/addr.sh'; x_addr_family_of 2001:db8::1")
+assert_eq "$got" "IPv6" "地址族 IPv6"
+
+# ---------------------------------------------------------------- 取文件镜像链
+group "取文件镜像链 (fetch.sh)"
+got=$(bash -c "source '$LIB/fetch.sh'; echo \${#X_REPO_MIRRORS[@]}")
+[[ "$got" -ge 4 ]] && ok "镜像链至少 4 个源 ($got)" || bad "镜像链太短 ($got)"
+# ★ jsdelivr 必须垫底: 它是 CDN 带缓存的, 推完 commit 后仍返回旧文件,
+#   加时间戳也绕不过去 —— 放前面会让人拿到旧版本还以为推送失败
+last=$(bash -c "source '$LIB/fetch.sh'; echo \${X_REPO_MIRRORS[-1]}")
+[[ "$last" == *jsdelivr* ]] && ok "jsdelivr 排在最后 (带缓存的源垫底)" \
+    || bad "jsdelivr 没垫底, 当前最后一个是: $last"
+# ★ 探测目标必须确认存在 —— 首版写的是 src/VERSION, 而本仓库没有这个文件,
+#   于是每个源都探不通, 整条链直接全废
+got=$(bash -c "source '$LIB/fetch.sh'; echo \$X_PROBE_FILE")
+[[ -f "$ROOT/$got" ]] && ok "探测目标存在 ($got)" \
+    || bad "探测目标在仓库里不存在: $got (整条链会全废)"
+# 源名映射
+got=$(bash -c "source '$LIB/fetch.sh'; x_source_name 'https://raw.githubusercontent.com/mi1314cat/xray--core/main'")
+assert_eq "$got" "主站" "主站识别"
+got=$(bash -c "source '$LIB/fetch.sh'; x_source_name 'https://ghproxy.net/https://raw.githubusercontent.com/x/y/main'")
+assert_eq "$got" "ghproxy.net" "镜像名识别"
+got=$(bash -c "source '$LIB/fetch.sh'; x_source_name ''")
+assert_eq "$got" "未探测" "未探测时不报错"
+
+# ---------------------------------------------------------------- 随机值 / 交互输入
+# 这两个库原来是"定义了但没人测", 于是幽灵函数门禁长期把它们报成不可达。
+# 它们各自守着一个**记在注释里的真实事故**:
+#   random.sh  —— random_pass / random_user 曾"零处定义"却被 Trojan/http/sock5
+#                 调用, 默认值拿到空串 => 节点能建能连, 但密码是空的。
+#   read.sh    —— 各脚本复制了十几份 safe_read 且都不检查 read 的返回值,
+#                 EOF 时拿着空值反复报"格式无效", 无限刷屏到超时。
+group "随机值 (random.sh)"
+got=$(bash -c "source '$LIB/random.sh'; random_path")
+[[ "$got" =~ ^/[A-Za-z0-9]{8}$ ]] && ok "random_path 形状 (/ + 8 位字母数字)" \
+    || bad "random_path 形状不对: '$got'"
+for spec in "random_pass:20" "random_user:16" "random_token:32"; do
+    fn="${spec%%:*}"; want="${spec##*:}"
+    got=$(bash -c "source '$LIB/random.sh'; $fn")
+    [[ "${#got}" == "$want" ]] && ok "$fn 长度 $want" || bad "$fn 长度应 $want, 实得 ${#got}"
+    [[ "$got" =~ ^[A-Za-z0-9]+$ ]] && ok "$fn 只用字母数字 (要进 URL/YAML)" \
+        || bad "$fn 含非字母数字字符: '$got'"
+done
+# 空值是最危险的形态: 调用方拿它当"回车即用的默认值"
+got=$(bash -c "source '$LIB/random.sh'; random_pass")
+[[ -n "$got" ]] && ok "random_pass 不为空 (空密码=任何人都能连)" || bad "random_pass 返回空"
+
+group "交互输入 (read.sh)"
+got=$(bash -c "source '$LIB/read.sh'; clean_input '  a b  '")
+assert_eq "$got" "a b" "clean_input 去首尾空白"
+got=$(bash -c "source '$LIB/read.sh'; clean_input \$'x\r'")
+assert_eq "$got" "x" "clean_input 去 CR (CRLF 输入)"
+# ★ EOF 契约: 必须 **exit**, 不能返回空值。
+#   返回空值的话调用方的校验分支会反复报"格式无效", 自动化里表现为卡死到超时。
+printf '' | bash -c "source '$LIB/read.sh'; xr_read 'q' >/dev/null 2>&1; echo ALIVE" > "$TMP/eof1" 2>/dev/null
+[[ "$(cat "$TMP/eof1")" != "ALIVE" ]] && ok "xr_read 在 EOF 时退出 (不返回空值)" \
+    || bad "xr_read 在 EOF 时没退出 —— 死循环的根源"
+printf '' | bash -c "source '$LIB/read.sh'; safe_read 'q' >/dev/null 2>&1; echo ALIVE" > "$TMP/eof2" 2>/dev/null
+[[ "$(cat "$TMP/eof2")" != "ALIVE" ]] && ok "safe_read 在 EOF 时退出" \
+    || bad "safe_read 在 EOF 时没退出"
+got=$(printf 'hello\n' | bash -c "source '$LIB/read.sh'; safe_read 'q'")
+assert_eq "$got" "hello" "safe_read 正常读入"
+got=$(printf '\n' | bash -c "source '$LIB/read.sh'; safe_read 'q' '默认值'")
+assert_eq "$got" "默认值" "safe_read 回车取默认值"
+
+# ---------------------------------------------------------------- 节点命名
+# 守的是"节点在客户端列表和分享链接里认得出、筛得准"。
+# 踩过的现场: 同一台机器上并存 VLESS-WS_01 / vless-xhttp01 / hysteria-01 ——
+# 大小写混用、`_` 与 `-` 混用、编号位数不一, 按前缀筛节点写不准。
+group "节点命名 (naming.sh)"
+# 协议名规范化: 各处的写法收敛成一种
+for pair in "vless:vless" "VLESS:vless" "SS:ss" "shadowsocks:ss" \
+            "SS2022:ss2022" "hy2:hysteria2" "hysteria:hysteria2" "Hysteria2:hysteria2"; do
+    a="${pair%%:*}"; want="${pair##*:}"
+    got=$(bash -c "source '$LIB/naming.sh'; x_proto_slug '$a'")
+    assert_eq "$got" "$want" "协议名规范化 $a"
+done
+# 安全等级: 大写
+for pair in "tls:TLS" "TLS:TLS" "reality:REALITY" "none:none"; do
+    a="${pair%%:*}"; want="${pair##*:}"
+    got=$(bash -c "source '$LIB/naming.sh'; x_sec_slug '$a'")
+    assert_eq "$got" "$want" "安全等级规范化 '$a'"
+done
+# 空串单独测 —— 不能写成 for 里的 "" 元素: 两个引号会把它后面整段吞掉
+# (实测就是这么写出语法错误的: `"":none"` 被解析成一段引号字符串)
+got=$(bash -c "source '$LIB/naming.sh'; x_sec_slug ''")
+assert_eq "$got" "none" "安全等级规范化 空串"
+# tag 形态
+got=$(bash -c "source '$LIB/naming.sh'; x_node_tag vless 1 tls")
+assert_eq "$got" "x-vless01-TLS" "tag 基本形态 (含 x 前缀 + 补零)"
+got=$(bash -c "source '$LIB/naming.sh'; x_node_tag trojan 2 reality")
+assert_eq "$got" "x-trojan02-REALITY" "REALITY 节点 tag"
+got=$(bash -c "source '$LIB/naming.sh'; x_node_tag vmess 1 tls cdn")
+assert_eq "$got" "x-vmess01-TLS-CDN" "CDN 节点带 -CDN 后缀"
+got=$(bash -c "source '$LIB/naming.sh'; x_node_tag vless 12 tls")
+assert_eq "$got" "x-vless12-TLS" "两位数编号不补零"
+got=$(bash -c "source '$LIB/naming.sh'; x_node_tag vless 100 none")
+assert_eq "$got" "x-vless100-none" "三位数编号原样"
+# ★ x 前缀是硬要求: 三个内核共用一个服务器时要能认出这是 Xray 建的
+got=$(bash -c "source '$LIB/naming.sh'; x_node_tag vless 1 tls")
+[[ "$got" == x-* ]] && ok "tag 带 x- 前缀 (跨内核可辨认)" || bad "tag 缺 x- 前缀: $got"
+# 显示名默认值不能为空 —— 空 fragment 会让客户端退化成用域名当名字,
+# 同一域名下的节点在列表里全叫一个名
+got=$(bash -c "source '$LIB/naming.sh'; x_default_name vless 1 tls")
+[[ -n "$got" ]] && ok "显示名默认值非空 ($got)" || bad "显示名默认值为空"
+# 编号自增: 从已有节点里取最大编号 +1
+ND="$TMP/naming"; mkdir -p "$ND"
+printf '{"inbounds":[{"tag":"x-vless01-TLS"}]}' > "$ND/a.json"
+printf '{"inbounds":[{"tag":"x-vless07-TLS-CDN"}]}' > "$ND/b.json"
+printf '{"inbounds":[{"tag":"x-trojan02-REALITY"}]}' > "$ND/c.json"
+got=$(bash -c "source '$LIB/naming.sh'; x_next_index vless '$ND'")
+assert_eq "$got" "8" "下一个 vless 编号 = 已有最大 + 1"
+got=$(bash -c "source '$LIB/naming.sh'; x_next_index trojan '$ND'")
+assert_eq "$got" "3" "下一个 trojan 编号"
+got=$(bash -c "source '$LIB/naming.sh'; x_next_index ss '$ND'")
+assert_eq "$got" "1" "没有同协议节点时从 1 开始"
+# 坏文件不能让编号计算崩掉
+printf 'not json' > "$ND/bad.json"
+got=$(bash -c "source '$LIB/naming.sh'; x_next_index vless '$ND'")
+assert_eq "$got" "8" "坏片段不影响编号计算"
+
 group "Nginx 站点管理 (conf/nginx_site.sh 菜单)"
 bash -n "$ROOT/conf/nginx_site.sh" 2>/dev/null && ok "nginx_site.sh 语法" || bad "nginx_site.sh 语法"
 

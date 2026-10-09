@@ -976,7 +976,7 @@ add_outbound() {
 
 wizard_vless() {
     ensure_uuidgen
-    OB_NAME=$(safe_read "显示名称" "")
+    OB_NAME=$(safe_read "显示名称" "$(x_default_name vless 1)")
     OB_ADDR=$(safe_read "服务器 IP/域名" "")
     [[ -z "$OB_ADDR" ]] && { print_error "服务器地址不能为空"; return 1; }
     OB_PORT=$(safe_read_int "端口" 443)
@@ -1021,7 +1021,7 @@ wizard_vless() {
 
 wizard_vmess() {
     ensure_uuidgen
-    OB_NAME=$(safe_read "显示名称" "")
+    OB_NAME=$(safe_read "显示名称" "$(x_default_name vmess 1)")
     OB_ADDR=$(safe_read "服务器 IP/域名" "")
     [[ -z "$OB_ADDR" ]] && { print_error "服务器地址不能为空"; return 1; }
     OB_PORT=$(safe_read_int "端口" 443)
@@ -1052,7 +1052,7 @@ wizard_vmess() {
 }
 
 wizard_trojan() {
-    OB_NAME=$(safe_read "显示名称" "")
+    OB_NAME=$(safe_read "显示名称" "$(x_default_name trojan 1)")
     OB_ADDR=$(safe_read "服务器 IP/域名" "")
     [[ -z "$OB_ADDR" ]] && { print_error "服务器地址不能为空"; return 1; }
     OB_PORT=$(safe_read_int "端口" 443)
@@ -1074,7 +1074,7 @@ wizard_trojan() {
 }
 
 wizard_ss() {
-    OB_NAME=$(safe_read "显示名称" "")
+    OB_NAME=$(safe_read "显示名称" "$(x_default_name ss 1)")
     OB_ADDR=$(safe_read "服务器 IP/域名" "")
     [[ -z "$OB_ADDR" ]] && { print_error "服务器地址不能为空"; return 1; }
     OB_PORT=$(safe_read_int "端口" 8388)
@@ -1102,7 +1102,7 @@ wizard_hy2() {
         fi
         [[ ! "$OB_PIN" =~ ^[0-9a-f]{64}$ ]] && { print_error "pin 格式无效，请重试"; return 1; }
     else
-        OB_NAME=$(safe_read "显示名称" "")
+        OB_NAME=$(safe_read "显示名称" "$(x_default_name hysteria2 1)")
         OB_ADDR=$(safe_read "服务器 IP/域名" "")
         [[ -z "$OB_ADDR" ]] && { print_error "服务器地址不能为空"; return 1; }
         OB_PORT=$(safe_read_int "端口" 443)
@@ -1118,7 +1118,7 @@ wizard_hy2() {
 }
 
 wizard_freedom() {
-    OB_NAME=$(safe_read "显示名称" "")
+    OB_NAME=$(safe_read "显示名称" "$(x_default_name freedom 1)")
     OB_SEND=""; OB_POOL=""
     echo "直连类型：" >&2
     echo "  1) 默认直连（无指定源IP）" >&2
@@ -1169,6 +1169,14 @@ wizard_freedom() {
     esac
     write_outbound freedom
 }
+
+# 节点命名约定 (单一实现) —— 本地优先, 否则从仓库取。
+if [[ -r "$_lib_dir/lib/naming.sh" ]]; then
+    source "$_lib_dir/lib/naming.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/naming.sh") \
+        || { print_error "命名库加载失败"; exit 1; }
+fi
 
 # 对外地址探测库 (单一实现) —— 本地优先, 否则从仓库取。
 # 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。

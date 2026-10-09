@@ -153,7 +153,17 @@ mk_run() {
     local cred; cred=$(mk_ask_credential "$proto") || return 1
 
     # ---- 组装规格 ----
-    local tag="${proto}-${tr}-${sec}-${port}"
+    #
+    # ★ 命名统一走 conf/lib/naming.sh, 不再各处随手拼。
+    #   原来这里是 `proto-tr-sec-port` (如 vless-xhttp-tls-45630), 而协议脚本
+    #   各写各的, 于是同一台机器上并存 VLESS-WS_01 / vless-xhttp01 /
+    #   hysteria-01 三种形态 —— 大小写混用、`_` 与 `-` 混用、编号位数不一。
+    #   后果: 按前缀筛节点写不准, 分享链接的 fragment 跟着乱, 客户端列表里
+    #   认不出谁是谁; 三个内核共用一个服务器时也看不出节点归属。
+    #
+    #   新约定: x-<协议><两位编号>-<安全>[-CDN]  (x 前缀表明是 Xray 建的)
+    local _n; _n=$(x_next_index "$proto" "$CONF_DIR" 2>/dev/null || echo 1)
+    local tag; tag=$(x_node_tag "$proto" "$_n" "$sec" "$([[ "$tier" == *cdn* ]] && echo cdn)")
     local domain=""
     if [[ "$sec" == "tls" ]]; then
         read -rp "  申请证书的域名: " domain
