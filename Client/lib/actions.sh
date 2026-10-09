@@ -754,7 +754,26 @@ cmd_node_browser() {
   # 这样关掉之后节点自动走原生 TLS，既省下 Chromium 的内存，也不需要用户理解这些。
   # 之前的做法等于"因为实现有缺陷，就不让用户关"。
   if [ "$can" = "True" ] && [ "$v" = "off" ]; then
-    info "该节点将改用 Xray 自带 TLS（不影响可用性，只是不再经过浏览器）"
+    # 协议支持 != 关掉之后还能用。
+    #
+    # 有些服务端就是靠"客户端用浏览器完成 TLS"才有活路 —— 常见于套了 CDN,
+    # 或专门对浏览器指纹做校验的。这类节点一旦切到 Xray 自带 TLS,
+    # 指纹对不上, 直接连不通。
+    #
+    # CC 实测: node-001-ccsmvless-01 (xhttp+tls) 开着浏览器 SOCKS 返回 204,
+    # 一关就变 000; 直接用 curl 原生 TLS 连它服务端, 连根路径都是 000。
+    #
+    # 所以这里不能无脑放行。能不能关让用户自己定, 但必须把后果说清楚 ——
+    # 之前这里只 info 一句"不影响可用性", 在这个场景下是错的:
+    # 用户照着关, 节点就废了, 而提示还说了没事。
+    warn "关掉后该节点改用 Xray 自带 TLS"
+    info "但有些服务端只认浏览器的 TLS 指纹, 关掉就可能连不通。"
+    printf '  要继续关闭吗? [y/N]: '
+    local go; read -r go || return 1
+    case "$go" in
+      y|Y|yes|YES) ;;
+      *) info "已取消"; return 0 ;;
+    esac
   fi
 
   if [ "$can" != "True" ] && [ "$v" != "off" ] && [ "$v" != "auto" ]; then
@@ -2320,9 +2339,10 @@ _mmenu_node() {
     printf "  \033[36m5)\033[0m 测速 (全部)\n"
     printf "  \033[36m6)\033[0m 删除节点\n"
     printf "  \033[36m7)\033[0m 分组管理      新建/整组删除\n"
+    printf "  \033[36m8)\033[0m 浏览器拨号    逐节点开关（省内存）\n"
     printf "  \033[36m0)\033[0m 返回\n"
     printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-7]: " c || return 0
+    read -r -p "请输入选项 [0-8]: " c || return 0
     case "$c" in
       1) xbd node list ;;
       2) xbd node add ;;
@@ -2331,6 +2351,7 @@ _mmenu_node() {
       5) xbd node latency ;;
       6) _mmenu_del ;;
       7) _mmenu_group ;;
+      8) _mmenu_browser ;;
       0) return ;;
       *) printf '  无效选项 %s\n' "$c" ;;
     esac
@@ -2365,6 +2386,181 @@ _mmenu_del() {
   printf '  确认删除 %s ? [y/N] ' "$c"; read -r a || return 0
   [ "$a" = "y" ] || [ "$a" = "Y" ] || { printf '  已取消\n'; return 0; }
   xbd node remove "$c"
+}
+
+# Browser Dialer 逐节点开关。
+#
+# 为什么放在节点菜单里而不是做成全局开关:
+# Browser Dialer 是**每个节点各自的属性**。只有 xhttp/websocket + 域名 +
+# 非 REALITY 的节点能走浏览器转发；hysteria/trojan/raw-tcp 这些由 Xray 自己
+# 完成 TLS，跟浏览器无关。
+#
+# 做成全局开关的后果是：切到一个不需要浏览器的节点，浏览器还开着，白占
+# 一份 Chromium 的内存（实测 ~180MB）。所以这里的语义是**跟着节点走**，
+# 而 Chromium 本身在"当前节点不用浏览器"时会自动停掉释放内存。
+#
+# 三态：
+#   默认  auto —— 协议支持就用，不支持就不用（推荐）
+#   浏览器 on   —— 强制用（协议不支持时会拒绝并说明原因）
+#   原生  off  —— 强制不用，省内存，节点仍完全可用
+_mmenu_browser() {
+  local c
+  while :; do
+    printf '\n\033[36m浏览器拨号 (Browser Dialer)\033[0m\n'
+    printf '  只有 xhttp/websocket 且非 REALITY 的节点能走浏览器转发。\n'
+    printf '  选「原生」可省下 Chromium 的内存，节点仍然完全可用。\n'
+    printf -- '----------------------\n'
+    _xbd_browser_table
+    printf -- '----------------------\n'
+    printf "  \033[36m1)\033[0m 逐个切换开关\n"
+    printf "  \033[36m2)\033[0m 当前节点：切到「浏览器 / 原生 / 默认」\n"
+    printf "  \033[36m3)\033[0m 把所有支持浏览器的节点设为「浏览器」\n"
+    printf "  \033[36m4)\033[0m 把所有节点设为「原生」（最省内存）\n"
+    printf "  \033[36m0)\033[0m 返回\n"
+    printf -- '----------------------\n'
+    read -r -p "请输入选项 [0-4]: " c || return 0
+    case "$c" in
+      1) _xbd_browser_pick ;;
+      2)
+         local cur_name
+         cur_name=$(readlink -f "$XBD_NODES/current" 2>/dev/null | xargs -r basename)
+         [ -n "$cur_name" ] || { warn "还没有当前节点"; continue; }
+         printf '\n  当前节点: %s\n' "$cur_name"
+         printf '  设置为 [b=浏览器 / n=原生 / a=默认]: '
+         local v; read -r v || return 0
+         case "$v" in
+           b|B) xbd node browser "$cur_name" on ;;
+           n|N) xbd node browser "$cur_name" off ;;
+           a|A|"") xbd node browser "$cur_name" auto ;;
+           *) warn "没听懂，输入 b / n / a" ;;
+         esac
+         ;;
+      3) _xbd_browser_bulk on ;;
+      4) _xbd_browser_bulk off ;;
+      0) return 0 ;;
+    esac
+  done
+}
+
+# 打印所有节点 + 浏览器能力 + 当前设置。
+# 不支持的节点也要列出来 —— 用户需要知道"为什么这个没有开关"，
+# 而不是发现列表里少了几个节点以为没导入成功。
+_xbd_browser_table() {
+  local f name can want cur
+  printf '  %-34s %-9s %-8s %s\n' "节点" "可浏览器" "当前" "传输/协议"
+  for f in "$XBD_NODES"/node-*.json; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .json)
+    [ "$name" = "current" ] && continue
+    cur=""; [ "$(readlink -f "$XBD_NODES/current" 2>/dev/null)" = "$(readlink -f "$f")" ] && cur=" *"
+    can=$(python3 "$XBD_LIBDIR/compat.py" json "$f" 2>/dev/null \
+          | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+    print("是" if d.get("can_use_dialer") else "否")
+except Exception:
+    print("?")' 2>/dev/null)
+    want=$(python3 -c '
+import json,sys
+try:
+    v=json.load(open(sys.argv[1])).get("use_browser", None)
+    print({True:"浏览器", False:"原生", None:"默认"}[v] if v is None or isinstance(v,bool) else "默认")
+except Exception:
+    print("?")' "$f" 2>/dev/null)
+    local info
+    info=$(python3 -c '
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print("%s/%s" % (d.get("transport") or "-", d.get("protocol") or "-"))
+except Exception:
+    print("-")' "$f" 2>/dev/null)
+    printf '  %-34s %-9s %-8s %s\n' "${name}${cur}" "$can" "$want" "$info"
+  done
+}
+
+# 逐个选：列出来 → 输入编号 → 选值
+_xbd_browser_pick() {
+  local idx=0 f name pick
+  printf '\n'
+  for f in "$XBD_NODES"/node-*.json; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .json)
+    [ "$name" = "current" ] && continue
+    idx=$((idx+1))
+    local can want
+    can=$(python3 "$XBD_LIBDIR/compat.py" json "$f" 2>/dev/null \
+          | python3 -c 'import sys,json
+try:
+    print("是" if json.load(sys.stdin).get("can_use_dialer") else "否")
+except Exception:
+    print("?")' 2>/dev/null)
+    want=$(python3 -c '
+import json,sys
+try:
+    v=json.load(open(sys.argv[1])).get("use_browser", None)
+    print({True:"浏览器", False:"原生", None:"默认"}[v] if v is None or isinstance(v,bool) else "默认")
+except Exception:
+    print("?")' "$f" 2>/dev/null)
+    printf '  %2d) %-32s 可浏览器=%-3s 当前=%s\n' "$idx" "$name" "$can" "$want"
+  done
+  [ "$idx" -eq 0 ] && { warn "还没有节点"; return 0; }
+  printf '\n  编号 (直接回车取消): '
+  read -r pick || return 0
+  [ -n "$pick" ] || return 0
+  case "$pick" in
+    ''|*[!0-9]*) warn "编号不对"; return 0 ;;
+  esac
+  [ "$pick" -ge 1 ] && [ "$pick" -le "$idx" ] || { warn "编号超出范围"; return 0; }
+
+  local target
+  target=$(ls "$XBD_NODES"/node-*.json 2>/dev/null | grep -v '/current$' | sed -n "${pick}p")
+  [ -n "$target" ] || { warn "找不到节点"; return 0; }
+  printf '\n  %s → [b=浏览器 / n=原生 / a=默认]: ' "$(basename "$target")"
+  local v; read -r v || return 0
+  case "$v" in
+    b|B) xbd node browser "$target" on ;;
+    n|N) xbd node browser "$target" off ;;
+    a|A|"") xbd node browser "$target" auto ;;
+    *) warn "没听懂，输入 b / n / a" ;;
+  esac
+}
+
+# 批量设置。只改**协议支持浏览器**的节点 —— 给 hysteria 设成"浏览器"
+# 没有意义，cmd_node_browser 会拒绝，不如在这里就不去碰。
+_xbd_browser_bulk() {
+  local v="$1" f name n=0 skipped=0
+  printf '\n'
+  for f in "$XBD_NODES"/node-*.json; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .json)
+    [ "$name" = "current" ] && continue
+    local can
+    can=$(python3 "$XBD_LIBDIR/compat.py" json "$f" 2>/dev/null \
+          | python3 -c 'import sys,json
+try:
+    print("True" if json.load(sys.stdin).get("can_use_dialer") else "False")
+except Exception:
+    print("False")' 2>/dev/null)
+    if [ "$can" != "True" ]; then skipped=$((skipped+1)); continue; fi
+    _xbd_set_node_browser "$f" "$( [ "$v" = "on" ] && echo true || echo false )"
+    n=$((n+1))
+  done
+  ok "已把 $n 个节点设为「$([ "$v" = on ] && echo 浏览器 || echo 原生)」"
+  if [ "$skipped" -gt 0 ]; then
+    dim "$skipped 个节点协议不支持浏览器拨号，已跳过（它们本来就不用浏览器）"
+  fi
+  # 当前节点改了的话要重启才生效
+  if _xbd_node_needs_dialer; then
+    info "正在重启 Xray 让设置生效…"
+    systemctl restart "$XBD_U_XRAY" 2>/dev/null || true
+    sleep 4
+    if _xbd_node_needs_dialer; then
+      unit_active "$XBD_U_CHROMIUM" || xbd_dialer_on || warn "Chromium 启动失败，可手动执行: xbd dialer on"
+    else
+      unit_active "$XBD_U_CHROMIUM" && xbd_dialer_off || true
+    fi
+  fi
 }
 
 _mmenu_group() {

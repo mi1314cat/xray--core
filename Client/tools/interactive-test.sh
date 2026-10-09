@@ -157,6 +157,41 @@ test_client() {
     printf '    \033[90m(skipped) multi on/off —— 会重启并改配置\033[0m\n'
   fi
 
+  # ---------------------------------------------------------- Browser Dialer
+  printf '\n  \033[36m浏览器拨号\033[0m\n'
+  # 菜单入口: 之前 node browser 只能敲命令行, 菜单里没有
+  printf '1\n8\n0\n0\n' | timeout 90 "$XBD" menu >"$TMPO" 2>&1
+  hasf "节点菜单含「浏览器拨号」" "浏览器拨号" ""
+  printf '1\n8\n0\n0\n' | timeout 90 "$XBD" menu >"$TMPO" 2>&1
+  hasf "浏览器拨号菜单列出每个节点" "可浏览器" ""
+  # 不支持的节点也要列出来 —— 用户要能看出"为什么这个没开关"
+  hasf "浏览器拨号菜单说明能力边界" "xhttp/websocket" ""
+  hasf "浏览器拨号菜单有批量开关" "最省内存" ""
+
+  # 关浏览器必须先警告: 有服务端只认浏览器 TLS 指纹, 关掉就断
+  # (CC 上 node-001-ccsmvless-01 实测: 开 204 / 关 000)
+  # readlink -f 给的是全路径带 .json, 而 node browser 要的是节点名(不带后缀)
+  cur_node=$(readlink -f "$PREFIX/nodes/current" 2>/dev/null || true)
+  cur_name=$(basename "${cur_node:-}" .json)
+  cur_json="$cur_node"
+  if [ -n "$cur_node" ] && [ -e "$cur_node" ]; then
+    can=$(python3 "$PREFIX/lib/compat.py" json "$cur_json" 2>/dev/null \
+          | python3 -c 'import sys,json
+try: print("yes" if json.load(sys.stdin).get("can_use_dialer") else "no")
+except Exception: print("no")' 2>/dev/null)
+    if [ "$can" = "yes" ]; then
+      printf 'n\n' | timeout 60 "$XBD" node browser "$cur_name" off >"$TMPO" 2>&1
+      hasf "关浏览器前会警告后果" "只认浏览器的 TLS 指纹" ""
+      hasf "关浏览器前要用户确认" "要继续关闭吗" ""
+      # 输入 n 之后不能真改掉
+      still=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("use_browser"))' "$cur_json" 2>/dev/null)
+      if [ "$still" != "False" ]; then ok "回答 n 时不改动设置"
+      else bad "回答 n 时不改动设置" "use_browser 变成了 False"; fi
+    else
+      printf '    \033[90m(skipped) 关闭确认 —— 当前节点不支持浏览器\033[0m\n'
+    fi
+  fi
+
   # ---------------------------------------------------------- 配置分发
   printf '\n  \033[36m配置分发\033[0m\n'
   timeout 30 "$XBD" share list >"$TMPO" 2>&1
