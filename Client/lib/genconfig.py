@@ -324,6 +324,9 @@ def build(node: dict, args) -> dict:
         {"type": "field", "outboundTag": "proxy", "network": "tcp,udp"},
     ]
 
+    # metrics 端口: 显式给了就用, 否则自动挑一个**确认空闲**的。
+    # 固定值在端口被占时会让内核启动失败, 代价远大于读不到 metrics。
+    _metrics_port = args.metrics_port or pick_metrics_port()
     cfg = {
         "log": {
             "loglevel": args.loglevel,
@@ -332,6 +335,18 @@ def build(node: dict, args) -> dict:
         },
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService", "HandlerService"]},
+        # ★ 这里**故意不加 metrics**。
+        #
+        #   单节点配置就是 Browser Dialer 用的那份，而 BD 模式下**没有观测器**
+        #   —— genconfig 里另一处的注释写明了原因: BD 的 env 是进程级的, 所有
+        #   出站都会去抢浏览器的连接额度, 观测器一探测就把额度耗光。
+        #   既然没有观测数据, 健康列在这一模式下本来就显示"未观测",
+        #   在这里开一个监听端口只有"多一份流量统计"这点收益。
+        #
+        #   而代价是真实的: selftest-groups 有一条守卫断言"单节点配置与 HEAD
+        #   逐字节一致（Browser Dialer 未受影响）"—— 那条守卫**真的拦住了**
+        #   这次改动, 说明它守的是有价值的东西（BD 是最脆的一条路径）。
+        #   不值得为了一点统计信息去动它。
         "policy": {
             "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True,
@@ -444,6 +459,21 @@ def _apply_dns(cfg: dict, args) -> None:
         # 插在最前面：DNS 的出口要压过后面所有规则，否则会被某条宽泛规则抢先。
         cfg["routing"].setdefault("rules", [])
         cfg["routing"]["rules"] = rules + cfg["routing"]["rules"]
+
+
+def pick_metrics_port(preferred: int = 18086) -> int:
+    """挑一个**确认空闲**的 metrics 端口。
+
+    ★ 不能直接用固定值: 这个端点是要真去 bind 的, 端口被占时内核启动失败,
+    而报错是内核级的 "listen tcp 127.0.0.1:18086: bind: address already in use"
+    —— 与"metrics 读不到"相比, 这是一个**服务起不来**的故障, 代价大得多。
+    复用 ports.py 的 pick_free (它用真 bind 判断, 比 grep ss 准)。
+    """
+    try:
+        import ports as _P
+        return int(_P.pick_free(preferred, "127.0.0.1"))
+    except Exception:
+        return int(preferred)
 
 
 def tag_for(node: dict) -> str:
@@ -600,6 +630,9 @@ def build_multi(nodes: list, current: dict, args) -> dict:
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False},
         })
 
+    # metrics 端口: 显式给了就用, 否则自动挑一个**确认空闲**的。
+    # 固定值在端口被占时会让内核启动失败, 代价远大于读不到 metrics。
+    _metrics_port = args.metrics_port or pick_metrics_port()
     cfg = {
         "log": {
             "loglevel": args.loglevel,
@@ -612,8 +645,22 @@ def build_multi(nodes: list, current: dict, args) -> dict:
         "api": {
             "tag": "api",
             "listen": f"127.0.0.1:{args.api_port}",
+            # ★ 这里**故意没有** ObservatoryService。
+            #
+            #   官方源码的判据: services 里写了 ObservatoryService 但配置里
+            #   没有 observatory / burstObservatory 时, 内核**直接启动失败**:
+            #       Failed to create server > core: not all dependencies are resolved.
+            #   而单节点模式本来就没有观测器 —— 加进去就是把"打开配置"变成
+            #   "服务起不来"。
+            #
+            #   读观测结果改走 metrics 的 /debug/vars (官方文档化的那条路),
+            #   它没有启动期依赖, 两种模式都能用。这里保留 balancer 用的
+            #   RoutingService。
             "services": ["StatsService", "HandlerService", "RoutingService"],
         },
+        # 只读 HTTP 端点: 一次 GET 同时拿到流量聚合与观测结果。
+        # 无鉴权, 所以只绑回环 —— 与 api 同一个原则。
+        "metrics": {"listen": f"127.0.0.1:{_metrics_port}"},
         "policy": {
             "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True,
@@ -708,6 +755,8 @@ def main() -> int:
                     help="off=不接管 DNS；standard=境外加密 DNS + 国内加密 DNS；"
                          "strict=全部加密 DNS 并强制经代理（防泄漏最严）")
     ap.add_argument("--api-port", type=int, default=18085)
+    ap.add_argument("--metrics-port", type=int, default=0,
+                    help="只读 metrics 端点 (GET /debug/vars); 0=自动挑一个空闲的")
     ap.add_argument("--http-port", type=int, default=0,
                     help="本机回环 HTTP 代理端口（0=不启用）。docker 等只认 HTTP 代理")
     ap.add_argument("--lan-http-port", type=int, default=0,

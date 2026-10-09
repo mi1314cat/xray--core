@@ -141,6 +141,74 @@ def node_stats(server: str) -> dict:
     return out
 
 
+# 观测结果的读法 —— 走 metrics 的只读 HTTP 端点, 不走 gRPC。
+#
+# 为什么不走 gRPC 的 ObservatoryService: 官方源码里那个服务**有启动期依赖** ——
+# services 写了它但配置里没有 observatory/burstObservatory 时, 内核直接
+#     Failed to create server > core: not all dependencies are resolved.
+# 而单节点模式本来就没有观测器。metrics 没这个问题, 而且官方文档化了
+# (metrics.html 明确写: `observatory` 包含观测结果)。
+#
+# 死节点的判据有**三个坑**, 都来自官方源码与实测:
+#   1. delay 的哨兵值是 **99999999**, 而且 alive 字段**直接缺失** ——
+#      只看 delay 是个数字就当成"在线且很快"会得到完全相反的结论。
+#   2. burstObservatory 的 health_ping.average 是**纳秒** (Go time.Duration
+#      原值), 而 delay 是毫秒。混用会渲染出"延迟 589528066 毫秒"。
+#   3. 没被 subjectSelector 覆盖的出站**根本不在结果里** —— 那是"未观测",
+#      不是"离线"。所以缺的 tag 不返回条目, 由调用方显示"未观测"。
+OBS_SENTINEL = 99999999
+
+
+def observatory_status(port: int, timeout: int = 5) -> dict:
+    """{tag: {"alive": bool|None, "delay_ms": int|None, "last_error": str}}
+
+    读不到就返回 {} —— 调用方据此显示"未知", 而不是把所有节点标成离线。
+    """
+    import urllib.request
+
+    url = f"http://127.0.0.1:{int(port)}/debug/vars"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    obs = data.get("observatory") or {}
+    if not isinstance(obs, dict):
+        return {}
+
+    out = {}
+    for tag, v in obs.items():
+        if not isinstance(v, dict):
+            continue
+        alive = v.get("alive")
+        delay_ms = None
+
+        raw = v.get("delay")
+        if isinstance(raw, (int, float)):
+            if int(raw) >= OBS_SENTINEL:
+                alive = False            # 哨兵值 = 探测超时/失败
+            else:
+                delay_ms = int(raw)
+
+        # burst 的 health_ping 是纳秒；只有拿不到 delay 时才退到它
+        if delay_ms is None:
+            avg = (v.get("health_ping") or {}).get("average")
+            if isinstance(avg, (int, float)) and 0 < avg < OBS_SENTINEL * 1_000_000:
+                delay_ms = int(avg / 1_000_000)
+
+        # 有可用延迟但没显式 alive -> 视为在线 (官方只在失败时才写 alive=false)
+        if alive is None and delay_ms is not None:
+            alive = True
+
+        out[tag] = {
+            "alive": alive,
+            "delay_ms": delay_ms,
+            "last_error": str(v.get("last_error_reason") or ""),
+            "last_seen": str(v.get("last_seen_time") or ""),
+        }
+    return out
+
+
 def outbounds(server: str) -> list:
     data = _json(server, ["lso"])
     return [o.get("tag") for o in (data.get("outbounds") or []) if o.get("tag")]

@@ -32,6 +32,10 @@ PORT_SPECS = [
     ("DIALER_ADDR",   "Xray↔Chromium 内部通道",   "loopback", 18081),
     ("PANEL_PORT",    "面板",                     "bind",     18090),
     ("API_PORT",      "Xray 统计 API",            "loopback", 18085),
+    # 只读的 HTTP 端点 (GET /debug/vars)。用于读观测结果与流量聚合 ——
+    # 比走 gRPC 的 ObservatoryService 更省事, 而且**没有启动期依赖**
+    # (见 genconfig 里关于 ObservatoryService 的说明)。
+    ("METRICS_PORT",  "Xray metrics (/debug/vars)", "loopback", 18086),
 ]
 # 这些端口绝不使用：SSH / DNS / 其它服务常用端口
 RESERVED = {22, 53, 80, 443, 1080 + 100000}   # 占位，见下方 forbidden()
