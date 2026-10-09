@@ -46,12 +46,26 @@ _resolve_client() {
 
 SHARE_CLIENT="${SHARE_CLIENT:-$(_resolve_client)}"
 
-_RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _RST=$'\033[0m'
-[[ -t 2 ]] || { _RED=""; _GRN=""; _YEL=""; _CYN=""; _RST=""; }
-ok()   { printf "  ${_GRN}[OK]${_RST} %s\n" "$*" >&2; }
-info() { printf "  ${_CYN}[--]${_RST} %s\n" "$*" >&2; }
-warn() { printf "  ${_YEL}[!]${_RST} %s\n" "$*" >&2; }
-err()  { printf "  ${_RED}[X]${_RST} %s\n" "$*" >&2; }
+# 提示函数 —— 本脚本在面板里是 `bash <(curl …)` 跑的，$BASH_SOURCE 指向
+# /dev/fd/63，"脚本旁边"永远是空的。所以和 _resolve_client 一样三级查找，
+# 最后现拉（XRAY_RAW 已在上面定义）。
+if [[ -r "$XRAY_BASE/conf/lib/print.sh" ]]; then
+    source "$XRAY_BASE/conf/lib/print.sh"
+else
+    _self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    if [[ -n "$_self" && -r "$_self/lib/print.sh" ]]; then
+        source "$_self/lib/print.sh"
+    else
+        _ptmp="$(mktemp -d /tmp/.xprint.XXXXXX)" \
+            && curl -fsSL --max-time 20 "$XRAY_RAW/conf/lib/print.sh" \
+                   -o "$_ptmp/print.sh" 2>/dev/null \
+            && source "$_ptmp/print.sh"
+        if ! declare -F ok >/dev/null; then
+            printf '  [X] 取不到 conf/lib/print.sh —— 提示函数不可用\n' >&2
+            exit 1
+        fi
+    fi
+fi
 
 python() { command python3 "$@"; }
 

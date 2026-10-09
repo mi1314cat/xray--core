@@ -22,6 +22,10 @@ PREFIX="${XBD_PREFIX:-/opt/xray-browser-dialer}"
 
 if [ -t 1 ]; then R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[36m'; D=$'\033[2m'; O=$'\033[0m'
 else R=""; G=""; Y=""; B=""; D=""; O=""; fi
+# 这三个提示函数**故意**不共用 lib/core.sh，别顺手统一：
+#   · 本脚本在解压出来的目录里跑, 理论上够得着 lib/core.sh; 但它要在
+#     "解压了一半 / 依赖没装齐"的时候也能给出可读的报错 —— 那正是它存在的意义。
+#   · 服务端的同类重复已经收进 conf/lib/print.sh; 这里不收是**约束**不是遗漏。
 dim()  { printf '%s%s%s\n' "${D:-}" "$*" "$O"; }
 ok()   { printf '%s✓%s %s\n' "$G" "$O" "$*"; }
 warn() { printf '%s!%s %s\n' "$Y" "$O" "$*"; }

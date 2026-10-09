@@ -76,6 +76,15 @@ _x_ensure_client() {
 
 LIB_DIR="$(_x_ensure_lib)" || LIB_DIR="$(_x_self_dir)/lib"
 
+# 提示函数 —— 与 addr.sh 同一套三级查找：脚本旁边 -> 安装目录 -> 现拉。
+if [[ -r "$LIB_DIR/print.sh" ]]; then
+    source "$LIB_DIR/print.sh"
+else
+    _x_fetch "conf/lib/print.sh" "$LIB_DIR/print.sh" 2>/dev/null \
+        && source "$LIB_DIR/print.sh" \
+        || { printf '  [X] 提示函数库加载失败\n' >&2; exit 1; }
+fi
+
 # 对外地址探测库 —— 地址族切换要用 (x_addr6_real / x_iface_public_addr)。
 # 与其它脚本同一套三级查找: 脚本旁边 -> 安装目录 -> 现拉。
 if [[ -r "$LIB_DIR/addr.sh" ]]; then
@@ -86,14 +95,6 @@ else
 fi
 SHARE_ADDR="${XRAY_SHARE_ADDR:-127.0.0.1}"
 
-_RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _DIM=$'\033[2m'; _RST=$'\033[0m'
-[[ -t 2 ]] || { _RED=""; _GRN=""; _YEL=""; _CYN=""; _DIM=""; _RST=""; }
-
-ok()   { printf "  ${_GRN}[OK]${_RST} %s\n" "$*" >&2; }
-info() { printf "  ${_CYN}[--]${_RST} %s\n" "$*" >&2; }
-warn() { printf "  ${_YEL}[!]${_RST} %s\n" "$*" >&2; }
-err()  { printf "  ${_RED}[X]${_RST} %s\n" "$*" >&2; }
-die()  { err "$*"; exit 1; }
 
 python() { command python3 "$@"; }
 

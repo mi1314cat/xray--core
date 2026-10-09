@@ -412,3 +412,43 @@ curl -Ls "https://raw.githubusercontent.com/mi1314cat/xray--core/<commit>/conf/s
 
 按 commit 拉不受分支缓存影响。这条与 §二 记的"本地改了不生效，必须先 push"
 是同一类坑的第二层 —— **push 了也可能还要等几分钟**。
+
+## 九、镜像链只做了一半 —— §八 那些「例外」的续集
+
+面板侧的镜像链是完整的：19 个菜单项全部改走 `xray_run` → `xray_fetch`，带
+`XRAY_MIRRORS` 多源回退。`conf/lib/fetch.sh`（`X_REPO_MIRRORS` + `x_fetch`）
+也已经建好，并有 3 条断言守着。
+
+**但是**：各协议脚本内部的**依赖兜底加载**仍然是直连 github.com：
+
+```bash
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh") \
+        || die "..."
+fi
+```
+
+实测统计（`grep -rn 'source <(curl -fsSL "https://github.com/'`）：
+
+| | |
+|---|---|
+| 出现次数 | **40** |
+| 涉及文件 | **17**（`conf/` 下 13 个 + 根目录 `VEVLRE.sh` / `ngcadall.sh` / `nginx.sh` / `caddy.sh`） |
+
+**为什么这个缺口要紧**：这条 `else` 分支恰恰是"本地没有 lib"时才走的 ——
+也就是 `bash <(curl ...)` 首次运行、以及国内网络连不上 github.com 的时候。
+换句话说，**镜像链存在的唯一理由，正好就是这条没走镜像链的路径**。
+另外 `conf/share.sh` 的 `_x_fetch` 也是单源（`$XRAY_RAW`），没接 `X_REPO_MIRRORS`。
+
+### 建议做法（不要在收尾时仓促做）
+
+不要逐个脚本内联一段镜像循环 —— 那是把重复从 40 处换成 17 处。正确做法是
+一个 `conf/lib/deps.sh`，提供 `x_dep <lib 文件名>`（本地三级查找 → 镜像链），
+各脚本的 `else` 分支改成调它。难点在**它自己怎么被加载**（鸡生蛋）：需要一段
+不超过 3 行的引导，且镜像表要能从脚本内部拿到（不能依赖面板的 `XRAY_MIRRORS`）。
+
+改完必须在 **RN 测试机**上按"模拟 curl 路径"验证：把脚本复制到临时目录再执行、
+并临时把 lib 目录改名，否则这条分支永远不会被测到 —— 这也正是它至今没被发现的
+原因（面板菜单路径被测试覆盖了，脚本内部路径没有）。

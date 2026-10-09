@@ -328,6 +328,90 @@ assert_eq "$got" "ghproxy.net" "镜像名识别"
 got=$(bash -c "source '$LIB/fetch.sh'; x_source_name ''")
 assert_eq "$got" "未探测" "未探测时不报错"
 
+# ---------------------------------------------------------------- 提示函数统一
+# ok/info/warn/err 原来在 node.sh / share.sh / share_service.sh 里各抄了一份
+# **逐字节相同**的四行。抄三遍的代价不是行数, 而是"改一处漏两处" ——
+# 这组的重点不是"函数在不在", 而是那两条容易被漏掉的**行为约定**:
+#   1) 一律写 stderr。stdout 是数据通道 (分享链接/节点列表都走它),
+#      提示混进去, 下游会把 "[OK] 已创建" 当链接解析。
+#   2) 非终端时不上色。否则重定向到日志, 每行都是 ^[[32m 这类垃圾。
+group "提示函数统一 (print.sh)"
+[[ -f "$LIB/print.sh" ]] && ok "conf/lib/print.sh 存在" || bad "conf/lib/print.sh 缺失"
+
+for fn in ok info warn err die; do
+    bash -c "source '$LIB/print.sh'; declare -F $fn >/dev/null" \
+        && ok "导出 $fn()" || bad "没有 $fn()"
+done
+
+# ★ stdout 必须是空的 —— 这条是整组里最重要的
+out=$(bash -c "source '$LIB/print.sh'; ok A; info B; warn C; err D" 2>/dev/null)
+[[ -z "$out" ]] && ok "四条提示都不写 stdout (stdout 留给数据通道)" \
+    || bad "有提示写进了 stdout: [$out]"
+
+# 非终端不上色 (命令替换里一定不是终端)
+out=$(bash -c "source '$LIB/print.sh'; ok A; warn B; err C; info D" 2>&1)
+if printf '%s' "$out" | grep -q $'\033'; then
+    bad "非终端下仍带 ANSI 转义序列 (重定向到日志会全是垃圾)"
+else
+    ok "非终端下不上色"
+fi
+
+# die 的退出码: 面板靠它判断成败, 必须固定
+bash -c "source '$LIB/print.sh'; die x" >/dev/null 2>&1
+assert_eq "$?" "1" "die 退出码为 1"
+
+# 调用方已经设过颜色时不能被覆盖 (install.sh 用的是另一套变量名)
+got=$(bash -c "source '$LIB/print.sh'; _GRN=X; source '$LIB/print.sh'; printf '%s' \"\$_GRN\"")
+assert_eq "$got" "X" "重复 source 不覆盖调用方已有的颜色变量"
+
+# 三个脚本不该再各留一份本地定义 —— 这才是这次改动的目的
+for f in conf/node.sh conf/share.sh conf/share_service.sh; do
+    n=$(grep -cE '^(ok|info|warn|err|die)\(\)' "$ROOT/$f" 2>/dev/null || true)
+    [[ "$n" = "0" ]] && ok "$f 已无本地定义" || bad "$f 仍有 $n 处本地定义"
+done
+
+# 真的能加载 (跑一个未知子命令, 走它自己的 usage 分支就说明库加载过了)
+for f in conf/node.sh conf/share.sh conf/share_service.sh; do
+    out=$(bash "$ROOT/$f" __probe__ 2>&1 || true)
+    if printf '%s' "$out" | grep -qi "command not found"; then
+        bad "$f 加载提示库失败: $(printf '%s' "$out" | head -1)"
+    elif [[ -z "$out" ]]; then
+        bad "$f 未知子命令没有任何输出 (库可能没加载)"
+    else
+        ok "$f 能加载 print.sh"
+    fi
+done
+
+# 顺序回归: share.sh 里 addr.sh 的失败分支要调 warn,
+# warn 必须在那之前就定义好 —— 原来定义在它后面, 那条分支一旦走到
+# 就是 "warn: command not found"。
+a=$(grep -n 'source "\$LIB_DIR/print.sh"' "$ROOT/conf/share.sh" | head -1 | cut -d: -f1)
+b=$(grep -n 'source "\$LIB_DIR/addr.sh"' "$ROOT/conf/share.sh" | head -1 | cut -d: -f1)
+if [[ -n "$a" && -n "$b" && "$a" -lt "$b" ]]; then
+    ok "share.sh: print.sh 在 addr.sh 之前加载 (warn 已可用)"
+else
+    bad "share.sh: 加载顺序不对 (print=$a addr=$b) —— warn 可能在定义前被调用"
+fi
+
+# 反方向的门禁: 这几个**引导脚本**必须保持自包含, 不能被"顺手统一"掉。
+#   uninstall 尤其要紧 —— 它得在安装树损坏时照常工作, 而它自己还会把
+#   lib/core.sh 列进删除清单, 自己依赖自己即将删的文件是说不通的。
+if grep -qE '^[[:space:]]*(source|\.)[[:space:]]+.*core\.sh' "$ROOT/Client/uninstall-xray-client.sh"; then
+    bad "uninstall-xray-client.sh 开始依赖 lib/core.sh 了 —— 安装树损坏时它会连提示都打不出来"
+else
+    ok "uninstall-xray-client.sh 保持自包含 (不依赖 lib/core.sh)"
+fi
+for f in Client/l.sh Client/RUN.sh; do
+    grep -q '故意.*不共用 lib/core.sh' "$ROOT/$f" \
+        && ok "$f 写明了为何不统一" || bad "$f 缺少「为何不统一」的说明"
+done
+
+# python() 包装不能被误吞 (它和提示函数挨着, 是最容易被误删的邻居)
+for f in conf/share.sh conf/share_service.sh; do
+    grep -q '^python() { command python3' "$ROOT/$f" \
+        && ok "$f: python() 包装还在" || bad "$f: python() 包装丢了"
+done
+
 # ---------------------------------------------------------------- 随机值 / 交互输入
 # 这两个库原来是"定义了但没人测", 于是幽灵函数门禁长期把它们报成不可达。
 # 它们各自守着一个**记在注释里的真实事故**:

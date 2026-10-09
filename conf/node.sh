@@ -21,13 +21,14 @@ LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
 XRAY_SERVICE="${XRAY_SERVICE:-xrayls}"
 MAIN_CONFIG="${XRAY_MAIN_CONFIG:-$XRAY_BASE/config.json}"
 
-_RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _DIM=$'\033[2m'; _RST=$'\033[0m'
-[[ -t 2 ]] || { _RED=""; _GRN=""; _YEL=""; _CYN=""; _DIM=""; _RST=""; }
-ok()   { printf "  ${_GRN}[OK]${_RST} %s\n" "$*" >&2; }
-info() { printf "  ${_CYN}[--]${_RST} %s\n" "$*" >&2; }
-warn() { printf "  ${_YEL}[!]${_RST} %s\n" "$*" >&2; }
-err()  { printf "  ${_RED}[X]${_RST} %s\n" "$*" >&2; }
-die()  { err "$*"; exit 1; }
+# 提示函数（ok/info/warn/err/die）—— 与 share.sh / share_service.sh 共用一份。
+# 这里的 LIB_DIR 就是脚本旁边的 lib/；只要 node.sh 找得到 nodes.py，它就成立。
+if [[ -r "$LIB_DIR/print.sh" ]]; then
+    source "$LIB_DIR/print.sh"
+else
+    printf '  [X] 取不到 %s/print.sh —— 提示函数不可用\n' "$LIB_DIR" >&2
+    exit 1
+fi
 
 py() { python3 "$@"; }
 

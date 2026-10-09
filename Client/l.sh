@@ -49,6 +49,10 @@ if [ -t 1 ]; then
 else
   R=""; G=""; Y=""; B=""; D=""; O=""
 fi
+# 这四个提示函数**故意**不共用 lib/core.sh，别顺手统一：
+#   · 本脚本是 `bash <(curl ...)` 拉的，$BASH_SOURCE 指向 /dev/fd/63,
+#     "脚本旁边"永远是空的 —— 入口脚本必须自包含, 不能依赖还没下载下来的东西。
+#   · 服务端的同类重复已经收进 conf/lib/print.sh; 这里不收是**约束**不是遗漏。
 info() { printf '%s\n' "$*" | tee -a "$LOG"; }
 dim()  { printf '%s%s%s\n' "$D" "$*" "$O" | tee -a "$LOG"; }
 ok()   { printf '%s✓%s %s\n' "$G" "$O" "$*" | tee -a "$LOG"; }
