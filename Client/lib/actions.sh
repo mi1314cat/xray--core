@@ -179,6 +179,21 @@ PORT_HTTP=10808
 PORT_LAN_HTTP=10809
 EOF
 
+  # 多出站默认关。写出来而不是留着空文件，是为了让用户能一眼看到这个开关
+  # 存在、默认值是什么、以及怎么改 —— 一个不存在的文件和一个空文件，
+  # 用户都会怀疑"是不是漏配了什么"。
+  [ -f "$XBD_MULTI_ENV" ] || cat > "$XBD_MULTI_ENV" <<'EOF'
+# 多出站开关
+#
+# off（默认）：只有当前节点进运行配置。切换节点需要重启 Xray（连接断 1-2 秒），
+#               但坏掉的只是那一个节点。
+# on         ：所有节点常驻一份配置，切换节点不用重启。代价是所有节点共享
+#               一份配置 —— 任何一个节点构建失败，整份配置都通不过校验。
+#
+# 改法：xbd multi on / xbd multi off，或面板「运行概况」里的下拉框。
+MULTI_OUTBOUND=off
+EOF
+
   [ -f "$XBD_CONF/chromium.env" ] || cat > "$XBD_CONF/chromium.env" <<'EOF'
 # Chromium 运行参数（Browser Dialer 的运行时依赖）
 BROWSER_DIALER_ADDR=127.0.0.1:18081
@@ -944,10 +959,18 @@ cmd_apply() {
   )
   # validate-with 让 genconfig 自己把构建不出来的节点剔掉。多出站把所有节点塞进
   # 同一份配置，一条坏节点就足以让整份配置通不过校验 —— 服务直接起不来。
+  #
+  # 多出站默认关闭，开启了才让所有节点常驻一份配置（切换不断线）。
+  # 与 run-xray.sh 读同一个 multi.env，两边判断必须一致 —— 不一致就会出现
+  # "面板说是多出站、实际是单节点"这种最难查的状态。
+  local multi_mode
+  multi_mode=$(_xbd_multi_mode)
   if [ "$want_bd" = "yes" ]; then
-    gen_args+=(--node "$XBD_NODES/current")
-  else
+    gen_args+=(--node "$XBD_NODES/current")     # Browser Dialer 只能单节点
+  elif [ "$multi_mode" = "on" ]; then
     gen_args+=(--all-nodes --nodes-dir "$XBD_NODES" --node "$XBD_NODES/current")
+  else
+    gen_args+=(--node "$XBD_NODES/current")
   fi
   [ -x "$XBD_XRAY" ] && gen_args+=(--validate-with "$XBD_XRAY")
 
@@ -963,7 +986,13 @@ try: print(len(json.load(open(sys.argv[1]))["tags"]))
 except Exception: print(0)' "$XBD_RUNTIME/xray-gen.json" 2>/dev/null || echo 0)
       ok "xray-client.json（$n 个节点常驻出站，切换不重启）"
     fi
-  elif [ "$want_bd" != "yes" ]; then
+  # 降级只在"本来想走多出站"时才有意义。
+  #
+  # 多出站默认关闭后, 这个条件还挂在 want_bd 上就成了 bug: 正常单节点生成
+  # 走的是上面那个 if, 没问题; 但一旦生成失败, 会去试"降级成单节点" ——
+  # 而它本来就是单节点, 于是白跑一趟, 失败时 die 还会把调用方一起掐断。
+  # 症状是 `xbd multi off` 改完配置却不重启、也不报任何错。
+  elif [ "$want_bd" != "yes" ] && [ "$multi_mode" = "on" ]; then
     # 回退：多出站生成不出来，就退成单节点。
     #
     # 为什么必须有这条：多出站把所有节点塞进一份配置，任何一处不通都让整份配置
@@ -2206,6 +2235,7 @@ xbd_main() {
     selftest)   cmd_selftest "$@" ;;
     share)      cmd_share "$@" ;;
     menu)       cmd_menu "$@" ;;
+    multi)      cmd_multi "$@" ;;
     ""|-h|--help|help) xbd_usage ;;
     *) xbd_usage; die "未知命令: $cmd" ;;
   esac
@@ -2233,12 +2263,13 @@ _mmenu() {
     printf "  \033[36m1)\033[0m 节点管理      添加/删除/切换/测速\n"
     printf "  \033[36m2)\033[0m 服务控制      启动/停止/重启/状态\n"
     printf "  \033[36m3)\033[0m 端口设置      HTTP/SOCKS 入口\n"
+  printf "  \033[36m7)\033[0m 多出站        所有节点常驻, 切换不断线\n"
     printf "  \033[36m4)\033[0m 配置分发      局域网设备用 URL 拉配置\n"
     printf "  \033[36m5)\033[0m Web 面板      地址/令牌/开关\n"
     printf "  \033[36m6)\033[0m 诊断          连接排查\n"
     printf "  \033[36m0)\033[0m 退出\n"
     printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-6]: " c || return 0
+    read -r -p "请输入选项 [0-7]: " c || return 0
     case "$c" in
       1) _mmenu_node ;;
       2) _mmenu_service ;;
@@ -2246,6 +2277,7 @@ _mmenu() {
       4) _mmenu_share ;;
       5) _mmenu_panel ;;
       6) xbd diagnose ;;
+      7) _mmenu_multi ;;
       0) return 0 ;;
       *) printf '  无效选项 %s\n' "$c" ;;
     esac
@@ -2395,6 +2427,32 @@ _mmenu_service() {
 _mmenu_port() {
   printf '\n'; xbd ports 2>/dev/null || xbd status
   printf '\n'; read -r -p "  改端口执行 xbd port <类型> <值>, 回车返回..." _ || true
+}
+
+_mmenu_multi() {
+  local c
+  while :; do
+    printf '\n\033[36m多出站\033[0m\n'; printf -- '----------------------\n'
+    xbd multi status
+    printf -- '----------------------\n'
+    printf '  关: 只有当前节点进配置, 切换节点需要重启 (连接断 1-2 秒)\n'
+    printf '      出问题也只有那一个节点坏, 其余不受影响。\n'
+    printf '  开: 所有节点常驻一份配置, 切换不断线。\n'
+    printf '      但共享一份配置 —— 一个节点构建失败, 整份都过不了校验。\n'
+    printf -- '----------------------\n'
+    printf "  \033[36m1)\033[0m 开启\n"
+    printf "  \033[36m2)\033[0m 关闭\n"
+    printf "  \033[36m0)\033[0m 返回\n"
+    printf -- '----------------------\n'
+    read -r -p "请输入选项 [0-2]: " c || return 0
+    case "$c" in
+      1) xbd multi on ;;
+      2) xbd multi off ;;
+      0) return ;;
+      *) printf '  无效选项 %s\n' "$c" ;;
+    esac
+    _mmenu_pause
+  done
 }
 
 _mmenu_share() {
@@ -2580,6 +2638,88 @@ cmd_share() {
 
 cmd_menu() {
   _mmenu
+}
+
+cmd_multi() {
+  local op="${1:-status}"
+  case "$op" in
+    on)   _xbd_multi_set on ;;
+    off)  _xbd_multi_set off ;;
+    status|"") _xbd_multi_status ;;
+    *) die "未知操作: $op (xbd multi status 看当前状态)" ;;
+  esac
+}
+
+_xbd_multi_set() {
+  local v="$1"
+  [ "$(id -u)" = "0" ] || die "改多出站开关需要 root"
+  mkdir -p "$XBD_CONF"
+  printf '# 多出站开关。on = 所有节点常驻一份配置, 切换节点不用重启; off = 单节点。\nMULTI_OUTBOUND=%s\n' "$v" > "$XBD_MULTI_ENV"
+  if [ "$v" = "on" ]; then
+    ok "已开启多出站"
+    info "  切换节点不再需要重启。"
+    warn "  所有节点共享一份配置：任何一个节点构建失败，整份配置通不过校验。"
+  else
+    ok "已关闭多出站，回到单节点"
+    info "  切换节点会重启 Xray（连接断 1-2 秒）。"
+  fi
+  # 必须 apply **并重启** 才能生效, 只 apply 不够。
+  #
+  # cmd_apply 只重新生成配置, 不会碰运行中的实例。所以只 apply 的话, 开关显示
+  # 已开启、配置里 balancer 也有了, 但跑着的还是旧配置 —— 用户切换节点时照样要
+  # 重启, 而他刚点的"开启不断线切换"。这种"看着开了、实际没开"最难解释。
+  #
+  # 面板那条路径 (act_multi_set) 走的是 xbd restart, 是一致的。
+  # 判据用"配置文件有没有变成期望的样子", 不用 xbd apply 的退出码 ——
+  # cmd_apply 成功时没有显式 return 0, 返回的是最后一条命令的退出码, 不可靠。
+  cmd_apply >/dev/null 2>&1 || true   # 它失败会自己 die, 走不到这里
+  local want_bal now_bal
+  want_bal=$([ "$v" = "on" ] && echo 1 || echo 0)
+  # 这里有两个坑, 少处理一个都会静默失败:
+  #
+  # 1) grep -c 没匹配时退出码是 1。脚本跑在 set -euo pipefail 下, 裸写会让
+  #    整条管道返回 1, set -e 当场退出脚本 —— 而我们恰恰要频繁问"有没有
+  #    balancer"(单节点模式答案就是 0)。所以 || true 必须有。
+  # 2) 命中多个文件时 grep -c 会逐文件输出一串数字, 要 head -1 取第一个。
+  now_bal=$(grep -c 'balancerTag' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | head -1 || true)
+  now_bal=${now_bal:-0}
+  if [ "$want_bal" != "$now_bal" ]; then
+    warn "配置生成不符合预期（期望 balancerTag $want_bal，实际 $now_bal）"
+    warn "开关已保存但还没生效: xbd apply 看详情"
+    return
+  fi
+  if unit_active "$XBD_U_XRAY"; then
+    if _xbd_sync_xray_with_node force; then
+      sleep 1
+      local actual
+      actual=$(cat "$XBD_RUNTIME/multi.actual" 2>/dev/null || echo "")
+      [ "$actual" = "$([ "$v" = on ] && echo multi || echo single)" ] \
+        || warn "服务已重启，但实际模式与开关不一致 —— xbd multi status 看详情"
+    else
+      warn "Xray 重启失败，开关已保存: xbd restart 重试"
+    fi
+  fi
+}
+
+_xbd_multi_status() {
+  local m actual
+  m=$(_xbd_multi_mode)
+  actual=$(cat "$XBD_RUNTIME/multi.actual" 2>/dev/null || echo "")
+  if [ "$m" = "on" ]; then
+    printf '  \033[32m多出站已开启\033[0m  所有节点常驻一份配置，切换节点不用重启\n'
+    # 同样要 || true: 单节点模式下匹配数不为 0, 但文件不存在时 grep 会返回 1,
+    # 在 pipefail 下配合 set -e 会让整个 status 命令失败。
+    printf '  出站数: %s\n' "$(grep -c '"tag":' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | head -1 || true)"
+  else
+    printf '  \033[36m单节点模式\033[0m  当前配置只有当前节点，切换节点需要重启\n'
+  fi
+  # 开关说开、实际却是单节点（或反过来），是会出现的不一致状态。必须报出来：
+  # 用户看到"已开启"却发现切换仍然要重启，第一反应是"面板坏了"。
+  if [ "$m" = "on" ] && [ "$actual" != "multi" ]; then
+    warn "开关是开的，但实际跑的是单节点 —— 执行 xbd apply 重启后才会生效"
+  elif [ "$m" = "off" ] && [ "$actual" = "multi" ]; then
+    warn "开关是关的，但实际跑的是多出站 —— 执行 xbd apply 重启后才会生效"
+  fi
 }
 
 cmd_selftest() {

@@ -318,6 +318,65 @@ def test_state_carries_group(lib, tmp):
            f"节点带出 group（{ns[0].get('group')!r} == {sub['id']!r}）")
 
 
+def test_multi_defaults_off(lib):
+    """多出站必须默认关闭。
+
+    默认单节点时，坏掉的只是那一个节点；多出站下所有节点共享一份配置，
+    一个节点构建失败整份就通不过校验。默认值代表这个交换的默认方向，
+    不能被别处的改动悄悄翻掉。
+
+    另外检查两处读法一致：run-xray.sh 由 systemd 拉起、不 source core.sh，
+    所以它自己读一遍文件。两边路径或逻辑不一致，就会出现"面板说是多出站、
+    实际是单节点"这种最难查的状态。
+    """
+    print("多出站默认关闭")
+    rep = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def rd(*parts):
+        with open(os.path.join(rep, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    sh = rd("lib", "actions.sh")
+    ok("MULTI_OUTBOUND=off" in sh, "安装时写出 MULTI_OUTBOUND=off")
+
+    core = rd("lib", "core.sh")
+    ok("*) printf 'off' ;; esac" in core,
+       "core.sh 读开关时认不出的值一律当 off（不是当 on）")
+
+    rx = rd("scripts", "run-xray.sh")
+    ok('"$PREFIX/config/multi.env"' in rx, "run-xray.sh 读的是同一个 multi.env")
+    ok('elif [ "$MULTI" = "on" ]; then' in rx,
+       "run-xray.sh 只有开关为 on 才走 --all-nodes")
+
+    pan = rd("lib", "web", "panel.py")
+    ok('cfg_get(f, "MULTI_OUTBOUND", "off")' in pan,
+       "面板读开关的默认值同样是 off")
+
+    # 这条踩过: 降级分支的条件还挂在 want_bd 上, 多出站关着的时候照样进 ——
+    # 而它本来就是单节点, 降级等于白跑一趟, 失败时 die 还会把调用方掐断。
+    # 症状是 `xbd multi off` 改完配置不重启、也不报错, 静默地什么都不发生。
+    ok('elif [ "$want_bd" != "yes" ] && [ "$multi_mode" = "on" ]; then' in sh,
+       "单节点模式下不会误入多出站的降级分支")
+    ok('elif [ "$MULTI" = "on" ]; then' in rx,
+       "run-xray.sh 的降级分支同样限定在多出站开启时")
+    # 开关改了必须真的重启, 否则"看起来开了、实际没开"
+    ok("_xbd_sync_xray_with_node force" in sh,
+       "改开关后会真正重启服务, 不只是重新生成配置")
+
+    # 脚本跑在 set -euo pipefail 下, 而我们要频繁问"有没有 balancer" ——
+    # 单节点模式答案就是 0, grep -c 退出码为 1。裸写会让 set -e 当场退出,
+    # 症状是 `xbd multi off` 什么都不做、不报错, 静默地失败。
+    import re as _re
+    # 只看"对文件 grep -c"这一种。管道输入的 (pgrep -c / env | grep -c)
+    # 失败时通常是"没有匹配"这个正常结果, 调用点各自已经处理过。
+    bad = []
+    for m in _re.finditer(r'=\$\(([^)]*grep -c [^)]*\.json[^)]*)\)', sh):
+        if "|| true" not in m.group(1) and "|| echo" not in m.group(1):
+            bad.append(m.group(0)[:44])
+    ok(not bad, "actions.sh 里 grep -c 的结果都带了 || true (set -e 陷阱)" +
+       ("" if not bad else f" —— {bad}"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lib", default=None, help="Client/lib 目录")
@@ -337,6 +396,7 @@ def main():
         test_multi(lib, tmp)
         test_build_roundtrip(lib)
         test_state_carries_group(lib, tmp)
+        test_multi_defaults_off(lib)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

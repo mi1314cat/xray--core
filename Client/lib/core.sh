@@ -30,12 +30,27 @@ XBD_PANEL_PORT="${XBD_PANEL_PORT:-18090}"
 XBD_PANEL_HOST_DEFAULT="127.0.0.1"
 
 # systemd 单元
-XBD_U_XRAY="xray-client.service"
-XBD_U_SHARE="xbd-share.service"        # 配置分发服务 (xbd share new 开启)                  # 唯一实例：SOCKS+HTTP，Browser Dialer 常备
+XBD_U_XRAY="xray-client.service"      # 唯一实例：SOCKS+HTTP，Browser Dialer 常备
+XBD_U_SHARE="xbd-share.service"       # 配置分发服务 (xbd share new 开启)
 XBD_U_CHROMIUM="chromium-browser-dialer.service" # Browser Dialer 的运行时依赖
 XBD_U_PANEL="browser-dialer-panel.service"
 XBD_U_HEALTH="browser-dialer-health.service"
 XBD_U_TIMER="browser-dialer-health.timer"
+
+# 多出站开关。缺省关闭 —— 单节点模式下坏掉的只是那一个节点, 多出站下所有节点
+# 共享一份配置, 一处构建失败整份就通不过校验。开关放在 config/multi.env 而不是
+# 环境变量, 是因为 run-xray.sh 由 systemd 拉起, 那边的环境不受 shell 影响。
+#
+# 读它的地方必须只有这一个函数。run-xray.sh (bash) 和 actions.sh (bash) 都调它,
+# 面板那边经 /api/action 也走同一条路径 —— 判断散在多处就会出现"面板说是多出站、
+# 实际是单节点"这种最难查的状态。
+XBD_MULTI_ENV="$XBD_CONF/multi.env"
+
+_xbd_multi_mode() {
+  local v
+  v=$(awk -F= '$1=="MULTI_OUTBOUND" {print $2; exit}' "$XBD_MULTI_ENV" 2>/dev/null) || true
+  case "$v" in on|1|true) printf 'on' ;; *) printf 'off' ;; esac
+}
 
 XBD_XRAY_REPO="XTLS/Xray-core"
 XBD_IMPL="Xray Browser Dialer（XRAY_BROWSER_DIALER + 真实 Chromium）"

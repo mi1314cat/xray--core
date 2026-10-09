@@ -123,6 +123,21 @@ def build_state():
     state["doh"] = cfg_get(os.path.join(CONF, "chromium.env"), "XBD_DOH", "")
     _dm = cfg_get(os.path.join(CONF, "dns.env"), "DNS_MODE", "off")
     state["dns_mode"] = _dm if _dm in ("off", "standard", "strict") else "off"
+    # 多出站状态要一起给出。开关和运行配置可能不一致（改了没 apply），
+    # 所以两个都报，面板上才看得出"我开了但没生效"这种状态。
+    state["multi_mode"] = multi_mode()
+    # 实际生效的模式由 run-xray.sh 落盘。以它为准，而不是靠开关推断 ——
+    # 开关和运行状态不一致是会出现的情况（改了没重启、降级过）。
+    try:
+        with open(os.path.join(RUNTIME, "multi.actual"), encoding="utf-8") as fh:
+            state["multi_active"] = (fh.read().strip() == "multi")
+    except OSError:
+        # 落盘文件还没有（老版本升级上来的），退回看配置里有没有 balancer
+        try:
+            with open(os.path.join(RUNTIME, "xray-client.json"), encoding="utf-8") as fh:
+                state["multi_active"] = ("\"balancerTag\"" in fh.read())
+        except OSError:
+            state["multi_active"] = state["multi_mode"] == "on"
 
     ports = os.path.join(CONF, "ports.env")
     state["ports_cfg"] = {
@@ -313,6 +328,32 @@ def act_dns_set(mode):
         # 会以为按钮坏了。
         return False, (err or out or "重启失败").strip() + "（设置已保存，下次重启生效）"
     return True, f"DNS 已切换为「{DNS_LABELS[mode]}」并重启"
+
+
+def multi_mode():
+    """读多出站开关。缺文件 = 关（与 run-xray.sh 的默认一致）。"""
+    f = os.path.join(CONF, "multi.env")
+    v = cfg_get(f, "MULTI_OUTBOUND", "off")
+    return "on" if str(v).strip().lower() in ("on", "1", "true") else "off"
+
+
+def act_multi_set(mode):
+    """切换多出站。
+
+    和 DNS 开关一样：改完必须重启才生效，所以这里直接重启而不是让用户自己记。
+    多出站开启后重启更久（要校验所有节点），超时给足。
+    """
+    if mode not in ("on", "off"):
+        return False, f"未知取值: {mode}"
+    os.makedirs(CONF, exist_ok=True)
+    cfg_set(os.path.join(CONF, "multi.env"), "MULTI_OUTBOUND", mode)
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "restart"], timeout=180)
+    if rc != 0:
+        return False, (err or out or "重启失败").strip() + f"（设置已保存，{'已开启' if mode=='on' else '已关闭'}）"
+    if mode == "on":
+        return True, "多出站已开启 · 切换节点不再需要重启"
+    return True, "已回到单节点 · 切换节点会重启（连接断 1-2 秒）"
 
 
 def act_import(uri, sub_name=""):
@@ -776,6 +817,7 @@ DISPATCH = {
     "group_create": lambda p: act_group_create(str(p.get("name", "")).strip()),
     "group_delete": lambda p: act_group_delete(str(p.get("key", "")).strip()),
     "dns_set": lambda p: act_dns_set(str(p.get("mode", "")).strip()),
+    "multi_set": lambda p: act_multi_set(str(p.get("mode", "")).strip()),
     "node_use": lambda p: act_node_use(p.get("ident", "")),
     "node_browser": lambda p: act_node_browser(p.get("ident", ""), p.get("value", "auto")),
     "node_probe": lambda p: act_node_probe(p.get("ident", "")),
@@ -1110,7 +1152,14 @@ display:none;font-size:13px;white-space:pre-wrap}
           <option value="standard">标准：加密 DNS</option>
           <option value="strict">严格防泄漏</option>
         </select></span></div>
+    <div class="row"><span class="k">多出站</span><span class="v">
+        <select id="multi-mode" onchange="setMulti(this.value)" style="background:rgba(255,
+          border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8p
+          <option value="off">关：单节点（切换需重启）</option>
+          <option value="on">开：全部常驻（切换不断线）</option>
+        </select></span></div>
     <div class="row"><span class="k">出口 IP</span><span class="v mono" id="s-ip2">—</span></div>
+    <div class="hint" id="hint-multi"></div>
     <div class="hint">端口统一在下面的「端口设置」里改，这里只做显示 ——
       之前两处都能改，容易改重。</div>
   </div>
@@ -1464,10 +1513,32 @@ async function load(){
   renderNodes();
 }
 
+async function setMulti(v){
+  if(!confirm(v==='on'
+     ? '开启多出站？所有节点会常驻一份配置，切换节点不再需要重启。\n\n代价：所有节点共享一份配置，任何一个节点构建失败，整份配置都通不过校验。'
+     : '关闭多出站？回到单节点模式，切换节点需要重启 Xray（连接断 1-2 秒）。\n\n好处是出问题只有那一个节点，不影响其余。')) return;
+  act('multi_set', {mode:v}, ()=>{
+    toast(v==='on' ? '已开启多出站，正在重启…' : '已回到单节点，正在重启…');
+    poll();
+  });
+}
+
 function setDns(mode){
   // 切换 DNS 要重启 Xray 才生效 —— 这一点要说在前面, 否则用户改完看着没反应。
   if(!confirm('切换 DNS 模式会重启 Xray（约 3 秒），期间连接会断一次。继续？')){
-    $('dns-mode').value = (ST.dns_mode || 'off'); return;
+    $('dns-mode').value = (ST.dns_mode || 'off');
+    if ($('multi-mode')) {
+      $('multi-mode').value = (ST.multi_mode || 'off');
+      // 开关和运行配置可能不一致：面板上开着、运行配置里却没有 balancer。
+      // 这种情况必须说出来，否则用户会以为"开关坏了"。
+      const off = ST.multi_mode === 'on' && !ST.multi_active;
+      $('hint-multi').innerHTML = off
+        ? '<b style="color:var(--warn)">开关已打开但还没生效</b>，需要重启一次服务。'
+        : (ST.multi_mode === 'on'
+            ? '所有节点常驻一份配置，切换不需要重启。代价：所有节点共享一份配置，一个节点构建失败整份都过不了校验。'
+            : '只有当前节点进配置。切换节点需要重启（连接断 1-2 秒），但出问题的只有那一个节点。');
+    }
+    return;
   }
   post('dns_set', {mode:mode}, '正在切换 DNS 并重启…');
 }

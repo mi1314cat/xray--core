@@ -56,15 +56,34 @@ GEN_ARGS=(
   --dns "$DNS_MODE"
   --validate-with "$XRAY"
 )
+# 多出站默认关闭。
+#
+# 开启后所有节点常驻一份配置，切换节点不用重启；代价是它们共享同一份配置 ——
+# 任何一个节点构建失败，整份配置就通不过校验。多出站内部会剔除坏节点，
+# 再加生成失败自动降级，起不来的情况堵住了，但故障域仍是"全体"而非"那一个"。
+#
+# 默认单节点：切换节点要重启一次（连接断 1-2 秒），换来坏的只是那一个节点。
+# 节点少、切换不频繁时这个交换划算；节点多且经常切再开。
+#
+# 这里没有 source lib/core.sh（那份依赖交互式环境），所以直接读同一个文件。
+# 路径必须和 core.sh 里的 XBD_MULTI_ENV 一致，判断逻辑也必须一致 ——
+# 散在两处各判一次，迟早会出现"面板说是多出站、实际是单节点"。
+MULTI=$(awk -F= '$1=="MULTI_OUTBOUND" {print $2; exit}' "$PREFIX/config/multi.env" 2>/dev/null || true)
+case "$MULTI" in on|1|true) MULTI=on ;; *) MULTI=off ;; esac
+# 实际跑的是哪种模式。多出站关着、或降级发生过, 都是 single。
+ACTUAL_MODE="$([ "$MULTI" = "on" ] && echo multi || echo single)"
 if [ "$WANT_BD" = "yes" ]; then
-  GEN_ARGS+=(--node "$NODE")
-else
+  GEN_ARGS+=(--node "$NODE")          # Browser Dialer 只能单节点
+  [ "$MULTI" = "on" ] && echo "browser-dialer: 多出站已开启，本次仍走单节点（拨号必须单节点）" >&2
+elif [ "$MULTI" = "on" ]; then
   GEN_ARGS+=(--all-nodes --nodes-dir "$PREFIX/nodes" --node "$NODE")
+else
+  GEN_ARGS+=(--node "$NODE")
 fi
 
 python3 "$DIST/lib/genconfig.py" "${GEN_ARGS[@]}" >/tmp/.xbd_gen.$$ 2>&1
 GEN_RC=$?
-if [ "$GEN_RC" -ne 0 ] && [ "$WANT_BD" != "yes" ]; then
+if [ "$GEN_RC" -ne 0 ] && [ "$MULTI" = "on" ]; then
   # 多出站生成失败 → 降级成单节点再试一次。
   #
   # 这条路径由 systemd 拉起，是"重启后能不能起来"的最后一关。多出站把所有
@@ -76,7 +95,10 @@ if [ "$GEN_RC" -ne 0 ] && [ "$WANT_BD" != "yes" ]; then
   GEN_ARGS=(--node "$NODE" --dns "$DNS_MODE")
   python3 "$DIST/lib/genconfig.py" "${GEN_ARGS[@]}" >/tmp/.xbd_gen.$$ 2>&1
   GEN_RC=$?
-  WANT_BD="yes"     # 降级后就是单节点，后续按单节点收尾（不再导 balancer）
+  # 用独立的标志表示"现在实际是单节点"。之前借用 WANT_BD 来表达这件事，
+  # 而 WANT_BD 的语义是"这个节点要浏览器拨号" —— 降级之后拨号标志并不会变成
+  # 是，借用它会让后面 export XRAY_BROWSER_DIALER 跟着一起错。
+  ACTUAL_MODE=single
   if [ "$GEN_RC" -eq 0 ]; then
     echo "已降级为单节点：切换节点需重启" >&2
   fi
@@ -85,6 +107,13 @@ if [ "$GEN_RC" -ne 0 ]; then
   echo "配置生成失败:" >&2; cat /tmp/.xbd_gen.$$ >&2; rm -f /tmp/.xbd_gen.$$; exit 1
 fi
 rm -f /tmp/.xbd_gen.$$
+
+# 把"实际生效的是哪种模式"落成一个文件。
+#
+# 开关说开、运行配置里却没有 balancer（或者反过来）是会出现的不一致状态 ——
+# 面板、菜单、xbd multi status 都要知道真实情况，而不是只看开关说什么。
+# 只看开关的话，用户看到"已开启"却发现切换仍然要重启，只会以为面板坏了。
+printf '%s\n' "$ACTUAL_MODE" > "$PREFIX/runtime/multi.actual" 2>/dev/null || true
 
 # 校验失败绝不启动：宁可起不来，也不带着坏配置上线
 "$XRAY" run -test -config "$OUT" >/dev/null 2>&1 \
