@@ -316,3 +316,74 @@ x_cert_container_certs() {
     done
     [[ "$found" == "1" ]]
 }
+
+# ================================================================
+# 项目证书目录 (/root/catmi/certs) —— 与 KPanel 的 /home/web/certs 解耦
+#
+# 为什么要有这个目录:
+#
+#   KPanel 的 /root/auto_cert_renewal.sh (cron, 每天午夜) 会在续签时
+#   **先删** letsencrypt lineage, 再重新签发, 最后才 cp 回
+#   /home/web/certs/。三步里任何一步失败, 磁盘上的 *_cert.pem 就没了。
+#
+#   实测踩过: 2026-10-08 那次续签没走完, /home/web/certs 只剩 *_key.pem,
+#   私钥在、证书没了。而 nginx 因为已经把证书加载进内存, 网站照常能开,
+#   直到重启才会暴露 —— 静默故障, 极难发现。
+#
+#   当时 sing-box 7 个配置 + Xray 5 个片段全部引用这个路径, 内核直接
+#   起不来。mihomo 没事, 因为它用的是 /root/catmi/mihomo/conf/certs/。
+#
+# 所以: 证书从 letsencrypt 复制一份到本项目目录, 配置只引用本项目目录。
+# KPanel 那边被删、被改、被续签, 都不影响我们。
+#
+# 实测验证 (RN, 2026-10-08): 把 /home/web/certs/*_cert.pem 全部移走,
+# sing-box check / xray run -test / mihomo -t 三个全部通过。
+# ================================================================
+x_cert_project_dir() {
+    echo "${X_CERT_DIR:-/root/catmi/certs}"
+}
+
+# 从 letsencrypt lineage 同步证书到项目目录。
+#
+# 只在源文件更新时才复制 —— 靠 mtime 比较, 不看内容, 免得每次都重写
+# 导致 mihomo/nginx 认为证书变了而 reload。
+#
+# 返回 0 = 至少同步了一张; 返回 1 = 没有可同步的源。
+x_cert_sync() {
+    local src="${1:-/etc/letsencrypt/live}"
+    local dst; dst="$(x_cert_project_dir)"
+    local copied=0 n f s
+
+    [[ -d "$src" ]] || return 1
+    mkdir -p "$dst" || return 1
+
+    for d in "$src"/*/; do
+        [[ -d "$d" ]] || continue
+        n=$(basename "$d")
+        [[ "$n" == "README" ]] && continue
+        s="$d/fullchain.pem"
+        [[ -f "$s" ]] || continue
+
+        f="$dst/${n}_cert.pem"
+        if [[ ! -f "$f" || "$s" -nt "$f" ]]; then
+            cp "$s" "$f" || continue
+            cp "$d/privkey.pem" "$dst/${n}_key.pem" 2>/dev/null || true
+            chmod 600 "$dst/${n}_key.pem" 2>/dev/null || true
+            echo "    同步: ${n}_cert.pem"
+            copied=1
+        fi
+    done
+
+    [[ "$copied" == "1" ]]
+}
+
+# 项目目录里某张证书是否可用。
+# 不只看文件在不在 —— 从 letsencrypt 同步过来的可能已经过期, 而内核
+# 不检查有效期, 只会在握手时把客户端拒掉。
+x_cert_project_ok() {
+    local name="$1" dir f
+    dir="$(x_cert_project_dir)"
+    f="$dir/${name}_cert.pem"
+    [[ -f "$f" ]] || return 1
+    openssl x509 -in "$f" -noout -checkend $((30*86400)) >/dev/null 2>&1
+}
