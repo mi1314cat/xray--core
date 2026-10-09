@@ -2452,7 +2452,32 @@ _xbd_browser_table() {
     [ -e "$f" ] || continue
     name=$(basename "$f" .json)
     [ "$name" = "current" ] && continue
-    cur=""; [ "$(readlink -f "$XBD_NODES/current" 2>/dev/null)" = "$(readlink -f "$f")" ] && cur=" *"
+    # 原来这里写成 `[ ... ] &` —— 那个 & 把整个 test 丢进后台, 于是它不再是
+    # 条件表达式, 而是一个后台作业, 退出码也不参与判断。xbd 顶部有
+    # `set -euo pipefail`, 非当前节点的 test 返回 1, 整个菜单当场被杀:
+    # 节点表能打印(那是上一个循环的输出, 已经写出去了), 但后面的选项行
+    # 一行都没打出来。症状是"进得去、看得见列表、就是没法操作"。
+    # XBD_NODES 未定义时 readlink -f "$XBD_NODES/current" 会去解析 "/current",
+    # 失败返回空 —— 于是它和每个节点的路径都不相等(正常) 或都"相等"(另一侧
+    # 也是空时), 于是每个节点都被标成当前。读不到就当没有当前节点, 别猜。
+    # 这一段两次踩坑, 都是 set -e 干的:
+    #
+    #   1) `[ ... ] &` —— 把 test 丢进后台, 退出码不参与判断, 非当前节点的
+    #      test 返回 1, 整个菜单当场被杀。
+    #   2) `[ -n "${XBD_NODES:-}" ] && _cur_real=...` —— 当 XBD_NODES 为空
+    #      时, `[ -n ]` 返回 1, 而它是 && 链的**最后一个命令**, 于是整条
+    #      语句返回 1, set -e 照样把脚本杀掉。
+    #
+    # 所以这里不用 && 串联任何 test, 全部写成 if 的 then 分支 ——
+    # if 里的条件返回非 0 是正常控制流, 不会触发 errexit。
+    cur=""
+    local _cur_real=""
+    if [ -n "${XBD_NODES:-}" ]; then
+      _cur_real=$(readlink -f "$XBD_NODES/current" 2>/dev/null || true)
+    fi
+    if [ -n "$_cur_real" ] && [ "$_cur_real" = "$(readlink -f "$f" 2>/dev/null)" ]; then
+      cur=" *"
+    fi
     can=$(python3 "$XBD_LIBDIR/compat.py" json "$f" 2>/dev/null \
           | python3 -c 'import sys,json
 try:
