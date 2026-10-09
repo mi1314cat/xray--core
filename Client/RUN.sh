@@ -145,14 +145,35 @@ do_server() {
   exit 1
 }
 
-# 前面已经消费掉了 install 和 --vless/--no-start, 这里剩下的才是角色/子命令。
-# 之前忘了 shift, "bash RUN.sh install" 的 MODE 会拿到 "install" 本身,
-# 于是装完之后报一句"无效选项 install" —— 看着像安装失败, 其实是分发没清干净。
-while [ "${1:-}" = "install" ] || [ "${1:-}" = "--no-start" ] || [ "${1:-}" = "--vless" ]; do
-  shift
+# 把部署层参数**连同它们的值**一起吃掉, 剩下的才是角色/子命令。
+#
+# ★ 这里踩过三次, 症状完全一样: 前面步骤全 ✓, 最后一句「无效选项 …」+
+#   退出码 1 —— 看着像"安装失败", 其实装得好好的。
+#
+#     1) "bash RUN.sh install" → MODE 拿到 "install" 本身     (已修)
+#     2) --yes  不被消费       → MODE 拿到 "--yes"
+#     3) --vless 只 shift 掉标志、**值**留下 → MODE 拿到 "vless://…"
+#
+#   2 和 3 都出自 l.sh: 它把 --yes / --vless <uri> 原样透传下来。
+#   代价是 `l.sh --yes` 每一次都以退出码 1 收场 —— 自动化里等于永远失败。
+YES_MODE=0
+while :; do
+  case "${1:-}" in
+    install|--no-start) shift ;;
+    --yes|-y)           YES_MODE=1; shift ;;
+    --vless)            shift; [ $# -gt 0 ] && shift ;;   # 值也要吃掉
+    --prefix)           shift; [ $# -gt 0 ] && shift ;;
+    *) break ;;
+  esac
 done
 
 MODE="${1:-}"
+if [ -z "$MODE" ] && [ "$YES_MODE" -eq 1 ]; then
+  # 全自动模式：不弹角色菜单, 也不进交互面板（没有 stdin 可读, 进去只会挂住）。
+  # 装完就走, 退出码 0 —— 这样 l.sh --yes 的成功/失败才有意义。
+  printf '\n'
+  exit 0
+fi
 if [ -z "$MODE" ]; then
   clear 2>/dev/null || true
   printf '\033[32mXray Client 一键管理\033[0m\n'
