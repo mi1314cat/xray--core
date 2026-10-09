@@ -130,6 +130,42 @@ DIALER_OK_ENCRYPTION = {"none", "auto", "mlkem768x25519plus", "mlkem768", "x2551
 DIALER_MIN_VERSION = {"websocket": (1, 4, 1), "xhttp": (1, 8, 19)}
 
 
+# 内核认得的指纹取值 —— 取自官方源码 transport/internet/tls/tls.go 的三张表
+# （PresetFingerprints / ModernFingerprints / OtherFingerprints）。
+#
+# ★ 为什么要在脚本里拦：未知值**不是静默降级，是整份配置构建失败**
+#   （infra/conf: unknown "fingerprint": xxx）。多出站把所有节点放进一份配置，
+#   所以一个节点写错 fp 就能让整个客户端起不来。
+#   实测：fp=not-a-real-fingerprint → run -test 退出码 23、Failed to start。
+#
+# 大小写不敏感（实测 fp=Chrome / CHROME 均通过），比较时统一转小写。
+FP_VALUES = {
+    # 面板/客户端推荐的短名
+    "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+    "random", "randomized", "randomizednoalpn", "unsafe",
+    # 具体版本（会被 random 抽中的一组）
+    "hellofirefox_120", "hellofirefox_148", "hellochrome_120", "hellochrome_131",
+    "hellochrome_133", "helloios_13", "helloios_14", "helloedge_106",
+    "hellosafari_26_3", "hello360_11_0", "helloqq_11_1",
+    # 其余（含过老版本），内核也认
+    "hellogolang", "hellorandomized", "hellorandomizedalpn",
+    "hellorandomizednoalpn", "hellofirefox_auto", "hellofirefox_55",
+    "hellofirefox_56", "hellofirefox_63", "hellofirefox_65", "hellofirefox_99",
+    "hellofirefox_102", "hellofirefox_105", "hellochrome_auto",
+    "hellochrome_58", "hellochrome_62", "hellochrome_70", "hellochrome_72",
+    "hellochrome_83", "hellochrome_87", "hellochrome_96", "hellochrome_100",
+    "hellochrome_102", "hellochrome_106_shuffle", "helloios_auto",
+    "helloios_11_1", "helloios_12_1", "helloandroid_11_okhttp",
+    "helloedge_85", "helloedge_auto", "hellosafari_16_0", "hellosafari_auto",
+    "hello360_auto", "hello360_7_5", "helloqq_auto", "hellochrome_100_psk",
+    "hellochrome_112_psk_shuf", "hellochrome_114_padding_psk_shuf",
+    "hellochrome_115_pq", "hellochrome_115_pq_psk", "hellochrome_120_pq",
+}
+
+# 给用户看的一小段（不要把 40 多个都糊上去）
+FP_HINT = "chrome firefox safari edge ios android 360 qq random randomized"
+
+
 def parse_version(text: str) -> tuple:
     """从 'Xray 26.3.27 (Xray, Penetrates Everything.) ...' 里取出 (26,3,27)。"""
     m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
@@ -176,6 +212,19 @@ def check_xray(node: dict) -> dict:
         add("地址", NO, "缺失")
     else:
         add("地址", OK, f'{node["address"]}:{node.get("port")}')
+    # 指纹：内核未知值会**整份配置构建失败**，必须在导入时就拦住。
+    # 放在这里而不是渲染阶段 —— 那时配置已经生成完了，用户看到的是
+    # "某个节点莫名其妙不见了"，而不是"这个 fp 不支持"。
+    _fp = (node.get("fingerprint") or "").strip()
+    if _fp:
+        if _fp.lower() in FP_VALUES:
+            add("指纹", OK, _fp)
+        else:
+            add("指纹", NO, f"{_fp} 内核不认")
+            notes.append(f'内核遇到未知 fingerprint 会直接构建失败'
+                         f'（unknown "fingerprint": {_fp}），'
+                         f'多出站时一个节点就能让整份配置起不来。'
+                         f'可用：{FP_HINT}')
 
     if proto in ("vless", "vmess") and not node.get("uuid"):
         add("凭据", NO, "缺少 UUID")

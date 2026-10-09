@@ -46,6 +46,17 @@ XBD_U_TIMER="browser-dialer-health.timer"
 # 实际是单节点"这种最难查的状态。
 XBD_MULTI_ENV="$XBD_CONF/multi.env"
 
+# 出站地址族。auto = 直连走 IPv4、DNS 按连通性选（历史行为）；
+# v4/v6 = 强制只走该族。双栈机器上某一边不通时才有必要改。
+# 与 multi.env 同一个约定：读它的地方只有下面这一个函数。
+XBD_FAMILY_ENV="$XBD_CONF/network.env"
+
+_xbd_family() {
+  local v
+  v=$(awk -F= '$1=="ADDR_FAMILY" {print $2; exit}' "$XBD_FAMILY_ENV" 2>/dev/null) || true
+  case "$v" in v4|v6) printf '%s' "$v" ;; *) printf 'auto' ;; esac
+}
+
 _xbd_multi_mode() {
   local v
   v=$(awk -F= '$1=="MULTI_OUTBOUND" {print $2; exit}' "$XBD_MULTI_ENV" 2>/dev/null) || true

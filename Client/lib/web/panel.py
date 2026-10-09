@@ -126,6 +126,7 @@ def build_state():
     # 多出站状态要一起给出。开关和运行配置可能不一致（改了没 apply），
     # 所以两个都报，面板上才看得出"我开了但没生效"这种状态。
     state["multi_mode"] = multi_mode()
+    state["addr_family"] = addr_family()
     # 实际生效的模式由 run-xray.sh 落盘。以它为准，而不是靠开关推断 ——
     # 开关和运行状态不一致是会出现的情况（改了没重启、降级过）。
     try:
@@ -328,6 +329,38 @@ def act_dns_set(mode):
         # 会以为按钮坏了。
         return False, (err or out or "重启失败").strip() + "（设置已保存，下次重启生效）"
     return True, f"DNS 已切换为「{DNS_LABELS[mode]}」并重启"
+
+
+def addr_family():
+    """读出站地址族。缺文件 / 认不出 = auto（与 core.sh 的 _xbd_family 同一套判据）。
+
+    两边各判各的就会出现"面板显示 v6、实际是 auto"这种最难查的状态 ——
+    所以白名单必须与 core.sh 保持一致，多一个值都要两边一起改。
+    """
+    v = cfg_get(os.path.join(CONF, "network.env"), "ADDR_FAMILY", "auto")
+    return v if str(v).strip() in ("v4", "v6") else "auto"
+
+
+FAMILY_LABELS = {"auto": "auto（直连走 IPv4，DNS 按连通性选）",
+                 "v4": "强制 IPv4", "v6": "强制 IPv6"}
+
+
+def act_family_set(family):
+    """切换出站地址族。
+
+    与 DNS / 多出站同一套：改完必须重启才生效，这里直接重启，不让用户自己记。
+    双栈机器上某一边不通时才有人动它，属于低频开关。
+    """
+    if family not in FAMILY_LABELS:
+        return False, f"未知取值: {family}（可用 auto / v4 / v6）"
+    os.makedirs(CONF, exist_ok=True)
+    cfg_set(os.path.join(CONF, "network.env"), "ADDR_FAMILY", family)
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "restart"], timeout=180)
+    label = FAMILY_LABELS[family]
+    if rc != 0:
+        return False, (err or out or "重启失败").strip() + f"（设置已保存为「{label}」，下次重启生效）"
+    return True, f"出站地址族已切换为「{label}」并重启"
 
 
 def multi_mode():
@@ -818,6 +851,7 @@ DISPATCH = {
     "group_delete": lambda p: act_group_delete(str(p.get("key", "")).strip()),
     "dns_set": lambda p: act_dns_set(str(p.get("mode", "")).strip()),
     "multi_set": lambda p: act_multi_set(str(p.get("mode", "")).strip()),
+    "family_set": lambda p: act_family_set(str(p.get("mode", "")).strip()),
     "node_use": lambda p: act_node_use(p.get("ident", "")),
     "node_browser": lambda p: act_node_browser(p.get("ident", ""), p.get("value", "auto")),
     "node_probe": lambda p: act_node_probe(p.get("ident", "")),
@@ -1314,6 +1348,13 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
           <option value="strict">严格防泄漏</option>
         </select></span></div>
     <div class="row"><span class="k">多出站</span><span class="v">
+        <select id="family-mode" onchange="setFamily(this.value)"
+                style="background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--fg);
+                       border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit">
+          <option value="auto">auto：直连走 IPv4，DNS 按连通性选</option>
+          <option value="v4">强制 IPv4</option>
+          <option value="v6">强制 IPv6</option>
+        </select>
         <select id="multi-mode" onchange="setMulti(this.value)" style="background:rgba(255,
           border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8p
           <option value="off">关：单节点（切换需重启）</option>
@@ -1670,10 +1711,15 @@ async function load(){
 
   const dm = $('dns-mode');
   if (dm && ST.dns_mode) dm.value = ST.dns_mode;
+  const fm = $('family-mode');
+  if (fm && ST.addr_family) fm.value = ST.addr_family;
   renderSubs();
   renderNodes();
 }
 
+async function setFamily(v){
+  await post('family_set', {mode: v}, '正在切换出站地址族并重启 Xray…');
+}
 async function setMulti(v){
   if(!confirm(v==='on'
      ? '开启多出站？所有节点会常驻一份配置，切换节点不再需要重启。\n\n代价：所有节点共享一份配置，任何一个节点构建失败，整份配置都通不过校验。'

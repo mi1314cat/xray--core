@@ -28,6 +28,25 @@ import sys
 
 NORMAL, DIALER = "normal", "dialer"
 
+# 出站地址族。auto 是**当前行为**（direct 走 IPv4、DNS 交给内核按连通性选），
+# v4/v6 才强制。取名而不是用布尔，是因为以后要加 "prefer-v6" 这类档位时
+# 不用改调用方。
+FAMILIES = ("auto", "v4", "v6")
+
+
+def _family_settings(family: str) -> tuple:
+    """返回 (direct 出站的 domainStrategy, DNS 的 queryStrategy)。
+
+    auto 保持现状：direct=UseIPv4（国内直连站点 v4 更稳），dns=UseIP
+    （注释里写明了理由：交给上层按实际连通性选，兼容性最好）。
+    """
+    f = family if family in FAMILIES else "auto"
+    if f == "v4":
+        return "UseIPv4", "UseIPv4"
+    if f == "v6":
+        return "UseIPv6", "UseIPv6"
+    return "UseIPv4", "UseIP"
+
 # WebSocket early data 默认长度。官方 browser_dialer 文档推荐 ?ed=2048，
 # 而且实测它是浏览器转发下 ws 能用的前提（缺了会让内嵌页面抛 TypeError）。
 WS_ED_DEFAULT = 2048
@@ -110,6 +129,20 @@ def build_stream(node: dict, mode: str) -> dict:
         if node.get("fingerprint") and mode == NORMAL:
             # dialer 模式下指纹无意义（Chromium 自带真实指纹）
             tls["fingerprint"] = node["fingerprint"]
+        # ECH —— 官方 tlsSettings.echConfigList，**仅客户端参数**，
+        # 不为空即代表客户端启用 Encrypted Client Hello。
+        #
+        # ★ 只在普通模式写。dialer 模式下 TLS 由 Chromium 完成，这条配置
+        #   不会被读；那边的 ECH 是 Chromium 自己按 Secure DNS 里的
+        #   HTTPS 记录做的（echcli.py 从 netlog 验过）。
+        #
+        # ★ 必须原样透传整个字符串，不能只记"有没有 ECH"：
+        #   走 CDN 时它的形状是 "cloudflare-ech.com+https://dns.alidns.com/dns-query"
+        #   —— 意思是"用 cloudflare-ech.com 的 DNS 记录里的 ECHConfig，
+        #   并且指定从这个 DoH 查"。丢掉这个值 = 服务端配了 ECH 而客户端
+        #   什么都没做，SNI 照样明文出去。
+        if node.get("ech") and mode == NORMAL:
+            tls["echConfigList"] = node["ech"]
         # 自签证书节点的正确解法：固定服务端证书哈希。
         # Xray 26.x 移除了 allowInsecure，官方替代就是 pinnedPeerCertSha256。
         if node.get("pinned_cert_sha256"):
@@ -307,7 +340,8 @@ def build(node: dict, args) -> dict:
 
     outbounds = [
         build_outbound(node, mode, args.mux),
-        {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
+        {"tag": "direct", "protocol": "freedom",
+         "settings": {"domainStrategy": _family_settings(getattr(args, "family", "auto"))[0]}},
         {"tag": "block", "protocol": "blackhole"},
     ]
 
@@ -383,7 +417,7 @@ def build(node: dict, args) -> dict:
 DNS_MODES = ("off", "standard", "strict")
 
 
-def build_dns(mode: str) -> dict:
+def build_dns(mode: str, family: str = "auto") -> dict:
     """生成 dns 段。off 返回空字典（表示不写这个 key）。"""
     if mode not in DNS_MODES:
         mode = "standard"
@@ -420,8 +454,9 @@ def build_dns(mode: str) -> dict:
 
     return {
         "servers": servers,
-        # UseIP 而不是 UseIPv4/IPv6：交给上层按实际连通性选，兼容性最好。
-        "queryStrategy": "UseIP",
+        # auto: UseIP —— 交给上层按实际连通性选，兼容性最好（原行为）。
+        # v4/v6: 强制只查 A / 只查 AAAA，配合 --family 一起用。
+        "queryStrategy": _family_settings(family)[1],
         "tag": "dns-out",
         # 核心防泄漏开关，见文件头第 2 条。
         "disableFallback": True,
@@ -450,7 +485,7 @@ def _apply_dns(cfg: dict, args) -> None:
     然后用户在某一种模式下发现 DNS 又开始漏。
     """
     mode = getattr(args, "dns", "off")
-    dns = build_dns(mode)
+    dns = build_dns(mode, getattr(args, "family", "auto"))
     if not dns:
         return
     cfg["dns"] = dns
@@ -604,7 +639,8 @@ def build_multi(nodes: list, current: dict, args) -> dict:
         node_tag_by_id[node["__id"]] = tag
         outbounds.append(build_outbound(node, mode, args.mux, tag=tag))
     outbounds.append({"tag": "direct", "protocol": "freedom",
-                      "settings": {"domainStrategy": "UseIPv4"}})
+                      "settings": {"domainStrategy": _family_settings(
+                          getattr(args, "family", "auto"))[0]}})
     outbounds.append({"tag": "block", "protocol": "blackhole"})
 
     direct_domains, direct_ips = collect_direct_exemptions(nodes)
@@ -751,6 +787,9 @@ def main() -> int:
     ap.add_argument("--validate-with", default="",
                     help="xray 二进制路径。给了就先用它剔掉构建不出来的节点 —— "
                          "多出站模式下订阅里一条坏节点会让整份配置起不来")
+    ap.add_argument("--family", choices=list(FAMILIES), default="auto",
+                    help="出站地址族。auto=直连走 IPv4、DNS 按连通性选（默认行为）；"
+                         "v4/v6=强制只走该族（双栈机器上某一边不通时用）")
     ap.add_argument("--dns", choices=list(DNS_MODES), default="off",
                     help="off=不接管 DNS；standard=境外加密 DNS + 国内加密 DNS；"
                          "strict=全部加密 DNS 并强制经代理（防泄漏最严）")

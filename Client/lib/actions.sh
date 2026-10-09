@@ -961,6 +961,7 @@ cmd_apply() {
   step "生成运行配置"
   xbd_load_ports
   XBD_DNS_MODE=$(_xbd_dns_mode); export XBD_DNS_MODE
+  XBD_ADDR_FAMILY=$(_xbd_family); export XBD_ADDR_FAMILY
   # 走多出站还是单节点，判据只有一个来源：compat.py want-bd，和 run-xray.sh 用的是
   # 同一个判定。两边各判各的就会出现"配置按多出站生成、启动时却按单节点起"，
   # 而症状是 balancer 选中的节点根本不在配置里。
@@ -974,6 +975,7 @@ cmd_apply() {
     --http-port "$XBD_PORT_HTTP" --lan-http-port "$XBD_PORT_LAN_HTTP"
     --api-port "${XBD_API_PORT:-18085}" --logs "$XBD_LOGS"
     --dns "${XBD_DNS_MODE:-off}"
+    --family "${XBD_ADDR_FAMILY:-auto}"
     --validate-with "$XBD_XRAY"
   )
   # validate-with 让 genconfig 自己把构建不出来的节点剔掉。多出站把所有节点塞进
@@ -1032,6 +1034,7 @@ except Exception: print(0)' "$XBD_RUNTIME/xray-gen.json" 2>/dev/null || echo 0)
     done
     _fb=(--node "$XBD_NODES/current" --api-port "${XBD_API_PORT:-18085}"
          --logs "$XBD_LOGS" --dns "${XBD_DNS_MODE:-off}" --port-normal "${XBD_PORT_NORMAL:-1080}"
+         --family "${XBD_ADDR_FAMILY:-auto}"
          --listen-addr "${XBD_LISTEN_ADDR:-127.0.0.1}" --loglevel "${XBD_LOGLEVEL:-warning}")
     if python3 "$XBD_LIBDIR/genconfig.py" "${_fb[@]}" 2>&1 | grep -q '"ok": true'; then
       ok "xray-client.json（单节点 · 已降级，切换节点需重启）"
@@ -2225,6 +2228,9 @@ Xray Client Web Manager v$XBD_VERSION
     multi status|on|off                    多出站开关（默认关：单节点模式）。
                                            开启后所有节点同时在线，按权重分流；
                                            想要的时候再开，别默认打开。
+    family [auto|v4|v6]                    出站地址族（默认 auto=历史行为：
+                                           直连走 IPv4、DNS 按连通性选）。
+                                           双栈机器上某一边不通时才需要改。
     share new|list|url|off                  配置分发：生成带令牌的分享链接，
                                            别人扫码/导入即可拿到你的节点配置。
                                            分享服务只在开启时占用一个端口。
@@ -2272,6 +2278,7 @@ xbd_main() {
     share)      cmd_share "$@" ;;
     menu)       cmd_menu "$@" ;;
     multi)      cmd_multi "$@" ;;
+    family)     cmd_family "$@" ;;
     ""|-h|--help|help) xbd_usage ;;
     *) xbd_usage; die "未知命令: $cmd" ;;
   esac
@@ -2883,6 +2890,68 @@ cmd_share() {
 
 cmd_menu() {
   _mmenu
+}
+
+cmd_family() {
+  local op="${1:-status}"
+  case "$op" in
+    auto|v4|v6) _xbd_family_set "$op" ;;
+    status|"")  _xbd_family_status ;;
+    *) die "未知取值: $op（可用 auto | v4 | v6）" ;;
+  esac
+}
+
+# 地址族开关。为什么要有它：
+#   客户端原来是硬编码的 —— direct 出站 UseIPv4、DNS UseIP。双栈机器上
+#   如果 v4 不通（或反过来只有 v6 可达），用户没有任何开关可拨，表现是
+#   "直连的站点全打不开，走代理的却正常"，很难联想到是地址族的问题。
+#   SB 那边有"切换产物地址族"，M 的 hysteria2 也会探测 ipv4/ipv6/dual。
+#
+# auto 就是历史行为，**不改任何存量用户的解析方式**。
+_xbd_family_set() {
+  local v="$1"
+  [ "$(id -u)" = "0" ] || die "改地址族需要 root"
+  mkdir -p "$XBD_CONF"
+  printf '# 出站地址族。auto = 直连走 IPv4、DNS 按连通性选（历史行为）\n# v4/v6 = 强制只走该族。双栈机器上某一边不通时才需要改。\nADDR_FAMILY=%s\n' "$v" > "$XBD_FAMILY_ENV"
+  case "$v" in
+    v4) ok "已强制走 IPv4" ; info "  直连出站与 DNS 都只走 IPv4（UseIPv4）" ;;
+    v6) ok "已强制走 IPv6" ; info "  直连出站与 DNS 都只走 IPv6（UseIPv6）" ;;
+    *)  ok "已回到 auto"    ; info "  直连走 IPv4，DNS 交给内核按连通性选（历史行为）" ;;
+  esac
+  [ "$v" = "v6" ] && warn "  目标站点若没有 AAAA 记录会直接解析失败 —— 这是预期行为，不是 bug"
+
+  # 与 cmd_multi 同一套：apply -> 回读校验 -> 重启。
+  # 只 apply 不重启的话，开关显示已改、配置也是新的，但跑着的还是旧配置。
+  cmd_apply >/dev/null 2>&1 || true   # 它失败会自己 die
+  local want now
+  case "$v" in v4) want="UseIPv4" ;; v6) want="UseIPv6" ;; *) want="UseIPv4" ;; esac
+  # grep -c 无匹配时返回 1，在 set -euo pipefail 下必须 || true
+  now=$(grep -o '"tag": *"direct"[^}]*}' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | grep -o 'UseIPv[46]' | head -1 || true)
+  if [ -n "$now" ] && [ "$now" != "$want" ]; then
+    warn "配置里 direct 出站是 $now，期望 $want —— 开关已保存但可能没生效"
+    warn "xbd apply 看详情"
+    return
+  fi
+  if unit_active "$XBD_U_XRAY"; then
+    if xbd restart >/dev/null 2>&1; then
+      sleep 1
+      ok "Xray 已重启，新地址族生效"
+    else
+      warn "Xray 重启失败，开关已保存: xbd restart 重试"
+    fi
+  fi
+}
+
+_xbd_family_status() {
+  local v now
+  v=$(_xbd_family)
+  now=$(grep -o '"tag": *"direct"[^}]*}' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | grep -o 'UseIPv[46]' | head -1 || true)
+  case "$v" in
+    v4) printf '  \033[32m强制 IPv4\033[0m   直连出站与 DNS 都只走 IPv4\n' ;;
+    v6) printf '  \033[32m强制 IPv6\033[0m   直连出站与 DNS 都只走 IPv6\n' ;;
+    *)  printf '  \033[32mauto\033[0m        直连走 IPv4，DNS 按连通性选（历史行为）\n' ;;
+  esac
+  [ -n "$now" ] && printf '  运行配置里的 direct 出站: %s\n' "$now"
 }
 
 cmd_multi() {

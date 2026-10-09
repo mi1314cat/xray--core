@@ -1008,6 +1008,92 @@ rm -f "$TMP_A"
 BAD=$(grep -nE "^\s*[^#].*\| *grep [^|]*\| *while read" "$ACT" | grep -v '|| true' | wc -l)
 assert_eq "$BAD" "0" "没有「grep 无匹配即杀脚本」的裸管道"
 
+# ---------------------------------------------------------------- ECH / 指纹 / 地址族
+# 这三项是同一轮加的，都围绕"服务端下发的值要被客户端**真正用上**"这个主题。
+group "ECH 下发 (echConfigList)"
+# 服务端 cdn 模式写的形状（官方 tlsSettings.echConfigList 的第二种格式：
+# "从 DNS 服务器查询"，特殊写法 "example.com+https://1.1.1.1/dns-query"）
+ech_node() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+json.dump({"protocol": "vless", "address": "a.example", "port": 443,
+           "uuid": "11111111-2222-3333-4444-555555555555",
+           "transport": "xhttp", "security": "tls", "sni": "a.example",
+           "path": "/x", "ech": sys.argv[2]}, open(sys.argv[1], "w"))
+PY
+}
+ECHT="$(mktemp -d)"
+CDN_ECH='cloudflare-ech.com+https://dns.alidns.com/dns-query'
+ech_node "$ECHT/n.json" "$CDN_ECH"
+python3 "$ROOT/Client/lib/genconfig.py" --node "$ECHT/n.json" --output "$ECHT/normal.json" \
+  --mode normal --listen 127.0.0.1 --port-normal 1080 --logs "$ECHT" >/dev/null 2>&1
+got=$(python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+for o in d["outbounds"]:
+    ts=(o.get("streamSettings") or {}).get("tlsSettings") or {}
+    if ts.get("echConfigList"): print(ts["echConfigList"]); break
+' "$ECHT/normal.json" 2>/dev/null || true)
+assert_eq "$got" "$CDN_ECH" "普通模式把 ECHConfigList 原样下发（走 CDN 用的就是这条）"
+
+python3 "$ROOT/Client/lib/genconfig.py" --node "$ECHT/n.json" --output "$ECHT/dialer.json" \
+  --mode dialer --listen 127.0.0.1 --port-normal 1080 --port-dialer 18081 --logs "$ECHT" >/dev/null 2>&1
+n=$(grep -c echConfigList "$ECHT/dialer.json" 2>/dev/null || true)
+assert_eq "${n:-0}" "0" "拨号模式不写（那条路 TLS 由 Chromium 完成，写了也不会被读）"
+rm -rf "$ECHT"
+
+group "指纹白名单 (内核未知值会整份配置失败)"
+fp_node() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+json.dump({"protocol": "vless", "address": "a.example", "port": 443,
+           "uuid": "11111111-2222-3333-4444-555555555555",
+           "transport": "tcp", "security": "tls", "sni": "a.example",
+           "fingerprint": sys.argv[2]}, open(sys.argv[1], "w"))
+PY
+}
+FPT="$(mktemp -d)"
+for pair in "chrome:SUPPORTED" "Chrome:SUPPORTED" "random:SUPPORTED" \
+            "hellochrome_131:SUPPORTED" "not-a-real-fp:NOT_SUPPORTED"; do
+  fp="${pair%%:*}"; want="${pair##*:}"
+  fp_node "$FPT/n.json" "$fp"
+  got=$(python3 "$ROOT/Client/lib/compat.py" json "$FPT/n.json" 2>/dev/null \
+        | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(next((c["verdict"] for c in d["xray"]["checks"] if c["item"]=="指纹"), "缺失"))' 2>/dev/null || true)
+  # 注意是 `|| true` 不是 `|| echo ...`：compat.py 对"不可用"的节点**退出码为 1**
+  # （那是有效结论），pipefail 下会把整条管道判失败 —— 用 echo 追加会把
+  # "解析失败" 拼到结果后面，断言跟着错。
+  assert_eq "$got" "$want" "指纹 $fp"
+done
+rm -rf "$FPT"
+
+group "出站地址族 (--family)"
+FAMT="$(mktemp -d)"
+cat > "$FAMT/n.json" <<'EOF'
+{"protocol":"vless","address":"a.example","port":443,
+ "uuid":"11111111-2222-3333-4444-555555555555",
+ "transport":"tcp","security":"tls","sni":"a.example"}
+EOF
+fam_check() { # <family> <期望 direct> <期望 dns>
+  python3 "$ROOT/Client/lib/genconfig.py" --node "$FAMT/n.json" --output "$FAMT/$1.json" \
+    --mode normal --listen 127.0.0.1 --port-normal 1080 --dns standard \
+    --family "$1" --logs "$FAMT" >/dev/null 2>&1
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+ds=next((o["settings"]["domainStrategy"] for o in d["outbounds"] if o.get("tag")=="direct"), "?")
+print(ds, (d.get("dns") or {}).get("queryStrategy","?"))
+' "$FAMT/$1.json" 2>/dev/null || echo "生成失败 ?"
+}
+got=$(fam_check auto); assert_eq "$got" "UseIPv4 UseIP" "auto = 历史行为（不改存量用户的解析方式）"
+got=$(fam_check v4);   assert_eq "$got" "UseIPv4 UseIPv4" "v4 强制只走 IPv4"
+got=$(fam_check v6);   assert_eq "$got" "UseIPv6 UseIPv6" "v6 强制只走 IPv6"
+# auto 必须是默认值，否则不传 --family 的调用方会被改行为
+grep -q 'add_argument("--family".*default="auto"' "$ROOT/Client/lib/genconfig.py" \
+  && ok "--family 默认 auto" || bad "--family 默认值不是 auto"
+rm -rf "$FAMT"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。

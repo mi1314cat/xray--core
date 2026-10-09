@@ -187,7 +187,47 @@ def main():
                       ("尊重减少动态效果", r"prefers-reduced-motion")]:
         ck(re.search(pat, bare) is not None, what)
 
-    print("\n[5] 页面骨架")
+    print("\n[5] 面板接线：HTML 的 id 与 JS 引用对得上")
+    # 这类错只会在浏览器里暴露成 "Cannot read properties of null"，
+    # 而页面主体照常渲染 —— 静态检查能提前抓住。
+    ids = set(re.findall(r'id="([\w-]+)"', page))
+    used = set(re.findall(r"\$\('([\w-]+)'\)", page))
+    missing = sorted(used - ids)
+    ck(not missing, "JS 引用的 id 都在 HTML 里定义", ", ".join(missing[:6]))
+    # onXXX 里调用的函数：普通函数 + 箭头函数两种写法都要认
+    handlers = set(re.findall(r'on\w+="(\w+)\(', page))
+    fns = (set(re.findall(r'function (\w+)', page))
+           | set(re.findall(r'window\.(\w+)\s*=', page))
+           | set(re.findall(r'const (\w+)\s*=', page)))
+    undef = sorted(h for h in handlers if h not in fns)
+    ck(not undef, "onXXX 调用的函数都有定义", ", ".join(undef[:6]))
+    # 新增的地址族开关：面板与 core.sh 的白名单必须一致
+    ck('id="family-mode"' in page and "setFamily" in page,
+       "出站地址族下拉框已接线")
+    ck("family_set" in page, "family_set 已进 DISPATCH")
+
+    print("\n[6] 内联 JS 语法")
+    # ★ 这一条是补一个真实盲区：页面的 JS 全拼在字符串里，此前**没有任何东西
+    #   检查它的语法** —— CSS 有括号配对检查，JS 没有。一次重复的 const 声明
+    #   就能让整个面板的脚本静默失效（页面照常渲染，只是所有按钮都没反应）。
+    import shutil as _sh
+    import subprocess as _sp
+    import tempfile as _tf
+    blocks = re.findall(r"<script>(.*?)</script>", page, re.S)
+    if _sh.which("node"):
+        with _tf.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                    encoding="utf-8") as fh:
+            fh.write("\n;\n".join(blocks))
+            jspath = fh.name
+        r = _sp.run(["node", "--check", jspath], capture_output=True, text=True)
+        os.unlink(jspath)
+        ck(r.returncode == 0,
+           "内联 JS 语法通过（%d 个 script 块）" % len(blocks),
+           (r.stderr or "").strip().splitlines()[0] if r.returncode else "")
+    else:
+        print("  ⏭  没有 node，跳过 JS 语法检查")
+
+    print("\n[7] 页面骨架")
     ck(page.lstrip().startswith("<!DOCTYPE html>"), "以 DOCTYPE 开头")
     ck(page.count("<style>") == 1 and page.count("</style>") == 1,
        "只有一段 <style>")

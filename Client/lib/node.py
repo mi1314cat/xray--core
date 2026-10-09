@@ -57,7 +57,11 @@ DEFAULT_NODE = {
     "reality_public_key": "",
     "reality_short_id": "",
     "reality_spider_x": "",
-    "ech": False,              # 节点是否声明支持 ECH
+    # ECHConfigList 原文（不是布尔）。官方 tlsSettings.echConfigList 支持两种格式：
+    #   固定值 "AF7+DQBaAAAg…" / DNS 查询式 "example.com+https://1.1.1.1/dns-query"
+    # 走 CDN 时是后者 —— 必须原样下发，只记"有没有"等于没配。
+    "ech": "",
+    "ech_declared": False,     # 来源声明了 ECH 但没给出可用配置（只有 mihomo 的 enable 会这样）
     "pinned_cert_sha256": "",  # 自签证书节点的证书哈希（Xray 26.x 的 allowInsecure 替代）
     "mux": False,
     "udp": True,
@@ -139,7 +143,8 @@ def parse_vless(uri: str) -> dict:
         "reality_short_id": q.get("sid") or "",
         "reality_spider_x": q.get("spx") or "",
         "allow_insecure": str(q.get("allowInsecure", "")).lower() in ("1", "true"),
-        "ech": bool(q.get("ech")),
+        "ech": (q.get("ech") or "").strip(),
+        "ech_declared": bool(q.get("ech")),
         "source": "vless-uri",
         "raw_params": q,
         "raw": uri,
@@ -338,7 +343,11 @@ def parse_xray_json(text: str) -> dict:
     n["reality_public_key"] = reality.get("publicKey") or ""
     n["reality_short_id"] = reality.get("shortId") or ""
     n["mux"] = bool(ob.get("mux", {}).get("enabled"))
-    n["ech"] = bool(tls.get("echSettings"))
+    # 官方字段名：客户端是 echConfigList，服务端是 echServerKeys。
+    # 原来读的 "echSettings" 在官方文档里不存在 —— 所以从 Xray JSON 导入的
+    # ECH 节点，配置一直是空的。
+    n["ech"] = str(tls.get("echConfigList") or "").strip()
+    n["ech_declared"] = bool(n["ech"] or tls.get("echServerKeys") or tls.get("echSettings"))
     return n
 
 
@@ -482,7 +491,12 @@ def _yaml_entry_to_node(entry: dict) -> dict:
         headers = xh.get("headers") or {}
         n["host"] = str(headers.get("Host") or headers.get("host") or n["host"])
     if entry.get("ech-opts"):
-        n["ech"] = True
+        # mihomo 的形状是 {enable: bool, config: "<ECHConfigList>"}。
+        # config 才是能下发的值；只有 enable: true 时**拿不到配置**，不能瞎猜 ——
+        # 记成 declared，由 compat 如实说明"声明了但没有配置"。
+        _eo = entry["ech-opts"] if isinstance(entry["ech-opts"], dict) else {}
+        n["ech"] = str(_eo.get("config") or "").strip()
+        n["ech_declared"] = bool(n["ech"] or _eo.get("enable"))
     if "alpn" in entry:
         alpn = entry["alpn"]
         n["alpn"] = ",".join(alpn) if isinstance(alpn, list) else str(alpn)
