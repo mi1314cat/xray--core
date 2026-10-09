@@ -233,8 +233,16 @@ x_cert_search_dirs() {
     # 没有一张是用户的证书。把它当搜索范围, "列出我的证书"会列出 120 个
     # 无关文件, 把用户自己那两三张淹掉。用户的证书在 letsencrypt 的 live/
     # 或项目自己的 certs 目录。
+    # 这几个目录的取舍对齐 sing-box-core 的 sb_scan_certs —— 它是被实机
+    # 打过的: RN 上用户的证书就在 /home/web/certs, 而我们原来没扫它,
+    # 于是面板"找不到证书", 站点其实一直在用。
+    #
+    #   /home/web/certs         KPanel / 容器化 nginx 的宿主证书目录
+    #   /root/catmi/cloudflare/certs  本项目 catmi 体系的证书目录
+    #   /root/.acme.sh           acme.sh 默认落盘位置, 和 letsencrypt 并列
     for d in /etc/letsencrypt/live /root/catmi/xray/certs \
              /root/catmi/certs /usr/local/share/letsencrypt/live \
+             /home/web/certs /root/catmi/cloudflare/certs /root/.acme.sh \
              ${X_CERT_EXTRA_DIRS:-/nonexistent}; do
         [[ -d "$d" ]] && printf '%s\n' "$d"
     done
