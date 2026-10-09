@@ -31,6 +31,41 @@ TEST_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 TEST_URL_FALLBACK = "https://api.ipify.org"
 
 
+# ---------------------------------------------------------------------------
+# Browser Dialer 相关
+#
+# 判定"这个节点要不要浏览器完成 TLS"只有一个来源: compat.py 的 want_bd。
+# 这里不自己写一套 —— 三处各判一次迟早走偏, 而走偏的后果是"测速说节点坏了"
+# 这种会让人删掉好节点的误报。
+# ---------------------------------------------------------------------------
+def _load_compat():
+    for base in (os.path.dirname(os.path.abspath(__file__)), DIST):
+        p = os.path.join(base, "lib", "compat.py")
+        if os.path.isfile(p):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("_xbd_compat", p)
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(mod)
+                return mod
+            except Exception:
+                return None
+    return None
+
+
+def want_browser_dialer(node: dict) -> bool:
+    mod = _load_compat()
+    if not mod:
+        # 判定不了就不要求浏览器 —— 保持旧行为, 宁可少报也不误报。
+        return False
+    try:
+        return bool(mod.want_browser_dialer(node))
+    except Exception:
+        return False
+
+
+
+
 def sh(args, timeout=60):
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -109,7 +144,40 @@ def measure(node_path: str, url: str, timeout: int, tls_mismatch_ok: bool = True
             return {"ok": False, "latency_ms": None, "error": "config_failed",
                     "detail": (out or err)[:200]}
 
-        proc = subprocess.Popen([XRAY, "run", "-config", cfg],
+        # Browser Dialer 是**进程级**能力: 只有带着 XRAY_BROWSER_DIALER 启动的
+        # Xray 才会让 Chromium 完成 TLS。上面这个探测进程原本不带, 于是走
+        # Xray 自带 TLS —— 对"只认浏览器指纹"的服务端必然失败。
+        #
+        # 症状是: xbd node latency 对所有 xhttp 节点报「失败 tls」, 但切过去
+        # 实际能用 (CC 上 node-001-ccsmvless-01 延时测速报 tls 失败, 常驻
+        # 服务下 HTTP 204 / 出口正确)。用户看到"测速失败"会以为节点坏了,
+        # 可能直接删掉好节点 —— 误报比不可用更糟。
+        #
+        # 所以这里两件事: 能带就带上, 带不上就明说原因。
+        node = json.loads(open(node_path).read())
+        needs_bd = want_browser_dialer(node)
+        env = None
+        if needs_bd:
+            # 这里故意**不**给探测进程挂 XRAY_BROWSER_DIALER。
+            #
+            # 试过带上, 错误确实从 tls 变成 timeout, 说明变量传到了 —— 但仍不通。
+            # 根因是 Browser Dialer 的额度只有一份: browser_dialer.dialTask()
+            # 是 `conn = <-conns`, 没有超时。常驻 Xray 已经在用它, 探测进程再去
+            # 抢同一个 Chromium 就永久挂住, 表现为 timeout。
+            #
+            # 要真测这种节点得给它单独的 Chromium 实例, 代价是几百 MB 内存和
+            # 十几秒启动时间 —— 对"测一下快慢"这个动作太重。所以这里不测,
+            # 直接说清楚原因, 让用户以实际使用为准。
+            #
+            # 关键是**别报"失败"**: 那个节点可能完全正常, 用户看到"失败"
+            # 会以为节点坏了, 可能直接删掉 (CC 上 node-001-ccsmvless-01 就是
+            # 常驻下 HTTP 204、被测速说 tls 失败)。
+            return {"ok": False, "latency_ms": None,
+                    "error": "need_browser",
+                    "detail": ("该节点由浏览器完成 TLS，测速不适用。"
+                               "切到它实际能用与否，以使用为准。")}
+
+        proc = subprocess.Popen([XRAY, "run", "-config", cfg], env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             if not wait_port(port):
@@ -181,13 +249,20 @@ def main() -> int:
         if not args.json:
             if r["ok"]:
                 print(f"  {name:<44} {r['latency_ms']:>5} ms   {r.get('exit_ip','')}")
+            elif r.get("error") == "need_browser":
+                # 不能写成"失败"。这个节点很可能完全正常, 只是这次测不了 ——
+                # 报"失败"会让人以为节点坏了, 直接删掉。
+                print(f"  {name:<44}  需浏览器  {r.get('detail','')}")
             else:
                 print(f"  {name:<44}  失败   {r['error']}")
         sys.stdout.flush()
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
-    return 0 if any(v.get("ok") for v in results.values()) else 1
+    # need_browser 不是失败 —— 节点没被证明不可用, 只是这次没测成。
+    # 算进失败会让整条命令 exit 1, 调用方据此报"有节点坏了", 同样是误导。
+    return 0 if any(v.get("ok") or v.get("error") == "need_browser"
+                    for v in results.values()) else 1
 
 
 if __name__ == "__main__":
