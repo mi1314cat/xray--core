@@ -958,6 +958,56 @@ done
     || bad "这些函数没容错, 菜单会被 set -e 杀掉:$miss"
 rm -rf "$DT"
 
+# ---------------------------------------------------------------- apply 健康路径
+# 这一组守的是"**成功的时候才炸**"那类 bug —— 最难发现的一种。
+#
+#   xbd 顶部是 `set -euo pipefail`, 而 cmd_apply 里有
+#       printf '%s\n' "$_gen_out" | grep 'genconfig:' | while read -r l; do ...; done
+#   genconfig 成功、没有任何警告行时 grep **无匹配返回 1**, pipefail 让整条管道
+#   非零, set -e 当场杀掉脚本。
+#
+#   配置文件其实已经写好了(genconfig 自己成功了), 但脚本死在这一行 ——
+#   后面的 systemctl restart 永远不执行: **改了配置不生效, 还不报错**。
+#   实测 CC 上从 10-09 15:07 部署起就是坏的, 一直没人发现。
+#
+#   做法是抽**真实语句**来跑, 不是复刻一份 —— 复刻的测试只能证明"我知道怎么写对",
+#   证明不了"文件里那行是对的"。
+group "apply 健康路径 (set -e 与 pipefail)"
+ACT="$ROOT/Client/lib/actions.sh"
+
+# 语句 1: grep 无匹配时不能杀脚本
+STMT=$(grep -n "printf '%s\\\\n' \"\$_gen_out\" | grep 'genconfig:'" "$ACT" | head -1 | cut -d: -f2-)
+[[ -n "$STMT" ]] && ok "找到 genconfig 警告输出那一行" || bad "找不到那一行(可能被改写, 请更新本测试)"
+run_stmt() { # $1=语句  $2=喂给 _gen_out 的内容
+  # 被抽出来的语句会调 warn/dim —— 它们是 actions.sh 里的函数, 独立夹具里没有。
+  # 不给桩的话报 "command not found" (rc=127), 会把"夹具缺函数"误报成"代码有问题"。
+  { printf 'set -euo pipefail\n'
+    printf 'warn() { :; }; dim() { :; }; ok() { :; }; bad() { :; }\n'
+    printf '_gen_out=%s\n' "$2"
+    printf '%s\n' "$1"
+    printf 'echo REACHED\n'
+  } > "$TMP_A"
+  bash "$TMP_A" >/dev/null 2>&1
+}
+TMP_A="$(mktemp)"
+run_stmt "$STMT" "'{\"ok\": true, \"mode\": \"normal\"}'"
+assert_eq "$?" "0" "genconfig 成功且无警告时, 脚本能走到最后 (不再被 grep 的退出码杀掉)"
+
+# 语句 2: 循环体末命令遇空行不能杀脚本
+# 用 awk 按标记行取到 done —— sed 的 \\n 在 BRE 里不表示换行，上一步就是这么抽空的。
+STMT2=$(awk '/\| tail -3 \| while read/{f=1} f{print; if(/done/) exit}' "$ACT")
+[[ -n "$STMT2" ]] && ok "找到 tail 输出那一段" || bad "找不到 tail 那一段"
+# 必须喂一个**末尾带换行**的值: genconfig 的警告输出常以换行收尾,
+# `printf '%s\n'` 之后就多出一个空行, 循环体会读到它。
+# 喂 "a" 是测不出来的 —— 那样压根不会出现空行, 门禁会变成假的。
+run_stmt "$STMT2" "\$'a\\n'"
+assert_eq "$?" "0" "tail 循环遇到空行时不再中断"
+rm -f "$TMP_A"
+
+# 静态兜底: 同一类写法不该再出现(命令位置的裸 grep 管道, 结尾 while read)
+BAD=$(grep -nE "^\s*[^#].*\| *grep [^|]*\| *while read" "$ACT" | grep -v '|| true' | wc -l)
+assert_eq "$BAD" "0" "没有「grep 无匹配即杀脚本」的裸管道"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。

@@ -995,7 +995,11 @@ cmd_apply() {
 
   _gen_out=$(python3 "$XBD_LIBDIR/genconfig.py" "${gen_args[@]}" 2>&1)
   if printf '%s' "$_gen_out" | grep -q '"ok": true'; then
-    printf '%s\n' "$_gen_out" | grep 'genconfig:' | while read -r l; do warn "  $l"; done
+    # ★ `|| true` 不能省。genconfig 成功、没有警告行时 grep **无匹配返回 1**,
+    #   pipefail 让整条管道非零, set -e 会在这里杀掉脚本 —— 而且是"健康路径上
+    #   才炸"：配置已经写好了, 但后面的重启永远不执行, 表现成"改了配置不生效
+    #   还不报错"。这是同类 set -e 事故的第三例。
+    printf '%s\n' "$_gen_out" | grep 'genconfig:' | while read -r l; do warn "  $l"; done || true
     if [ "$want_bd" = "yes" ]; then
       ok "xray-client.json（单节点 · 浏览器拨号）"
     else
@@ -1021,7 +1025,11 @@ except Exception: print(0)' "$XBD_RUNTIME/xray-gen.json" 2>/dev/null || echo 0)
     #
     # 单节点配置只含当前节点，能生成成功的概率高得多。先让它跑起来，比什么都强。
     warn "多出站配置生成失败，自动降级为单节点模式"
-    printf '%s\n' "$_gen_out" | tail -3 | while read -r l; do [ -n "$l" ] && dim "  $l"; done
+    # 循环体末命令不能是 `[ ... ] && cmd`：最后一行若是空行, [ -n ] 返回 1,
+    # 那正是循环体的最后一条命令, 循环退出码就是 1 —— 同样会被 set -e 杀。
+    printf '%s\n' "$_gen_out" | tail -3 | while read -r l; do
+      if [ -n "$l" ]; then dim "  $l"; fi
+    done
     _fb=(--node "$XBD_NODES/current" --api-port "${XBD_API_PORT:-18085}"
          --logs "$XBD_LOGS" --dns "${XBD_DNS_MODE:-off}" --port-normal "${XBD_PORT_NORMAL:-1080}"
          --listen-addr "${XBD_LISTEN_ADDR:-127.0.0.1}" --loglevel "${XBD_LOGLEVEL:-warning}")
