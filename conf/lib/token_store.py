@@ -150,7 +150,7 @@ def consume_once(share_dir, token):
             return False
         # 扣减放在确认要发 body 之后、真正保存之前 —— 但仍在本函数内原子完成。
         # 顺序: 判定 → 构造载荷(函数外) → 回到这里扣。
-        # 见 share_server 里 build 与 consume 的调用次序说明。
+        # 见分享载荷构建 (share_payload) 与公共基础服务的扣次次序说明。
         m["_pending"] = True
         return True
 

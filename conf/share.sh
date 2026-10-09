@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
-# Xray 分享管理 —— 生成 token / 启停 / 改次数 / 改有效期 / 列出 / 撤销
+# Xray 分享管理 —— 生成 / 列表 / 启停撤销 / 改次数 / 改有效期 / 服务管理
 #
-# 设计原则 (与 SB/M 一致, 但载荷是 Xray 自己的分享链接):
-#   · 一个 token = 一份订阅 = 若干节点
-#   · token 可以有 max_uses 和 TTL
-#   · 节点被删时, 关联 token 要能看出"少了个节点"而不是静默少发
+# ==============================================================
+# 分享的**存储与生命周期** (Token / TTL / max_uses / 次数 / 过期) 归
+# **公共基础服务** proxy-share-service —— 它是服务器上的公共基础服务,
+# M / SB / X 三个内核共用, 不是 Xray 的子服务。
+#
+# Xray 只负责两件事:
+#   1. **生成内容** —— 把 conf/ 片段变成 base64 订阅 (这是内核自己的知识)
+#   2. **决定何时创建与刷新** —— 节点增删后要把新内容推上去
+#
+# 面板怎么展示也是我们自己的事。
+#
+# provider 固定 `xray` —— 公共服务的列表/删除接口**强制**要求 provider,
+# 所以 X 在结构上看不到、也删不掉 M / SB 的记录。
+#
+# 载荷格式**一字未改**: base64 的订阅行。已发出去的链接、已经导入过的
+# 客户端都按这个格式解析, 改格式等于把所有人踢下线。
+#
+# ⚠ 路径变了: 本地服务端原来发 `/sub/<token>`, 公共基础服务发
+#   `/share/<token>` (与 M/SB 统一)。老链接失效 —— 那台本地服务已经不存在了,
+#   保留旧路径没有任何意义。
+# ==============================================================
 
 set -uo pipefail
 
@@ -12,7 +29,6 @@ XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
 CONF_DIR="${XRAY_CONF_DIR:-$XRAY_BASE/conf}"
 SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
-SHARE_PORT="${XRAY_SHARE_PORT:-9443}"
 SHARE_ADDR="${XRAY_SHARE_ADDR:-127.0.0.1}"
 
 _RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _DIM=$'\033[2m'; _RST=$'\033[0m'
@@ -31,18 +47,109 @@ list_nodes() {
     python "$LIB_DIR/nodes.py" "$CONF_DIR"
 }
 
-# ---------------------------------------------------------------- token 生成
-gen_token() {
-    mkdir -p "$SHARE_DIR/tokens"
-    # token 用 secrets 而不是 $RANDOM —— 分享链接是访问凭证, 可预测的随机数
-    # 等于没有随机数。
-    local tok
-    tok=$(python3 -c "import secrets;print(secrets.token_urlsafe(18))")
-    tok=$(printf '%s' "$tok" | tr -d '=+/' | cut -c1-24)
-    [[ -f "$SHARE_DIR/tokens/$tok.json" ]] && die "token 撞号, 重试"
-    printf '%s' "$tok"
+# ==============================================================
+# 公共分享服务适配层
+# ==============================================================
+SHARE_CLIENT="${SHARE_CLIENT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_client.py}"
+
+# 公共服务实际端口 —— 它可能因端口回避而不是 9443, 绝不能写死。
+x_share_port() {
+    local p=""
+    [[ -f "$SHARE_CLIENT" ]] && p=$(python "$SHARE_CLIENT" port 2>/dev/null)
+    printf '%s' "${p:-9443}"
 }
 
+# 确保公共服务在位 (不存在则从独立项目装)。装有检验、幂等, 多内核共用。
+#
+# 返回约定: 成功时 **stdout 输出端口** + 退出码 0; 失败退出码非 0。
+# (SB 那边踩过: 只返回退出码而调用方写 port=$(...) 再判空, 于是服务
+#  明明活着也永远判成"不可用"。端口只在这一处吐。)
+x_share_ensure() {
+    [[ -f "$SHARE_CLIENT" ]] || return 1
+    local p
+    p=$(SHARE_PROVIDER=xray python "$SHARE_CLIENT" ensure 2>/dev/null) || return 1
+    printf '%s' "${p:-$(x_share_port)}"
+}
+
+# 适配器透传。适配器的 stdout 只放数据, 所以可以直接接。
+_x_share_api() { SHARE_PROVIDER=xray python "$SHARE_CLIENT" "$@"; }
+
+_x_share_list() { _x_share_api list 2>/dev/null; }
+
+# 编号 / token / 前缀 / 名称 -> 完整 token
+_x_share_find() {
+    local c="${1:-}" js
+    js=$(_x_share_list)
+    [[ -z "$js" || "$js" == "[]" ]] && return 1
+    printf '%s' "$js" | python -c '
+import sys, json
+c = sys.argv[1]
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+if c.isdigit():
+    i = int(c)
+    if 1 <= i <= len(recs):
+        print(recs[i-1]["token"]); raise SystemExit
+for r in recs:
+    t = r.get("token",""); m = r.get("meta") or {}
+    if t == c or t.startswith(c) or str(m.get("name","")) == c:
+        print(t); raise SystemExit
+raise SystemExit(1)
+' "$c"
+}
+
+# 读一条记录里的某个字段 (meta 里的用 meta.xxx)
+_x_share_field() {
+    _x_share_api get --token "$1" 2>/dev/null | python -c '
+import sys, json
+k = sys.argv[1]
+try: r = json.load(sys.stdin)
+except Exception: raise SystemExit(1)
+if k.startswith("meta."):
+    v = (r.get("meta") or {}).get(k[5:], "")
+else:
+    v = r.get(k, "")
+print(v if v is not None else "")
+' "$2" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- 载荷构建
+# 按 tag 列表重建 base64 订阅, 写到临时文件。成功打印临时文件路径。
+#
+# ★ 走 conf/lib/share_payload.py —— 与"刷新已发链接"用的是**同一份**实现。
+#   抄一遍必然漂移, 表现是"新建的链接对、刷新过的链接少个节点"。
+x_share_build_payload() {
+    local out; out=$(mktemp /tmp/.xshare.XXXXXX) || return 1
+    if ! python - "$LIB_DIR" "$CONF_DIR" "$SHARE_DIR" "$out" "$@" <<'PY' 2>/tmp/.xshare.err
+import sys, os
+lib_dir, conf_dir, share_dir, out = sys.argv[1:5]
+tags = sys.argv[5:]
+os.environ["XRAY_CONF_DIR"] = conf_dir
+os.environ["XRAY_SHARE_DIR"] = share_dir
+sys.path.insert(0, lib_dir)
+import share_payload
+payload, missing, nometa, bad = share_payload.build_payload(tags)
+if payload is None:
+    print("无可分发内容 (片段没了? 缺对外地址?)", file=sys.stderr)
+    raise SystemExit(1)
+with open(out, "w", encoding="utf-8") as fh:
+    fh.write(payload)
+# 三类"没发出去"分开报 —— 合并成一条就查不出是哪一种
+for label, items in (("节点已删", missing), ("缺分享元数据", nometa)):
+    if items:
+        print("%s: %s" % (label, ",".join(items)), file=sys.stderr)
+if bad:
+    print("片段解析失败: %d 个" % len(bad), file=sys.stderr)
+PY
+    then
+        rm -f "$out"; sed 's/^/    /' /tmp/.xshare.err >&2 2>/dev/null
+        return 1
+    fi
+    sed 's/^/    /' /tmp/.xshare.err >&2 2>/dev/null
+    printf '%s' "$out"
+}
+
+# ---------------------------------------------------------------- 生成
 share_create() {
     local name="" max_uses=0 ttl_days=0
     local -a tags=()
@@ -55,19 +162,18 @@ share_create() {
 
     printf "  选择要分享的节点 (编号, 空格分隔; 留空=全部): " >&2
     read -r sel || true
-    if [[ -z "${sel// /}" ]]; then
-        mapfile -t tags < <(python -c "
+    local -a all
+    mapfile -t all < <(python -c "
 import sys; sys.path.insert(0,'$LIB_DIR'); import nodes
 n,_=nodes.collect('$CONF_DIR')
 print('\n'.join(x['tag'] for x in n))")
+    if [[ -z "${sel// /}" ]]; then
+        tags=("${all[@]}")
         info "已选择全部 ${#tags[@]} 个节点"
     else
-        local all; mapfile -t all < <(python -c "
-import sys; sys.path.insert(0,'$LIB_DIR'); import nodes
-n,_=nodes.collect('$CONF_DIR')
-print('\n'.join(x['tag'] for x in n))")
+        local i idx
         for i in $sel; do
-            local idx=$((i - 1))
+            idx=$((i - 1))
             [[ $idx -ge 0 && $idx -lt ${#all[@]} ]] || die "编号 $i 超出范围"
             tags+=("${all[$idx]}")
         done
@@ -83,33 +189,35 @@ print('\n'.join(x['tag'] for x in n))")
     printf "  有效期天数 [0=永久]: " >&2; read -r ttl_days || true
     [[ "$ttl_days" =~ ^[0-9]+$ ]] || ttl_days=0
 
-    local tok; tok=$(gen_token)
-    local url="http://$SHARE_ADDR:$SHARE_PORT/sub/$tok"
-    if [[ "$SHARE_ADDR" == "0.0.0.0" ]]; then
-        local ip; ip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "<服务器IP>")
-        url="http://$ip:$SHARE_PORT/sub/$tok"
+    # 公共服务不在就装 (幂等; 已有则空操作)
+    local port; port=$(x_share_ensure)
+    [[ -n "$port" ]] || die "公共分享服务不可用 —— 分享链接暂时发不出去"
+
+    local payload; payload=$(x_share_build_payload "${tags[@]}") \
+        || die "生成订阅内容失败 (看上面对应原因)"
+
+    # tags / name 存进 meta —— 刷新时要靠它重建内容。
+    # 公共服务只存不读, 这是"内核用它记自己的东西"的正当用法。
+    local meta
+    meta=$(python -c '
+import json, sys
+tags = sys.argv[1:]
+print(json.dumps({"name": tags[0], "tags": tags[1:]}, ensure_ascii=False))
+' "$name" "${tags[@]}")
+
+    local rec token
+    rec=$(_x_share_api create --type node --content-file "$payload" \
+            --ttl $((ttl_days * 86400)) --max-uses "$max_uses" --meta "$meta" 2>&1) || {
+        rm -f "$payload"; die "公共服务创建分享失败: $rec"; }
+    rm -f "$payload"
+    token=$(printf '%s' "$rec" | python -c 'import sys,json;print(json.load(sys.stdin).get("token",""))' 2>/dev/null)
+    [[ -n "$token" ]] || die "公共服务没有返回 token"
+
+    local ip="$SHARE_ADDR"
+    if [[ "$SHARE_ADDR" == "0.0.0.0" || "$SHARE_ADDR" == "127.0.0.1" ]]; then
+        ip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null || echo "<服务器IP>")
     fi
-
-    python - "$LIB_DIR" "$SHARE_DIR" "$tok" "$name" "$max_uses" "$ttl_days" "${tags[@]}" <<'PY' || die "写入 token 失败"
-import sys, time
-sys.path.insert(0, sys.argv[1])
-import token_store as T
-share_dir, tok, name, max_uses, ttl_days = sys.argv[2:7]
-now = int(time.time())
-meta = {
-    "schema": 1, "token": tok, "name": name,
-    "tags": sys.argv[7:],
-    "enabled": True, "used_count": 0,
-    "max_uses": int(max_uses),
-    "expires_at": (now + int(ttl_days) * 86400) if int(ttl_days) else 0,
-    "created_at": now,
-}
-T.write(share_dir, tok, meta)
-PY
-
-    # 链接生成成功但服务没跑的话, 面板显示一切正常, 客户端一律连不上,
-    # 而且排查会被引向防火墙。所以在这里就确认服务可用。
-    ensure_service || warn "分享服务未就绪, 链接已保存但现在拉不动 —— 服务起来后立刻可用"
+    local url="http://$ip:$port/share/$token"
 
     ok "分享已生成"
     printf "\n    ${_GRN}%s${_RST}\n\n" "$url" >&2
@@ -122,114 +230,323 @@ PY
 # ---------------------------------------------------------------- 列表
 share_list() {
     printf "\n${_CYN}=== 分享列表 ===${_RST}\n" >&2
-    python - "$LIB_DIR" "$SHARE_DIR" <<'PY'
-import sys, time
-sys.path.insert(0, sys.argv[1])
-import token_store as T
-share_dir = sys.argv[2]
-items = T.list_all(share_dir)
-if not items:
-    print("  (还没有生成分享)", file=sys.stderr); raise SystemExit(0)
+    # ★ 先分清"没有分享"和"服务不可达"。
+    #   适配器在服务挂掉时返回空 —— 直接当成"没有分享"是在说谎: 用户会以为
+    #   自己没建过链接 (或者以为被谁删了), 而真实原因是服务没跑。
+    if ! _x_share_api health >/dev/null 2>&1; then
+        err "公共分享服务不可达 —— 看不到列表, 不代表没有分享"
+        info "用菜单 6) 分享服务管理 -> 1) 确保在位 来修复"
+        printf '\n' >&2
+        return 1
+    fi
+    local js; js=$(_x_share_list)
+    if [[ -z "$js" || "$js" == "[]" ]]; then
+        info "(还没有生成分享)"
+        printf '\n' >&2
+        return 0
+    fi
+    python - "$(x_share_port)" <<'PY' < <(printf '%s' "$js")
+import sys, json, time
+port = sys.argv[1]
+recs = json.load(sys.stdin)
 now = int(time.time())
-print(f"  {'TOKEN':<26} {'名称':<16} {'已用/上限':<10} {'过期':<12} {'状态':<6} 节点", file=sys.stderr)
-for d in items:
-    tok = d.get("token", "")
-    if d.get("_broken"):
-        print(f"  {tok:<26} {'!文件损坏':<16} {'-':<10} {'-':<12} {'损坏':<6} ", file=sys.stderr)
-        continue
-    # 状态判定与服务端共用 status_of —— 列表说"有效"而服务端发 410,
-    # 是最难查的一类不一致。
-    st = T.status_of(d, now)
-    used, maxu = d.get("used_count", 0), d.get("max_uses", 0)
-    exp = d.get("expires_at", 0)
+print(f"  {'编号':<5}{'TOKEN':<20}{'名称':<16}{'已用/上限':<11}{'过期':<12}{'状态':<7}节点", file=sys.stderr)
+for i, r in enumerate(recs, 1):
+    m = r.get("meta") or {}
+    exp = int(r.get("expires_at", 0))
     exps = "永久" if not exp else time.strftime("%Y-%m-%d", time.localtime(exp))
-    tags = d.get("tags") or d.get("tag") or []
+    used, maxu = int(r.get("used_count", 0)), int(r.get("max_uses", 0))
+    tags = m.get("tags") or []
     if isinstance(tags, str): tags = [tags]
-    print(f"  {tok:<26} {str(d.get('name',''))[:15]:<16} "
-          f"{f'{used}/{maxu if maxu else chr(8734)}':<10} {exps:<12} {st:<6} {','.join(tags)[:40]}", file=sys.stderr)
+    print(f"  {i:<5}{str(r.get('token',''))[:18]:<20}{str(m.get('name',''))[:15]:<16}"
+          f"{f'{used}/{maxu if maxu else chr(8734)}':<11}{exps:<12}{r.get('state',''):<7}"
+          f"{','.join(tags)[:40]}", file=sys.stderr)
 PY
     printf '\n' >&2
+    info "拉取地址: http://<服务器IP>:$(x_share_port)/share/<token>"
 }
 
 # ---------------------------------------------------------------- 启停 / 撤销
 share_toggle() {
-    local tok="$1"
-    python - "$LIB_DIR" "$SHARE_DIR" "$tok" <<'PY' || die "操作失败"
-import sys
-sys.path.insert(0, sys.argv[1])
-import token_store as T
-share_dir, tok = sys.argv[2:4]
-res = {}
-def _flip(m):
-    if m.get("_broken"):
-        print(f"token 文件损坏: {tok}", file=sys.stderr); return False
-    m["enabled"] = not m.get("enabled", True)
-    res["v"] = m["enabled"]
-T.update(share_dir, tok, _flip)
-if "v" not in res:
-    print(f"找不到 token: {tok}", file=sys.stderr); raise SystemExit(1)
-print("已启用" if res["v"] else "已停用", file=sys.stderr)
-PY
+    local tok; tok=$(_x_share_find "$1") || die "找不到: $1"
+    local cur want
+    cur=$(_x_share_field "$tok" enabled)
+    [[ "$cur" == "True" ]] && want=false || want=true
+    _x_share_api update --token "$tok" --enabled "$want" >/dev/null 2>&1 \
+        || die "切换失败"
+    # 回读确认 —— 静默失败在旧实现里踩过
+    [[ "$(_x_share_field "$tok" enabled)" == "$([[ "$want" == true ]] && echo True || echo False)" ]] \
+        || die "切换未生效"
+    ok "$([[ "$want" == true ]] && echo 已启用 || echo 已停用) $tok"
 }
 
 share_revoke() {
-    local tok="$1"
-    python - "$LIB_DIR" "$SHARE_DIR" "$tok" <<'PY' || die "撤销失败"
-import sys, time
-sys.path.insert(0, sys.argv[1])
-import token_store as T
-share_dir, tok = sys.argv[2:4]
-def _rev(m):
-    if m.get("_broken"): return False
-    m["enabled"] = False; m["revoked_at"] = int(time.time())
-T.update(share_dir, tok, _rev) or print(f"找不到 token: {tok}", file=sys.stderr)
-PY
+    local tok; tok=$(_x_share_find "$1") || die "找不到: $1"
+    _x_share_api delete --token "$tok" >/dev/null 2>&1 || die "撤销失败"
+    _x_share_api get --token "$tok" >/dev/null 2>&1 && die "撤销未生效 (记录还在)"
     ok "已撤销 $tok"
 }
 
 share_set() {
-    local tok="$1" field="$2" value="$3"
-    python - "$LIB_DIR" "$SHARE_DIR" "$tok" "$field" "$value" <<'PY' || die "设置失败"
-import sys
-sys.path.insert(0, sys.argv[1])
-import token_store as T
-share_dir, tok, field, value = sys.argv[2:6]
-def _set(m):
-    if m.get("_broken"): return False
-    if field == "max_uses":   m["max_uses"] = int(value or 0)
-    elif field == "expires_at": m["expires_at"] = int(value or 0)
-T.update(share_dir, tok, _set) or print(f"找不到 token: {tok}", file=sys.stderr)
-PY
+    local tok; tok=$(_x_share_find "$1") || die "找不到: $1"
+    case "$2" in
+        max_uses)   _x_share_api update --token "$tok" --max-uses "${3:-0}" >/dev/null 2>&1 \
+                        || die "设置失败" ;;
+        expires_at) # 公共服务用 ttl(相对秒) 或 expires_at(绝对)。
+                    # 这里给的是绝对时间戳, 直接透传 —— 用 ttl 反推会算错,
+                    # 而且"已经过期"的时间点用 ttl 表达不出来 (负数非法)。
+                    _x_share_api update --token "$tok" --expires-at "${3:-0}" >/dev/null 2>&1 \
+                        || die "设置失败" ;;
+        *) die "未知字段: $2" ;;
+    esac
     ok "已更新 $tok"
 }
 
-# ---------------------------------------------------------------- 服务
+# ---------------------------------------------------------------- 内容保鲜
+# 节点增删/改动之后, 已发出去的链接内容会变旧 —— 客户端再拉还是老的订阅。
+# 这里按记录里的 tags 重建内容, 变了才 PUT (token/URL 不变)。
+#
+# ★ 不做这件事的后果是静默的: 面板显示一切正常, 链接也能打开,
+#   只是少了一个节点 / 还留着已删的节点, 没人会发现。
+share_refresh_all() {
+    local js; js=$(_x_share_list)
+    [[ -z "$js" || "$js" == "[]" ]] && return 0
+
+    # 刷新是"尽力而为": 绝不为了刷新去装服务 (节点生成路径不能被网络安装阻塞),
+    # 但服务不可达时必须**说出来** —— 否则已有链接会一直发旧内容而无人察觉。
+    if ! _x_share_api health >/dev/null 2>&1; then
+        warn "公共分享服务不可达, 已有分享链接的内容未刷新"
+        return 0
+    fi
+
+    local n=0 tok name tags newh curh payload
+    while IFS=$'\t' read -r tok name tags; do
+        [[ -n "$tok" ]] || continue
+        [[ -n "$tags" ]] || continue
+        # shellcheck disable=SC2086
+        payload=$(x_share_build_payload $(printf '%s' "$tags" | tr ',' ' ')) || continue
+        newh=$(sha256sum "$payload" | awk '{print $1}')
+        curh=$(_x_share_api get --token "$tok" 2>/dev/null \
+               | python -c 'import sys,json
+try: print(json.load(sys.stdin).get("content_sha256",""))
+except Exception: print("")' 2>/dev/null)
+        if [[ "$newh" != "$curh" ]]; then
+            _x_share_api update --token "$tok" --content-file "$payload" >/dev/null 2>&1 \
+                && n=$((n + 1))
+        fi
+        rm -f "$payload"
+    done < <(printf '%s' "$js" | python -c '
+import sys, json
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    m = r.get("meta") or {}
+    tags = m.get("tags") or []
+    if isinstance(tags, list) and tags:
+        print("%s\t%s\t%s" % (r.get("token",""), m.get("name",""), ",".join(tags)))
+' 2>/dev/null)
+
+    (( n > 0 )) && info "已刷新 ${n} 条分享链接的内容 (token 与地址未变)"
+    return 0
+}
+
+# ---------------------------------------------------------------- 服务管理
+# 菜单第 6 项。以前这里管的是**本机自己的** xray-share 服务端 (端口 9443);
+# 那个服务已经不存在了 —— 存储与生命周期归公共基础服务。
+# 文案与菜单项保持不变, 内容改成管公共服务。
 svc_script() {
     printf '%s' "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_service.sh"
 }
 
 service_running() {
-    local url="http://$SHARE_ADDR:$SHARE_PORT/status"
-    curl -fsS --max-time 3 "$url" >/dev/null 2>&1
+    [[ -f "$SHARE_CLIENT" ]] && _x_share_api health >/dev/null 2>&1
 }
 
-# 没在跑就装 + 起。已经是运行的, 什么都不做。
+# 兼容旧调用点: 没在跑就装 + 起。
 ensure_service() {
     service_running && return 0
-    local svc; svc=$(svc_script)
-    if [[ ! -f "$svc" ]]; then
-        warn "找不到 share_service.sh, 分享服务无法自动启动"
-        return 1
-    fi
-    info "分享服务未运行, 正在启动"
-    XRAY_BASE="$XRAY_BASE" XRAY_SHARE_DIR="$SHARE_DIR"         XRAY_SHARE_PORT="$SHARE_PORT" XRAY_SHARE_ADDR="$SHARE_ADDR"         bash "$svc" install >/dev/null 2>&1         || { warn "分享服务启动失败"; return 1; }
+    info "公共分享服务未运行, 正在确保它在位"
+    x_share_ensure >/dev/null || { warn "公共分享服务启动失败"; return 1; }
     service_running
 }
 
 share_service_menu() {
     local svc; svc=$(svc_script)
     [[ -f "$svc" ]] || { err "找不到 share_service.sh"; return 1; }
-    XRAY_BASE="$XRAY_BASE" XRAY_SHARE_DIR="$SHARE_DIR"         XRAY_SHARE_PORT="$SHARE_PORT" XRAY_SHARE_ADDR="$SHARE_ADDR"         bash "$svc" menu
+    XRAY_BASE="$XRAY_BASE" XRAY_SHARE_DIR="$SHARE_DIR" \
+        XRAY_SHARE_ADDR="$SHARE_ADDR" \
+        bash "$svc" menu
+}
+
+# ---------------------------------------------------------------- 节点改名/删除的联动
+# 列出 tags 里含指定节点的分享 token (每行一个)。给"删除前预告"和
+# "改名联动"共用 —— 两处各写一遍必然漂移。
+share_tokens_for_tag() {
+    local tag="${1:-}" js
+    [[ -n "$tag" ]] || return 1
+    js=$(_x_share_list)
+    [[ -z "$js" || "$js" == "[]" ]] && return 0
+    printf '%s' "$js" | python -c '
+import sys, json
+tag = sys.argv[1]
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    m = r.get("meta") or {}
+    tags = m.get("tags") or []
+    if isinstance(tags, str): tags = [tags]
+    if tag in tags:
+        print(r.get("token", ""))
+' "$tag" 2>/dev/null
+}
+
+# 节点改名 -> 分享里的 tag 引用跟着改。
+#
+# ★ 改漏了的后果是**静默少一个节点**: 令牌本身没报错, 客户端拉到的订阅里
+#   就是少了一个, 而面板显示一切正常。
+share_retag() {
+    local old="${1:-}" new="${2:-}"
+    [[ -n "$old" && -n "$new" ]] || die "用法: share.sh retag <旧名> <新名>"
+    local toks n=0 tok _cur
+    toks=$(share_tokens_for_tag "$old")
+    if [[ -z "$toks" ]]; then
+        info "没有分享引用 $old, 无需联动"
+        return 0
+    fi
+    while IFS= read -r tok; do
+        [[ -n "$tok" ]] || continue
+        # 取回原 meta, 只替换 tags 里那一个, 其余字段原样保留
+        _cur=$(_x_share_api get --token "$tok" 2>/dev/null | python -c '
+import sys, json
+old, new = sys.argv[1], sys.argv[2]
+d = json.load(sys.stdin)
+m = d.get("meta") or {}
+tags = m.get("tags") or []
+if isinstance(tags, str): tags = [tags]
+m["tags"] = [new if x == old else x for x in tags]
+print(json.dumps(m, ensure_ascii=False))
+' "$old" "$new" 2>/dev/null)
+        [[ -n "$_cur" ]] || continue
+        _x_share_api update --token "$tok" --meta "$_cur" >/dev/null 2>&1 && n=$((n + 1))
+    done <<< "$toks"
+    ok "已联动更新 $n 条分享的节点引用: $old -> $new"
+    # 内容也变了 (链接里的名字/tag), 刷一次
+    share_refresh_all
+}
+
+# 删除节点前的预告: 会影响到哪几条分享。
+share_affected() {
+    local tag="${1:-}" toks
+    toks=$(share_tokens_for_tag "$tag")
+    if [[ -z "$toks" ]]; then
+        return 0
+    fi
+    local n; n=$(printf '%s\n' "$toks" | grep -c . )
+    printf '  ${_YEL}受影响分享: %s 条 (删除成功后将自动吊销)${_RST}\n' "$n" >&2
+    printf '%s\n' "$toks" | head -5 | while IFS= read -r t; do
+        printf '    %s\n' "$t" >&2
+    done
+    (( n > 5 )) && printf '    ... 还有 %s 条\n' "$((n - 5))" >&2
+    return 0
+}
+
+# ---------------------------------------------------------------- 迁移
+# 本地 token (out/share/tokens/*.json) 搬进公共基础服务。
+#
+# ★ 已过期 / 已用尽的**直接删掉**, 不搬。搬过去也只是占地方, 而且公共服务
+#   的自动清理器下一轮就会把它删掉 —— 用户看到的是"迁移了又在几分钟后
+#   自己消失", 比不搬更费解。
+#
+# ★ 保留原 token: 虽然链接路径从 /sub/ 变成 /share/ (老链接本来就会失效,
+#   那台本地服务已经不存在了), 但保留 token 能让人对得上"哪条是哪条"。
+#
+# 跑完把原目录改名成 .migrated 备份, 不直接删 —— 出问题还能回看。
+share_migrate() {
+    local tdir="$SHARE_DIR/tokens"
+    if [[ ! -d "$tdir" ]]; then
+        info "没有本地 token 目录, 无需迁移"
+        return 0
+    fi
+
+    # 读旧格式用 token_store —— 它是那份格式的规范读取器 (且处理损坏记录),
+    # 比在这里手搓 json.load 可靠, 那份格式的解析规则也有测试覆盖。
+    local rows
+    rows=$(LIB="$LIB_DIR" SHARE_DIR="$SHARE_DIR" python -c '
+import os, sys, json
+sys.path.insert(0, os.environ["LIB"])
+import token_store as T
+for t in T.list_all(os.environ["SHARE_DIR"]):
+    if t.get("_broken"):
+        continue
+    tags = t.get("tags") or ([t["tag"]] if t.get("tag") else [])
+    if isinstance(tags, str): tags = [tags]
+    print("\t".join([
+        str(t.get("token", "")), str(t.get("name", "")),
+        str(int(t.get("max_uses", 0) or 0)), str(int(t.get("expires_at", 0) or 0)),
+        str(int(t.get("used_count", 0) or 0)), str(bool(t.get("enabled", True))),
+        json.dumps(tags, ensure_ascii=False),
+    ]))
+' 2>/dev/null)
+    if [[ -z "$rows" ]]; then
+        info "本地没有可迁移的分享记录"
+        return 0
+    fi
+
+    local port; port=$(x_share_ensure) || { err "公共分享服务不可用, 迁移中止"; return 1; }
+
+    printf "\n${_CYN}=== 迁移本地分享到公共基础服务 ===${_RST}\n" >&2
+    local now; now=$(date +%s)
+    local n_ok=0 n_dead=0 n_skip=0 tok name maxu exp used en tags_json
+    while IFS=$'\t' read -r tok name maxu exp used en tags_json; do
+        [[ -n "$tok" ]] || continue
+
+        # 已过期 / 已用尽 -> 不搬, 直接算作清理。
+        # 搬过去也只是占地方: 公共服务的自动清理器下一轮就会删掉它,
+        # 用户看到的是"迁移了又自己消失", 比不搬更费解。
+        if [[ "$exp" != "0" && "$now" -gt "$exp" ]]; then
+            info "过期, 不迁移: ${tok:0:12}…"; n_dead=$((n_dead+1)); continue
+        fi
+        if [[ "$maxu" != "0" && "$used" -ge "$maxu" ]]; then
+            info "已用尽, 不迁移: ${tok:0:12}…"; n_dead=$((n_dead+1)); continue
+        fi
+
+        # 重建内容 (节点可能早就变了, 直接搬旧内容反而是错的)
+        local -a tarr=()
+        mapfile -t tarr < <(python -c 'import json,sys
+for t in json.loads(sys.argv[1]): print(t)' "$tags_json")
+        (( ${#tarr[@]} > 0 )) || { n_skip=$((n_skip+1)); continue; }
+        local payload; payload=$(x_share_build_payload "${tarr[@]}") || {
+            warn "内容重建失败, 跳过: ${tok:0:12}…"; n_skip=$((n_skip+1)); continue; }
+
+        local meta ttl=0
+        [[ "$exp" != "0" ]] && ttl=$((exp - now))
+        meta=$(python -c '
+import json, sys
+print(json.dumps({"name": sys.argv[1], "tags": json.loads(sys.argv[2])}, ensure_ascii=False))' "$name" "$tags_json")
+
+        local -a extra=()
+        [[ "$ttl" -gt 0 ]] && extra+=(--ttl "$ttl")
+        [[ "$en" == "False" ]] && extra+=(--enabled false)
+        if _x_share_api create --type node --content-file "$payload" --token "$tok" \
+               --max-uses "$maxu" --used-count "$used" --meta "$meta" "${extra[@]}" >/dev/null 2>&1; then
+            ok "已迁移 ${tok:0:12}… (${name:-无名}, 节点 ${#tarr[@]} 个)"
+            n_ok=$((n_ok+1))
+        else
+            warn "迁移失败, 跳过: ${tok:0:12}…"; n_skip=$((n_skip+1))
+        fi
+        rm -f "$payload"
+    done <<< "$rows"
+
+    printf '\n' >&2
+    ok "迁移完成: 成功 $n_ok, 已过期/用尽未搬 $n_dead, 跳过 $n_skip"
+    if (( n_dead > 0 )); then
+        info "已过期/用尽的记录**没有**搬过去 —— 按惯例它们本来就该被清理"
+    fi
+    local bak="$SHARE_DIR/tokens.migrated-$(date +%Y%m%d-%H%M%S)"
+    mv "$tdir" "$bak" 2>/dev/null && info "原目录已改名备份: $bak"
+    info "新链接形如 http://<服务器IP>:$port/share/<token>"
+    info "注意: 路径由 /sub/ 变成 /share/ (与 M/SB 统一), 老链接已失效"
+    return 0
 }
 
 # ---------------------------------------------------------------- 菜单
@@ -253,7 +570,10 @@ EOF
             3)
                 share_list
                 printf "  token: " >&2; read -r t || true
-                [[ -n "$t" ]] && share_toggle "$t"
+                if [[ -n "$t" ]]; then
+                    printf "  [t]停用·启用 / [r]撤销 [t]: " >&2; read -r a || true
+                    [[ "$a" == "r" ]] && share_revoke "$t" || share_toggle "$t"
+                fi
                 ;;
             4)
                 share_list
@@ -277,9 +597,13 @@ EOF
 # ---------------------------------------------------------------- 直跑
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-menu}" in
-        create) share_create ;;
-        list)   share_list ;;
-        menu)   share_menu ;;
-        *) die "用法: share.sh [menu|create|list]" ;;
+        create)  share_create ;;
+        list)    share_list ;;
+        refresh) share_refresh_all ;;
+        migrate) share_migrate ;;
+        retag)   share_retag "${2:-}" "${3:-}" ;;
+        affected) share_affected "${2:-}" ;;
+        menu)    share_menu ;;
+        *) die "用法: share.sh [menu|create|list|refresh|migrate|retag <旧> <新>|affected <tag>]" ;;
     esac
 fi

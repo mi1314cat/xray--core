@@ -7,6 +7,21 @@ YELLOW="\033[33m"
 BLUE="\033[36m"
 PLAIN="\033[0m"  # 修复缺失的闭合引号
 
+# 仓库 raw 前缀。面板的每一项都是 curl 出去的, 这里统一一份。
+XRAY_RAW="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
+
+# 节点增删之后刷新"已发出去的分享链接"的内容。
+#
+# 为什么挂在面板层: 协议脚本各写各的收尾 (各自 restart xrayls), 没有统一的
+# 收口点; 而**面板是唯一的用户入口** —— 增删节点都得从这几项菜单走。
+# 这是真正的收口点, 比去 20 多个脚本尾部各插一行可靠得多。
+#
+# ★ 失败一律不报错 (|| true)。删节点/加节点是主流程, 不能因为分享服务那边
+#   的问题而失败; 刷新本身是"尽力而为", 服务不可达时 share.sh 会自己说一声。
+share_refresh_hook() {
+    bash <(curl -Ls "$XRAY_RAW/conf/share.sh") refresh >/dev/null 2>&1 || true
+}
+
 # 主菜单
 # clear 在没有 TERM 的环境（cron、管道、部分 SSH）会报
 # "TERM environment variable not set" 并刷一堆错。
@@ -73,18 +88,18 @@ xrayls 服务状态: ${xrayls_server_status_text}
         2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/uninstall_xray.sh) ;;
         3) show_xray_configs ;;
         4) systemctl status xrayls --no-pager ;;
-        5) add_node_menu ;;
+        5) add_node_menu; share_refresh_hook ;;
         6) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/verify.sh) ;;
         7) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/outbound.sh) ;;
         8) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/split.sh) ;;
         9) reverse_menu ;;
         10) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/share.sh) ;;
-        11) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/node.sh) ;;
+        11) bash <(curl -Ls "$XRAY_RAW/conf/node.sh"); share_refresh_hook ;;
         12) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/tools/check_libs.sh) ;;
         13) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/dns.sh) ;;
         14) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/logs.sh) ;;
-        15) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/mknode.sh) ;;
-        16) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/tools/preset_batch.sh) --help ;;
+        15) bash <(curl -Ls "$XRAY_RAW/conf/mknode.sh"); share_refresh_hook ;;
+        16) bash <(curl -Ls "$XRAY_RAW/tools/preset_batch.sh") --help; share_refresh_hook ;;
         17) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cert.sh) ;;
         18) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/nginx_site.sh) ;;
         19) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/share_service.sh) menu ;;

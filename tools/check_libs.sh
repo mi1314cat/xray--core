@@ -67,7 +67,6 @@ else
     printf '  - 完整链路验证需要 Xray 内核 (本机没有, 已在实机跑过)\n'
 fi
 
-# ---------------------------------------------------------------- 节点注册表
 group "节点注册表 (nodes.py)"
 CONF="$TMP/nodes"; mkdir -p "$CONF"
 cat > "$CONF/vless-01.json" <<'J'
@@ -89,134 +88,97 @@ n,_=N.collect('$CONF')
 print(next((x['method'] for x in n if x['tag']=='ss-02'),''))")
 assert_eq "$SS" "2022-blake3-aes-128-gcm" "Shadowsocks 单用户形态也能抽出 method"
 
-# ---------------------------------------------------------------- 损坏隔离
-# 一个片段文件损坏 (磁盘写坏、被手动改坏、迁移时被截断) 不该让整个订阅挂掉。
-group "损坏隔离 (单个片段损坏不影响其它节点)"
-CX="$TMP/corrupt"; mkdir -p "$CX/conf" "$CX/share/tokens"
-python3 - "$LIB" "$CX" <<'PY'
+
+# ---------------------------------------------------------------- 说明
+# 原来这里还有一组"损坏隔离", 是通过 HTTP 打本地分享服务端来验证
+# "一个片段坏了其余节点照样发得出去"的。服务端已删 (存储与生命周期归公共
+# 基础服务), 同样的性质改到下面「载荷构建」组里直接验 build_payload ——
+# 少一跳网络, 断言反而更贴近真正要守的东西。
+
+# ---------------------------------------------------------------- 载荷构建
+# 以前这一组是通过 HTTP 打本地分享服务端来验证的。服务端已经删掉了
+# (存储与生命周期归公共基础服务), 但**要验的性质没变** —— 所以改成直接
+# 打 share_payload.build_payload(), 不经过任何网络:
+#   "一个片段坏了, 其余节点照样要能发出去; 坏的那个不能混进订阅"
+# 这是最容易静默失效的地方: 坏片段混进 base64 订阅后, 客户端整段解析失败,
+# 用户看到的是"订阅导入 0 个节点", 而面板这边一切正常。
+group "载荷构建 (share_payload.build_payload)"
+PB="$TMP/payload"; mkdir -p "$PB/conf" "$PB/share"
+python3 - "$LIB" "$PB" <<'PY'
 import json, sys, os
 sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+import share_meta as M
 for t, p in (("good1", 20001), ("good2", 20002)):
     with open(os.path.join(d, "conf", t + ".json"), "w") as f:
         json.dump({"inbounds": [{"tag": t, "port": p, "protocol": "vless",
           "settings": {"clients": [{"id": "u"}]},
           "streamSettings": {"network": "tcp", "security": "none"}}]}, f)
-# 损坏的那一个
+    M.save(os.path.join(d, "share"), t, {"host": "h.com", "port": p, "name": t})
+# 没有 share_meta 的 —— "缺对外地址", 与"节点被删"是两类不同的故障
+with open(os.path.join(d, "conf", "nometa.json"), "w") as f:
+    json.dump({"inbounds": [{"tag": "nometa", "port": 20003, "protocol": "vless",
+      "settings": {"clients": [{"id": "u"}]},
+      "streamSettings": {"network": "tcp", "security": "none"}}]}, f)
 with open(os.path.join(d, "conf", "broken.json"), "w") as f:
     f.write('{"inbounds": [ THIS IS NOT JSON')
-import token_store as T, share_meta as M
-for t in ("good1", "good2"):
-    T.write(os.path.join(d, "share"), "t" + t, {"enabled": True, "max_uses": 0,
-        "used_count": 0, "expires_at": 0, "tags": [t]})
-    M.save(os.path.join(d, "share"), t, {"host": "h.com", "port": 20001, "name": t})
 PY
-CO=$(python3 - "$LIB" "$CX" 19481 <<'PY'
-import sys, os, threading, time, urllib.request, urllib.error
-sys.path.insert(0, sys.argv[1]); d = sys.argv[2]; port = int(sys.argv[3])
-os.environ.update(XRAY_CONF_DIR=os.path.join(d,"conf"), XRAY_SHARE_DIR=os.path.join(d,"share"),
-                  XRAY_SHARE_PORT=str(port))
-import share_server as S
-os.makedirs(os.path.join(S.SHARE_DIR,"tokens"), exist_ok=True)
-srv = S.Server(("127.0.0.1", port), S.Handler)
-threading.Thread(target=srv.serve_forever, daemon=True).start()
-time.sleep(0.6)
-B = "http://127.0.0.1:%d" % port
-r = urllib.request.urlopen(B + "/sub/tgood1", timeout=4)
-body = r.read().decode().strip()
-import base64
-try:
-    txt = base64.b64decode(body, validate=True).decode()
-except Exception:
-    txt = "DECODE_FAIL"
-print("code=%s" % r.status)
-print("unreadable=%s" % r.headers.get("X-Xray-Unreadable-Fragments", "无"))
-print("has_good1=%s" % ("good1" in txt))
-print("has_broken=%s" % ("broken" in txt))
-print("body_b64=%s" % all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" for c in body))
+PO=$(python3 - "$LIB" "$PB" <<'PY'
+import sys, os, base64
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+os.environ.update(XRAY_CONF_DIR=os.path.join(d, "conf"), XRAY_SHARE_DIR=os.path.join(d, "share"))
+import share_payload as P
+payload, missing, nometa, bad = P.build_payload(["good1", "good2", "nometa", "gone", "broken"])
+print("payload_is_none=%s" % (payload is None))
+print("bad_count=%d" % len(bad))
+print("missing=%s" % (",".join(missing) or "-"))
+print("nometa=%s" % (",".join(nometa) or "-"))
+if payload is None:
+    print("decoded=DECODE_FAIL"); print("pure_b64=False")
+else:
+    try:
+        txt = base64.b64decode(payload, validate=True).decode()
+    except Exception:
+        txt = "DECODE_FAIL"
+    print("has_good1=%s" % ("good1" in txt))
+    print("has_good2=%s" % ("good2" in txt))
+    print("has_broken=%s" % ("broken" in txt))
+    print("has_nometa=%s" % ("nometa" in txt))
+    print("pure_b64=%s" % all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" for c in payload))
 PY
 )
-echo "$CO" | grep -q 'code=200' && ok "损坏片段时订阅仍返回 200" || bad "损坏片段导致订阅失败"
-echo "$CO" | grep -q 'unreadable=1' && ok "损坏数量在诊断头暴露" || bad "缺 Unreadable-Fragments 头"
-echo "$CO" | grep -q 'has_good1=True' && ok "好节点照常返回" || bad "好节点丢失"
-echo "$CO" | grep -q 'has_broken=False' && ok "坏节点被跳过而非混入" || bad "坏节点混进订阅"
-echo "$CO" | grep -q 'body_b64=True' && ok "body 仍是纯 base64" || bad "body 混入非 base64 内容"
+echo "$PO" | grep -q 'payload_is_none=False' && ok "好节点存在时仍构建出载荷" || bad "载荷构建失败"
+echo "$PO" | grep -q 'has_good1=True' && ok "坏片段不影响好节点 (good1)" || bad "好节点丢失"
+echo "$PO" | grep -q 'has_good2=True' && ok "坏片段不影响好节点 (good2)" || bad "好节点丢失"
+echo "$PO" | grep -q 'has_broken=False' && ok "坏片段被跳过而非混入" || bad "坏片段混进订阅 (客户端会整段解析失败)"
+echo "$PO" | grep -q 'has_nometa=False' && ok "缺对外地址的节点不混入" || bad "缺元数据的节点混进订阅"
+echo "$PO" | grep -q 'pure_b64=True' && ok "载荷仍是纯 base64" || bad "载荷混入非 base64 内容"
+echo "$PO" | grep -q 'bad_count=1' && ok "坏片段数量被单独报出" || bad "坏片段没有单独报出"
+echo "$PO" | grep -q 'missing=gone' && ok "已删节点单独报出 (与缺元数据区分)" || bad "已删节点没有单独报出"
+echo "$PO" | grep -q 'nometa=nometa' && ok "缺元数据单独报出 (与已删区分)" || bad "缺元数据没有单独报出"
 
-# ---------------------------------------------------------------- 分享服务兜底
-# 常驻服务里一个未捕获异常的代价, 不是那一个请求失败:
-#   有兜底 → HTTP 500 + X-Xray-Error, 客户端能判定, 服务继续服务
-#   无兜底 → RemoteDisconnected, 客户端收到的是连接错误而非状态码,
-#            且同一条连接上后续请求也一起断 (实测)
-group "分享服务兜底 (share_server._guard)"
-SG="$TMP/guard"; mkdir -p "$SG/conf" "$SG/share/tokens"
-python3 - "$LIB" "$SG" <<'PY'
+# ---------------------------------------------------------------- 面板降级
+# 公共基础服务不存在/没跑时, 面板必须**说清楚**, 不能装作一切正常。
+#   share_list 若把"服务不可达"报成"还没有生成分享" —— 用户会以为链接被谁删了;
+#   share_create 若继续往下走, 用户会拿到一条永远打不开的链接。
+group "面板降级 (公共服务不可达时)"
+DEG="$TMP/degrade"; mkdir -p "$DEG/conf" "$DEG/share"
+python3 - "$LIB" "$DEG" <<'PY'
 import json, sys, os
 sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
-import token_store as T, share_meta as M
 with open(os.path.join(d, "conf", "t.json"), "w") as f:
     json.dump({"inbounds": [{"tag": "t", "port": 20001, "protocol": "vless",
       "settings": {"clients": [{"id": "u"}]},
       "streamSettings": {"network": "tcp", "security": "none"}}]}, f)
-T.write(os.path.join(d, "share"), "tok1", {"enabled": True, "max_uses": 0,
-  "used_count": 0, "expires_at": 0, "tags": ["t"]})
-M.save(os.path.join(d, "share"), "t", {"host": "h.com", "port": 20001, "name": "t"})
 PY
-GRD=$(python3 - "$LIB" "$SG" 19461 <<'PY'
-import sys, os, threading, time, urllib.request, urllib.error
-sys.path.insert(0, sys.argv[1]); d = sys.argv[2]; port = int(sys.argv[3])
-os.environ.update(XRAY_CONF_DIR=os.path.join(d, "conf"),
-                  XRAY_SHARE_DIR=os.path.join(d, "share"),
-                  XRAY_SHARE_PORT=str(port))
-import share_server as S
-real = S.Handler._route
-def selective(self, head_only):
-    # 只让 /status 炸, 其余路径正常 —— 这样能验证"一个请求的异常不会
-    # 连累服务其它功能"
-    if self.path.startswith("/status"):
-        raise OSError("注入: 配置目录权限变了")
-    return real(self, head_only)
-S.Handler._route = selective
-os.makedirs(os.path.join(S.SHARE_DIR, "tokens"), exist_ok=True)
-srv = S.Server(("127.0.0.1", port), S.Handler)
-threading.Thread(target=srv.serve_forever, daemon=True).start()
-time.sleep(0.6)
-B = "http://127.0.0.1:%d" % port
-
-def hit(p):
-    try:
-        r = urllib.request.urlopen(B + p, timeout=4)
-        return str(r.status), dict(r.headers)
-    except urllib.error.HTTPError as e:
-        return str(e.code), dict(e.headers)
-    except Exception as e:
-        return "ERR:" + type(e).__name__, {}
-
-code, hdr = hit("/status")
-print("boom_code=%s" % code)
-print("boom_hdr=%s" % hdr.get("X-Xray-Error", "无"))
-c2, _ = hit("/sub/tok1")
-print("other_code=%s" % c2)
-c3, _ = hit("/status")
-print("boom_again=%s" % c3)
-PY
-)
-echo "$GRD" | grep -q 'boom_code=500' && ok "异常请求返回 500 (不是断连)" || bad "异常请求未返回 500: $(echo "$GRD" | grep boom_code)"
-echo "$GRD" | grep -q 'boom_hdr=internal' && ok "带 X-Xray-Error 诊断头" || bad "缺 X-Xray-Error 头"
-echo "$GRD" | grep -q 'other_code=200' && ok "异常不影响其它路径" || bad "异常连累了其它路径"
-echo "$GRD" | grep -q 'boom_again=500' && ok "重复异常仍稳定返回 500" || bad "重复异常行为不一致"
-# body 必须仍是纯 base64 —— 多一行诊断就整个订阅解析失败
-B64=$(python3 - "$LIB" "$SG" <<'PY'
-import sys, os, threading, time, urllib.request
-sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
-os.environ.update(XRAY_CONF_DIR=os.path.join(d,"conf"), XRAY_SHARE_DIR=os.path.join(d,"share"), XRAY_SHARE_PORT="19462")
-import share_server as S
-os.makedirs(os.path.join(S.SHARE_DIR,"tokens"), exist_ok=True)
-srv = S.Server(("127.0.0.1", 19462), S.Handler)
-threading.Thread(target=srv.serve_forever, daemon=True).start()
-time.sleep(0.6)
-print(urllib.request.urlopen("http://127.0.0.1:19462/sub/tok1", timeout=4).read().decode().strip())
-PY
-)
-echo "$B64" | grep -qE '^[A-Za-z0-9+/=]+$' && ok "订阅 body 是纯 base64" || bad "订阅 body 混入非 base64 内容"
+# 指一个确定没人听的端口。适配器按 SHARE_PORT / env / /run 文件找端口,
+# 这里全部覆盖掉。
+DL=$(SHARE_CLIENT="$ROOT/conf/share_client.py" SHARE_PORT=19499 \
+     SHARE_PORT_FILE=/nonexistent SHARE_ETC=/nonexistent \
+     XRAY_BASE="$DEG" XRAY_CONF_DIR="$DEG/conf" XRAY_SHARE_DIR="$DEG/share" \
+     bash "$ROOT/conf/share.sh" list 2>&1; echo "rc=$?")
+echo "$DL" | grep -q 'rc=1' && ok "服务不可达时 list 返回非 0" || bad "服务不可达时 list 仍返回 0"
+echo "$DL" | grep -q '不可达' && ok "服务不可达被明确说出来" || bad "服务不可达没有说清楚"
+echo "$DL" | grep -qv '还没有生成分享' && ok "没有把'服务挂了'说成'没有分享'" || bad "把服务故障误报成没有分享"
 
 # ---------------------------------------------------------------- 证书管理
 # cert.sh 此前只有库没有用户入口。证书问题在现场的表现恰恰最难自查:

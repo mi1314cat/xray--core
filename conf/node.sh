@@ -120,14 +120,18 @@ node_rename() {
     rm -f "$f" || { err "新片段已写入但旧文件删除失败: $f"; warn "请手动删除, 否则该节点会重复出现"; }
     rm -f "$bak"
 
-    # 分享侧跟着改: 节点元数据 sidecar 和令牌里的 tag 引用, 两处都要动。
+    # 分享侧跟着改, 两处:
+    #   1) 节点元数据 sidecar (仍在本地 —— 它记的是"这个节点的对外地址",
+    #      是生成分享链接的输入, 属于内核自己的知识)
+    #   2) 分享记录里的 tag 引用 (在**公共基础服务**里)
+    #
+    # ★ 第 2 处改漏了的后果是**静默少一个节点**: 令牌本身没报错, 客户端
+    #   拉到的订阅里就是少了一个, 而面板显示一切正常。
     SHARE_DIR="$SHARE_DIR" TAG="$tag" NEW="$new" LIB="$LIB_DIR" py -c "
-import os, sys, json, glob
+import os, sys
 sys.path.insert(0, os.environ['LIB'])
-import share_meta, token_store as T
+import share_meta
 d, tag, new = os.environ['SHARE_DIR'], os.environ['TAG'], os.environ['NEW']
-
-# 1) 节点元数据 sidecar 改名
 src = share_meta.meta_path(d, tag)
 if os.path.exists(src):
     m = share_meta.load(d, tag) or {}
@@ -135,22 +139,13 @@ if os.path.exists(src):
     m['name'] = m.get('name') or new
     share_meta.save(d, new, m)
     os.unlink(src)
-
-# 2) 令牌里的 tag 引用跟着改 —— 改漏了, 改名后的分享就少一个节点,
-#    而令牌本身没报错, 客户端只会看到"少了一个"。
-changed = 0
-for t in T.list_all(d):
-    tags = t.get('tags') or ([t['tag']] if t.get('tag') else [])
-    if isinstance(tags, str): tags = [tags]
-    if tag in tags:
-        nt = [new if x == tag else x for x in tags]
-        def _set(m):
-            m['tags'] = nt
-            if 'tag' in m: m['tag'] = new
-        T.update(d, t['token'], _set)
-        changed += 1
-print(f'  令牌更新: {changed} 个')
 "
+    local _sh="$LIB_DIR/../share.sh"
+    if [[ -f "$_sh" ]]; then
+        bash "$_sh" retag "$tag" "$new" 2>&1 | sed 's/^/  /' >&2 || true
+    else
+        warn "找不到 share.sh —— 分享里的节点引用未联动, 请到菜单 10 检查"
+    fi
     ok "已改名: $tag → $new"
     info "别忘了重启服务让配置生效"
 }
@@ -168,21 +163,8 @@ node_delete() {
     printf "  片段文件: %s\n" "$f" >&2
 
     # 提前告知会影响哪些分享 —— 事后才知道链接失效就晚了
-    SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
-import os, sys
-sys.path.insert(0, os.environ['LIB'])
-import token_store as T
-d, tag = os.environ['SHARE_DIR'], os.environ['TAG']
-hit = []
-for t in T.list_all(d):
-    tags = t.get('tags') or ([t['tag']] if t.get('tag') else [])
-    if isinstance(tags, str): tags = [tags]
-    if tag in tags: hit.append(t['token'])
-if hit:
-    print(f'  ${_YEL}受影响分享: {len(hit)} 条 (删除成功后将自动吊销)${_RST}')
-    for h in hit[:5]: print(f'    {h}')
-    if len(hit) > 5: print(f'    ... 还有 {len(hit)-5} 条')
-"
+    local _sh="$LIB_DIR/../share.sh"
+    [[ -f "$_sh" ]] && bash "$_sh" affected "$tag" 2>&1 | sed 's/^/  /' >&2 || true
     printf "  确认删除? 输入节点名确认: " >&2
     read -r conf || true
     [[ "$conf" == "$tag" ]] || { info "已取消"; return 1; }
@@ -192,6 +174,13 @@ if hit:
     mv "$f" "$bak" || { err "无法移动片段文件"; return 2; }
 
     # --- 第 2 步: 校验 + 重载 ---
+    # 节点没了, 其它分享的内容也变了 —— 刷新一次。
+    # 放在 reload 之前: reload 失败也要刷新, 否则"配置没生效"和
+    # "分享内容陈旧"两件事会一起留下来。
+    declare -F share_refresh_all >/dev/null 2>&1 || {
+        local _sh="$LIB_DIR/../share.sh"
+        [[ -f "$_sh" ]] && bash "$_sh" refresh >/dev/null 2>&1 || true
+    }
     if ! validate_and_reload; then
         err "配置校验或重载失败, 已回滚节点"
         mv -f "$bak" "$f"
@@ -225,27 +214,63 @@ validate_and_reload() {
 }
 
 # 只停用不删记录 —— 删了就看不出"这个节点分享过又被撤了", 也没法恢复。
+#
+# ★ 存储已经搬到**公共基础服务** (与 M/SB 共用), 所以这里不再改本地
+#   token 文件, 而是让公共服务把对应记录停用。
+#   判据仍然是"这条分享的 tags 里含这个节点" —— 与旧实现一致。
+#
+# ★ 找不到适配器时**只告警不报错**: 删节点是主流程, 不能因为分享服务
+#   那边的问题而失败。但要**说出来** —— 静默跳过的话, 用户以为分享已撤,
+#   其实那条链接还活着, 而节点已经没了 (客户端拉到的是连不上的订阅)。
 revoke_shares_for() {
+    local tag="$1" client="$LIB_DIR/../share_client.py"
+    if [[ ! -f "$client" ]]; then
+        warn "找不到 share_client.py —— 分享未自动吊销, 请到菜单 10 手动检查"
+        share_meta_purge "$tag"
+        return 0
+    fi
+    local js; js=$(SHARE_PROVIDER=xray python3 "$client" list 2>/dev/null)
+    if [[ -z "$js" || "$js" == "[]" ]]; then
+        share_meta_purge "$tag"
+        return 0
+    fi
+    local toks
+    toks=$(printf '%s' "$js" | python3 -c '
+import sys, json
+tag = sys.argv[1]
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    m = r.get("meta") or {}
+    tags = m.get("tags") or []
+    if isinstance(tags, str): tags = [tags]
+    if tag in tags and r.get("enabled", True):
+        print(r["token"])
+' "$tag" 2>/dev/null)
+    if [[ -z "$toks" ]]; then
+        share_meta_purge "$tag"
+        return 0
+    fi
+    local n=0 t
+    while IFS= read -r t; do
+        [[ -n "$t" ]] || continue
+        SHARE_PROVIDER=xray python3 "$client" update --token "$t" --enabled false \
+            >/dev/null 2>&1 && n=$((n + 1))
+    done <<< "$toks"
+    ok "已吊销 $n 条分享 (链接仍在, 但拉取会返回已失效)"
+    share_meta_purge "$tag"
+}
+
+# 节点没了, 它的"对外地址/端口"元数据也要清掉 —— 否则下次同名节点复用时
+# 会带着上一次的地址, 生成的分享链接指向一个已经不存在的地方。
+share_meta_purge() {
     local tag="$1"
     SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
 import os, sys
 sys.path.insert(0, os.environ['LIB'])
-import token_store as T, share_meta
-d, tag = os.environ['SHARE_DIR'], os.environ['TAG']
-n = 0
-for t in T.list_all(d):
-    tags = t.get('tags') or ([t['tag']] if t.get('tag') else [])
-    if isinstance(tags, str): tags = [tags]
-    if tag in tags:
-        def _off(m):
-            m['enabled'] = False
-            m['revoked_at'] = int(__import__('time').time())
-            m['revoked_reason'] = 'node deleted'
-        T.update(d, t['token'], _off)
-        n += 1
-share_meta.purge(d, tag)
-print(f'  已吊销 {n} 条分享, 节点分享元数据已清理')
-"
+import share_meta
+share_meta.purge(os.environ['SHARE_DIR'], os.environ['TAG'])
+" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- 菜单

@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
-# 分享服务管理 —— 安装 / 启停 / 查看状态
+# 公共分享服务管理 —— 确保在位 / 状态 / 统计 / 升级 / 防火墙
 #
-# 分享链接生成出来就必须能拉取。token 落盘了但服务没跑, 面板一切正常,
-# 客户端一律 connection refused, 而且排查会被引向防火墙。
-# 所以安装/启停这块是分享功能可用性的前提, 不是附加项。
+# ==============================================================
+# ★ 这个脚本以前管的是**本机自己的** xray-share 服务端 (conf/lib/share_server.py,
+#   端口 9443)。那个服务已经不存在了 —— 分享的存储与生命周期归**公共基础服务**
+#   proxy-share-service, 它被 M / SB / X 三个内核共用。
+#
+# ★ 菜单里**故意没有"停止"和"卸载"**。
+#
+#   公共服务的生命周期属于它自己, 不属于任何一个内核: 从 X 的面板把它停掉,
+#   M 和 SB 已经发出去的链接会一起断, 而且现场看不出是谁干的。
+#   它自己的仓库才有卸载入口:
+#
+#       git clone https://github.com/mi1314cat/Share-Service
+#       bash Share-Service/install.sh uninstall --force   # 保留数据
+#       bash Share-Service/install.sh uninstall --purge   # 连数据一起删
+#
+#   这里只做"确保它好好跑着"以及只读的查看。
+# ==============================================================
 
 set -uo pipefail
 
 XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
-LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
 SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
-SHARE_PORT="${XRAY_SHARE_PORT:-9443}"
 SHARE_ADDR="${XRAY_SHARE_ADDR:-127.0.0.1}"
-XRAY_SERVICE="${XRAY_SERVICE:-xrayls}"
-UNIT="xray-share"
+SHARE_CLIENT="${SHARE_CLIENT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_client.py}"
 
 _RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _RST=$'\033[0m'
 [[ -t 2 ]] || { _RED=""; _GRN=""; _YEL=""; _CYN=""; _RST=""; }
@@ -22,98 +33,87 @@ info() { printf "  ${_CYN}[--]${_RST} %s\n" "$*" >&2; }
 warn() { printf "  ${_YEL}[!]${_RST} %s\n" "$*" >&2; }
 err()  { printf "  ${_RED}[X]${_RST} %s\n" "$*" >&2; }
 
-# 找 share_server.py —— 本地找不到就拉仓库里那份。
-# 自解析脚本自身目录: 被 curl 到临时路径运行时, $0 指向的是临时副本,
-# ExecStart 必须指向真正的安装位置。
-resolve_server() {
-    local d
-    for d in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib" "$LIB_DIR" "/root/catmi/xray/conf/lib"; do
-        [[ -f "$d/share_server.py" ]] && { printf '%s' "$d/share_server.py"; return 0; }
-    done
-    return 1
+python() { command python3 "$@"; }
+
+xapi() { SHARE_PROVIDER=xray python "$SHARE_CLIENT" "$@"; }
+
+share_port() {
+    local p=""
+    [[ -f "$SHARE_CLIENT" ]] && p=$(xapi port 2>/dev/null)
+    printf '%s' "${p:-9443}"
 }
 
-server_running() { systemctl is-active --quiet "$UNIT" 2>/dev/null; }
-
-# 端口在不在听。注意 ss 可能不可用 (容器缺 NETLINK) —— 分不清"没在听"和
-# "查不了", 这时不能报"未监听"。
+# 端口在不在听。ss 可能不可用 (容器缺 NETLINK) —— 分不清"没在听"和"查不了",
+# 这时不能报"未监听"。
 port_listening() {
-    local dump
-    dump=$(ss -tulnH 2>/dev/null | grep -cE "[:.]${SHARE_PORT}[[:space:]]") || dump=0
+    local port="$1" dump
+    dump=$(ss -tulnH 2>/dev/null | grep -cE "[:.]${port}[[:space:]]") || dump=0
     [[ "$dump" -gt 0 ]]
 }
 
-install_share() {
-    local srv; srv=$(resolve_server) || {
-        err "找不到 share_server.py, 先确认 conf/lib/ 已部署"; return 1; }
-
-    info "写入 systemd 单元 $UNIT.service"
-    cat > "/etc/systemd/system/$UNIT.service" <<EOF
-[Unit]
-Description=Xray Share Server (订阅分发)
-After=network.target $XRAY_SERVICE.service
-
-[Service]
-Type=simple
-Environment="XRAY_CONF_DIR=$XRAY_BASE/conf"
-Environment="XRAY_SHARE_DIR=$SHARE_DIR"
-Environment="XRAY_SHARE_ADDR=$SHARE_ADDR"
-Environment="XRAY_SHARE_PORT=$SHARE_PORT"
-Environment="XRAY_SERVICE=$XRAY_SERVICE"
-ExecStart=$(command -v python3) $srv
-Restart=on-failure
-RestartSec=3
-# 只读令牌和片段。分享服务没有任何理由写配置。
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    ok "单元已写入 /etc/systemd/system/$UNIT.service"
-    info "配置: conf=$XRAY_BASE/conf share=$SHARE_DIR listen=$SHARE_ADDR:$SHARE_PORT"
+# ---------------------------------------------------------------- 动作
+ensure_share() {
+    [[ -f "$SHARE_CLIENT" ]] || { err "找不到 share_client.py, 先确认 conf/ 已部署"; return 1; }
+    info "确保公共分享服务在位 (幂等; 已有则空操作)"
+    local p; p=$(xapi ensure 2>/dev/null) || { err "公共服务不可用"; return 1; }
+    ok "公共分享服务运行中 (端口 ${p:-$(share_port)})"
 }
-
-start_share() {
-    systemctl restart "$UNIT" 2>/dev/null
-    # 监听是异步绑定的, restart 返回不等于已经在听。
-    for _ in $(seq 1 15); do
-        if port_listening; then
-            curl -fsS --max-time 3 "http://$SHARE_ADDR:$SHARE_PORT/status" >/dev/null 2>&1 && {
-                ok "分享服务已启动 (http://$SHARE_ADDR:$SHARE_PORT)"; return 0; }
-        fi
-        sleep 0.3
-    done
-
-    err "分享服务没能起来, 看日志: journalctl -u $UNIT -n 30 --no-pager"
-    # 已经在跑但端口没动 —— 大概率是端口被占, 这时把占用的进程报出来,
-    # 否则用户只能自己 ss 去猜。
-    local who; who=$(ss -tulnpH 2>/dev/null | grep -E "[:.]${SHARE_PORT}[[:space:]]" | head -1)
-    [[ -n "$who" ]] && warn "端口 $SHARE_PORT 被占用: $who"
-    return 1
-}
-
-stop_share() {
-    systemctl stop "$UNIT" 2>/dev/null && ok "分享服务已停止" || err "停止失败"
-}
-
-restart_share() { systemctl restart "$UNIT" && ok "分享服务已重启" || err "重启失败"; }
 
 status_share() {
-    if server_running; then
-        ok "$UNIT 运行中"
-        port_listening && info "端口 $SHARE_PORT 在监听" || warn "服务在跑但 $SHARE_PORT 看不到监听"
-        curl -fsS --max-time 3 "http://$SHARE_ADDR:$SHARE_PORT/status" 2>/dev/null | sed 's/^/  /' \
-            || warn "健康检查无响应"
+    local port; port=$(share_port)
+    local h; h=$(xapi health 2>/dev/null)
+    if [[ -n "$h" ]]; then
+        ok "proxy-share-service 运行中"
+        info "端口 $port"
+        port_listening "$port" && info "端口 $port 在监听" \
+            || warn "服务在跑但 $port 看不到监听 (ss 可能不可用)"
+        printf '%s' "$h" | python -c '
+import sys, json
+d = json.load(sys.stdin)
+print("  版本: %s (api v%s)" % (d.get("version","?"), d.get("api_version","?")))
+ps = d.get("providers", {})
+print("  各内核分享: %s" % (", ".join("%s=%d" % (k, v["total"]) for k, v in sorted(ps.items())) or "（无）"))
+' 2>/dev/null >&2
     else
-        warn "$UNIT 未运行"
+        warn "proxy-share-service 未运行或不可达"
+        info "可用菜单 1) 确保在位 来安装/修复它"
     fi
-    info "分享目录: $SHARE_DIR"
+    info "Xray 分享目录(仅存分享元数据): $SHARE_DIR"
 }
 
-# 防火墙只提示不擅改 —— 擅自改防火墙规则可能把用户其它放行弄丢,
+show_providers() {
+    local h; h=$(xapi health 2>/dev/null)
+    [[ -n "$h" ]] || { err "公共服务不可达"; return 1; }
+    printf '%s' "$h" | python -c '
+import sys, json
+ps = json.load(sys.stdin).get("providers", {})
+if not ps:
+    print("  （还没有任何内核登记过分享）"); raise SystemExit
+print("  %-12s %6s %6s %6s %6s %6s" % ("PROVIDER", "总数", "活跃", "node", "config", "file"))
+for k, v in sorted(ps.items()):
+    print("  %-12s %6d %6d %6d %6d %6d" % (
+        k, v["total"], v.get("active", 0), v.get("node", 0),
+        v.get("config", 0), v.get("file", 0)))
+' >&2
+    info "provider 是隔离边界: X 只看得到 xray 那一行, 也删不掉别人的记录"
+}
+
+upgrade_share() {
+    # 升级走公共服务自己的 install.sh —— 这里不重复实现一套
+    local tmp; tmp=$(mktemp -d) || return 1
+    info "从 GitHub 取 Share-Service 的安装器"
+    if ! curl -fsSL --max-time 30 \
+        https://raw.githubusercontent.com/mi1314cat/Share-Service/main/install.sh \
+        -o "$tmp/install.sh"; then
+        rm -rf "$tmp"; err "下载失败 (网络?)"; return 1
+    fi
+    bash "$tmp/install.sh" upgrade
+    local rc=$?
+    rm -rf "$tmp"
+    return $rc
+}
+
+# 防火墙只提示不擅改 —— 擅自改规则可能把用户其它放行弄丢,
 # 而"外网连不上"十有八九确实是这里, 但决定权在用户。
 check_firewall() {
     local port="$1"
@@ -136,26 +136,38 @@ check_firewall() {
 share_service_menu() {
     while :; do
         printf "\n${_CYN}===== 分享服务 =====${_RST}\n" >&2
-        local st="未运行"
-        server_running && st="运行中"
+        local port st="未运行"
+        port=$(share_port)
+        xapi health >/dev/null 2>&1 && st="运行中"
         cat >&2 <<EOF
-  当前状态: $st    监听 $SHARE_ADDR:$SHARE_PORT
+  当前状态: $st    端口 $port
+  说明: 这是 **M/SB/X 共用的公共基础服务**, 本面板只能确保它在位, 不能停它
+        (停掉会连带打断另外两个内核已经发出去的链接)
 
-  1) 安装并启动
-  2) 启动 / 重启
-  3) 停止
-  4) 查看状态
-  5) 检查防火墙放行
+  1) 确保在位 (安装 / 修复)
+  2) 启动 / 重启      (仅当未运行; 不动数据)
+  3) 查看状态
+  4) 各内核分享统计
+  5) 升级服务代码
+  6) 检查防火墙放行
   0) 返回
 EOF
         printf "  选择: " >&2
         read -r c || return 0
         case "$c" in
-            1) install_share && start_share && check_firewall "$SHARE_PORT" ;;
-            2) start_share ;;
-            3) stop_share ;;
-            4) status_share ;;
-            5) check_firewall "$SHARE_PORT" ;;
+            1) ensure_share ;;
+            2)
+                if xapi health >/dev/null 2>&1; then
+                    info "已经在运行 —— 不做任何改动 (重启会瞬断另外两个内核的链接)"
+                else
+                    systemctl restart proxy-share-service 2>/dev/null \
+                        && ok "已重启" || { warn "systemctl 重启失败, 改用确保在位"; ensure_share; }
+                fi
+                ;;
+            3) status_share ;;
+            4) show_providers ;;
+            5) upgrade_share ;;
+            6) check_firewall "$port" ;;
             0|"") return 0 ;;
             *) warn "无效选择" ;;
         esac
@@ -164,12 +176,11 @@ EOF
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-menu}" in
-        install) install_share && start_share ;;
-        start)   start_share ;;
-        stop)    stop_share ;;
-        restart) restart_share ;;
+        ensure)  ensure_share ;;
         status)  status_share ;;
+        port)    share_port; echo ;;
+        health)  xapi health >/dev/null 2>&1 && echo ok || { echo down; exit 1; } ;;
         menu)    share_service_menu ;;
-        *) echo "用法: share_service.sh [menu|install|start|stop|restart|status]" >&2; exit 1 ;;
+        *) echo "用法: share_service.sh [menu|ensure|status|port|health]" >&2; exit 1 ;;
     esac
 fi
