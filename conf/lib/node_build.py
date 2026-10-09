@@ -81,8 +81,18 @@ def _stream_settings(transport, security, opts):
         # "配置全对但连不上"最难查, 所以直接补上。
         elif transport == "hysteria":
             tls["alpn"] = ["h3"]
-        if opts.get("allow_insecure"):
-            tls["allowInsecure"] = True
+        # ★ 这里原来有一句 `if opts.get("allow_insecure"): tls["allowInsecure"] = True`。
+        #
+        #   现在没有任何调用方传 allow_insecure, 所以它一直是死代码 —— 但它是
+        #   一颗**哑雷**: 谁哪天给向导加个"跳过证书校验"选项接上来, 生成的配置
+        #   就会**直接启动失败**, 而且报错是内核级的:
+        #       The feature "allowInsecure" has been removed and migrated to
+        #       "pinnedPeerCertSha256".
+        #
+        #   官方替代方案是证书钉扎。自签证书要连通, 唯一正确的做法是钉扎,
+        #   不是跳过校验 —— 跳过校验等于把中间人攻击的门打开。
+        if opts.get("pinned_cert_sha256"):
+            tls["pinnedPeerCertSha256"] = opts["pinned_cert_sha256"]
         ss["security"] = "tls"
         ss["tlsSettings"] = tls
 
