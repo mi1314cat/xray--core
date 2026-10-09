@@ -847,8 +847,60 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Xray Client Manager</title>
 <style>
-:root{--bg:#0f1115;--card:#171a21;--line:#252a34;--fg:#e7ebf0;--dim:#8b95a5;
---ok:#3ddc84;--warn:#ffb44d;--bad:#ff5c5c;--acc:#4c9aff}
+:root{
+  /* 语义色 */
+  --bg:#0f1115;--card:#171a21;--line:#252a34;--fg:#e7ebf0;--dim:#8b95a5;
+  --ok:#3ddc84;--warn:#ffb44d;--bad:#ff5c5c;--acc:#4c9aff;--acc2:#5aa0ff;
+  --ov0:rgba(255,255,255,.03);--ov1:rgba(255,255,255,.045);--ov2:rgba(255,255,255,.055);
+  --ov3:rgba(255,255,255,.08);--ov-strong:rgba(255,255,255,.85);
+  --btn:#222834;--input:#11141a;--dot-idle:#4a5262;--on-acc:#fff;
+  --acc-bg:rgba(76,154,255,.10);--acc-bg2:rgba(90,160,255,.16);--acc-line:rgba(76,154,255,.55);
+  --ok-bg:rgba(61,220,132,.13);--ok-line:rgba(61,220,132,.55);
+  --warn-bg:rgba(255,180,77,.13);--warn-line:rgba(255,180,77,.55);
+  --bad-bg:rgba(255,92,92,.13);--bad-line:rgba(255,92,92,.55);--bad-glow:rgba(255,92,92,.25);
+  --ok-text:#8ff0b8;--warn-text:#ffd08a;--bad-text:#ff9b9b;
+  --shadow:0 1px 2px rgba(0,0,0,.35),0 8px 24px rgba(0,0,0,.18);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.3);
+  --code-bg:#0b0d11;--modal-bg:#12161c;--modal-shadow:0 18px 60px rgba(0,0,0,.55);--acc-tag-text:#9cc8ff;--acc-tag-bg:rgba(76,154,255,.13);
+  --acc-btn:#2f6fd0;--bad-btn:#c0392b;--acc-fg-dim:rgba(255,255,255,.85);
+}
+/* 浅色主题。两处入口：系统偏好（未手动指定时生效）与手动切换（data-theme）。
+   手动指定的优先级更高 —— 用 :not([data-theme]) 把系统偏好限制住，
+   否则用户手动选了深色、系统是浅色时会被系统覆盖回去。 */
+@media (prefers-color-scheme: light){
+  :root:not([data-theme]){
+    --bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--fg:#1b1f24;--dim:#666f7b;
+    --ok:#0f9d58;--warn:#b26a00;--bad:#d93025;--acc:#1a73e8;--acc2:#1a73e8;
+    --ov0:rgba(0,0,0,.02);--ov1:rgba(0,0,0,.035);--ov2:rgba(0,0,0,.05);
+    --ov3:rgba(0,0,0,.07);--ov-strong:rgba(0,0,0,.8);
+    --btn:#fff;--input:#fff;--dot-idle:#c2c8d0;--on-acc:#fff;
+    --acc-bg:rgba(26,115,232,.08);--acc-bg2:rgba(26,115,232,.13);--acc-line:rgba(26,115,232,.5);
+    --ok-bg:rgba(15,157,88,.10);--ok-line:rgba(15,157,88,.5);
+    --warn-bg:rgba(178,106,0,.10);--warn-line:rgba(178,106,0,.5);
+    --bad-bg:rgba(217,48,37,.09);--bad-line:rgba(217,48,37,.5);--bad-glow:rgba(217,48,37,.18);
+    --ok-text:#0b7a44;--warn-text:#8a5200;--bad-text:#b3261e;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 20px rgba(16,24,40,.08);
+    --shadow-sm:0 1px 2px rgba(16,24,40,.06);
+    --code-bg:#f4f6f9;--modal-bg:#fff;--modal-shadow:0 18px 60px rgba(16,24,40,.18);--acc-tag-text:#0b4fa8;--acc-tag-bg:rgba(26,115,232,.10);
+    --acc-btn:#1a73e8;--bad-btn:#d93025;--acc-fg-dim:rgba(255,255,255,.85);
+  }
+}
+:root[data-theme="light"]{
+--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--fg:#1b1f24;--dim:#666f7b;
+  --ok:#0f9d58;--warn:#b26a00;--bad:#d93025;--acc:#1a73e8;--acc2:#1a73e8;
+  --ov0:rgba(0,0,0,.02);--ov1:rgba(0,0,0,.035);--ov2:rgba(0,0,0,.05);
+  --ov3:rgba(0,0,0,.07);--ov-strong:rgba(0,0,0,.8);
+  --btn:#fff;--input:#fff;--dot-idle:#c2c8d0;--on-acc:#fff;
+  --acc-bg:rgba(26,115,232,.08);--acc-bg2:rgba(26,115,232,.13);--acc-line:rgba(26,115,232,.5);
+  --ok-bg:rgba(15,157,88,.10);--ok-line:rgba(15,157,88,.5);
+  --warn-bg:rgba(178,106,0,.10);--warn-line:rgba(178,106,0,.5);
+  --bad-bg:rgba(217,48,37,.09);--bad-line:rgba(217,48,37,.5);--bad-glow:rgba(217,48,37,.18);
+  --ok-text:#0b7a44;--warn-text:#8a5200;--bad-text:#b3261e;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 20px rgba(16,24,40,.08);
+  --shadow-sm:0 1px 2px rgba(16,24,40,.06);
+  --code-bg:#f4f6f9;--modal-bg:#fff;--modal-shadow:0 18px 60px rgba(16,24,40,.18);--acc-tag-text:#0b4fa8;--acc-tag-bg:rgba(26,115,232,.10);
+  --acc-btn:#1a73e8;--bad-btn:#d93025;--acc-fg-dim:rgba(255,255,255,.85);
+}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:14px/1.55 -apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif}
@@ -861,26 +913,26 @@ h1{font-size:19px;margin:0;font-weight:600}
 .card h2{margin:0 0 12px;font-size:12px;color:var(--dim);font-weight:600;
 text-transform:uppercase;letter-spacing:.05em}
 .row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;
-border-bottom:1px solid rgba(255,255,255,.04);gap:10px}
+border-bottom:1px solid var(--ov1);gap:10px}
 .row:last-child{border:0}
 .k{color:var(--dim);white-space:nowrap}
 .v{font-variant-numeric:tabular-nums;text-align:right}
 /* 圆点：背景色只加在 .dot 上。
    之前 .ok/.bad 是独立类且带实心背景，凡是同时写 class="tag ok"
    的元素都会被涂成绿底绿字 —— 文字完全看不见。 */
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle;background:#4a5262}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle;background:var(--dot-idle)}
 .dot.ok{background:var(--ok);box-shadow:0 0 8px rgba(61,220,132,.5)}
 .dot.bad{background:var(--bad);box-shadow:0 0 8px rgba(255,92,92,.5)}
 .dot.warn{background:var(--warn)}
-.dim2{background:#4a5262}
-button{background:#222834;color:var(--fg);border:1px solid var(--line);
+.dim2{background:var(--dot-idle)}
+button{background:var(--btn);color:var(--fg);border:1px solid var(--line);
 border-radius:7px;padding:7px 13px;cursor:pointer;font-size:13px;transition:.12s}
-button:hover:not(:disabled){border-color:var(--acc);color:#fff}
-button.pri{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
-button.danger{background:var(--bad);border-color:var(--bad);color:#fff;font-weight:600}
+button:hover:not(:disabled){border-color:var(--acc);color:var(--acc)}
+button.pri{background:var(--acc-btn);border-color:var(--acc-btn);color:var(--on-acc);font-weight:600}
+button.danger{background:var(--bad-btn);border-color:var(--bad-btn);color:var(--on-acc);font-weight:600}
 button.sm{padding:5px 10px;font-size:12px}
 button:disabled{opacity:.4;cursor:not-allowed}
-input,select{background:#11141a;color:var(--fg);border:1px solid var(--line);
+input,select{background:var(--input);color:var(--fg);border:1px solid var(--line);
 border-radius:7px;padding:7px 10px;font-size:13px;width:100%}
 input:focus,select:focus{outline:none;border-color:var(--acc)}
 .bar{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center}
@@ -888,41 +940,45 @@ input:focus,select:focus{outline:none;border-color:var(--acc)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--dim);font-weight:600;padding:7px 8px;
 border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase}
-td{padding:9px 8px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle}
-tr.cur{background:rgba(76,154,255,.10)}
+td{padding:9px 8px;border-bottom:1px solid var(--ov1);vertical-align:middle}
+tr.cur{background:var(--acc-bg)}
 tr.cur td:first-child{box-shadow:inset 3px 0 0 var(--acc)}
 .tag{display:inline-block;padding:2px 7px;border-radius:5px;font-size:11px;
-border:1px solid var(--line);color:var(--dim);background:rgba(255,255,255,.03);
+border:1px solid var(--line);color:var(--dim);background:var(--ov0);
 margin:1px 3px 1px 0;white-space:nowrap}
-.tag.ok{color:#8ff0b8;border-color:rgba(61,220,132,.55);background:rgba(61,220,132,.13)}
-.tag.warn{color:#ffd08a;border-color:rgba(255,180,77,.55);background:rgba(255,180,77,.13)}
-.tag.bad{color:#ff9b9b;border-color:rgba(255,92,92,.55);background:rgba(255,92,92,.13)}
+.tag.ok{color:var(--ok-text);border-color:var(--ok-line);background:var(--ok-bg)}
+.tag.warn{color:var(--warn-text);border-color:var(--warn-line);background:var(--warn-bg)}
+.tag.bad{color:var(--bad-text);border-color:var(--bad-line);background:var(--bad-bg)}
 
 /* ---- 节点列表：分组 / 密度 ----
    密度不是"把字调小"，而是每屏能塞下多少个**节点**。三十个节点时，
    表格一行要一行、卡片一行两行，紧凑列表能一行三个 —— 一屏能对比的节点
    数量差三倍，这才是真正决定"节点多了好不好用"的东西。 */
 .nlt{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 12px;align-items:center}
-.nli{background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--fg);
+.nli{background:var(--ov2);border:1px solid var(--line);color:var(--fg);
  border-radius:7px;padding:6px 9px;font-size:12px;font-family:inherit}
 .nli#nq{flex:1 1 220px;min-width:160px}
- background:rgba(255,255,255,.045);user-select:none;border-bottom:1px solid transparent}
 .nm{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
 .nm .sel{width:13px;height:13px;accent-color:var(--acc)}
 .nm .cur-dot{width:7px;height:7px;border-radius:50%;background:var(--acc);flex:0 0 auto}
 .tr{color:var(--dim);font-size:11px;white-space:nowrap}
 /* 卡片视图：一行两个，信息密度靠并排而不是靠缩小字号 */
 .view-grid .gridwrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:8px}
-.ncard{border:1px solid var(--line);border-radius:9px;padding:10px;background:rgba(255,255,255,.03)}
-.ncard.cur{border-color:var(--acc);background:rgba(76,154,255,.10)}
+.ncard{border:1px solid var(--line);border-radius:9px;padding:10px;background:var(--ov0)}
+.ncard.cur{border-color:var(--acc);background:var(--acc-bg)}
 /* 紧凑列表：一行一个，只留"名字 + 状态 + 操作"，延迟和流量合并成一行小字 */
 .view-list .grp-body{padding:0}
 .view-list .listwrap{display:flex;flex-direction:column}
 .view-list .nrow{display:flex;align-items:center;gap:8px;padding:6px 9px;
- border-bottom:1px solid rgba(255,255,255,.04);flex-wrap:wrap}
-.view-list .nrow:hover{background:rgba(255,255,255,.04)}
-.view-list .nrow.cur{background:rgba(76,154,255,.10)}
-.view-list .nrow .grow{flex:1 1 auto;min-width:140px}
+ border-bottom:1px solid var(--ov1);flex-wrap:wrap}
+.view-list .nrow:hover{background:var(--ov1)}
+.view-list .nrow.cur{background:var(--acc-bg)}
+/* min-width:0 而不是 140px。
+   flex 子项默认 min-width:auto, 内容多宽就多宽, 永远不肯收缩 ——
+   节点名一长就把后面的按钮推出容器边界, 这正是"字出框"的第二个来源。
+   归零之后 .grow 里的 ellipsis 截断才真正生效。 */
+.view-list .nrow .grow{flex:1 1 auto;min-width:0;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
 .empty{color:var(--dim);font-size:12px;padding:14px 6px}
 /* ---- 节点区: 左订阅栏 + 右节点表 ----
    两栏而不是一棵可嵌套的树。调研下来 (metacubexd / zashboard / v2rayN) 分组
@@ -933,19 +989,19 @@ margin:1px 3px 1px 0;white-space:nowrap}
 .nodes-head{display:flex;align-items:center;gap:10px;padding:11px 13px;
  border-bottom:1px solid var(--line);flex-wrap:wrap}
 .nh-l{display:flex;align-items:center;gap:8px}
-.badge{background:rgba(255,255,255,.08);border-radius:20px;padding:1px 8px;
+.badge{background:var(--ov3);border-radius:20px;padding:1px 8px;
  font-size:11px;color:var(--dim)}
 .chipbar{display:flex;gap:8px;margin-left:4px}
 .chk{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--dim);cursor:pointer}
 .nodes-body{display:flex;align-items:stretch;min-height:220px}
 .subs-rail{width:212px;flex:0 0 212px;border-right:1px solid var(--line);
- padding:10px;display:flex;flex-direction:column;gap:7px;background:rgba(255,255,255,.015)}
+ padding:10px;display:flex;flex-direction:column;gap:7px;background:var(--ov0)}
 .subs-rail .wide{width:100%}
 #subs-list{flex:1 1 auto;overflow:auto;max-height:420px}
 .srow{display:flex;align-items:center;gap:6px;padding:6px 7px;border-radius:7px;
  cursor:pointer;font-size:12px;line-height:1.3}
-.srow:hover{background:rgba(255,255,255,.055)}
-.srow.on{background:rgba(90,160,255,.16);box-shadow:inset 2px 0 0 #5aa0ff}
+.srow:hover{background:var(--ov2)}
+.srow.on{background:var(--acc-bg2);box-shadow:inset 2px 0 0 var(--acc2)}
 .srow .sn{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .srow .sc{color:var(--dim);font-size:10px;flex:0 0 auto}
 .srow .sd{opacity:0;flex:0 0 auto;font-size:11px;padding:0 3px;border-radius:4px}
@@ -958,8 +1014,8 @@ margin:1px 3px 1px 0;white-space:nowrap}
 .modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:50;
  align-items:flex-start;justify-content:center;padding:40px 12px;overflow:auto}
 .modal.show{display:flex}
-.mbox{background:#12161c;border:1px solid var(--line);border-radius:13px;max-width:640px;
- width:100%;box-shadow:0 18px 60px rgba(0,0,0,.55)}
+.mbox{background:var(--modal-bg);border:1px solid var(--line);border-radius:13px;max-width:640px;
+ width:100%;box-shadow:var(--modal-shadow)}
 .mhead{display:flex;align-items:center;padding:13px 16px;border-bottom:1px solid var(--line);
  font-weight:600;font-size:14px}
 .mhead button{margin-left:auto}
@@ -969,31 +1025,31 @@ margin:1px 3px 1px 0;white-space:nowrap}
 .mitem{display:block;width:100%;text-align:left;margin:0 0 5px;padding:9px 12px}
 .mrow{display:flex;align-items:center;gap:10px;margin-bottom:9px}
 .mrow label{width:72px;flex:0 0 auto;color:var(--dim);font-size:12px}
-.mrow input,.mrow select{flex:1 1 auto;background:rgba(255,255,255,.05);border:1px solid var(--line);
+.mrow input,.mrow select{flex:1 1 auto;background:var(--ov2);border:1px solid var(--line);
  color:var(--fg);border-radius:7px;padding:7px 9px;font-size:12px;font-family:inherit}
 .mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;
  padding-top:13px;border-top:1px solid var(--line)}
-.tag.acc{color:#9cc8ff;border-color:rgba(76,154,255,.55);background:rgba(76,154,255,.13)}
-pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:12px;
+.tag.acc{color:var(--acc-tag-text);border-color:var(--acc-line);background:var(--acc-tag-bg)}
+pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:12px;
 overflow:auto;max-height:380px;font-size:12px;margin:0;white-space:pre-wrap}
 #msg{margin:12px 0;padding:10px 13px;border-radius:8px;border:1px solid var(--line);
 display:none;font-size:13px;white-space:pre-wrap}
 #msg.on{display:block}
-#msg.good{border-color:rgba(61,220,132,.5)}
-#msg.err{border-color:rgba(255,92,92,.5)}
+#msg.good{border-color:var(--ok-line)}
+#msg.err{border-color:var(--bad-line)}
 .hint{color:var(--dim);font-size:12px;margin-top:8px;line-height:1.5}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .mode-pick{display:flex;gap:8px;margin-top:6px}
 .mode-pick button{flex:1}
-.mode-pick button.sel{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.mode-pick button.sel{background:var(--acc-btn);border-color:var(--acc-btn);color:var(--on-acc);font-weight:600}
 .stopped{color:var(--dim)}
 .modes{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
 .modes button{display:flex;flex-direction:column;align-items:flex-start;gap:4px;
   text-align:left;padding:11px 12px;line-height:1.35}
 .modes button b{font-size:13px}
 .modes button span{font-size:11px;color:var(--dim);font-weight:400}
-.modes button.sel{background:var(--acc);border-color:var(--acc)}
-.modes button.sel span{color:rgba(255,255,255,.85)}
+.modes button.sel{background:var(--acc-btn);border-color:var(--acc-btn)}
+.modes button.sel span{color:var(--acc-fg-dim)}
 /* ---- 防溢出: 全局兜底 ----
    之前只有 620px 一个断点, 而 table 视图七列并排, 每列 min-width 加起来
    远超窄屏宽度; 节点名又是 inline 元素, 不换行也不截断。结果就是文字直接
@@ -1031,12 +1087,81 @@ table{table-layout:auto;max-width:100%}
   .k{white-space:normal}
   button{padding:6px 10px;font-size:12px}
 }
-</style></head><body><div class="wrap">
+
+/* ---- 打磨层 ----
+   这一层不动布局，只处理"精致感"的三个来源：
+   1) 一致的状态过渡 —— 元素变色要有 120ms 过渡，否则界面会"跳"；
+   2) 可感知的层次 —— 卡片靠极淡的阴影浮起来，而不是靠更粗的边框；
+   3) 键盘可达 —— :focus-visible 只在键盘操作时显形，鼠标点击不留焦点环。 */
+button,.nli,.tag,.nrow,.ncard,.mbox,.srow{transition:background-color .12s ease,
+ border-color .12s ease,color .12s ease,box-shadow .12s ease}
+.card{box-shadow:var(--shadow)}
+thead th{position:sticky;top:0;z-index:2;background:var(--card)}
+button:focus-visible,.nli:focus-visible,input:focus-visible,
+select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
+ outline-offset:2px}
+/* 滚动条跟随主题。不处理的话，浅色模式里会突兀地出现一条深色滚动条。 */
+*{scrollbar-color:var(--line) transparent}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px;
+ border:2px solid var(--card)}
+::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+/* 换肤瞬间关掉所有过渡。
+   深色↔浅色时 color 与 background 会同时渐变，两条曲线在中点相交 ——
+   文字和底色亮度相等，界面会糊大约 60ms。探针在切换后立刻采样量到过
+   1.03:1 的对比度，就是这么来的。悬停/选中的过渡照旧，只是换肤时不走。 */
+:root.theme-switching *,:root.theme-switching *::before,
+:root.theme-switching *::after{transition:none !important}
+
+/* 尊重系统的"减少动态效果"。对晕动症用户，过渡本身就是不适来源。 */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{transition-duration:.01ms !important;
+   animation-duration:.01ms !important;animation-iteration-count:1 !important}
+}
+</style>
+<script>
+/* 主题切换。三态循环：跟随系统 → 浅色 → 深色 → 跟随系统。
+   状态写在 <html data-theme> 上而不是 class 上，因为 CSS 里
+   :root[data-theme="light"] 与 @media(prefers-color-scheme:light) 下的
+   :root:not([data-theme]) 是两套优先级不同的入口 —— 属性才能让"手动选择"
+   稳定压过"系统偏好"。
+   这段必须放在 <head> 里、在页面主体之前执行：放在文档末尾的话，浅色
+   用户每次刷新都会先按深色画一帧再翻白。
+   注释里刻意不写字面的开始/结束标签名 —— 它们会被任何按标签做字符串
+   插入的处理命中，把这段脚本从中间劈开（踩过一次）。 */
+(function(){
+  var KEY='xray-panel-theme';
+  function saved(){try{return localStorage.getItem(KEY)||''}catch(e){return''}}
+  function apply(v){
+    var r=document.documentElement;
+    /* 先关过渡，改完强制重排，再放过渡回来。顺序不能反：反了就还是会渐变。 */
+    r.classList.add('theme-switching');
+    if(v){r.setAttribute('data-theme',v)}else{r.removeAttribute('data-theme')}
+    void r.offsetHeight;
+    r.classList.remove('theme-switching');
+    try{v?localStorage.setItem(KEY,v):localStorage.removeItem(KEY)}catch(e){}
+    var b=document.getElementById('btn-theme');
+    if(b){
+      b.textContent=(v==='light')?'☀':((v==='dark')?'☾':'◐');
+      b.title='主题：'+(v==='light'?'浅色':((v==='dark')?'深色':'跟随系统'));
+    }
+  }
+  window.themeCycle=function(){
+    var v=saved();
+    apply(v===''?'light':((v==='light')?'dark':''));
+  };
+  apply(saved());
+  /* 首次 apply 时按钮还没解析出来，DOM 就绪后再刷一次图标。 */
+  document.addEventListener('DOMContentLoaded',function(){apply(saved())});
+})();
+</script></head><body><div class="wrap">
 
 <header>
   <h1>Xray Client</h1>
   <span class="sub" id="stamp">加载中…</span>
   <span style="flex:1"></span>
+  <button id="btn-theme" class="sm" onclick="themeCycle()" title="主题">◐</button>
   <button onclick="load()">刷新</button>
 </header>
 
@@ -1703,17 +1828,16 @@ function renderBody(ns, sk){
     }).join('') + `</div>`;
   }
   if (VIEW.density === 'list'){
+    // 列表视图刻意做减法: 只留勾选、名称+地址、延迟、主操作。
+    // Xray / Dialer 能力标记和流量统计都不在这里 —— 它们在 table 视图里有,
+    // 想看细节的人可以切过去。默认视图服务于"扫一眼、切一个", 不是"查资料"。
     return `<div class="listwrap">` + ns.map(n => {
-      const c = n.compat || {};
-      const ok = c.can_use_xray, dl = c.can_use_dialer;
       return `<div class="nrow ${n.current?'cur':''}">
         ${sel(n)}
-        <span class="grow">${n.current?'<span class="tag ok">当前</span> ':''}${ESC(n.name)}</span>
-        <span class="tag ${ok?'':'bad'}">${ok?'Xray':'不可用'}</span>
-        ${dl?'<span class="tag acc">Dialer</span>':''}
-        <span class="tr mono" id="lat-${ESC(n.file)}">${latText(n.file)}</span>
-        <span class="tr">${trafficText(n.file)}</span>
-        <span>${useButtons(n)}
+        <span class="grow">${ESC(n.name)}
+          <span class="dim2 mono">${ESC(n.address)}:${ESC(n.port)}</span></span>
+        <span class="tr mono nowrap" id="lat-${ESC(n.file)}">${latText(n.file)}</span>
+        ${useButtons(n)}
           <button class="sm" onclick="testLatency('${ESC(n.file)}', this)">测速</button>
           ${n.current?'':`<button class="sm" onclick="rmNode('${ESC(n.file)}')">删除</button>`}</span>
       </div>`;
