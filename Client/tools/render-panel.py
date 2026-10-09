@@ -283,7 +283,64 @@ PROBE = """
                    + rows.join(String.fromCharCode(10));
     return p.textContent;
   }
+  // ---- 界面重做的结构性检查 ----
+  // 样式探针量的是"好不好看"（对比度/溢出），这一组量的是"改动的部件在不在、
+  // 能不能用"：分段控件、分组行的圆点与计数、拖放属性、批量条的出现时机。
+  // 顺带抓 JS 运行时错误 —— 面板的 JS 全拼在字符串里，出错只会静默失效。
+  function uiChecks(){
+    const rows = [];
+    const q = s => document.querySelector(s);
+    const segs = document.querySelectorAll('#node-list .seg');
+    rows.push('分段控件数=' + segs.length +
+              ' 首个含两侧=' + (segs[0]
+                ? !!(segs[0].querySelector('[data-side="normal"]')
+                     && segs[0].querySelector('[data-side="bd"]')) : false));
+    const first = segs[0];
+    rows.push('分段高亮侧=' + (first
+      ? [...first.querySelectorAll('button')].map(b => (b.classList.contains('on') ? '●' : '○')).join('')
+      : '-') + ' (●=当前走的那条路)');
+    // 不能走浏览器的那一侧必须是 disabled 且有说明
+    const na = document.querySelector('#node-list .seg.na');
+    rows.push('不可用侧被禁用=' + (na
+      ? na.querySelector('[data-side="bd"]').disabled : '(本次夹具无此类节点)'));
+
+    const srows = document.querySelectorAll('.srow');
+    rows.push('分组行=' + srows.length +
+              ' 有圆点=' + [...srows].every(r => !!r.querySelector('.gd')) +
+              ' 有计数=' + [...srows].every(r => !!r.querySelector('.sc')) +
+              ' 有操作按钮=' + [...srows].slice(1).every(r => !!r.querySelector('.sa')));
+
+    // 拖放属性：列表/卡片/表格三种视图各看一个
+    const draggables = document.querySelectorAll(
+      '#node-list [draggable="true"]');
+    rows.push('可拖拽节点行=' + draggables.length +
+              ' 带 ondragstart=' + (draggables[0]
+                ? draggables[0].getAttribute('ondragstart').indexOf('nodeDragStart') >= 0
+                : false));
+
+    // 批量条：没勾选时应隐藏，勾一个后应出现且选项里列出全部组
+    const bar = q('#bulkbar');
+    const before = bar ? bar.classList.contains('on') : null;
+    const cb = q('#node-list .sel');
+    if(cb){ cb.checked = true; cb.dispatchEvent(new Event('change')); }
+    const after = bar ? bar.classList.contains('on') : null;
+    const opts = q('#bulk-move') ? q('#bulk-move').options.length : 0;
+    rows.push('批量条 勾选前/后=' + before + '/' + after + ' 可移动目标=' + opts);
+    if(cb){ cb.checked = false; cb.dispatchEvent(new Event('change')); }
+
+    rows.push('分组菜单可弹出=' + (typeof groupMenu === 'function'));
+    rows.push('JS 运行时错误=' + (window.__jserr || '无'));
+    return rows;
+  }
+
   window.__probe = report;
+  // 抓运行时错误：面板的 JS 静态语法对了也可能在运行时抛（比如 CSS.escape
+  // 不存在、某个 id 拼错）。不抓的话界面上只会"点了没反应"。
+  window.__jserr = '';
+  window.addEventListener('error', function(e){
+    window.__jserr = (e.message || 'error') + ' @' + (e.lineno || '?');
+  });
+
   window.addEventListener('load', function(){
     setTimeout(function(){
       // 先把上次运行遗留的选择清掉，否则"默认"那一次测的是上次的残留主题。
@@ -302,6 +359,11 @@ PROBE = """
       // 这种不可能的数字）。先让出一帧。
       requestAnimationFrame(function(){ requestAnimationFrame(function(){
         report('默认（跟随系统）');
+      try { report('界面结构检查'); document.getElementById('style-report')
+              .textContent += String.fromCharCode(10)
+              + uiChecks().join(String.fromCharCode(10)); }
+      catch(e){ document.getElementById('style-report').textContent +=
+                String.fromCharCode(10) + 'uiChecks 抛异常: ' + e; }
         const b = document.getElementById('btn-theme');
         if (!b) return;
         b.click();                                // '' → light

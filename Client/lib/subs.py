@@ -317,6 +317,79 @@ def group_order(registry: dict, gid: str) -> int:
     return 8000
 
 
+def rename_group(prefix_dir: str, gid: str, name: str) -> bool:
+    """给分组改名。
+
+    为什么需要它：原来只有"新建"和"删除"，组名打错了唯一的办法是删掉重建 ——
+    而删除会**连带删掉组里的节点**（不可撤销）。为了改一个字而删掉几十个节点，
+    没人会做，于是错名字就一直留着。
+    """
+    data = load(prefix_dir)
+    for s in data["subs"]:
+        if s.get("id") == gid:
+            s["name"] = name
+            save(prefix_dir, data)
+            return True
+    return False
+
+
+def move_nodes_to_group(prefix_dir: str, gid: str, files: list) -> int:
+    """把一批节点挪到指定分组，返回成功的个数。
+
+    两件事都要做，缺一件就不一致：
+      1. 给节点文件写 group 字段（stamp_group）——这是**事实**来源
+      2. 把文件从原来那条订阅的 nodes 里摘掉、加进目标组的 nodes
+
+    只做 1 的话，注册表里两边都还记着这些节点；组视图是按注册表建的，
+    于是节点会**同时出现在两个组里**。只做 2 的话，group_nodes 会优先信
+    文件里的 group 字段（那是导入时落盘的事实），同样对不上。
+    """
+    files = [os.path.basename(f) for f in files]
+    ok = stamp_group(prefix_dir, gid, files)
+    if not ok:
+        return 0
+
+    data = load(prefix_dir)
+    target = None
+    for s in data["subs"]:
+        if s.get("id") == gid:
+            target = s
+            break
+    if target is None:
+        # 目标是「其它」这类不是注册表记录的组：只写文件字段就够了，
+        # group_nodes 会因为 gid 不在 by_group_ids 里而落到 other 桶。
+        return len(ok)
+
+    moved = set(ok)
+    for s in data["subs"]:
+        if s is target:
+            continue
+        if any(f in moved for f in (s.get("nodes") or [])):
+            s["nodes"] = [f for f in (s.get("nodes") or []) if f not in moved]
+    target["nodes"] = sorted(set(target.get("nodes") or []) | moved)
+    save(prefix_dir, data)
+    return len(ok)
+
+
+def reorder_group(prefix_dir: str, gid: str, delta: int) -> bool:
+    """把分组在列表里上移/下移一格。
+
+    顺序是按注册表里的下标来的（group_nodes 的 order），所以移动列表里
+    两条记录的位置即可。用户整理完分组后，顺序往往是最后一块没得管的东西。
+    """
+    data = load(prefix_dir)
+    subs = data["subs"]
+    i = next((k for k, s in enumerate(subs) if s.get("id") == gid), None)
+    if i is None:
+        return False
+    j = i + delta
+    if j < 0 or j >= len(subs):
+        return False
+    subs[i], subs[j] = subs[j], subs[i]
+    save(prefix_dir, data)
+    return True
+
+
 def infer_groups(nodes: list) -> dict:
     """没有注册表时，从节点名反推分组。
 

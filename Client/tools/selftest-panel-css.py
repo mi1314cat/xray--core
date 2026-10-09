@@ -206,7 +206,192 @@ def main():
        "出站地址族下拉框已接线")
     ck("family_set" in page, "family_set 已进 DISPATCH")
 
-    print("\n[6] 内联 JS 语法")
+    print("\n[6] 节点区重做：分段控件 / 分组行 / 拖放 / 批量条")
+    # 连接方式是节点的属性，用分段控件表达；三内核里只有 X 有浏览器拨号，
+    # 它值得一个专门的控件而不是混在一排按钮里。
+    # 注意别先把空格去掉再找带空格的串 —— 上一版就是这么把自己绊倒的。
+    ck(re.search(r"\.seg\s*\{", bare) is not None
+       and re.search(r"\.seg\s+button\.on\s*\{", bare) is not None,
+       "分段控件有样式（含选中态）")
+    ck("data-side=\"normal\"" in page and "data-side=\"bd\"" in page,
+       "分段控件两侧齐全（原生 / 浏览器）")
+    ck("class=\"seg${canBD ? '' : ' na'}\"" in page or "seg${canBD" in page,
+       "不可用的一侧会置灰（不是直接消失 —— 用户要看到能力边界）")
+    # 延迟 pill：色点 + 三档类名
+    ck(all(x in bare.replace(" ", "") for x in [".lat.ok{", ".lat.warn{", ".lat.bad{"]),
+       "延迟 pill 三档配色齐全（沿用 300/800 阈值）")
+    # 分组行：圆点 / 计数 / 操作按钮 / 拖放目标
+    ck(".srow .gd{" in bare.replace(" ", "") or ".srow .gd{" in bare,
+       "分组行有来源圆点")
+    ck(".srow.dragover{" in bare.replace(" ", ""), "分组行有拖放高亮")
+    ck("ondragover=\"groupDragOver" in page and "ondrop=\"groupDrop" in page,
+       "分组行是拖放目标")
+    ck('draggable="true"' in page and "nodeDragStart" in page, "节点行可拖拽")
+    # ⋯ 菜单取代原来的裸 ✕（删除不可撤销，不该只有一个难发现的图标）
+    ck("groupMenu(" in page and 'class="sa"' in page, "分组操作收进 ⋯ 菜单")
+    ck("renameGroup(" in page and "group_rename" in page, "分组可重命名")
+    ck("reorderGroup(" in page and "group_reorder" in page, "分组可排序")
+    ck('id="bulkbar"' in page and "renderBulkbar" in page and "pickMoveTarget" in page,
+       "批量条含「移动到分组」")
+    ck("node_group_set" in page, "移动分组已进 DISPATCH")
+
+    print("\n[7] 纯函数的产出标记（Node 实跑）")
+    import shutil as _sh2
+    import subprocess as _sp2
+    if not _sh2.which("node"):
+        print("  ⏭  没有 node，跳过")
+    else:
+        js_all = "\n".join(re.findall(r"<script>(.*?)</script>", page, re.S))
+        harness = r"""
+const js = require('fs').readFileSync(process.argv[2], 'utf8');
+const grab = (n) => {
+  let i = js.indexOf('const ' + n + ' = ');
+  if (i >= 0) return js.slice(i, js.indexOf('\n', i));
+  i = js.indexOf('function ' + n + '(');
+  if (i < 0) return '';
+  let d = 0, j = js.indexOf('{', i);
+  for (let k = j; k < js.length; k++) {
+    if (js[k] === '{') d++;
+    else if (js[k] === '}') { d--; if (!d) return js.slice(i, k + 1); }
+  }
+  return '';
+};
+const src = ['ESC','escAttr','tagHtml','latText','useButtons'].map(grab).filter(Boolean).join('\n');
+const fn = new Function('LAT','VIEW', src + '\nreturn {latText, useButtons};');
+const out = [];
+const ck = (c, m) => out.push((c ? 'OK ' : 'NO ') + m);
+const base = (o) => Object.assign({file:'n.json', name:'n', compat:{protocol_may_dialer:true}, probe_ok:true}, o);
+
+// 延迟 pill 五档
+for (const [lat, want, why] of [
+    [{}, 'class="lat"', '未测'],
+    [{a:{loading:true}}, 'lat busy', '测试中'],
+    [{a:{ok:true,ms:120}}, 'lat ok', '120ms 绿'],
+    [{a:{ok:true,ms:500}}, 'lat warn', '500ms 黄'],
+    [{a:{ok:true,ms:1200}}, 'lat bad', '1200ms 红'],
+    [{a:{ok:false,msg:'超时'}}, 'lat bad', '失败 红']]) {
+  const f = fn(lat, {sel:new Set(), density:'list'});
+  ck(f.latText('a').includes(want), '延迟 ' + why);
+}
+
+// 分段控件：四种状态各高亮/禁用哪一侧
+let f = fn({}, {sel:new Set(), density:'list'});
+let h = f.useButtons(base({current:true, use_browser:false}));
+ck(/data-side="normal" class="on"/.test(h), '当前+显式原生 → 原生侧高亮');
+h = f.useButtons(base({current:true, use_browser:true}));
+ck(/data-side="bd" class="on"/.test(h), '当前+显式浏览器 → 浏览器侧高亮');
+h = f.useButtons(base({current:true}));
+ck(/data-side="bd" class="on"/.test(h),
+   '当前+未设(=auto)+协议支持 → 浏览器侧高亮（auto 的语义就是"支持就用"）');
+h = f.useButtons(base({current:false}));
+ck(!/class="on"/.test(h), '非当前 → 两侧都不高亮（点了才切过去）');
+h = f.useButtons(base({compat:{protocol_may_dialer:false, dialer:{notes:['只有 vless 的 ws/xhttp 能走']}}}));
+ck(h.includes('seg na') && /data-side="bd"[^>]*disabled/.test(h) && h.includes('只有 vless'),
+   '协议不支持 → 浏览器侧禁用且带原因');
+ck(!h.includes('>重测<'), '协议不支持时不给「重测」');
+h = f.useButtons(base({probe_ok:false}));
+ck(/data-side="bd"[^>]*disabled/.test(h) && h.includes('重测'),
+   '实测失败 → 浏览器侧禁用 + 给「重测」');
+ck(!f.useButtons(base({file:'a"b.json'})).includes('"a"b.json"'),
+   '文件名里的引号被转义（否则 onclick 会被截断）');
+
+require('fs').writeFileSync(process.argv[3], out.join('\n'));
+"""
+        import tempfile as _tf2
+        # 后缀必须是 .cjs：夹具用的是 require，而 .mjs 是 ES 模块作用域，
+        # require 在里面根本不存在（第一版就栽在这儿）。
+        with _tf2.NamedTemporaryFile("w", suffix=".cjs", delete=False, encoding="utf-8") as fh:
+            fh.write(harness)
+            hpath = fh.name
+        with _tf2.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+            fh.write(js_all)
+            jpath = fh.name
+        opath = hpath + ".out"
+        r = _sp2.run(["node", hpath, jpath, opath], capture_output=True, text=True)
+        if r.returncode != 0:
+            ck(False, "Node 夹具能跑通", (r.stderr or "").strip().splitlines()[-1:] and
+               (r.stderr or "").strip().splitlines()[-1] or "")
+        else:
+            lines = open(opath, encoding="utf-8").read().strip().splitlines()
+            for ln in lines:
+                ck(ln.startswith("OK "), "分段/延迟：" + ln[3:])
+        for p_ in (hpath, jpath, opath):
+            try:
+                os.unlink(p_)
+            except OSError:
+                pass
+
+    print("\n[8] 节点区新样式的对比度（本地计算，不依赖浏览器）")
+    # 远端浏览器只看得到"页面跑起来了"，看不到"这两块颜色放一起能不能读"。
+    # 新样式全部复用已验证的变量对，但**复用不等于没问题** —— 底色一变
+    # （比如 --ov3 换 --ov2）对比度就跟着变。这里逐对算一遍。
+    def _theme(block):
+        return dict(re.findall(r"(--[\w-]+)\s*:\s*([^;}]+)", block))
+
+    _d = re.search(r"^:root\{(.*?)\n\}", bare, re.S | re.M)
+    _l = re.search(r':root\[data-theme="light"\]\{(.*?)\n\}', bare, re.S)
+    if _d and _l:
+        TD, TL = _theme(_d.group(1)), _theme(_l.group(1))
+
+        def _parse(c):
+            c = (c or "").strip()
+            m = re.match(r"^#([0-9a-f]{6})$", c, re.I)
+            if m:
+                v = int(m.group(1), 16)
+                return ((v >> 16) & 255, (v >> 8) & 255, v & 255, 1.0)
+            # ★ 三位写法（#fff）必须认 —— 第一版漏了它，于是"当前节点高亮"
+            #   那一对直接被判成解析失败。
+            m = re.match(r"^#([0-9a-f]{3})$", c, re.I)
+            if m:
+                h = m.group(1)
+                return (int(h[0] * 2, 16), int(h[1] * 2, 16), int(h[2] * 2, 16), 1.0)
+            m = re.match(r"rgba?\(([^)]+)\)", c)
+            if m:
+                p = [float(x) for x in m.group(1).split(",")]
+                return (p[0], p[1], p[2], p[3] if len(p) > 3 else 1.0)
+            return None
+
+        def _over(f, b):
+            a = f[3]
+            return (f[0] * a + b[0] * (1 - a), f[1] * a + b[1] * (1 - a),
+                    f[2] * a + b[2] * (1 - a), 1.0)
+
+        def _lum(c):
+            g = lambda v: (v / 255) / 12.92 if (v / 255) <= .03928 else (((v / 255) + .055) / 1.055) ** 2.4
+            return .2126 * g(c[0]) + .7152 * g(c[1]) + .0722 * g(c[2])
+
+        def _cr(a, b):
+            la, lb = _lum(a), _lum(b)
+            hi, lo = max(la, lb), min(la, lb)
+            return (hi + .05) / (lo + .05)
+
+        PAIRS = [("分段控件·选中", "--on-acc", "--acc-btn", "--acc-btn"),
+                 ("分段控件·未选中", "--dim", "--ov0", "--card"),
+                 ("延迟 pill·快", "--ok-text", "--ok-bg", "--card"),
+                 ("延迟 pill·中", "--warn-text", "--warn-bg", "--card"),
+                 ("延迟 pill·慢", "--bad-text", "--bad-bg", "--card"),
+                 ("分组计数徽标", "--dim", "--ov2", "--card"),
+                 ("分组行·选中名", "--fg", "--acc-bg2", "--card"),
+                 ("批量条文字", "--fg", "--acc-bg", "--card"),
+                 ("分组菜单·危险", "--bad-text", "--modal-bg", "--modal-bg")]
+        bad_pairs = []
+        for label, fgv, bgv, basev in PAIRS:
+            for tname, T in (("深色", TD), ("浅色", TL)):
+                fg, bg, base = (_parse(T.get(fgv)), _parse(T.get(bgv)),
+                                _parse(T.get(basev)))
+                if not (fg and bg and base):
+                    bad_pairs.append("%s/%s 解析失败" % (tname, label))
+                    continue
+                b = _over(bg, base)
+                r = _cr(_over(fg, b), b)
+                if r < 4.5:
+                    bad_pairs.append("%s/%s=%.2f:1" % (tname, label, r))
+        ck(not bad_pairs, "节点区新样式的配色对全部 ≥4.5:1（两套主题）",
+           "; ".join(bad_pairs[:4]))
+    else:
+        ck(False, "能取出两套主题变量")
+
+    print("\n[9] 内联 JS 语法")
     # ★ 这一条是补一个真实盲区：页面的 JS 全拼在字符串里，此前**没有任何东西
     #   检查它的语法** —— CSS 有括号配对检查，JS 没有。一次重复的 const 声明
     #   就能让整个面板的脚本静默失效（页面照常渲染，只是所有按钮都没反应）。
@@ -227,7 +412,7 @@ def main():
     else:
         print("  ⏭  没有 node，跳过 JS 语法检查")
 
-    print("\n[7] 页面骨架")
+    print("\n[10] 页面骨架")
     ck(page.lstrip().startswith("<!DOCTYPE html>"), "以 DOCTYPE 开头")
     ck(page.count("<style>") == 1 and page.count("</style>") == 1,
        "只有一段 <style>")

@@ -1114,6 +1114,74 @@ g=$(grep -o '"tag": *"direct"[^}]*}' "$FAMT/rt/xray-client.json" 2>/dev/null | h
               || bad "（反证）grep 竟然读到了，注释里的理由需要更新"
 rm -rf "$FAMT"
 
+# ---------------------------------------------------------------- 分组整理
+# 原来只有 group_create / group_delete —— 建完组就没法整理：
+#   · 名字打错只能删掉重建，而删除会**连带删掉组内节点**（不可撤销）
+#   · 节点归错组了没有任何办法挪走
+# 合起来就是"组与组之间的交互不好"。这组守新加的三件事。
+group "分组整理 (重命名 / 移动 / 排序)"
+GT="$(mktemp -d)"; mkdir -p "$GT/nodes"
+python3 - "$GT" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+for i in (1, 2):
+    json.dump({"name": "n%d" % i, "protocol": "vless",
+               "address": "a.example", "port": 443},
+              open(os.path.join(d, "nodes", "node-%02d.json" % i), "w"))
+PY
+cat > "$GT/run.py" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.join(sys.argv[1], "..", "..", "Client", "lib"))
+PY
+# 用真实 subs.py 跑一遍完整流程
+out=$(python3 - "$ROOT" "$GT" <<'PY' 2>&1
+import json, os, sys, shutil
+root, d = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+import subs as S
+res = []
+a = S.add_sub(d, "local:a", "组A", kind="local")
+b = S.add_sub(d, "local:b", "组B", kind="local")
+fa, fb = "node-01.json", "node-02.json"
+S.set_nodes(d, a["id"], [fa]); S.set_nodes(d, b["id"], [fb])
+S.stamp_group(d, a["id"], [fa]); S.stamp_group(d, b["id"], [fb])
+
+res.append(("rename", S.rename_group(d, b["id"], "机场B")))
+reg = S.load(d)["subs"]
+res.append(("renamed", any(x["name"] == "机场B" for x in reg)))
+res.append(("rename-bad-id", S.rename_group(d, "nope", "x")))
+
+n = S.move_nodes_to_group(d, a["id"], [fb])
+res.append(("moved-count", n))
+reg = S.load(d)["subs"]
+byid = {x["id"]: x for x in reg}
+res.append(("in-target", fb in byid[a["id"]]["nodes"]))
+res.append(("out-source", fb not in byid[b["id"]]["nodes"]))
+
+# ★ 关键：文件里的 group 字段与注册表必须一致，否则节点会同时出现在两个组里
+g = json.load(open(os.path.join(d, "nodes", fb))).get("group")
+res.append(("stamped", g == a["id"]))
+
+res.append(("reorder", S.reorder_group(d, b["id"], -1)))
+res.append(("order-first", S.load(d)["subs"][0]["id"] == b["id"]))
+res.append(("reorder-oob", S.reorder_group(d, b["id"], -1)))
+for k, v in res:
+    print("%s\t%r" % (k, v))
+PY
+)
+chk() { printf '%s' "$out" | grep -q "^$1	$2$" && ok "$3" || bad "$3" "$(printf '%s' "$out" | grep "^$1	" | head -1)"; }
+chk rename        True  "分组可重命名"
+chk renamed       True  "改名后注册表里是新名字"
+chk rename-bad-id False "对不存在的分组改名返回 False（不是假装成功）"
+chk moved-count   1     "移动 1 个节点"
+chk in-target     True  "节点进了目标分组"
+chk out-source    True  "节点从原分组摘掉了（否则会同时出现在两个组）"
+chk stamped       True  "节点文件里的 group 字段也更新了（与注册表一致）"
+chk reorder       True  "分组可上移"
+chk order-first   True  "上移后确实排在前面"
+chk reorder-oob   False "已经在最前时上移返回 False"
+rm -rf "$GT"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。

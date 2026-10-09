@@ -261,6 +261,77 @@ def act_group_create(name):
     return True, rec["id"]
 
 
+def _subs_mod():
+    """拿 subs 模块。每次重新 sys.path 一下，避免 import 顺序依赖。"""
+    sys.path.insert(0, os.path.join(DIST, "lib"))
+    import subs as _subs
+    return _subs
+
+
+def act_group_rename(key, name):
+    """分组改名。
+
+    补这个是因为原来**只能建和删**：名字打错唯一的办法是删掉重建，而删除会
+    连带删掉组内节点（不可撤销）。为一个错字付几十个节点的代价，没人会做。
+    """
+    if not key or key == "__all__":
+        return False, "「全部」不是分组，不能改名"
+    name = (name or "").strip()
+    if not name:
+        return False, "分组名不能为空"
+    if len(name) > 40:
+        return False, "分组名太长（最多 40 字）"
+    try:
+        if _subs_mod().rename_group(PREFIX, key, name):
+            return True, f"已改名为「{name}」"
+        # 「其它」这类不是注册表记录的组，没有可改的地方 —— 说清楚而不是假装成功
+        return False, "这个分组不是自定义/订阅分组，不能改名"
+    except Exception as e:                       # noqa: BLE001
+        return False, f"改名失败: {e}"
+
+
+def act_group_reorder(key, delta):
+    """分组上移/下移。顺序按注册表下标来。"""
+    try:
+        d = int(delta)
+    except (TypeError, ValueError):
+        return False, "方向不对"
+    if d not in (-1, 1):
+        return False, "方向只能是 -1 或 1"
+    try:
+        if _subs_mod().reorder_group(PREFIX, key, d):
+            return True, "已调整顺序"
+        return False, "已经到头了"
+    except Exception as e:                       # noqa: BLE001
+        return False, f"调整顺序失败: {e}"
+
+
+def act_node_group_set(idents, key):
+    """把一批节点挪到指定分组。
+
+    前端负责收集 idents（勾选的，或没勾选时把当前可见的都给过来），这里只做
+    落盘。返回搬了几个 —— 前端据此提示，比"操作成功"有用得多。
+    """
+    if not key:
+        return False, "缺少目标分组"
+    if isinstance(idents, str):
+        idents = [idents]
+    files = []
+    for it in (idents or []):
+        p = node_path(it)
+        if p:
+            files.append(os.path.basename(p))
+    if not files:
+        return False, "没有可移动的节点"
+    try:
+        n = _subs_mod().move_nodes_to_group(PREFIX, key, files)
+    except Exception as e:                       # noqa: BLE001
+        return False, f"移动失败: {e}"
+    if not n:
+        return False, "移动失败（节点文件可能已损坏）"
+    return True, f"已移动 {n} 个节点"
+
+
 def act_group_delete(key):
     """删除一个分组。
 
@@ -849,6 +920,11 @@ DISPATCH = {
     "build_link": lambda p: act_build_link(p),
     "group_create": lambda p: act_group_create(str(p.get("name", "")).strip()),
     "group_delete": lambda p: act_group_delete(str(p.get("key", "")).strip()),
+    "group_rename": lambda p: act_group_rename(str(p.get("key", "")).strip(),
+                                               str(p.get("name", ""))),
+    "group_reorder": lambda p: act_group_reorder(str(p.get("key", "")).strip(),
+                                                 p.get("delta", 0)),
+    "node_group_set": lambda p: act_node_group_set(p.get("idents") or [], str(p.get("key", "")).strip()),
     "dns_set": lambda p: act_dns_set(str(p.get("mode", "")).strip()),
     "multi_set": lambda p: act_multi_set(str(p.get("mode", "")).strip()),
     "family_set": lambda p: act_family_set(str(p.get("mode", "")).strip()),
@@ -1122,6 +1198,86 @@ table{table-layout:auto;max-width:100%}
   button{padding:6px 10px;font-size:12px}
 }
 
+/* ---- 节点区重做（对标开源 Clash 面板） ----
+   三条原则：
+     1) 连接方式是**节点的属性**，用分段控件表达当前走哪条路、还能走哪条路；
+     2) 延迟是**状态**，用带色点的 pill，扫一眼能分快慢；
+     3) 分组行要能**承载操作**（重命名/排序/删除）并作为拖放目标。 */
+
+/* 分段控件：原生 | 浏览器 */
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;
+ overflow:hidden;background:var(--ov0);flex:0 0 auto}
+.seg button{border:0;border-radius:0;background:transparent;color:var(--dim);
+ padding:4px 9px;font-size:11px;font-family:inherit;cursor:pointer;
+ white-space:nowrap;line-height:1.5}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button:hover:not(:disabled){background:var(--ov2);color:var(--fg)}
+.seg button.on{background:var(--acc-btn);color:var(--on-acc);font-weight:600}
+.seg button.on:hover{background:var(--acc-btn);color:var(--on-acc)}
+.seg button:disabled{opacity:.4;cursor:not-allowed}
+/* 不可用的那一侧不参与"选中"视觉，但仍保留位置 —— 让用户看到能力边界 */
+.seg.na button[data-side="bd"]{text-decoration:line-through;
+ text-decoration-color:var(--dim)}
+
+/* 延迟 pill */
+.lat{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:20px;
+ font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap;
+ border:1px solid var(--line);background:var(--ov0);color:var(--dim)}
+.lat .d{width:6px;height:6px;border-radius:50%;background:var(--dot-idle);flex:0 0 auto}
+.lat.ok{color:var(--ok-text);border-color:var(--ok-line);background:var(--ok-bg)}
+.lat.ok .d{background:var(--ok)}
+.lat.warn{color:var(--warn-text);border-color:var(--warn-line);background:var(--warn-bg)}
+.lat.warn .d{background:var(--warn)}
+.lat.bad{color:var(--bad-text);border-color:var(--bad-line);background:var(--bad-bg)}
+.lat.bad .d{background:var(--bad)}
+.lat.busy .d{animation:pulse 1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+
+/* 分组行：圆点 + 名字 + 计数 + 操作菜单 + 拖放目标 */
+.srow{gap:8px;padding:7px 8px}
+.srow .gd{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:var(--dot-idle)}
+.srow[data-origin="registry"] .gd{background:var(--acc)}
+.srow[data-origin="local"] .gd{background:var(--ok)}
+.srow[data-origin="other"]{color:var(--dim)}
+.srow .sn{font-size:12.5px}
+.srow .sc{min-width:22px;text-align:center;padding:1px 6px;border-radius:20px;
+ /* --ov2 而不是 --ov3：深 4.97:1 / 浅 4.56:1。--ov3 在浅色下只有 4.35:1，
+    刚过不了 AA（这个徽标是 10.5px 小字，不该拿"大字"那档放宽）。 */
+ background:var(--ov2);font-size:10.5px;color:var(--dim)}
+.srow.on .sc{background:var(--acc-bg2);color:var(--fg)}
+.srow .sa{opacity:0;flex:0 0 auto;font-size:13px;line-height:1;padding:2px 5px;
+ border-radius:5px;background:transparent;border:0;color:var(--dim);cursor:pointer}
+.srow:hover .sa,.srow.on .sa{opacity:.8}
+.srow .sa:hover{opacity:1;background:var(--ov3);color:var(--fg)}
+/* 拖放目标高亮 —— 拖节点到组上时整行亮起，用户才知道能放 */
+.srow.dragover{background:var(--acc-bg2);box-shadow:inset 0 0 0 1px var(--acc-line)}
+.srow.renaming{background:var(--ov2)}
+.srow input.grename{flex:1 1 auto;min-width:0;background:var(--input);color:var(--fg);
+ border:1px solid var(--acc);border-radius:5px;padding:3px 6px;font-size:12px;
+ font-family:inherit}
+
+/* 分组操作菜单（点 ⋯ 弹出） */
+.gpop{position:absolute;z-index:60;min-width:130px;background:var(--modal-bg);
+ border:1px solid var(--line);border-radius:9px;padding:4px;
+ box-shadow:var(--modal-shadow)}
+.gpop button{display:block;width:100%;text-align:left;border:0;background:transparent;
+ border-radius:6px;padding:6px 10px;font-size:12px;color:var(--fg);cursor:pointer}
+.gpop button:hover{background:var(--ov2)}
+.gpop button.danger{color:var(--bad-text)}
+.gpop button.danger:hover{background:var(--bad-bg)}
+.gpop hr{border:0;border-top:1px solid var(--line);margin:4px 2px}
+
+/* 节点行：主操作常驻、次要操作悬停出现，减少视觉噪音 */
+.acts{display:inline-flex;gap:5px;align-items:center;opacity:.35;transition:opacity .12s}
+.nrow:hover .acts,tr:hover .acts,.ncard:hover .acts{opacity:1}
+
+/* 批量操作条：勾选后才出现，只在需要时占位置 */
+.bulkbar{display:none;align-items:center;gap:8px;flex-wrap:wrap;
+ padding:7px 10px;margin:0 0 8px;border-radius:8px;
+ background:var(--acc-bg);border:1px solid var(--acc-line);font-size:12px}
+.bulkbar.on{display:flex}
+.bulkbar b{font-variant-numeric:tabular-nums}
+
 /* ---- 打磨层 ----
    这一层不动布局，只处理"精致感"的三个来源：
    1) 一致的状态过渡 —— 元素变色要有 120ms 过渡，否则界面会"跳"；
@@ -1309,6 +1465,15 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
       <button class="sm" onclick="batchDelete()">删除</button>
     </div>
   </div>
+    <div class="bulkbar" id="bulkbar">
+    <span>已选 <b id="bulk-n">0</b> 个节点</span>
+    <select id="bulk-move" class="nli" style="flex:0 0 auto" onchange="pickMoveTarget(this)">
+      <option value="">移动到分组…</option>
+    </select>
+    <button class="sm" onclick="batchTest()">批量测速</button>
+    <button class="sm" onclick="batchDelete()">批量删除</button>
+    <button class="sm" onclick="batchClear()">取消选择</button>
+  </div>
   <div class="nodes-body">
     <aside class="subs-rail">
       <input id="gq" class="nli" placeholder="筛选分组…" oninput="renderSubs()">
@@ -1475,14 +1640,17 @@ const escAttr = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':
 let ST = {};
 // 延时结果缓存在前端：测速较慢，不放进 5 秒轮询里
 const LAT = {};
+// 延迟是**状态**不是一列文字。原来测完就是 "123 ms" 纯文本，三十个节点
+// 扫下来分不出快慢；改成带色点的 pill，沿用既有的 300/800 两档阈值
+// （不另立一套标准 —— 同一份数据在两处用不同阈值是最难解释的那种不一致）。
 function latText(file){
   const v = LAT[file];
-  if (!v) return '<span class="hint">未测</span>';
-  if (v.loading) return '<span class="hint">测试中…</span>';
-  if (!v.ok) return `<span class="tag bad">${ESC(v.msg||'失败')}</span>`;
+  if (!v) return '<span class="lat"><span class="d"></span>未测</span>';
+  if (v.loading) return '<span class="lat busy"><span class="d"></span>测试中</span>';
+  if (!v.ok) return `<span class="lat bad" title="${escAttr(v.msg||'失败')}"><span class="d"></span>失败</span>`;
   const ms = v.ms;
   const cls = ms < 300 ? 'ok' : ms < 800 ? 'warn' : 'bad';
-  return `<span class="tag ${cls}">${ms} ms</span>`;
+  return `<span class="lat ${cls}"><span class="d"></span>${ms} ms</span>`;
 }
 
 function dot(on, text){ return `<span class="dot ${on?'ok':'bad'}"></span>${ESC(text)}`; }
@@ -1550,34 +1718,51 @@ function useButtons(n){
   const c = n.compat || {};
   const mayProto = !!c.protocol_may_dialer;      // 协议层面能否走浏览器
   const probe = n.probe_ok;                       // true / false / undefined
-  const canBD = mayProto && probe !== false;      // 能用浏览器的前提：协议可能 + 实测没失败
+  const canBD = mayProto && probe !== false;      // 协议可能 + 实测没失败
   const ub = n.use_browser;
   const bdOn = canBD && ub !== false;             // 当前是否在用浏览器
   const cur = !!n.current;
+  const f = ESC(n.file);
 
-  // 「普通连接」**永远**要有 —— 任何节点都能用 Xray 自带 TLS。
-  // 之前只在"能用浏览器"的分支里给这个按钮，导致不支持 BD 的节点完全没有入口切过去
-  // （用户反馈：其他节点连"普通连接"按钮都没有）。这是个实打实的疏漏。
-  let h = `<button class="sm ${(!bdOn && cur) ? 'pri' : ''}" `
-        + `onclick="useNodeAs('${ESC(n.file)}','normal', this)" `
-        + `title="用 Xray 自带 TLS（会关闭浏览器，释放内存）">普通连接</button>`;
+  // ★ 连接方式是**节点的属性**，不是一个"动作按钮"。
+  //
+  //   原来这里是并排两个按钮（普通连接 / BD 连接），用户看到的是"两个能点的
+  //   东西"，而不是"这个节点现在走哪条路、还能走哪条路"。改成分段控件：
+  //   当前节点高亮实际走的那一侧，非当前节点两侧都可点（点了就切过去）。
+  //
+  //   浏览器拨号是三内核里只有 X 有的能力，值得一个专门的控件；挤在一排
+  //   按钮里既表达不了状态，也显不出它的分量。
+  const normalOn = cur && !bdOn;
+  const bdActive = cur && bdOn;
 
-  if (!mayProto) {
-    // 协议层面就不可能走浏览器：标明原因即可，不再给 BD 按钮
-    const why = ((c.dialer||{}).notes||[])[0] || '该协议不走浏览器转发（只对 vless 的 ws/xhttp 生效）';
-    h += `<span class="tag" title="${ESC(why)}">仅原生</span>`;
-  } else if (probe === false) {
-    // 协议可能、实测失败：给「重测」，服务器修好后能恢复
-    h += `<span class="tag warn" style="cursor:pointer" `
-       + `title="${ESC('实测未通过，点此重新探测（服务器修好后可恢复）')}" `
-       + `onclick="reprobe('${ESC(n.file)}', this)">重测</span>`;
-  } else {
-    h += `<button class="sm ${(bdOn && cur) ? 'pri' : ''}" `
-       + `onclick="useNodeAs('${ESC(n.file)}','bd', this)" `
-       + `title="用浏览器完成 TLS（真实浏览器指纹）">BD 连接</button>`;
+  let why = '';
+  if (!canBD) {
+    why = probe === false
+      ? '实测未通过 —— 服务器修好后点「重测」可恢复'
+      : (((c.dialer || {}).notes || [])[0]
+         || '该协议不走浏览器转发（只对 vless 的 ws/xhttp 生效）');
+  }
+
+  let h = `<span class="seg${canBD ? '' : ' na'}">`
+        + `<button data-side="normal" class="${normalOn ? 'on' : ''}" `
+        +   `onclick="useNodeAs('${f}','normal', this)" `
+        +   `title="用 Xray 自带 TLS（不启动 Chromium，省内存）">原生</button>`
+        + `<button data-side="bd" class="${bdActive ? 'on' : ''}" `
+        +   (canBD
+              ? `onclick="useNodeAs('${f}','bd', this)" `
+                + `title="用真实 Chromium 完成 TLS —— 真浏览器指纹，抗识别更强"`
+              : `disabled title="${escAttr(why)}"`)
+        +   `>浏览器</button>`
+        + `</span>`;
+
+  // 实测失败但协议支持：给「重测」而不是把用户堵死
+  if (mayProto && probe === false) {
+    h += ` <button class="sm" title="${escAttr('实测未通过，点此重新探测（服务器修好后可恢复）')}" `
+       + `onclick="reprobe('${f}', this)">重测</button>`;
   }
   return h;
 }
+
 async function useNodeAs(file, mode, btn){
   const label = (mode === 'bd')
     ? '正在切到 BD 连接（启用浏览器）…'
@@ -1851,6 +2036,7 @@ function renderNodes(){
     const c = document.getElementById('lat-'+f);
     if (c) c.innerHTML = latText(f);
   });
+  renderBulkbar();
 }
 
 function renderBody(ns, sk){
@@ -1859,7 +2045,7 @@ function renderBody(ns, sk){
   if (VIEW.density === 'grid'){
     return `<div class="gridwrap">` + ns.map(n => {
       const c = n.compat || {};
-      return `<div class="ncard ${n.current?'cur':''}">
+      return `<div class="ncard ${n.current?'cur':''}" draggable="true" ondragstart="nodeDragStart(event,'${ESC(n.file)}')" ondragend="nodeDragEnd()" >
         <div class="nm">${sel(n)}${n.current?'<span class="cur-dot" title="当前节点"></span>':''}
           <span>${ESC(n.name)}</span></div>
         <div class="hint mono">${ESC(n.address)}:${ESC(n.port)}</div>
@@ -1867,9 +2053,11 @@ function renderBody(ns, sk){
         <div class="tr">延迟 <span id="lat-${ESC(n.file)}">${latText(n.file)}</span> · 流量 ${trafficText(n.file)}</div>
         <div style="margin-top:7px;display:flex;gap:5px;flex-wrap:wrap">
           ${useButtons(n)}
-          <button class="sm" onclick="testLatency('${ESC(n.file)}', this)">测速</button>
-          <button class="sm" onclick="checkNode('${ESC(n.file)}', this)">检查</button>
-          ${n.current?'':`<button class="sm" onclick="rmNode('${ESC(n.file)}')">删除</button>`}
+          <span class="acts">
+            <button class="sm" onclick="testLatency('${ESC(n.file)}', this)">测速</button>
+            <button class="sm" onclick="checkNode('${ESC(n.file)}', this)">检查</button>
+            ${n.current?'':`<button class="sm" onclick="rmNode('${ESC(n.file)}')">删除</button>`}
+          </span>
         </div></div>`;
     }).join('') + `</div>`;
   }
@@ -1878,14 +2066,17 @@ function renderBody(ns, sk){
     // Xray / Dialer 能力标记和流量统计都不在这里 —— 它们在 table 视图里有,
     // 想看细节的人可以切过去。默认视图服务于"扫一眼、切一个", 不是"查资料"。
     return `<div class="listwrap">` + ns.map(n => {
-      return `<div class="nrow ${n.current?'cur':''}">
+      return `<div class="nrow ${n.current?'cur':''}" draggable="true" ondragstart="nodeDragStart(event,'${ESC(n.file)}')" ondragend="nodeDragEnd()" >
         ${sel(n)}
         <span class="grow">${ESC(n.name)}
           <span class="dim2 mono">${ESC(n.address)}:${ESC(n.port)}</span></span>
         <span class="tr mono nowrap" id="lat-${ESC(n.file)}">${latText(n.file)}</span>
         ${useButtons(n)}
+        <span class="acts">
           <button class="sm" onclick="testLatency('${ESC(n.file)}', this)">测速</button>
-          ${n.current?'':`<button class="sm" onclick="rmNode('${ESC(n.file)}')">删除</button>`}</span>
+          <button class="sm" onclick="checkNode('${ESC(n.file)}', this)">检查</button>
+          ${n.current?'':`<button class="sm" onclick="rmNode('${ESC(n.file)}')">删除</button>`}
+        </span>
       </div>`;
     }).join('') + `</div>`;
   }
@@ -1894,7 +2085,7 @@ function renderBody(ns, sk){
       <th>Browser Dialer</th><th>延时</th><th>流量</th><th style="text-align:right">操作</th>
     </tr></thead><tbody>` + ns.map(n => {
     const c = n.compat || {};
-    return `<tr class="${n.current?'cur':''}">
+    return `<tr class="${n.current?'cur':''}" draggable="true" ondragstart="nodeDragStart(event,'${ESC(n.file)}')" ondragend="nodeDragEnd()" >
       <td class="rowsel">${sel(n)}</td>
       <td>${n.current?'<span class="tag ok">当前</span> ':''}${ESC(n.name)}
         <div class="hint mono">${ESC(n.address)}:${ESC(n.port)}</div></td>
@@ -1962,6 +2153,24 @@ async function batchDelete(){
   say(bad.length ? `已删除 ${ok} 个，${bad.length} 个失败` : `已删除 ${ok} 个节点`,
       bad.length ? 'err' : 'good');
 }
+// 批量操作条：勾选之后才出现。
+// 只在需要时占位置 —— 常驻的话工具栏会变成一排按钮，反而看不出重点。
+function renderBulkbar(){
+  const bar = $('bulkbar'); if(!bar) return;
+  const n = VIEW.sel.size;
+  bar.classList.toggle('on', n > 0);
+  if(!n) return;
+  const bn = $('bulk-n'); if(bn) bn.textContent = n;
+  const mv = $('bulk-move'); if(!mv) return;
+  const keep = mv.value;
+  mv.innerHTML = '<option value="">移动到分组…</option>'
+    + groupNodesNow().filter(g => g.key !== 'other' || true)
+        .map(g => `<option value="${escAttr(g.key)}">${ESC(g.name)}</option>`).join('');
+  mv.value = keep;
+}
+
+function batchClear(){ VIEW.sel.clear(); renderNodes(); }
+
 function selectedOrVisible(){
   return VIEW.sel.size ? [...VIEW.sel] : visibleFiles();
 }
@@ -2093,26 +2302,134 @@ function groupNodesNow(){
 }
 
 function renderSubs(){
-  const box = $('subs-list'); if(!box) return;
+  const box = $('subs-list');
+  if(!box) return;
   const q = ($('gq').value||'').trim().toLowerCase();
   const gs = groupNodesNow().filter(g => !q || g.name.toLowerCase().includes(q));
   const total = (ST.nodes||[]).length;
 
-  // 「全部」永远第一行：用户最常用的动作是"我想看所有节点"。
-  let h = `<div class="srow${SUBUI.group==='__all__'?' on':''}" onclick="pickGroup('__all__')">
-      <span class="sn">全部</span><span class="sc">${total}</span></div>`;
-  h += gs.map(g=>{
+  // 分组行同时是：筛选入口（点击）、操作入口（⋯ 菜单）、**拖放目标**（拖节点进来）。
+  // 拖放是"组与组之间"最自然的交互 —— 比"勾选 → 找菜单 → 选目标组"少三步。
+  const row = (key, name, n, origin, acts) =>
+      `<div class="srow${SUBUI.group===key?' on':''}" data-key="${escAttr(key)}"`
+    + ` data-origin="${escAttr(origin)}" onclick="pickGroup('${escAttr(key)}')"`
+    + ` ondragover="groupDragOver(event,this)" ondragleave="groupDragLeave(event,this)"`
+    + ` ondrop="groupDrop(event,'${escAttr(key)}')" title="${escAttr(name)}">`
+    + `<span class="gd"></span><span class="sn">${ESC(name)}</span>`
+    + `<span class="sc">${n}</span>${acts||''}</div>`;
+
+  let h = row('__all__', '全部', total, 'all', '');
+  h += gs.map(g => {
     const n = (g.nodes||[]).length;
-    return `<div class="srow${SUBUI.group===g.key?' on':''}" onclick="pickGroup('${escAttr(g.key)}')"
-        title="${escAttr(g.name)}">
-      <span class="sn">${ESC(g.name)}</span><span class="sc">${n}</span>
-      <button class="sd" title="删除这个组" onclick="event.stopPropagation();delGroup('${escAttr(g.key)}','${escAttr(g.name)}',${n})">✕</button>
-    </div>`;
+    const acts = `<button class="sa" title="分组操作" onclick="event.stopPropagation();`
+      + `groupMenu(event,'${escAttr(g.key)}','${escAttr(g.name)}',${n})">⋯</button>`;
+    return row(g.key, g.name, n, g.origin, acts);
   }).join('');
   if(!gs.length) h += '<div class="sempty">没有匹配的分组</div>';
   box.innerHTML = h;
   const sc = $('side-count'); if(sc) sc.textContent = total;
 }
+
+// 分组操作菜单。原来是悬停才出现的 ✕，删除还不可撤销 —— 既难发现又危险。
+// 改成显式的 ⋯ 菜单：重命名 / 上移 / 下移 / 删除，让用户看得见有哪些操作。
+function groupMenu(ev, key, name, n){
+  closeGroupMenu();
+  const pop = document.createElement('div');
+  pop.className = 'gpop'; pop.id = 'gpop';
+  pop.innerHTML =
+      `<button onclick="renameGroup('${escAttr(key)}','${escAttr(name)}')">重命名</button>`
+    + `<button onclick="reorderGroup('${escAttr(key)}',-1)">上移</button>`
+    + `<button onclick="reorderGroup('${escAttr(key)}',1)">下移</button>`
+    + `<hr><button class="danger" onclick="delGroup('${escAttr(key)}','${escAttr(name)}',${n})">删除分组</button>`;
+  document.body.appendChild(pop);
+  const r = ev.target.getBoundingClientRect();
+  pop.style.left = Math.min(r.left, window.innerWidth - 150) + 'px';
+  pop.style.top = (r.bottom + 4) + 'px';
+  // 点别处 / 按 Esc 关掉。capture 阶段监听，避免被行的 onclick 吃掉。
+  setTimeout(() => {
+    document.addEventListener('click', closeGroupMenu, {once:true, capture:true});
+    document.addEventListener('keydown', escGroupMenu, {once:true});
+  }, 0);
+}
+function escGroupMenu(e){ if(e.key === 'Escape') closeGroupMenu(); }
+function closeGroupMenu(){
+  const p = document.getElementById('gpop'); if(p) p.remove();
+}
+
+// 就地重命名：双击组名也行。改一个字不该逼用户删掉重建（那会连带删掉组内节点）。
+function renameGroup(key, name){
+  closeGroupMenu();
+  const row = document.querySelector(`.srow[data-key="${CSS.escape(key)}"]`);
+  if(!row) return;
+  const sn = row.querySelector('.sn');
+  const old = sn.innerHTML;
+  row.classList.add('renaming');
+  sn.innerHTML = `<input class="grename" value="${escAttr(name)}">`;
+  const inp = sn.querySelector('input');
+  inp.focus(); inp.select();
+  const done = (save) => {
+    const v = (inp.value||'').trim();
+    row.classList.remove('renaming'); sn.innerHTML = old;
+    if(!save || !v || v === name) return;
+    post('group_rename', {key:key, name:v}, `正在把分组改名为「${v}」…`);
+  };
+  inp.onclick = e => e.stopPropagation();
+  inp.onkeydown = e => {
+    e.stopPropagation();
+    if(e.key === 'Enter') done(true);
+    if(e.key === 'Escape') done(false);
+  };
+  inp.onblur = () => done(true);
+}
+
+async function reorderGroup(key, delta){
+  closeGroupMenu();
+  await post('group_reorder', {key:key, delta:delta}, '正在调整分组顺序…');
+}
+
+// ---- 拖放：把节点拖到分组上 ----
+// 拖的是"选中的那些"（有勾选时），否则是拖动的这一行本身。
+let DRAG = null;
+function nodeDragStart(ev, file){
+  DRAG = VIEW.sel.size && VIEW.sel.has(file) ? [...VIEW.sel] : [file];
+  ev.dataTransfer.effectAllowed = 'move';
+  ev.dataTransfer.setData('text/plain', DRAG.join(','));
+}
+function nodeDragEnd(){ DRAG = null; document.querySelectorAll('.srow.dragover')
+  .forEach(el => el.classList.remove('dragover')); }
+function groupDragOver(ev, el){
+  if(!DRAG) return;                    // 不拖节点时不亮，避免误以为能放
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = 'move';
+  el.classList.add('dragover');
+}
+function groupDragLeave(ev, el){ el.classList.remove('dragover'); }
+function groupDrop(ev, key){
+  ev.preventDefault();
+  document.querySelectorAll('.srow.dragover').forEach(el => el.classList.remove('dragover'));
+  const files = DRAG || String(ev.dataTransfer.getData('text/plain')||'').split(',').filter(Boolean);
+  DRAG = null;
+  if(!files.length || key === '__all__') return;
+  moveNodesTo(files, key);
+}
+
+// 把一批节点移到分组。勾选状态在这里是**有用的**：移完就清掉，
+// 否则用户会以为还没移（选择还在）。
+async function moveNodesTo(files, key){
+  const j = await post('node_group_set', {idents:files, key:key},
+                       `正在移动 ${files.length} 个节点…`);
+  if(j && j.ok) VIEW.sel.clear();
+}
+
+// 批量移动：从下拉里选目标组
+function pickMoveTarget(sel){
+  const k = sel.value; sel.value = '';
+  if(!k) return;
+  const files = selectedOrVisible();
+  if(!files.length) return say('先用勾选挑节点，或先点「全选」');
+  moveNodesTo(files, k);
+}
+
 
 function pickGroup(k){ SUBUI.group = k; renderSubs(); renderNodes(); }
 
