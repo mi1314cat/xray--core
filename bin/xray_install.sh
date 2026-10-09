@@ -36,6 +36,8 @@ CONF_DIR="$INSTALL_DIR/conf"
 LOG_DIR="$INSTALL_DIR/log"
 OUT_DIR="$INSTALL_DIR/out"
 BIN="$INSTALL_DIR/xrayls"
+# 内核备份 —— 更新失败时能退回去。放 INSTALL_DIR 下, 跟着面板一起备份/删除。
+CORE_BACKUP_DIR="$INSTALL_DIR/backup/core"
 SERVICE_NAME="xrayls"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 XRAY_REPO_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
@@ -43,6 +45,112 @@ XRAY_INSTALLER="https://github.com/XTLS/Xray-install/raw/main/install-release.sh
 BASE_CONF="$CONF_DIR/00-base.json"
 STEP_TOTAL=6
 TMP="/tmp/xray_install.$$"
+
+# ---------------------------------------------------------
+# 内核备份 / 回退
+#
+# ★ 为什么必须有: 更新内核是**不可逆**操作里最容易出事的一个 —— 新版可能
+#   改了配置语义 (本项目已经踩过 allowInsecure / proxySettings / 旧版 reverse
+#   被移除), 更新完服务起不来, 而原来的二进制已经被覆盖了。
+#   官方安装脚本不留备份, 所以备份必须由我们自己做。
+#
+#   备份按版本号命名, 同一个版本只留一份; 只保留最近 5 个 —— 一个 xray
+#   二进制约 30-40 MB, 无限留会把小磁盘的机器占满。
+#
+# ★ 这一整块**放在主流程之前**, 而且不依赖后面定义的函数:
+#   原来放在 current_version() 定义之后, 于是 `rollback` 会先打印
+#   "[1/6] 检查系统 / [2/6] 创建目录 / [3/6] 安装 Xray 内核" 再执行回退 ——
+#   看起来像"它正在安装内核", 用户根本不敢按。
+# ---------------------------------------------------------
+CORE_BACKUP_KEEP=5
+
+# 内核版本 —— 直接问二进制, 不依赖脚本后面定义的 current_version()
+_core_version_of() { # <二进制路径>
+    local b="${1:-}" v=""
+    [[ -x "$b" ]] || { printf 'unknown'; return; }
+    v=$("$b" version 2>/dev/null | head -1 | awk '{print $2}')
+    printf '%s' "${v:-unknown}"
+}
+
+backup_current_core() {
+    [[ -x "$BIN" ]] || return 0
+    local v; v="$(_core_version_of "$BIN")"
+    mkdir -p "$CORE_BACKUP_DIR" 2>/dev/null || return 0
+    local dest="$CORE_BACKUP_DIR/xray-$v"
+    if [[ -f "$dest" ]]; then
+        print_info "已有 ${v} 的内核备份，不重复备份"
+    elif cp -f "$BIN" "$dest" 2>/dev/null; then
+        chmod +x "$dest"
+        print_info "已备份当前内核：${v}"
+    else
+        print_warn "内核备份失败（$dest），本次更新将无法回退"
+    fi
+    local olds
+    olds="$(ls -1t "$CORE_BACKUP_DIR"/xray-* 2>/dev/null | tail -n +$((CORE_BACKUP_KEEP + 1)))"
+    [[ -n "$olds" ]] && printf '%s\n' "$olds" | xargs -r rm -f
+    return 0
+}
+
+list_core_backups() {
+    local f found=0
+    for f in "$CORE_BACKUP_DIR"/xray-*; do
+        [[ -f "$f" ]] || continue
+        found=1
+        printf '  %-16s %-6s %s\n' "$(basename "$f" | sed 's/^xray-//')" \
+            "$(du -h "$f" 2>/dev/null | cut -f1)" \
+            "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+    done
+    [[ $found -eq 1 ]] || print_info "还没有内核备份（第一次更新时才会创建）"
+}
+
+rollback_core() {
+    local want="${1:-}" picks=() f cur
+    mapfile -t picks < <(ls -1t "$CORE_BACKUP_DIR"/xray-* 2>/dev/null)
+    if ((${#picks[@]} == 0)); then
+        print_error "没有可回退的内核备份：$CORE_BACKUP_DIR"
+        return 1
+    fi
+    if [[ -z "$want" ]]; then
+        print_info "可回退的内核版本："
+        list_core_backups
+        printf '  要回退到哪个版本？（直接回车取消）: '
+        read -r want || return 1
+        [[ -n "$want" ]] || { print_info "已取消"; return 0; }
+    fi
+    f="$CORE_BACKUP_DIR/xray-$want"
+    [[ -f "$f" ]] || f="$want"
+    [[ -f "$f" ]] || { print_error "找不到备份：$want"; list_core_backups; return 1; }
+
+    cur="$(_core_version_of "$BIN")"
+    print_warn "将把内核换成 $(basename "$f" | sed 's/^xray-//')（当前 ${cur}）"
+    # 回退前把**当前**的也备份一份 —— 回退本身也可能选错版本
+    backup_current_core >/dev/null 2>&1 || true
+    if ! cp -f "$f" "$BIN"; then
+        print_error "回退失败：写不进 $BIN"; return 1
+    fi
+    chmod +x "$BIN"
+    print_info "内核已替换为：$(_core_version_of "$BIN")"
+    # 换完必须校验: 旧配置未必被旧内核接受。只做语法校验, **不自动重启** ——
+    # 让用户自己决定什么时候切。
+    if "$BIN" run -test -c "$INSTALL_DIR/config.json" >/dev/null 2>&1; then
+        print_info "配置校验通过"
+    else
+        print_warn "配置校验未通过 —— 当前配置可能不被这个版本接受，先别重启服务"
+    fi
+    print_info "确认无误后再重启：systemctl restart $SERVICE_NAME"
+    return 0
+}
+
+# ---------------------------------------------------------
+# 带参数 -> 只做这一件事就退出; 不带参数 -> 走完整安装流程。
+# 放在这里(主流程之前、路径定义之后)是为了让 rollback **不打印安装步骤**。
+# ---------------------------------------------------------
+case "${1:-}" in
+    rollback)     rollback_core "${2:-}"; exit $? ;;
+    list-backups) list_core_backups;      exit $? ;;
+    "")           : ;;
+    *) print_error "未知参数：$1（可用：rollback [版本] | list-backups）"; exit 2 ;;
+esac
 mkdir -p "$TMP"
 REL_TMP="$TMP/install-release.log"
 UNZIP_OK=0
@@ -220,6 +328,8 @@ else
         print_info "当前内核 ${CUR_VER} 已是最新版本（最新：${LAT_VER}），跳过下载"
     else
         print_info "开始安装/更新内核 ${CUR_VER:-无} -> ${LAT_VER}"
+        # 更新前留一份 —— 官方安装脚本会直接覆盖, 不留备份就真的退不回去了
+        backup_current_core
         if ! install_core; then
             die "Xray 内核安装/更新失败" "bash <(curl $XRAY_INSTALLER) @ install"
         fi

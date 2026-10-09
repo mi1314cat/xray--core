@@ -435,6 +435,58 @@ done
 got=$(bash -c "source '$AD'; x_has_v4 >/dev/null 2>&1; echo rc=\$?")
 [[ "$got" =~ ^rc=[01]$ ]] && ok "x_has_v4 返回 0/1 而不是崩掉" || bad "x_has_v4 异常: $got"
 
+# ---------------------------------------------------------------- 内核回退
+# 守的是"更新内核失败后能不能退回去"。更新是不可逆操作里最容易出事的一个:
+# 新版可能改了配置语义(本项目已踩过 allowInsecure / proxySettings / 旧版
+# reverse 被移除), 更新完服务起不来, 而原来的二进制已经被覆盖 —— 官方安装
+# 脚本**不留备份**, 所以备份必须我们自己留。
+group "内核回退 (bin/xray_install.sh)"
+RB="$TMP/rollback"; mkdir -p "$RB/bin"
+# 只抽"备份/回退"那一块来测 —— 整脚本会执行完整安装流程, 不能在测试里 source
+sed -n '/^# 内核备份 \/ 回退/,/^case "\${1:-}" in/,/^esac/p' "$ROOT/bin/xray_install.sh" \
+    > "$RB/block.sh" 2>/dev/null
+# 退而求其次: 用行号区间 (块以 CORE_BACKUP_KEEP 开头、以 esac 结尾)
+awk '/^CORE_BACKUP_KEEP=/{f=1} f{print} /^esac$/{if(f){exit}}' "$ROOT/bin/xray_install.sh" > "$RB/block.sh"
+[[ -s "$RB/block.sh" ]] && ok "抽出备份/回退块 ($(wc -l < "$RB/block.sh") 行)" || bad "抽不出备份/回退块"
+# 块里必须真的包含三个能力
+for fn in backup_current_core list_core_backups rollback_core; do
+    grep -q "^${fn}()" "$RB/block.sh" && ok "包含 $fn" || bad "缺少 $fn"
+done
+# ★ 回退前必须把"当前"版本也备份 —— 否则回退选错版本就再也回不来了
+grep -q 'backup_current_core >/dev/null 2>&1' "$RB/block.sh" \
+    && ok "rollback_core 在替换前备份当前版本 (回退本身可逆)" \
+    || bad "rollback_core 没有先备份当前版本 —— 回退选错就回不来了"
+# ★ 回退后只做校验、**不自动重启** —— 让用户决定什么时候切
+# 只找**真正的调用**(行首命令), 不找提示文案里那句
+# "确认无误后再重启：systemctl restart ..." —— 那句话是故意留的, 要告诉用户
+# 怎么切。用 'systemctl restart' 直接 grep 会把文案也算进去 (实测误报过一次)。
+if sed -n '/^rollback_core()/,/^}/p' "$RB/block.sh" | grep -qE '^[[:space:]]*systemctl[[:space:]]+restart'; then
+    bad "rollback_core 会自动重启服务 (应只校验, 让用户决定)"
+else
+    ok "rollback_core 只做校验不自动重启 (文案里的提示命令不算调用)"
+fi
+# ★ 参数分派必须**当场**退出: 否则回退失败也会报成功, 或者先打印一堆安装步骤
+grep -q 'rollback)     rollback_core "${2:-}"; exit \$? ;;' "$RB/block.sh" \
+    && ok "rollback 分支当场 exit \$? (状态码不被后续判断覆盖)" \
+    || bad "rollback 分派没有当场退出"
+grep -q 'list-backups) list_core_backups;      exit \$? ;;' "$RB/block.sh" \
+    && ok "list-backups 分支当场退出" || bad "list-backups 分派没有当场退出"
+# 块里不能出现安装步骤的输出 —— 否则 rollback 时会打印 "[1/6] 检查系统"
+if grep -q '^section "' "$RB/block.sh"; then
+    bad "备份/回退块里有 section 调用 (rollback 会打印安装步骤)"
+else
+    ok "备份/回退块不含安装步骤输出"
+fi
+# 实跑: 空目录下的行为
+RBIN="$RB/xrayls"; printf '#!/bin/sh\necho "Xray 1.2.3"\n' > "$RBIN"; chmod +x "$RBIN"
+RR=$(BIN="$RBIN" CORE_BACKUP_DIR="$RB/backup" bash -c "
+  print_info(){ echo INFO:\$*; }; print_warn(){ echo WARN:\$*; }; print_error(){ echo ERR:\$*; }
+  source '$RB/block.sh' 2>/dev/null || true
+  list_core_backups
+  rollback_core 99.9.9 >/dev/null 2>&1; echo rc=\$?" 2>&1)
+echo "$RR" | grep -q '还没有内核备份' && ok "空目录时如实报告 (不假装有备份)" || bad "空目录时报告不正确"
+echo "$RR" | grep -q 'rc=1' && ok "回退不存在的版本返回非 0" || bad "回退不存在的版本没报错"
+
 group "节点命名 (naming.sh)"
 # 协议名规范化: 各处的写法收敛成一种
 for pair in "vless:vless" "VLESS:vless" "SS:ss" "shadowsocks:ss" \

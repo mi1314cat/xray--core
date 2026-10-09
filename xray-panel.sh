@@ -55,6 +55,7 @@ EOF
 ${GREEN}xrayls 管理脚本${PLAIN}
 ----------------------
 ${GREEN}1.${PLAIN} 安装/更新 xray（自动检测版本：旧版升级、最新则跳过）
+${GREEN}1b.${PLAIN} 回退内核（列出版本备份并切换）
 ${GREEN}2.${PLAIN} 卸载 xray
 ${GREEN}3.${PLAIN} 查看客户端配置
 ${GREEN}4.${PLAIN} 查询服务状态
@@ -85,6 +86,7 @@ xrayls 服务状态: ${xrayls_server_status_text}
     case "${choice}" in
         0) _srv_clear; exit 0 ;;
         1) run_xray_install ;;
+        1b|1B) run_xray_rollback ;;
         2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/uninstall_xray.sh) ;;
         3) show_xray_configs ;;
         4) systemctl status xrayls --no-pager ;;
@@ -165,6 +167,21 @@ load_env() {
 # 统一安装/更新入口：bin/xray_install.sh
 # 幂等：已安装且为最新版本时跳过下载；旧版本自动升级；并重建基础配置、验证并重启 xrayls
 XRAY_INSTALL_URL="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/bin/xray_install.sh"
+
+# 回退内核 —— 转给 bin/xray_install.sh 的 rollback 模式。
+# 单独给一个菜单入口的理由: 更新失败时人往往已经连不上服务,
+# 这时"回退"必须是**一眼能找到**的一项, 而不是自己记住一条命令。
+run_xray_rollback() {
+  local py; py=$(mktemp)
+  if ! curl -fsSL --max-time 30 "$XRAY_INSTALL_URL" -o "$py" 2>/dev/null; then
+    echo -e "${RED}取不到安装脚本（网络?）${PLAIN}"; rm -f "$py"; return 1
+  fi
+  bash "$py" list-backups
+  bash "$py" rollback
+  local rc=$?
+  rm -f "$py"
+  return $rc
+}
 
 run_xray_install() {
     bash <(curl -fsSL "$XRAY_INSTALL_URL") || {
