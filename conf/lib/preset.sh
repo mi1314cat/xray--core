@@ -65,22 +65,24 @@ X_PRESETS=(
     # ---------- VLESS ----------
     # REALITY 预设挂在本段。抗 DPI 最强, 不需要域名和证书。
     "vless|tcp|reality|① 隐匿优先 · REALITY + Vision|裸 TCP + XTLS Vision; 不需要域名和证书, 抗 DPI 最强, 新装首选"
-    "vless|ws|tls|② CDN 友好 · WS + TLS|WebSocket 套 TLS; 走 Cloudflare 橙云最成熟. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ③"
-    "vless|xhttp|tls|③ 抗识别 · XHTTP + TLS|★ 官方主推传输: 没有 WS 那种 \"ALPN 是 http/1.1\" 的显著特征; 上下行分离、可走 CDN, 官方称其出现后其它基于 HTTP 的传输层都黯然失色"
-    "vless|grpc|tls|④ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ③"
-    "vless|httpupgrade|tls|⑤ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ③"
+    "vless|xhttp|tls|② CDN 友好 · XHTTP + TLS|★ 官方主推传输, 也是**新的 CDN 推荐档**: 没有 WS 那种 \"ALPN 是 http/1.1\" 的显著特征, 上下行分离可走 Cloudflare 橙云. 官方称其出现后其它基于 HTTP 的传输层都黯然失色"
+    "vless|ws|tls|③ WS + TLS（官方已弃用）|⚠ 官方文档顶部已挂 danger: \"推荐换用 XHTTP\". 迁移目标 XHTTP H2 & H3 — 只有在服务端/CDN 明确只吃 WS 时才选它"
+    "vless|grpc|tls|④ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ②"
+    "vless|httpupgrade|tls|⑤ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ②"
     "vless|tcp|tls|⑥ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用"
 
     # ---------- Trojan ----------
     "trojan|tcp|reality|① 隐匿优先 · REALITY + Vision|裸 TCP + REALITY; Trojan 侧最抗 DPI 的组合"
-    "trojan|ws|tls|② CDN 友好 · WS + TLS|WebSocket 套 TLS; 可走 Cloudflare 橙云"
-    "trojan|grpc|tls|③ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
-    "trojan|tcp|tls|④ 裸 TCP + TLS|最常见的默认选择"
+    "trojan|xhttp|tls|② CDN 友好 · XHTTP + TLS|★ 官方主推传输; 可走 Cloudflare 橙云 (与 VLESS 口径一致)"
+    "trojan|ws|tls|③ WS + TLS（官方已弃用）|⚠ 官方推荐换用 XHTTP; 只在服务端只吃 WS 时选它"
+    "trojan|grpc|tls|④ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
+    "trojan|tcp|tls|⑤ 裸 TCP + TLS|最常见的默认选择"
 
     # ---------- VMess ----------
-    "vmess|ws|tls|① CDN 友好 · WS + TLS|WebSocket 套 TLS; VMess 里兼容性最好的"
-    "vmess|grpc|tls|② gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
-    "vmess|tcp|tls|③ 裸 TCP + TLS|改连 TCP 伪装, 需要 VMess 自身配置"
+    "vmess|xhttp|tls|① CDN 友好 · XHTTP + TLS|★ 官方主推传输 (与 VLESS/Trojan 口径一致)"
+    "vmess|ws|tls|② WS + TLS（官方已弃用）|⚠ 官方推荐换用 XHTTP"
+    "vmess|grpc|tls|③ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
+    "vmess|tcp|tls|④ 裸 TCP + TLS|改连 TCP 伪装, 需要 VMess 自身配置"
 
     # ---------- Shadowsocks ----------
     "shadowsocks|tcp|reality|① 隐匿优先 · REALITY|裸 TCP + REALITY; 协议本身简单, 靠 REALITY 补抗识别"

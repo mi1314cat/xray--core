@@ -487,6 +487,48 @@ RR=$(BIN="$RBIN" CORE_BACKUP_DIR="$RB/backup" bash -c "
 echo "$RR" | grep -q '还没有内核备份' && ok "空目录时如实报告 (不假装有备份)" || bad "空目录时报告不正确"
 echo "$RR" | grep -q 'rc=1' && ok "回退不存在的版本返回非 0" || bad "回退不存在的版本没报错"
 
+# ---------------------------------------------------------------- 预置推荐档
+# 守的是"推荐配置是不是当前官方方向"。官方已把 websocket / grpc /
+# httpupgrade 标为**非移除型弃用**并指定迁移到 XHTTP, 且 XHTTP 是官方主推
+# (没有 WS 那种 "ALPN 是 http/1.1" 的显著特征)。所以"CDN 友好"这一档的
+# 推荐必须是 XHTTP —— 原来推的是 WS, 等于把人往弃用方向上带。
+group "预置推荐档 (preset.sh)"
+for proto in vless trojan vmess; do
+    # 该协议的第 2 档 (vless/trojan 是 CDN 档; vmess 的第 1 档)
+    sec=$(bash -c "source '$LIB/preset.sh'; x_preset_field $proto 2 2" 2>/dev/null)
+    if [[ "$proto" == "vmess" ]]; then
+        sec=$(bash -c "source '$LIB/preset.sh'; x_preset_field $proto 1 2" 2>/dev/null)
+    fi
+    assert_eq "$sec" "xhttp" "$proto 的 CDN 推荐档是 XHTTP (不是已弃用的 WS)"
+done
+# 弃用的传输必须仍在表里 (兼容老节点), 但说明里要写明官方弃用
+for proto_tr in "vless|ws" "vless|grpc" "vless|httpupgrade" "trojan|ws" "vmess|ws"; do
+    pr="${proto_tr%%|*}"; tr="${proto_tr##*|}"
+    body=$(grep -E "^\s*\"$pr\|$tr\|" "$LIB/preset.sh" | head -1)
+    echo "$body" | grep -q '弃用' \
+        && ok "$pr + $tr 仍在表里且标注了官方弃用" \
+        || bad "$pr + $tr 没标注官方弃用 (用户看不出它正在被淘汰)"
+done
+# 编号必须连续: 插档之后最容易出现的错就是两个 ③
+for proto in vless trojan vmess shadowsocks; do
+    nums=$(grep -oE "^\s*\"$proto\|[^|]*\|[^|]*\|[①②③④⑤⑥⑦⑧⑨]" "$LIB/preset.sh" | grep -oE '[①②③④⑤⑥⑦⑧⑨]$' | tr '\n' ' ')
+    want=""
+    i=0
+    for c in ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨; do
+        want="$want$c "
+    done
+    n=$(echo "$nums" | wc -w)
+    first=$(echo "$nums" | awk '{print $1}')
+    assert_eq "$first" "①" "$proto 编号从 ① 开始"
+    # 末尾编号应与条数一致
+    last=$(echo "$nums" | awk '{print $NF}')
+    idx=0; j=0
+    for c in ① ② ③ ④ ⑤ ⑥ ⑦ ⑧ ⑨; do
+        j=$((j+1)); [[ "$c" == "$last" ]] && idx=$j
+    done
+    assert_eq "$idx" "$n" "$proto 编号连续无重复 (共 $n 档, 末位 $last)"
+done
+
 group "节点命名 (naming.sh)"
 # 协议名规范化: 各处的写法收敛成一种
 for pair in "vless:vless" "VLESS:vless" "SS:ss" "shadowsocks:ss" \
@@ -1120,10 +1162,12 @@ PS=$(bash -c "source '$LIB/preset.sh'; x_preset_protocols" 2>/dev/null | tr '\n'
 for p in vless trojan vmess shadowsocks hysteria2 socks http; do
     [[ "$PS" == *"$p"* ]] && ok "预置覆盖协议: $p" || bad "预置覆盖协议: $p"
 done
-# 逐列提取不得错位: vless 第 2 个应是 ws/tls
+# 逐列提取不得错位。取样值随预置表调整而变 —— 这条的意图是**列对齐**,
+# 不是"第 2 档必须是某个传输"。当前 vless 第 2 档是 XHTTP + TLS (CDN 推荐档,
+# 见下面「预置推荐档」一组)。
 TR=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 2 2" 2>/dev/null)
 SE=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 2 3" 2>/dev/null)
-assert_eq "$TR/$SE" "ws/tls" "逐列提取不错位"
+assert_eq "$TR/$SE" "xhttp/tls" "逐列提取不错位"
 TR=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 1 2" 2>/dev/null)
 assert_eq "$TR" "tcp" "第一个预置提取正确"
 # 末尾空字段场景 —— read 会少给一个字段, cut 不会
