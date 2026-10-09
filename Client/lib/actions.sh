@@ -2194,6 +2194,15 @@ Xray Client Web Manager v$XBD_VERSION
     局域网设备：在设备的代理设置里填「本机 IP:1080(SOCKS5) / :10809(HTTP)」即可，
                 不需要本机做任何改动（透明网关模式已移除，见 docs/mode3-lan-gateway/）
 
+  多出站 / 配置分发 / 菜单
+    multi status|on|off                    多出站开关（默认关：单节点模式）。
+                                           开启后所有节点同时在线，按权重分流；
+                                           想要的时候再开，别默认打开。
+    share new|list|url|off                  配置分发：生成带令牌的分享链接，
+                                           别人扫码/导入即可拿到你的节点配置。
+                                           分享服务只在开启时占用一个端口。
+    menu                                   交互式菜单（推荐：日常操作用这个）
+
   状态与诊断
     status [--quick]                       状态（含当前节点实际走哪条 TLS 路径）
     diagnose [--quick]                     全面诊断

@@ -18,8 +18,21 @@ PASS=0; FAIL=0
 FAILED_NAMES=()
 
 PREFIX="${XBD_PREFIX:-/opt/xray-browser-dialer}"
-# HERE = Client/, 不是 tools/。RUN.sh 在 Client/ 下, 弄错的话入口那一组
-# 会一直去执行一个不存在的文件, 表现是"入口全部失败"而其他项全过。
+
+# 只读模式。生产机上跑验证台时必须开:
+#   --read-only   不做任何会改配置/重启服务的动作
+#
+# 默认是全量的, 因为在测试机上要把"能不能真的切过去"也验掉。
+# 但生产机上跑全量 = 可能把用户正在用的代理切掉, 所以要能只验不碰。
+READ_ONLY=0
+for a in "$@"; do
+  case "$a" in
+    --read-only) READ_ONLY=1 ;;
+    client|server) ROLE="$a" ;;
+  esac
+done
+[ "${READ_ONLY}" -eq 1 ] && printf '  \033[33m[只读模式]\033[0m 会改配置/重启的项已跳过\n\n'
+# HERE = Client/, 不是 tools/。写错的话各项路径断言会一起挂。
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TMPO="$(mktemp -t xbd-iv-out.XXXXXX)"
@@ -54,31 +67,23 @@ test_client() {
   [ -x "$XBD" ] || { printf '  找不到 %s\n' "$XBD"; return 1; }
 
   # ---------------------------------------------------------- 入口
-  printf '\n  \033[36m入口与角色分发\033[0m\n'
-  printf '0\n' | timeout 25 bash "$HERE/RUN.sh" >"$TMPO" 2>&1
-  hasf "入口列出服务端选项" "1\." "xrayls"
-  hasf "入口列出客户端选项" "2\." "客户端"
-  hasf "入口列出退出选项" "0\." "退出"
-  hasntf "入口不再说'暂未提供'" "暂未提供"
-  hasntf "入口不再说'还没有服务端功能'" "还没有服务端功能"
+  #
+  # 这里只验 xbd 自己的入口, 不验 RUN.sh。
+  #
+  # RUN.sh 是**客户端分发包**的安装脚本, 跑在还没装好的机器上;
+  # 它的菜单里有"1. 服务端"是给"手上捏着整个仓库、在服务端机上也能拉起
+  # xrayls 面板"用的。客户端机上装完之后, 服务端脚本根本不在旁边 ——
+  # `RUN.sh server` 会找不到面板直接报错, 那是正确行为, 不是缺陷。
+  #
+  # 服务端那条路径由 tools/server-interactive-test.sh 在服务端机上验。
+  printf '\n  \033[36m入口\033[0m\n'
+  timeout 25 "$XBD" help >"$TMPO" 2>&1
+  hasf "xbd help 列出全部子命令" "menu|node|multi" ""
+  hasf "xbd help 提到 share" "share" ""
 
-  timeout 25 bash "$HERE/RUN.sh" client multi status >"$TMPO" 2>&1
-  hasf "命令行直传 client 生效（不重装、直接执行）" "单节点模式|多出站已开启" ""
-
-  # 服务端分支：必须真的进 xrayls 面板，而不是又跑一遍安装
-  printf '0\n0\n' | timeout 25 bash "$HERE/RUN.sh" server >"$TMPO" 2>&1
-  if grep -qaE 'xrayls 管理脚本|找不到服务端面板' "$TMPO"; then
-    ok "服务端分支进到了 xrayls 面板"
-  else
-    bad "服务端分支进到了 xrayls 面板" "$(head -c 200 "$TMPO" | tr '\n' ' ')"
-  fi
-  hasntf "服务端分支不会先跑客户端安装" "Xray Client 安装"
-
-  printf '\n' | timeout 25 bash "$HERE/RUN.sh" >"$TMPO" 2>&1
-  hasf "空回车不退出（重画菜单）" "请输入选项" ""
-
-  printf 'zz\n0\n' | timeout 25 bash "$HERE/RUN.sh" >"$TMPO" 2>&1
-  hasf "入口非法选项被兜住" "无效选项 zz" ""
+  # 直接进菜单
+  printf '0\n' | timeout 40 "$XBD" menu >"$TMPO" 2>&1
+  hasf "xbd menu 能进能退" "请输入选项|状态" ""
 
   # ---------------------------------------------------------- 主菜单
   printf '\n  \033[36m主菜单\033[0m\n'
@@ -117,6 +122,15 @@ test_client() {
   timeout 40 "$XBD" node use 999999 >"$TMPO" 2>&1
   hasf "切到不存在的节点会明确报错" "没有编号|找不到|✗" ""
 
+  if [ "$READ_ONLY" -eq 0 ]; then
+    # 切节点会重写配置并重启 —— 生产机上不做, 除非显式要求
+    first=$(ls "$PREFIX"/nodes/node-*.json 2>/dev/null | head -1 | xargs -r basename)
+    [ -n "$first" ] && timeout 90 "$XBD" node use "${first%.json}" >"$TMPO" 2>&1
+    hasf "切节点能成功" "当前|✓" ""
+  else
+    printf '    \033[90m(skipped) node use —— 会重写配置并重启\033[0m\n'
+  fi
+
   # ---------------------------------------------------------- 多出站
   printf '\n  \033[36m多出站开关\033[0m\n'
   timeout 30 "$XBD" multi status >"$TMPO" 2>&1
@@ -127,6 +141,22 @@ test_client() {
   hasf "multi 非法取值被兜住" "未知操作" ""
   hasf "multi 非法取值给出正确提示" "xbd multi status" ""
 
+  if [ "$READ_ONLY" -eq 0 ]; then
+    # 切多出站会重启 xray 并改配置 —— 生产机上默认不碰
+    before=$(awk -F= '$1=="MULTI_OUTBOUND"{print $2}' "$PREFIX/config/multi.env" 2>/dev/null | head -1)
+    timeout 180 "$XBD" multi on >"$TMPO" 2>&1
+    hasf "multi on 能开启" "多出站|✓|已" ""
+    timeout 60 "$XBD" multi status >"$TMPO" 2>&1
+    hasf "multi on 后状态是开" "多出站已开启" ""
+    timeout 180 "$XBD" multi off >"$TMPO" 2>&1
+    timeout 60 "$XBD" multi status >"$TMPO" 2>&1
+    hasf "multi off 能关回去" "单节点模式" ""
+    # 恢复原状
+    [ "$before" = "on" ] && timeout 180 "$XBD" multi on >/dev/null 2>&1
+  else
+    printf '    \033[90m(skipped) multi on/off —— 会重启并改配置\033[0m\n'
+  fi
+
   # ---------------------------------------------------------- 配置分发
   printf '\n  \033[36m配置分发\033[0m\n'
   timeout 30 "$XBD" share list >"$TMPO" 2>&1
@@ -136,6 +166,15 @@ test_client() {
   hasf "share 非法操作给出用法" "xbd share help" ""
   timeout 30 "$XBD" share off >"$TMPO" 2>&1
   hasf "share off 不带 token 会给用法" "用法|缺少" ""
+
+  if [ "$READ_ONLY" -eq 0 ]; then
+    poke_share=$(timeout 60 "$XBD" share new >"$TMPO" 2>&1; echo $?)
+    hasf "share new 能开" "http|令牌|token|分享" ""
+    timeout 60 "$XBD" share off >"$TMPO" 2>&1
+    hasf "share off 能关" "已关闭|✓" ""
+  else
+    printf '    \033[90m(skipped) share new/off —— 会起服务并改配置\033[0m\n'
+  fi
 
   # ---------------------------------------------------------- 只读命令
   printf '\n  \033[36m只读命令（不能有副作用）\033[0m\n'
@@ -187,14 +226,32 @@ PY
   printf '\n  \033[36m代理可用性\033[0m\n'
   PORT=$(awk -F= '$1=="PORT_NORMAL"{print $2}' "$PREFIX/config/ports.env" 2>/dev/null | head -1)
   PORT="${PORT:-1080}"
-  printf '    (SOCKS 端口: %s)\n' "$PORT"
+
+  # 监听地址必须从实际生成的配置里读, 不能假设 127.0.0.1。
+  #
+  # LAN 模式下 socks 入站绑的是本机 LAN IP（LAN 共享是这版客户端的核心功能,
+  # 手机/其他设备要能连), 不是 localhost。
+  # 早先这里硬写 127.0.0.1, 在 LAN 模式下必然连不上 —— 测出来是
+  # "经 SOCKS 出网正常" 失败, 而服务其实好着。CC 上就踩了这个:
+  # 实际监听 192.168.1.178:1080, 出口 104.28.195.192, 完全正常。
+  BIND=$(python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+for i in d.get("inbounds",[]):
+    if i.get("protocol")=="socks" and i.get("port")==int(sys.argv[2]):
+        print(i.get("listen") or "0.0.0.0"); break
+' "$PREFIX/runtime/xray-client.json" "$PORT" 2>/dev/null)
+  case "$BIND" in ""|0.0.0.0|::) ADDR="127.0.0.1" ;; *) ADDR="$BIND" ;; esac
+  printf '    (SOCKS: %s —— 生成配置绑定 %s)\n' "$ADDR:$PORT" "${BIND:-未找到}"
+
   if command -v ss >/dev/null && ss -tln 2>/dev/null | grep -q ":$PORT "; then
     ok "SOCKS $PORT 在监听"
   else bad "SOCKS $PORT 在监听" "没监听"; fi
-  r=$(timeout 25 curl -s -o /dev/null -w '%{http_code}' --socks5-hostname "127.0.0.1:$PORT" https://www.gstatic.com/generate_204 2>/dev/null)
+
+  r=$(timeout 25 curl -s -o /dev/null -w '%{http_code}' --socks5-hostname "$ADDR:$PORT" https://www.gstatic.com/generate_204 2>/dev/null)
   case "$r" in
     204|200) ok "经 SOCKS 出网正常 (HTTP $r)" ;;
-    000) bad "经 SOCKS 出网正常" "连不上" ;;
+    000) bad "经 SOCKS 出网正常" "连不上 $ADDR:$PORT" ;;
     *) bad "经 SOCKS 出网正常" "HTTP $r" ;;
   esac
 }
