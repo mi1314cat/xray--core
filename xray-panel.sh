@@ -7,8 +7,91 @@ YELLOW="\033[33m"
 BLUE="\033[36m"
 PLAIN="\033[0m"  # 修复缺失的闭合引号
 
-# 仓库 raw 前缀。面板的每一项都是 curl 出去的, 这里统一一份。
-XRAY_RAW="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
+# =============================================================
+# 取仓库文件 —— 镜像链 + 重试
+#
+# ★ 面板是用户**第一个** curl 下来的东西, 所以这里必须自带一套, 不能去
+#   source 仓库里的 conf/lib/fetch.sh (那还得先下载)。
+#
+# ★ 为什么需要: 19/20 个菜单项都是 curl 出去跑的。国内机器连 github.com
+#   经常是**连接超时**而不是拒绝 —— 单个源不通就整个菜单项卡死, 用户看到的
+#   是"点了没反应"。而且实测 push 之后约 5 分钟内 raw 仍返回**旧内容**
+#   (GitHub CDN 缓存), 于是"改了不生效"又添一层。
+#
+# 镜像顺序照抄 mihomo--core 的实战结论:
+#   · ghproxy / gh-proxy 是**实时回源**的, 能立刻拿到刚推上去的版本 → 排前
+#   · jsdelivr 是 CDN **带缓存**的, 推完 commit 后它仍返回旧文件,
+#     加时间戳也绕不过去 → 只能放最后兜底
+# =============================================================
+XRAY_RAW="${XRAY_RAW:-https://raw.githubusercontent.com/mi1314cat/xray--core/main}"
+XRAY_MIRRORS=(
+    "https://ghproxy.net/https://raw.githubusercontent.com/mi1314cat/xray--core/main"
+    "https://gh-proxy.com/https://raw.githubusercontent.com/mi1314cat/xray--core/main"
+    "${XRAY_REPO_PROXY:-https://cfgithub.gw2333.workers.dev/https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
+    "https://cdn.jsdelivr.net/gh/mi1314cat/xray--core@main"
+    "https://fastly.jsdelivr.net/gh/mi1314cat/xray--core@main"
+)
+# 探测目标必须是**确认存在**的文件。首版曾用 src/VERSION, 而本仓库没有
+# 这个文件 —— 每个源都探不通, 整条链直接全废。
+XRAY_PROBE="README.md"
+
+_XRAY_CACHE=""
+_XRAY_SRC=""
+
+# 选一个可用源 (结果缓存到 _XRAY_SRC, 避免每个菜单项都重探一遍)
+xray_pick_source() {
+    [[ -n "$_XRAY_SRC" ]] && { printf '%s' "$_XRAY_SRC"; return 0; }
+    local base i
+    for base in "$XRAY_RAW" "${XRAY_MIRRORS[@]}"; do
+        for i in 1 2; do
+            # 25 秒 × 2: 12 秒会把"首包慢但其实能通"的镜像误判成不通,
+            # 整条链全废 (两个内核的注释里都记着这一条)
+            if curl -fsSL --max-time 25 "$base/$XRAY_PROBE" -o /dev/null 2>/dev/null; then
+                _XRAY_SRC="$base"
+                [[ "$base" == "$XRAY_RAW" ]] || echo -e "${YELLOW}[!] 主站不通, 已选用镜像 $(printf '%s' "$base" | cut -d/ -f3)${PLAIN}"
+                printf '%s' "$_XRAY_SRC"; return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# xray_fetch <仓库相对路径> -> stdout 打印本地路径; 失败非 0
+xray_fetch() {
+    local rel="$1" self dest
+    # 1) 从仓库检出目录直接跑 (开发时最常用)
+    self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    [[ -f "$self/$rel" ]] && { printf '%s' "$self/$rel"; return 0; }
+    # 2) 本次会话的缓存 (同一个菜单项反复进时不重复下载)
+    [[ -n "$_XRAY_CACHE" ]] || _XRAY_CACHE="$(mktemp -d /tmp/.xray-panel.XXXXXX 2>/dev/null)"
+    dest="$_XRAY_CACHE/$(printf '%s' "$rel" | tr '/' '_')"
+    [[ -s "$dest" ]] && { printf '%s' "$dest"; return 0; }
+    # 3) 镜像链
+    local base; base=$(xray_pick_source) || return 1
+    if curl -fsSL --max-time 30 "$base/$rel" -o "$dest.tmp" 2>/dev/null; then
+        mv -f "$dest.tmp" "$dest"; printf '%s' "$dest"; return 0
+    fi
+    rm -f "$dest.tmp"
+    # 选中的源这次抽风 —— 换一个再试, 别让整条链白探
+    for base in "$XRAY_RAW" "${XRAY_MIRRORS[@]}"; do
+        if curl -fsSL --max-time 30 "$base/$rel" -o "$dest.tmp" 2>/dev/null; then
+            mv -f "$dest.tmp" "$dest"; _XRAY_SRC="$base"; printf '%s' "$dest"; return 0
+        fi
+        rm -f "$dest.tmp"
+    done
+    return 1
+}
+
+# xray_run <仓库相对路径> [参数...] —— 取到就执行, 取不到给明确原因
+xray_run() {
+    local rel="$1"; shift
+    local f
+    if ! f=$(xray_fetch "$rel"); then
+        echo -e "${RED}[Error]${PLAIN} 取不到 $rel —— 镜像链全不通 (检查网络, 或设 XRAY_REPO_PROXY)"
+        return 1
+    fi
+    bash "$f" "$@"
+}
 
 # 节点增删之后刷新"已发出去的分享链接"的内容。
 #
@@ -19,7 +102,7 @@ XRAY_RAW="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/mai
 # ★ 失败一律不报错 (|| true)。删节点/加节点是主流程, 不能因为分享服务那边
 #   的问题而失败; 刷新本身是"尽力而为", 服务不可达时 share.sh 会自己说一声。
 share_refresh_hook() {
-    bash <(curl -Ls "$XRAY_RAW/conf/share.sh") refresh >/dev/null 2>&1 || true
+    xray_run conf/share.sh refresh >/dev/null 2>&1 || true
 }
 
 # 主菜单
@@ -87,25 +170,25 @@ xrayls 服务状态: ${xrayls_server_status_text}
         0) _srv_clear; exit 0 ;;
         1) run_xray_install ;;
         1b|1B) run_xray_rollback ;;
-        2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/uninstall_xray.sh) ;;
+        2) xray_run uninstall_xray.sh ;;
         3) show_xray_configs ;;
         4) systemctl status xrayls --no-pager ;;
         5) add_node_menu; share_refresh_hook ;;
-        6) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/verify.sh) ;;
-        7) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/outbound.sh) ;;
-        8) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/split.sh) ;;
+        6) xray_run conf/verify.sh ;;
+        7) xray_run conf/outbound.sh ;;
+        8) xray_run conf/split.sh ;;
         9) reverse_menu ;;
-        10) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/share.sh) ;;
-        11) bash <(curl -Ls "$XRAY_RAW/conf/node.sh"); share_refresh_hook ;;
-        12) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/tools/check_libs.sh) ;;
-        13) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/dns.sh) ;;
-        14) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/logs.sh) ;;
-        15) bash <(curl -Ls "$XRAY_RAW/conf/mknode.sh"); share_refresh_hook ;;
-        16) bash <(curl -Ls "$XRAY_RAW/tools/preset_batch.sh") --help; share_refresh_hook ;;
-        17) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cert.sh) ;;
-        18) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/nginx_site.sh) ;;
-        19) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/share_service.sh) menu ;;
-        20) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/tools/port-check.sh) ;;
+        10) xray_run conf/share.sh ;;
+        11) xray_run conf/node.sh; share_refresh_hook ;;
+        12) xray_run tools/check_libs.sh ;;
+        13) xray_run conf/dns.sh ;;
+        14) xray_run conf/logs.sh ;;
+        15) xray_run conf/mknode.sh; share_refresh_hook ;;
+        16) xray_run tools/preset_batch.sh --help; share_refresh_hook ;;
+        17) xray_run conf/cert.sh ;;
+        18) xray_run conf/nginx_site.sh ;;
+        19) xray_run conf/share_service.sh menu ;;
+        20) xray_run tools/port-check.sh ;;
 
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac
@@ -136,8 +219,8 @@ ${GREEN}0.${PLAIN} 返回主菜单
         # EOF 当退出, 否则按键用尽后无限重画子菜单
         read -r -p "请输入选项 [0-2]: " rc || return
         case "${rc}" in
-            1) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/fd/xrayserver-reverse.sh) ;;
-            2) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/fd/xrayclient-reverse.sh) ;;
+            1) xray_run conf/fd/xrayserver-reverse.sh ;;
+            2) xray_run conf/fd/xrayclient-reverse.sh ;;
             0) return ;;
             *) echo -e "${RED}无效的选项 ${rc}${PLAIN}" ;;
         esac
@@ -172,19 +255,16 @@ XRAY_INSTALL_URL="https://github.com/mi1314cat/xray--core/raw/refs/heads/main/bi
 # 单独给一个菜单入口的理由: 更新失败时人往往已经连不上服务,
 # 这时"回退"必须是**一眼能找到**的一项, 而不是自己记住一条命令。
 run_xray_rollback() {
-  local py; py=$(mktemp)
-  if ! curl -fsSL --max-time 30 "$XRAY_INSTALL_URL" -o "$py" 2>/dev/null; then
-    echo -e "${RED}取不到安装脚本（网络?）${PLAIN}"; rm -f "$py"; return 1
-  fi
+  local py
+  py=$(xray_fetch bin/xray_install.sh) || {
+    echo -e "${RED}取不到安装脚本（镜像链全不通）${PLAIN}"; return 1; }
   bash "$py" list-backups
   bash "$py" rollback
-  local rc=$?
-  rm -f "$py"
-  return $rc
+  return $?
 }
 
 run_xray_install() {
-    bash <(curl -fsSL "$XRAY_INSTALL_URL") || {
+    xray_run bin/xray_install.sh || {
         echo -e "${RED}xrayls 安装/更新失败，请查看上方错误信息${PLAIN}"
         return 1
     }
@@ -243,63 +323,63 @@ ${GREEN}0.${PLAIN} 返回主菜单
         0) return ;;
 
         1)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/tunnel.sh)
+            xray_run conf/tunnel.sh
             systemctl restart xrayls.service
             ;;
 
         2)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/hysteria2.sh)
+            xray_run conf/hysteria2.sh
             systemctl restart xrayls.service
             ;;
 
         3)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/sock5.sh)
+            xray_run conf/sock5.sh
             systemctl restart xrayls.service
             ;;
 
         4)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/vlessecn.sh)
+            xray_run conf/vlessecn.sh
             systemctl restart xrayls.service
             ;;
 
         5)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/http.sh)
+            xray_run conf/http.sh
             systemctl restart xrayls.service
             ;;
 
         6)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/vlessxhttpecn.sh)
+            xray_run conf/vlessxhttpecn.sh
             systemctl restart xrayls.service
             ;;
 
         7)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/Reality.sh)
+            xray_run conf/Reality.sh
             systemctl restart xrayls.service
             ;;
 
         8)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/Shadowsocks.sh)
+            xray_run conf/Shadowsocks.sh
             systemctl restart xrayls.service
             ;;
 
         9)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/Trojan.sh)
+            xray_run conf/Trojan.sh
             systemctl restart xrayls.service
             ;;
 
         10)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/GDargo.sh)
+            xray_run conf/GDargo.sh
             systemctl restart xrayls.service
             ;;
 
         11)
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lsargo.sh)
+            xray_run conf/lsargo.sh
             systemctl restart xrayls.service
             ;;
 
         12)
             # Batch Generator 收尾自带统一校验+一次重启, 这里不再 restart
-            bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/batch.sh)
+            xray_run conf/batch.sh
             ;;
 
         *)
