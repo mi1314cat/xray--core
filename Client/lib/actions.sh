@@ -2478,13 +2478,18 @@ _xbd_browser_table() {
     if [ -n "$_cur_real" ] && [ "$_cur_real" = "$(readlink -f "$f" 2>/dev/null)" ]; then
       cur=" *"
     fi
+    # ★ `|| true` 不能省。compat.py json 在"Xray 与浏览器都用不了"时**退出码
+    #   为 1**（有效结论，不是失败），而 xbd 顶部是 `set -euo pipefail` ——
+    #   管道里一个命令非零整条就非零，这个赋值会把整个菜单当场杀掉。
+    #   症状：表格打得出来、选项一行不出、rc=1、stderr 为空。
+    #   只要节点列表里**有任意一个**两模式都用不了的节点就会触发。
     can=$(python3 "$XBD_LIBDIR/compat.py" json "$f" 2>/dev/null \
           | python3 -c 'import sys,json
 try:
     d=json.load(sys.stdin)
     print("是" if d.get("can_use_dialer") else "否")
 except Exception:
-    print("?")' 2>/dev/null)
+    print("?")' 2>/dev/null || true)
     want=$(python3 -c '
 import json,sys
 try:
@@ -2514,12 +2519,13 @@ _xbd_browser_pick() {
     [ "$name" = "current" ] && continue
     idx=$((idx+1))
     local can want
+    # `|| true` 见上面 _xbd_browser_table 里的说明（compat.py 退出码 1 是结论）
     can=$(python3 "$XBD_LIBDIR/compat.py" json "$f" 2>/dev/null \
           | python3 -c 'import sys,json
 try:
     print("是" if json.load(sys.stdin).get("can_use_dialer") else "否")
 except Exception:
-    print("?")' 2>/dev/null)
+    print("?")' 2>/dev/null || true)
     want=$(python3 -c '
 import json,sys
 try:
@@ -2561,12 +2567,13 @@ _xbd_browser_bulk() {
     name=$(basename "$f" .json)
     [ "$name" = "current" ] && continue
     local can
+    # `|| true` 见上面 _xbd_browser_table 里的说明（compat.py 退出码 1 是结论）
     can=$(python3 "$XBD_LIBDIR/compat.py" json "$f" 2>/dev/null \
           | python3 -c 'import sys,json
 try:
     print("True" if json.load(sys.stdin).get("can_use_dialer") else "False")
 except Exception:
-    print("False")' 2>/dev/null)
+    print("False")' 2>/dev/null || true)
     if [ "$can" != "True" ]; then skipped=$((skipped+1)); continue; fi
     _xbd_set_node_browser "$f" "$( [ "$v" = "on" ] && echo true || echo false )"
     n=$((n+1))

@@ -908,6 +908,56 @@ for u in $(grep -rhoE 'raw/refs/heads/main\}/?[A-Za-z0-9_/.-]+\.(sh|py)' "$ROOT/
 done
 [[ -z "$badurl" ]] && ok "兜底 URL 指向的文件都存在" || bad "兜底 URL 指向不存在的文件:$badurl"
 
+# ---------------------------------------------------------------- 拨号菜单健壮性
+# 这组来自一次**真实事故**（交互验证台在 CC 上抓到的）:
+#
+#   compat.py json 在"Xray 与浏览器两种模式都用不了"时**退出码为 1** ——
+#   那是有效结论, 不是失败。而 xbd 顶部是 `set -euo pipefail`, 管道里
+#   一个命令非零整条就非零, 于是
+#       can=$(python3 compat.py json "$f" | python3 -c '...')
+#   这个赋值把整个菜单当场杀掉。症状是"表格打得出来、选项一行不出、
+#   rc=1、stderr 为空" —— 和另一个 `[ ... ] &` 的事故长得一模一样。
+#
+#   触发条件很现实: 节点列表里**有任意一个**两模式都用不了的节点就够。
+#   CC 上有一个 ECH 节点(整份 Xray JSON 配置, 不是节点对象), 于是
+#   浏览器拨号菜单在那儿一直是废的。
+group "拨号菜单健壮性 (compat.py 退出码)"
+DT="$(mktemp -d)"; DN="$DT/nodes"; mkdir -p "$DN"
+python3 - "$DN" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+# 正常节点
+json.dump({"protocol": "vless", "transport": "xhttp", "security": "tls",
+           "address": "a.example", "port": 443,
+           "uuid": "11111111-1111-1111-1111-111111111111"},
+          open(os.path.join(d, "node-01.json"), "w"))
+# 两模式都用不了的节点 —— compat.py 对它返回 1
+json.dump({"protocol": "wireguard", "transport": "tcp", "security": "none",
+           "address": "b.example", "port": 51820},
+          open(os.path.join(d, "node-02.json"), "w"))
+PY
+# 先确认前提成立: 第二个节点确实让 compat.py 退出 1
+bash -c "python3 '$ROOT/Client/lib/compat.py' json '$DN/node-02.json' >/dev/null 2>&1"
+[[ "$?" = "1" ]] && ok "前提成立: 有一类节点让 compat.py 退出 1" \
+    || bad "前提不成立: compat.py 没有返回 1, 这组测不到东西"
+sed -n '/^_xbd_browser_table()/,/^}/p' "$ROOT/Client/lib/actions.sh" > "$DT/fn.sh"
+out=$(XBD_NODES="$DN" XBD_LIBDIR="$ROOT/Client/lib" \
+      bash -c "set -euo pipefail; source '$DT/fn.sh'; _xbd_browser_table" 2>&1)
+rc=$?
+assert_eq "$rc" "0" "节点两模式都不可用时 _xbd_browser_table 仍然返回 0 (set -e 不杀)"
+n=$(printf '%s\n' "$out" | grep -c 'node-')
+assert_eq "$n" "2" "表格把两个节点都列出来了 (一个都不少)"
+# 逐个函数都要有 || true, 否则同样会踩
+miss=""
+for fn in _xbd_browser_table _xbd_browser_pick _xbd_browser_bulk; do
+  body=$(sed -n "/^${fn}()/,/^}/p" "$ROOT/Client/lib/actions.sh")
+  printf '%s' "$body" | grep -q 'compat.py" json' || continue
+  printf '%s' "$body" | grep -q '2>/dev/null || true)' || miss="$miss $fn"
+done
+[[ -z "$miss" ]] && ok "三个拨号菜单函数都容忍 compat.py 的退出码 1" \
+    || bad "这些函数没容错, 菜单会被 set -e 杀掉:$miss"
+rm -rf "$DT"
+
 # ---------------------------------------------------------------- 并发写
 # 这三个模块都是 read-modify-write 或原子写。flock 锁的是打开的文件描述符而不是
 # 进程, 所以同一进程的多线程不会被 flock 挡住 —— 必须另加 threading.Lock。
