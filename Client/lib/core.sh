@@ -30,7 +30,8 @@ XBD_PANEL_PORT="${XBD_PANEL_PORT:-18090}"
 XBD_PANEL_HOST_DEFAULT="127.0.0.1"
 
 # systemd 单元
-XBD_U_XRAY="xray-client.service"                  # 唯一实例：SOCKS+HTTP，Browser Dialer 常备
+XBD_U_XRAY="xray-client.service"
+XBD_U_SHARE="xbd-share.service"        # 配置分发服务 (xbd share new 开启)                  # 唯一实例：SOCKS+HTTP，Browser Dialer 常备
 XBD_U_CHROMIUM="chromium-browser-dialer.service" # Browser Dialer 的运行时依赖
 XBD_U_PANEL="browser-dialer-panel.service"
 XBD_U_HEALTH="browser-dialer-health.service"

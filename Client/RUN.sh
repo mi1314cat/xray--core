@@ -107,4 +107,55 @@ while [ $i -lt $# ]; do
 done
 
 echo
-exec "$PREFIX/bin/xbd" install ${FINAL_ARGS[@]+"${FINAL_ARGS[@]}"}
+"$PREFIX/bin/xbd" install ${FINAL_ARGS[@]+"${FINAL_ARGS[@]}"}
+rc=$?
+[ "$rc" -ne 0 ] && exit "$rc"
+
+
+# ================================================================
+# 入口分发 —— 与 sing-box-core / mihomo 的 install.sh 保持同一种交互
+#
+# 进去先选角色，而不是让人自己在这个脚本里猜现在是干什么的。同时支持命令行
+# 直传（bash RUN.sh client），免交互 —— 自动化和双端验证都靠它。
+# ================================================================
+do_client() {
+  case "${1:-}" in
+    menu) exec "$PREFIX/bin/xbd" menu ;;
+    "")   # 装完直接进菜单面板
+           printf '\n'
+           exec "$PREFIX/bin/xbd" menu ;;
+    *)    exec "$PREFIX/bin/xbd" "${@}" ;;
+  esac
+}
+
+do_server() {
+  # Xray 客户端这一侧暂时没有服务端。留这个分支是为了跟 SB/M 的结构对齐，
+  # 将来加服务端时不用再改入口。真要用却不存在，要说清楚而不是静默退出。
+  if [ -x "$PREFIX/bin/xbd-server" ]; then
+    exec "$PREFIX/bin/xbd-server" "${@}"
+  fi
+  printf '\n'
+  printf '  \033[33mXray 客户端这一版还没有服务端功能。\033[0m\n\n'
+  printf '  客户端功能（含 Web 面板、节点管理、配置分发）都在客户端这一侧。\n'
+  printf '  想管理服务端，请用 sing-box-core 或 mihomo 那边。\n\n'
+  exit 1
+}
+
+MODE="${1:-}"
+if [ -z "$MODE" ]; then
+  clear 2>/dev/null || true
+  printf '\033[32mXray Client 一键管理\033[0m\n'
+  printf -- '----------------------\n'
+  printf '\033[32m1.\033[0m 服务端 (暂未提供)\n'
+  printf '\033[32m2.\033[0m 客户端 (LAN SOCKS/HTTP + Web 面板 + 配置分发)\n'
+  printf '\033[32m0.\033[0m 退出\n'
+  printf -- '----------------------\n'
+  read -r -p '请输入选项 [0-2]: ' MODE || exit 0
+fi
+case "$MODE" in
+  1|server) shift; do_server "${@:-}" ;;
+  2|client) shift; do_client "${@:-}" ;;
+  0)        exit 0 ;;
+  *)        printf '无效选项 %s\n' "$MODE"; exit 1 ;;
+esac
+

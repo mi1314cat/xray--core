@@ -67,7 +67,7 @@ cmd_install() {
 
   step "安装 systemd 单元"
   local u
-  for u in "$XBD_U_XRAY" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
+  for u in "$XBD_U_XRAY" "$XBD_U_SHARE" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
     install -m 0644 "$XBD_SERVICE/$u" "/etc/systemd/system/$u"
   done
   systemctl daemon-reload
@@ -1527,7 +1527,7 @@ cmd_update() {
   fi
   chmod 0755 "$XBD_SCRIPTS"/*.sh "$XBD_LIB"/*.py "$XBD_DIST/lib"/*.py 2>/dev/null || true
   local u
-  for u in "$XBD_U_XRAY" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
+  for u in "$XBD_U_XRAY" "$XBD_U_SHARE" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
     install -m 0644 "$XBD_SERVICE/$u" "/etc/systemd/system/$u"
   done
   systemctl daemon-reload
@@ -1563,7 +1563,7 @@ cmd_uninstall() {
   fi
   step "将要删除的内容"
   local items=() u
-  for u in "$XBD_U_XRAY" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
+  for u in "$XBD_U_XRAY" "$XBD_U_SHARE" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
     [ -f "/etc/systemd/system/$u" ] && items+=("/etc/systemd/system/$u")
   done
   [ -d "$XBD_PREFIX" ] && items+=("$XBD_PREFIX/")
@@ -2204,9 +2204,363 @@ xbd_main() {
     export)     cmd_export "$@" ;;
     cert)       cmd_cert "$@" ;;
     selftest)   cmd_selftest "$@" ;;
+    share)      cmd_share "$@" ;;
+    menu)       cmd_menu "$@" ;;
     ""|-h|--help|help) xbd_usage ;;
     *) xbd_usage; die "未知命令: $cmd" ;;
   esac
+}
+
+# ================================================================
+# 客户端面板 — SSH 里的菜单
+#
+# 为什么要有这个：功能其实一直都在（27 个子命令），但全是参数式的。想看一眼
+# 现在用哪个节点，得先记得住 `xbd status`；想切节点，得记得 `xbd node use <编号>`。
+# 菜单的价值不是"多一种入口"，而是让人不用记命令 —— 站在服务器上打开就是
+# 眼前该做的几件事。
+#
+# 凡是面板里能做的，都转调已有的子命令，不另写一套逻辑。菜单和命令行
+# 因此永远一致，不会出现"菜单改了、命令行没改"这种分叉。
+# ================================================================
+_mmenu() {
+  local c
+  while :; do
+    clear 2>/dev/null || true
+    printf '\033[36mXray Client\033[0m\n'
+    printf -- '----------------------\n'
+    _mmenu_status
+    printf -- '----------------------\n'
+    printf "  \033[36m1)\033[0m 节点管理      添加/删除/切换/测速\n"
+    printf "  \033[36m2)\033[0m 服务控制      启动/停止/重启/状态\n"
+    printf "  \033[36m3)\033[0m 端口设置      HTTP/SOCKS 入口\n"
+    printf "  \033[36m4)\033[0m 配置分发      局域网设备用 URL 拉配置\n"
+    printf "  \033[36m5)\033[0m Web 面板      地址/令牌/开关\n"
+    printf "  \033[36m6)\033[0m 诊断          连接排查\n"
+    printf "  \033[36m0)\033[0m 退出\n"
+    printf -- '----------------------\n'
+    read -r -p "请输入选项 [0-6]: " c || return 0
+    case "$c" in
+      1) _mmenu_node ;;
+      2) _mmenu_service ;;
+      3) _mmenu_port ;;
+      4) _mmenu_share ;;
+      5) _mmenu_panel ;;
+      6) xbd diagnose ;;
+      0) return 0 ;;
+      *) printf '  无效选项 %s\n' "$c" ;;
+    esac
+    _mmenu_pause
+  done
+}
+
+_mmenu_pause() { printf '\n'; read -r -p "按回车返回主菜单..." _ || true; }
+
+# 顶部一行状态：不用进子菜单就知道现在是什么情况
+_mmenu_status() {
+  local st cur
+  st=$(systemctl is-active "$XBD_U_XRAY" 2>/dev/null || echo inactive)
+  cur=$(readlink "$XBD_NODES/current" 2>/dev/null | xargs -r basename | sed 's/^node-//; s/\.json$//')
+  local n; n=$(ls "$XBD_NODES"/node-*.json 2>/dev/null | wc -l)
+  if [ "$st" = "active" ]; then
+    printf '  状态: \033[32m运行中\033[0m    节点: %s 个    当前: %s\n' "$n" "${cur:-未选择}"
+  else
+    printf '  状态: \033[31m%s\033[0m    节点: %s 个    当前: %s\n' "$st" "$n" "${cur:-未选择}"
+  fi
+}
+
+_mmenu_node() {
+  local c
+  while :; do
+    printf '\n\033[36m节点管理\033[0m\n'; printf -- '----------------------\n'
+    printf "  \033[36m1)\033[0m 列出全部节点\n"
+    printf "  \033[36m2)\033[0m 添加节点 (链接/文件/配置)\n"
+    printf "  \033[36m3)\033[0m 导入订阅并命名成组\n"
+    printf "  \033[36m4)\033[0m 切换当前节点\n"
+    printf "  \033[36m5)\033[0m 测速 (全部)\n"
+    printf "  \033[36m6)\033[0m 删除节点\n"
+    printf "  \033[36m7)\033[0m 分组管理      新建/整组删除\n"
+    printf "  \033[36m0)\033[0m 返回\n"
+    printf -- '----------------------\n'
+    read -r -p "请输入选项 [0-7]: " c || return 0
+    case "$c" in
+      1) xbd node list ;;
+      2) xbd node add ;;
+      3) _mmenu_sub_add ;;
+      4) _mmenu_use ;;
+      5) xbd node latency ;;
+      6) _mmenu_del ;;
+      7) _mmenu_group ;;
+      0) return ;;
+      *) printf '  无效选项 %s\n' "$c" ;;
+    esac
+    _mmenu_pause
+  done
+}
+
+_mmenu_sub_add() {
+  local url name
+  printf '\n  订阅地址: '; read -r url || return 0
+  [ -n "$url" ] || { printf '  已取消\n'; return 0; }
+  printf '  组名 (留空则按域名自动命名): '; read -r name || name=""
+  # 组名必须往下传 —— 漏了的话面板上填的名字静默失效, 节点改按名字推断出别的组
+  xbd node sub "$url" "$name"
+}
+
+_mmenu_use() {
+  local c
+  printf '\n'
+  xbd node list
+  read -r -p "  切换到哪个节点 (编号/名称, 回车取消): " c || return 0
+  [ -n "$c" ] || { printf '  已取消\n'; return 0; }
+  xbd node use "$c"
+}
+
+_mmenu_del() {
+  local c
+  printf '\n'
+  xbd node list
+  read -r -p "  删除哪个节点 (编号/名称, 回车取消): " c || return 0
+  [ -n "$c" ] || { printf '  已取消\n'; return 0; }
+  printf '  确认删除 %s ? [y/N] ' "$c"; read -r a || return 0
+  [ "$a" = "y" ] || [ "$a" = "Y" ] || { printf '  已取消\n'; return 0; }
+  xbd node remove "$c"
+}
+
+_mmenu_group() {
+  local c
+  while :; do
+    printf '\n\033[36m分组管理\033[0m\n'; printf -- '----------------------\n'
+    python3 "$XBD_LIBDIR/subs.py" list "$XBD_PREFIX" 2>/dev/null | sed 's/^/  /' || printf '  (暂无分组)\n'
+    printf -- '----------------------\n'
+    printf "  \033[36m1)\033[0m 新建分组\n"
+    printf "  \033[36m2)\033[0m 整组删除 (连节点一起删)\n"
+    printf "  \033[36m0)\033[0m 返回\n"
+    printf -- '----------------------\n'
+    read -r -p "请输入选项 [0-2]: " c || return 0
+    case "$c" in
+      1)
+        local n
+        read -r -p "  新分组名称: " n || return 0
+        [ -n "$n" ] || { printf '  已取消\n'; continue; }
+        python3 "$XBD_LIBDIR/subs.py" add "$XBD_PREFIX" "local:1" "$n" >/dev/null 2>&1 \
+          && ok "已创建分组「$n」" || err "创建失败"
+        ;;
+      2)
+        local g
+        read -r -p "  删除哪个分组 (名称, 回车取消): " g || return 0
+        [ -n "$g" ] || continue
+        printf '  确认删除分组「%s」及其全部节点 ? [y/N] ' "$g"; read -r a || return 0
+        [ "$a" = "y" ] || [ "$a" = "Y" ] || { printf '  已取消\n'; continue; }
+        python3 - "$XBD_PREFIX" "$g" <<'PY'
+import sys
+sys.path.insert(0, __import__("os").environ.get("XBD_LIBDIR","/opt/xray-browser-dialer/lib"))
+import subs as S
+pre = sys.argv[1]; name = sys.argv[2]
+reg = S.load(pre)
+gid = next((s["id"] for s in reg["subs"] if s.get("name") == name), None)
+if not gid:
+    print("  找不到分组: %s" % name); sys.exit(1)
+S.drop(pre, gid)
+print("  已删除分组「%s」及其节点" % name)
+PY
+        ;;
+      0) return ;;
+      *) printf '  无效选项 %s\n' "$c" ;;
+    esac
+    _mmenu_pause
+  done
+}
+
+_mmenu_service() {
+  local c
+  while :; do
+    printf '\n\033[36m服务控制\033[0m\n'; printf -- '----------------------\n'
+    printf '  当前: %s\n' "$(systemctl is-active "$XBD_U_XRAY" 2>/dev/null)"
+    printf -- '----------------------\n'
+    printf "  \033[36m1)\033[0m 启动\n"
+    printf "  \033[36m2)\033[0m 停止\n"
+    printf "  \033[36m3)\033[0m 重启\n"
+    printf "  \033[36m4)\033[0m 应用配置并重启\n"
+    printf "  \033[36m0)\033[0m 返回\n"
+    printf -- '----------------------\n'
+    read -r -p "请输入选项 [0-4]: " c || return 0
+    case "$c" in
+      1) xbd start ;; 2) xbd stop ;; 3) xbd restart ;; 4) xbd apply ;; 0) return ;;
+      *) printf '  无效选项 %s\n' "$c" ;;
+    esac
+    _mmenu_pause
+  done
+}
+
+_mmenu_port() {
+  printf '\n'; xbd ports 2>/dev/null || xbd status
+  printf '\n'; read -r -p "  改端口执行 xbd port <类型> <值>, 回车返回..." _ || true
+}
+
+_mmenu_share() {
+  local c
+  while :; do
+    printf '\n\033[36m配置分发\033[0m\n'; printf -- '----------------------\n'
+    printf '  让局域网其他设备用一个 URL 拉走全部节点。\n'
+    printf -- '----------------------\n'
+    printf "  \033[36m1)\033[0m 开启 (生成链接)\n"
+    printf "  \033[36m2)\033[0m 列出所有链接\n"
+    printf "  \033[36m3)\033[0m 停用某条\n"
+    printf "  \033[36m0)\033[0m 返回\n"
+    printf -- '----------------------\n'
+    read -r -p "请输入选项 [0-3]: " c || return 0
+    case "$c" in
+      1) xbd share new ;;
+      2) xbd share list ;;
+      3)
+        local t
+        xbd share list
+        read -r -p "  停用哪条 (token): " t || return 0
+        [ -n "$t" ] || continue
+        xbd share off "$t"
+        ;;
+      0) return ;;
+      *) printf '  无效选项 %s\n' "$c" ;;
+    esac
+    _mmenu_pause
+  done
+}
+
+_mmenu_panel() {
+  printf '\n'; xbd panel 2>/dev/null || printf '  xbd panel 查看面板地址\n'
+  printf '\n'; read -r -p "  回车返回..." _ || true
+}
+
+_share_lan_ip() {
+  # 复用 ports.detect_lan —— 它对 `ip route get` 的解析是对的。
+  #
+  # 自己用 awk 写过一版是错的: 输出形如
+  #     1.1.1.1 via 107.173.154.1 dev eth0 src 107.173.154.178
+  # 里 src 后面才是本机地址, 而 `/src/ {print $NF}` 取到的是下一行 cache 的
+  # 最后一个字段 —— 实测得到 "0", 于是分享链接变成 http://0:18190,
+  # 拿到链接的人完全不知道该填什么地址。
+  python3 -c "
+import sys; sys.path.insert(0, '$XBD_LIBDIR')
+import ports
+print(ports.detect_lan())" 2>/dev/null || printf '127.0.0.1'
+}
+
+share_new() {
+  need_root
+  local host port tok
+  host=$(_share_lan_ip)
+  # 端口冲突时自动往后找一个，而不是硬编码一个 —— CC 上 10808/10809 已被占用
+  # 端口必须现找一个。CC 上 10808/10809 已被 Xray 占着，硬编码一个固定端口
+  # 会跟别的服务撞车 —— 而且撞了之后症状是"分享链接打不开"，很难联想到端口。
+  port=$(python3 -c "
+import sys; sys.path.insert(0, '$XBD_LIBDIR')
+import ports
+for p in range(18190, 18290):
+    if not ports.in_use(p): print(p); break
+else:
+    print(''); sys.exit(1)") || die "18190-18290 没有可用端口"
+  mkdir -p "$XBD_CONF" "$XBD_RUNTIME/share"
+  cat > "$XBD_CONF/share.env" <<EOF
+# 配置分发服务。局域网设备用这个 URL 拉本客户端的完整节点配置。
+SHARE_HOST=$host
+SHARE_PORT=$port
+SHARE_HEALTH_UNIT=$XBD_U_XRAY
+EOF
+  tok=$(python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join('$XBD_PREFIX','lib'))
+import share_server as S
+t = S.Store.new_token()
+S.Store.save(t, {'enabled': True, 'created_at': int(__import__('time').time()),
+                 'max_uses': 0, 'used_count': 0})
+print(t)")
+  ok "已开启配置分发"
+  info "  链接: http://$host:$port/share/$tok"
+  info "  在手机/笔记本的客户端里填这个地址就能拉走全部节点。"
+  info "  停用: xbd share off ${tok:0:8}..."
+  systemctl enable --now "$XBD_U_SHARE" >/dev/null 2>&1 \
+    || systemctl restart "$XBD_U_SHARE" >/dev/null 2>&1 || true
+}
+
+share_list() {
+  python3 - "$XBD_RUNTIME/share" <<'PY'
+import json, os, sys, time
+d = sys.argv[1]
+rows = []
+try:
+    for n in sorted(os.listdir(d)):
+        if not n.endswith(".json"): continue
+        try: m = json.load(open(os.path.join(d, n), encoding="utf-8"))
+        except Exception: continue
+        m["_t"] = n[:-5]; rows.append(m)
+except OSError:
+    pass
+if not rows:
+    print("  还没有分享链接。执行 xbd share new 开启。")
+    sys.exit(0)
+host, port = "", ""
+for line in open("/opt/xray-browser-dialer/config/share.env", encoding="utf-8"):
+    if line.startswith("SHARE_HOST="): host = line.split("=",1)[1].strip()
+    if line.startswith("SHARE_PORT="): port = line.split("=",1)[1].strip()
+for m in rows:
+    st = "启用" if m.get("enabled") else "已停用"
+    mx = m.get("max_uses", 0)
+    print("  %s...  %-6s  已用 %d 次%s" % (
+        m["_t"][:12], st, m.get("used_count", 0),
+        (" / 上限 %d" % mx) if mx else ""))
+    print("      http://%s:%s/share/%s" % (host, port, m["_t"]))
+PY
+}
+
+share_url() {
+  local t="${1:-}"
+  [ -n "$t" ] || die "用法: xbd share url <token>"
+  python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join('$XBD_PREFIX','lib'))
+import share_server as S
+m = S.Store.load('$t')
+print('  链接不存在: $t' if m is None else '')" 2>/dev/null
+  grep -E '^SHARE_(HOST|PORT)=' "$XBD_CONF/share.env" 2>/dev/null | cut -d= -f2 | tr '\n' ':' | \
+    sed "s|^|  http://|;s|:$||;s|\$|/$t|"
+}
+
+share_off() {
+  local t="${1:-}"
+  [ -n "$t" ] || die "用法: xbd share off <token>   (xbd share list 看 token)"
+  python3 - "$XBD_RUNTIME/share" "$t" <<'PY'
+import json, os, sys
+d, t = sys.argv[1], sys.argv[2]
+p = os.path.join(d, t + ".json")
+if not os.path.isfile(p):
+    print("  找不到该分享链接"); sys.exit(1)
+m = json.load(open(p, encoding="utf-8"))
+m["enabled"] = False
+json.dump(m, open(p, "w", encoding="utf-8"), ensure_ascii=False)
+print("  已停用: %s" % t)
+PY
+  info "  链接立即失效。节点和代理不受影响。"
+}
+
+cmd_share() {
+  local op="${1:-list}"
+  case "$op" in
+    on|new)    share_new ;;
+    list|status) share_list ;;
+    off|rm)   share_off "${2:-}" ;;
+    url)      share_url "${2:-}" ;;
+    -h|--help|help)
+      info "用法: xbd share <list|new|url|off> [token]"
+      info "  new          开启分享, 生成一条带 token 的链接"
+      info "  list         列出所有分享链接和已用次数"
+      info "  url <token>  打印某条的完整 URL"
+      info "  off <token>  停用 (链接立即失效, 节点配置不受影响)" ;;
+    *) die "未知操作: $op (xbd share help 看用法)" ;;
+  esac
+}
+
+cmd_menu() {
+  _mmenu
 }
 
 cmd_selftest() {

@@ -1,0 +1,29 @@
+[Unit]
+Description=Xray Client 配置分发服务（局域网设备用 URL 拉配置）
+After=network.target xray-client.service
+Wants=xray-client.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/opt/xray-browser-dialer/config/share.env
+WorkingDirectory=/opt/xray-browser-dialer
+ExecStart=/usr/bin/python3 /opt/xray-browser-dialer/lib/share_server.py
+Restart=on-failure
+RestartSec=3
+
+# 同样的加固思路：不绑 0.0.0.0、不给自己多余权限。
+# 这服务要把节点凭据发出去，所以只允许写自己的状态目录（用到次数的扣减）。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/opt/xray-browser-dialer/runtime /opt/xray-browser-dialer/config
+
+[Install]
+WantedBy=multi-user.target
