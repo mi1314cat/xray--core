@@ -150,6 +150,132 @@ if os.path.exists(src):
     info "别忘了重启服务让配置生效"
 }
 
+# ---------------------------------------------------------------- nginx 站点清理
+# 拿 nginx_apply.py (本地优先, 否则取仓库那份)。
+_ng_apply_py() {
+    local f="$LIB_DIR/nginx_apply.py"
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+    local t; t=$(mktemp -t nginx_apply.XXXXXX.py) || return 1
+    curl -fsSL --max-time 20 \
+        "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/nginx_apply.py" \
+        -o "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+    printf '%s' "$t"
+}
+
+# 删节点时，把当初为它插入的 nginx 片段一并摘掉。
+#
+# ★ 不做这件事的后果是**延迟暴露、且看起来像别的问题**：
+#   站点配置里留着一条指向已删端口的 location，回源时 nginx 连不上后端 ——
+#   表现是 Cloudflare 502，而且要等到**真的有人访问那条路径**才暴露。
+#   更麻烦的是现场没有任何线索指向"这个节点已经删了"。
+#   (sing-box-core 那边踩过同一个坑，它的 sb_cdn_cleanup_stale 就是为此而写。)
+#
+# 只在 tier == nginx 时做 —— CDN 直连档没有插入过 nginx，摘了反而误伤。
+cleanup_nginx_for() { # <tag>
+    local tag="$1"
+    local tier domain port transport path
+    tier=$(SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
+import os, sys
+sys.path.insert(0, os.environ['LIB'])
+import share_meta
+m = share_meta.load(os.environ['SHARE_DIR'], os.environ['TAG']) or {}
+print(m.get('tier', ''))
+" 2>/dev/null)
+    [[ "$tier" == "nginx" ]] || return 0
+
+    domain=$(SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
+import os, sys
+sys.path.insert(0, os.environ['LIB'])
+import share_meta
+m = share_meta.load(os.environ['SHARE_DIR'], os.environ['TAG']) or {}
+print(m.get('host', ''))
+" 2>/dev/null)
+    [[ -n "$domain" ]] || { warn "该节点是 nginx 档但没记域名, 无法自动摘除 nginx 片段"; return 0; }
+
+    # 端口与传输从片段里取 (删除前调用)
+    local f; f=$(node_file "$tag")
+    port=$(py -c 'import json,sys
+try:
+    j=json.load(open(sys.argv[1]))
+    ss=j["inbounds"][0].get("streamSettings") or {}
+    print(j["inbounds"][0].get("port",""))
+except Exception: print("")' "$f" 2>/dev/null)
+    transport=$(py -c 'import json,sys
+try:
+    j=json.load(open(sys.argv[1]))
+    ss=j["inbounds"][0].get("streamSettings") or {}
+    n=ss.get("network") or "tcp"
+    print({"ws":"ws","grpc":"grpc","h2":"h2","httpupgrade":"httpupgrade","xhttp":"xhttp"}.get(n,"tcp"))
+except Exception: print("tcp")' "$f" 2>/dev/null)
+    [[ -n "$port" ]] || { warn "读不到节点端口, 跳过 nginx 清理"; return 0; }
+
+    local pyf; pyf=$(_ng_apply_py) || { warn "拿不到 nginx_apply.py, 请手工摘除 $domain 的片段"; return 0; }
+    info "摘除 nginx 片段: $domain (port=$port transport=$transport)"
+    if py "$pyf" --domain "$domain" --port "$port" --transport "$transport" --remove; then
+        ok "nginx 片段已摘除 (不再有指向已删端口的 location)"
+    else
+        warn "nginx 片段摘除失败 —— 站点里可能残留指向 $port 的 location (会表现为 CDN 回源 502)"
+    fi
+}
+
+# ---------------------------------------------------------------- nginx 孤儿检查
+# 站点里还留着 xray-core 标记、但对应节点已经不在了 —— 那就是孤儿。
+#
+# 为什么需要它: cleanup_nginx_for 是**这次才加上的**, 在此之前所有删掉的
+# nginx 档节点都留下了残留 location。症状是 Cloudflare 回源 502, 而且要等到
+# 真有人访问那条路径才暴露, 现场也没有任何线索指向"某次删节点"。
+#
+# 只报告不自动删: 站点文件是用户自己的东西, 自动改动的风险大于收益。
+# 报告里直接给出可复制的摘除命令。
+check_orphan_nginx() {
+    local dirs=() d
+    for d in /etc/nginx/conf.d /etc/nginx/sites-enabled /usr/local/nginx/conf/conf.d; do
+        [[ -d "$d" ]] && dirs+=("$d")
+    done
+    ((${#dirs[@]})) || { info "本机没有常见的 nginx 配置目录, 跳过"; return 0; }
+
+    # 站点里被 xray-core 标记过的域名
+    local marked
+    marked=$(grep -rhoE '>>> xray-core BEGIN [^ >]+' "${dirs[@]}" 2>/dev/null |
+             awk '{print $4}' | sort -u)
+    if [[ -z "$marked" ]]; then
+        ok "没有发现 xray-core 插入的 nginx 片段"
+        return 0
+    fi
+
+    # 当前还活着的节点域名 (tier=nginx 的那些)
+    local live
+    live=$(SHARE_DIR="$SHARE_DIR" LIB="$LIB_DIR" py -c "
+import glob, json, os, sys
+sys.path.insert(0, os.environ['LIB'])
+import share_meta
+d = os.environ['SHARE_DIR']
+for f in glob.glob(os.path.join(d, '*.json')):
+    try: m = json.load(open(f, encoding='utf-8'))
+    except Exception: continue
+    if m.get('tier') == 'nginx' and m.get('host'):
+        print(m['host'])
+" 2>/dev/null | sort -u)
+
+    local orphan=0 dom
+    while IFS= read -r dom; do
+        [[ -n "$dom" ]] || continue
+        if ! grep -qxF "$dom" <<< "$live"; then
+            orphan=$((orphan + 1))
+            [[ $orphan -eq 1 ]] && warn "以下站点的片段已无对应节点 (CDN 回源会 502):"
+            printf '    %s\n' "$dom" >&2
+            printf '      摘除: 菜单 18) Nginx 站点管理 -> 移除, 或手工删掉标记段\n' >&2
+        fi
+    done <<< "$marked"
+
+    if (( orphan == 0 )); then
+        ok "nginx 片段与节点一一对应, 没有孤儿"
+    else
+        warn "共 $orphan 个孤儿片段 (只报告, 未自动改动 — 站点文件是你自己的)"
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- 删除
 # 返回 0 = 节点已删除且服务已重载; 1 = 用户取消; 2 = 失败已回滚
 node_delete() {
@@ -168,6 +294,11 @@ node_delete() {
     printf "  确认删除? 输入节点名确认: " >&2
     read -r conf || true
     [[ "$conf" == "$tag" ]] || { info "已取消"; return 1; }
+
+    # --- 第 0 步: 摘除为它插入的 nginx 片段 ---
+    # 必须放在移走片段**之前**: 端口与传输是从片段里读出来的, 片段没了就读不到。
+    # 失败不阻断删除 (节点本身还是要删掉), 但会明确告警。
+    cleanup_nginx_for "$tag" || true
 
     # --- 第 1 步: 移走片段 (留备份以便回滚) ---
     local bak="${f}.del-bak"
@@ -278,7 +409,7 @@ node_menu() {
     while :; do
         printf "\n${_CYN}===== 节点管理 =====${_RST}\n" >&2
         node_list >&2
-        printf "\n  1) 查看节点详情\n  2) 改名\n  3) 删除\n  0) 返回\n" >&2
+        printf "\n  1) 查看节点详情\n  2) 改名\n  3) 删除\n  4) 检查 nginx 孤儿片段 (残留的已删节点 location)\n  0) 返回\n" >&2
         printf "  选择: " >&2
         read -r c || return 0
         case "$c" in
@@ -295,6 +426,7 @@ node_menu() {
                 printf "  节点名: " >&2; read -r t || true
                 [[ -n "$t" ]] && node_delete "$t"
                 ;;
+            4) check_orphan_nginx ;;
             0|"") return 0 ;;
             *) warn "无效选择" ;;
         esac
@@ -307,7 +439,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         show)   node_show "${2:?用法: node.sh show <tag>}" ;;
         rename) node_rename "${2:?}" "${3:?}" ;;
         delete) node_delete "${2:?}" ;;
+        orphans) check_orphan_nginx ;;
         menu)   node_menu ;;
-        *) echo "用法: node.sh [menu|list|show <tag>|rename <tag> <新名>|delete <tag>]" >&2; exit 1 ;;
+        *) echo "用法: node.sh [menu|list|show <tag>|rename <tag> <新名>|delete <tag>|orphans]" >&2; exit 1 ;;
     esac
 fi

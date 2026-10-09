@@ -372,6 +372,42 @@ assert_eq "$got" "默认值" "safe_read 回车取默认值"
 # 守的是"节点在客户端列表和分享链接里认得出、筛得准"。
 # 踩过的现场: 同一台机器上并存 VLESS-WS_01 / vless-xhttp01 / hysteria-01 ——
 # 大小写混用、`_` 与 `-` 混用、编号位数不一, 按前缀筛节点写不准。
+# ---------------------------------------------------------------- nginx 片段生命周期
+# 守的是"删了节点却把 nginx 片段留下"。症状是 Cloudflare 回源 502, 而且要等到
+# **真有人访问那条路径**才暴露 —— 现场还没有任何线索指向"某次删节点"。
+# (sing-box-core 那边踩过同一个坑, 它的 sb_cdn_cleanup_stale 就是为此而写。)
+group "nginx 片段生命周期 (node.sh)"
+NG_T="$TMP/ngorph"; mkdir -p "$NG_T/conf.d"
+# 造一个"已无对应节点"的孤儿片段
+cat > "$NG_T/conf.d/orphan.conf" <<'NGE'
+server {
+    server_name orphan.example.com;
+    # >>> xray-core BEGIN orphan.example.com >>>
+    location /p { proxy_pass http://127.0.0.1:19999; }
+    # <<< xray-core END orphan.example.com <<<
+}
+NGE
+NO=$(SHARE_DIR="$TMP/ngshare" XRAY_BASE="$NG_T" bash -c "
+  LIB_DIR='$ROOT/conf/lib'
+  mkdir -p \"$TMP/ngshare\"
+  # 只取函数体, 换掉扫描目录
+  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh' | sed 's|/etc/nginx/conf.d /etc/nginx/sites-enabled /usr/local/nginx/conf/conf.d|$NG_T/conf.d|')
+  py() { python3 \"\$@\"; }
+  info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
+  check_orphan_nginx" 2>&1)
+echo "$NO" | grep -q 'orphan.example.com' && ok "查出孤儿片段 (会报出域名)" || bad "没查出孤儿片段"
+echo "$NO" | grep -q '502' && ok "告警里说明了后果 (CDN 回源 502)" || bad "告警没说清后果"
+echo "$NO" | grep -q '没有发现' && bad "明明有孤儿却报'没有发现'" || ok "没有误报"
+# 空目录 -> 必须报"没有发现", 不能凭空造出孤儿
+mkdir -p "$NG_T/empty"
+NE=$(XRAY_BASE="$NG_T" bash -c "
+  LIB_DIR='$ROOT/conf/lib'
+  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh' | sed 's|/etc/nginx/conf.d /etc/nginx/sites-enabled /usr/local/nginx/conf/conf.d|$NG_T/empty|')
+  py() { python3 \"\$@\"; }
+  info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
+  check_orphan_nginx" 2>&1)
+echo "$NE" | grep -q '没有发现' && ok "无片段时如实报告 (不凭空造孤儿)" || bad "无片段时报告不正确"
+
 group "节点命名 (naming.sh)"
 # 协议名规范化: 各处的写法收敛成一种
 for pair in "vless:vless" "VLESS:vless" "SS:ss" "shadowsocks:ss" \
