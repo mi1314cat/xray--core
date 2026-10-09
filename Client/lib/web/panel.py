@@ -994,7 +994,43 @@ display:none;font-size:13px;white-space:pre-wrap}
 .modes button span{font-size:11px;color:var(--dim);font-weight:400}
 .modes button.sel{background:var(--acc);border-color:var(--acc)}
 .modes button.sel span{color:rgba(255,255,255,.85)}
+/* ---- 防溢出: 全局兜底 ----
+   之前只有 620px 一个断点, 而 table 视图七列并排, 每列 min-width 加起来
+   远超窄屏宽度; 节点名又是 inline 元素, 不换行也不截断。结果就是文字直接
+   顶出容器边界 —— 用户报的"字出框"。
+
+   三层兜底, 缺一层都会在某种内容下复现:
+     1) min-width:0  —— grid/flex 子项默认 min-width:auto, 内容多宽就多宽,
+        永远不肯收缩。必须显式归零, overflow 才能生效。
+     2) overflow-wrap —— 允许在任意字符间断行, 长域名/长路径不会顶出一行。
+     3) .nowrap       —— 只给数字列/按钮区这类"断行反而难看"的元素, 而不是
+        像原来那样整张表到处 nowrap。
+   断点从 1 个加到 4 个, 因为节点表在 640-900px 之间就已经开始难看了。 */
+.nowrap{white-space:nowrap}
+.wrap, .card{min-width:0}
+.grid>*{min-width:0}
+.grow{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+td, th{overflow-wrap:anywhere}
+table{table-layout:auto;max-width:100%}
+.listwrap, .gridwrap{min-width:0;max-width:100%}
+
+@media(max-width:900px){
+  .subs-rail{width:auto;flex:0 0 auto;border-right:none;
+    border-bottom:1px solid var(--line)}
+  .nodes-body{flex-direction:column}
+}
+@media(max-width:760px){
+  .wrap{padding:14px 12px 48px}
+  .card{padding:13px}
+  header{gap:8px}
+  h1{font-size:17px}
+}
 @media(max-width:620px){.modes{grid-template-columns:1fr}}
+@media(max-width:520px){
+  .row{flex-wrap:wrap;gap:2px}
+  .k{white-space:normal}
+  button{padding:6px 10px;font-size:12px}
+}
 </style></head><body><div class="wrap">
 
 <header>
@@ -1550,7 +1586,11 @@ function setDns(mode){
 
    状态存在 VIEW 里而不是散在 DOM 上：轮询会整块重画节点区，靠 DOM 属性保存
    勾选/展开状态每次都会被冲掉。 */
-const VIEW = { density: 'table', open: {}, sel: new Set() };
+// 默认 list 而不是 table。
+// table 把「节点 / 能力标签 / Xray / Browser Dialer / 延时 / 流量 / 操作」
+// 七列并排, 节点名稍长就撑破容器, 而且每列都窄得看不清。
+// list 一行一个节点, 信息竖排, 手机和窄窗口都不用横向滚动。
+const VIEW = { density: 'list', open: {}, sel: new Set() };
 
 function nodeGroups(){
   // 后端已经算好分组；拿不到时退回"全部塞进一个组"，保证列表还能显示
@@ -1691,9 +1731,9 @@ function renderBody(ns, sk){
       <td>${(c.tags||[]).map(tagHtml).join('')}</td>
       <td>${vtag((c.xray||{}).overall,'xray')}</td>
       <td>${vtag((c.dialer||{}).overall,'dialer')}</td>
-      <td class="mono" id="lat-${ESC(n.file)}" style="white-space:nowrap">${latText(n.file)}</td>
+      <td class="mono nowrap" id="lat-${ESC(n.file)}">${latText(n.file)}</td>
       <td class="mono tr">${trafficText(n.file)}</td>
-      <td style="text-align:right;white-space:nowrap">
+      <td class="nowrap" style="text-align:right">
         ${useButtons(n)}
         <button class="sm" onclick="testLatency('${ESC(n.file)}', this)">测速</button>
         <button class="sm" onclick="checkNode('${ESC(n.file)}', this)">检查</button>
