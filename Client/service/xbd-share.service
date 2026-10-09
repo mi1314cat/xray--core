@@ -11,6 +11,14 @@ ExecStart=/usr/bin/python3 /opt/xray-browser-dialer/lib/share_server.py
 Restart=on-failure
 RestartSec=3
 
+# 端口复用前必须确认旧进程真的退了。
+#
+# 反复执行 `xbd share new` 时, 端口是每次现找的; 如果上一次那个实例还占着
+# 旧端口, systemd 拉起新实例后会同时有两个进程, 结果是"链接打不开"。
+# 实测踩到过: share.env 写了新端口, 服务却还在监听旧端口。
+KillMode=mixed
+TimeoutStopSec=5
+
 # 同样的加固思路：不绑 0.0.0.0、不给自己多余权限。
 # 这服务要把节点凭据发出去，所以只允许写自己的状态目录（用到次数的扣减）。
 NoNewPrivileges=yes

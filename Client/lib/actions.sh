@@ -2484,6 +2484,13 @@ print(t)")
   # share_server (mihomo / amneziawg 那边也有), 抢同一个端口是常事。抢不到时
   # 服务起不来, 而用户拿着一个打不开的链接, 根本无从判断是端口撞了还是自己填错。
   # 要么验证通过, 要么明说, 不留一个"看起来配好了"的假象。
+  # 换端口前先彻底停掉旧实例。systemctl restart 会等旧进程退出, 但如果旧进程
+  # 是脱离 unit 直接起的 (手工跑过、或上一版留下的), 它不会跟着停, 于是两个
+  # 进程各占一个端口, share.env 写的是新的、用户却连到旧的 —— 或者反过来。
+  # 端口复用前把残留清掉, 比事后猜是谁占了端口省事得多。
+  systemctl stop "$XBD_U_SHARE" >/dev/null 2>&1 || true
+  pkill -f "$XBD_LIBDIR/share_server.py" >/dev/null 2>&1 || true
+  sleep 1
   systemctl enable --now "$XBD_U_SHARE" >/dev/null 2>&1 \
     || systemctl restart "$XBD_U_SHARE" >/dev/null 2>&1 || true
   sleep 1
