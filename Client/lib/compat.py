@@ -96,6 +96,28 @@ def canon_transport(name: str) -> str:
 # Browser Dialer 只实现了这两种
 DIALER_TRANSPORTS = {"xhttp", "websocket"}
 
+# XHTTP 下 Browser Dialer **只实现了 packet-up**。
+#
+# ★ 这一条官方文档完全没写, 是从源码挖出来的:
+#     splithttp/browser_client.go:24-27 —— 非 nil body 直接返回
+#     "bidirectional streaming for browser dialer not implemented yet";
+#     而 stream-up (dialer.go:442-446) 与 stream-one (:423-428) 都传非 nil reader。
+#
+#   packet-up 与 auto 可以用:
+#     · packet-up 本来就是它
+#     · auto 在 TLS 下已于 commit 0995fa41 (→v1.250516.0) 改为 packet-up,
+#       所以 "auto + BD" 开箱可用
+#   显式写 stream-up / stream-one 的节点走 BD 会**失败**。
+BD_XHTTP_BAD_MODES = {"stream-up", "stream-one", "streamup", "streamone"}
+
+
+def bd_xhttp_mode_ok(node: dict) -> bool:
+    """XHTTP 节点的 mode 是否与 Browser Dialer 兼容（非 xhttp 一律 True）。"""
+    if canon_transport(node.get("transport") or "") != "xhttp":
+        return True
+    mode = (node.get("mode") or "").strip().lower().replace("_", "-")
+    return mode not in BD_XHTTP_BAD_MODES
+
 # 这些 vless 加密方案不影响浏览器拨号：浏览器只负责 TLS/HTTP 传输，
 # 加密协商仍然在 Xray 内完成。比较时只看算法名（点号前一段），且忽略大小写 ——
 # key 部分大小写敏感不能动，算法名不敏感。
@@ -289,6 +311,17 @@ def check_dialer(node: dict) -> dict:
                      "浏览器 JS 无法完成 REALITY 握手。该节点可用普通 Xray 模式。")
         return _pack(checks, notes)
 
+    # XHTTP 的 mode 限制 —— 官方文档没写, 依据在 bd_xhttp_mode_ok 的注释里
+    if transport == "xhttp" and not bd_xhttp_mode_ok(node):
+        add("XHTTP mode", NO, node.get("mode") or "")
+        notes.append("Browser Dialer 的 XHTTP 只实现了 packet-up："
+                     "stream-up / stream-one 会返回 "
+                     "\"bidirectional streaming for browser dialer not implemented yet\"。"
+                     "该节点仍可用普通 Xray 模式；要用浏览器请把 mode 改成 packet-up 或 auto。")
+        return _pack(checks, notes)
+    elif transport == "xhttp":
+        add("XHTTP mode", OK, (node.get("mode") or "auto") + "（回落到 packet-up）")
+
     if security == "tls":
         port = int(node.get("port") or 0)
         add("TLS", OK if port == 443 else WARN, f"TLS :{port}")
@@ -425,6 +458,12 @@ def want_browser_dialer(node: dict) -> bool:
     transport = canon_transport(node.get("transport") or "")
     security = (node.get("security") or "none").lower()
     if proto != "vless" or transport not in DIALER_TRANSPORTS or security == "reality":
+        return False
+    # XHTTP 只支持 packet-up (见 bd_xhttp_mode_ok 的源码依据)。
+    # ★ 必须与 check_dialer 判得一模一样 —— 这两处不一致的后果不是标签错,
+    #   是节点**永久挂住**: 进程带着 XRAY_BROWSER_DIALER, xhttp 出站就交给
+    #   浏览器, 而 dialTask() 阻塞在 <-conns 上没有超时。
+    if not bd_xhttp_mode_ok(node):
         return False
     probe = node.get("browser_probe") or {}
     if probe.get("ok") is False:

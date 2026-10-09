@@ -1014,6 +1014,22 @@ assert_eq "$TR" "tcp" "第一个预置提取正确"
 # 末尾空字段场景 —— read 会少给一个字段, cut 不会
 OUT=$(bash -c "source '$LIB/preset.sh'; echo \"a|b||\" | cut -d'|' -f3" 2>/dev/null)
 assert_eq "$OUT" "" "cut 对末尾空字段返回空串 (read 会少给一个字段)"
+# REALITY 的传输白名单必须与官方源码一致
+#   源码 infra/conf/transport_internet.go:107 的报错原文:
+#       "REALITY only supports RAW, XHTTP and gRPC for now."
+#   原来这里的实现是 `[[ "$tr" == "tcp" ]]` —— **挡掉了 xhttp 与 grpc 两个
+#   合法组合**, 用户想建 "官方主推传输 + 最强安全层" 会被无理由拒绝。
+for pair in "raw:Y" "tcp:Y" "xhttp:Y" "grpc:Y" "ws:N" "httpupgrade:N" "mkcp:N"; do
+    t="${pair%%:*}"; want="${pair##*:}"
+    got=$(bash -c "source '$LIB/preset.sh'; _preset_security_allows reality $t && echo Y || echo N")
+    assert_eq "$got" "$want" "REALITY 传输白名单 $t"
+done
+# 反向: 非 REALITY 一律不拦 (白名单只管 reality, 别把 tls/none 也拦掉)
+for t in raw xhttp ws httpupgrade grpc; do
+    got=$(bash -c "source '$LIB/preset.sh'; _preset_security_allows tls $t && echo Y || echo N")
+    assert_eq "$got" "Y" "tls 不被 REALITY 白名单误拦 ($t)"
+done
+
 # 预置表里的 REALITY 组合必须与 node_build.py 的限制一致
 NBREAL=$(python3 -c "import sys;sys.path.insert(0,'$LIB');import node_build as B;print('|'.join(sorted(B.SECURITY_TRANSPORTS['reality'])))")
 PBAD=0

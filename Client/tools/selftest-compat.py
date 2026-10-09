@@ -114,6 +114,29 @@ check("h2 不支持", bd(node(transport="h2")), False)
 check("httpupgrade 不支持", bd(node(transport="httpupgrade")), False)
 check("mkcp 不支持", bd(node(transport="mkcp")), False)
 
+# --- 2b. XHTTP 的 mode 限制（官方文档没写，源码依据）-------------------------
+# splithttp/browser_client.go:24-27 —— 非 nil body 直接返回
+# "bidirectional streaming for browser dialer not implemented yet"，
+# 而 stream-up（dialer.go:442-446）与 stream-one（:423-428）都传非 nil reader。
+# packet-up 本来就是它；auto 在 TLS 下已于 commit 0995fa41 改为 packet-up。
+# 显式写 stream-* 的节点走浏览器会失败 —— 而 dialTask() 没有超时，会永久挂住。
+print("\n[2b] XHTTP mode 限制（Browser Dialer 只实现 packet-up）")
+check("xhttp 不写 mode（等同 auto）→ 可用", bd(node(mode="")), True)
+check("xhttp auto → 可用", bd(node(mode="auto")), True)
+check("xhttp packet-up → 可用", bd(node(mode="packet-up")), True)
+check("xhttp stream-up → 不可用", bd(node(mode="stream-up")), False)
+check("xhttp stream-one → 不可用", bd(node(mode="stream-one")), False)
+check("xhttp STREAM_UP（大小写/下划线变体）→ 不可用", bd(node(mode="STREAM_UP")), False)
+check("xhttp stream_up（下划线写法）→ 不可用", bd(node(mode="stream_up")), False)
+check("websocket 不受 mode 限制", bd(node(transport="websocket", mode="stream-up")), True)
+check("want_browser_dialer 也拦住 stream-up（否则会挂住）",
+      c.want_browser_dialer(node(mode="stream-up")), False)
+# 不变式：两处判定必须一致。不一致的后果不是标签错，是节点永久挂住
+for _m in ("", "auto", "packet-up", "stream-up", "stream-one", "STREAM_UP"):
+    _n = node(mode=_m)
+    check(f"不变式 want⇒can_use_dialer（xhttp mode={_m or '空'}）",
+          (not c.want_browser_dialer(_n)) or bd(_n), True)
+
 # --- 3. REALITY 必须排除 ----------------------------------------------------
 # splithttp/dialer.go:50 只在 realityConfig == nil 时启用 browser dialer
 print("\n[3] REALITY 排除（源码 realityConfig == nil）")
