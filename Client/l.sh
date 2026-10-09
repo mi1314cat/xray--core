@@ -37,10 +37,18 @@ fi
 PREFIX="${XBD_PREFIX:-/opt/xray-browser-dialer}"
 LOG="/tmp/xbd-deploy-$(date +%H%M%S).log"
 
+# 镜像顺序与 xray-panel.sh 的取文件链保持同一套结论：
+#   · ghproxy / gh-proxy 是**实时回源**的, 刚推上去的版本立刻能拿到 → 排前面
+#   · jsdelivr 是 CDN **带缓存**的, 实测会出现"包还是上一版、.sha256 已经是新版"
+#     这种**混合状态** —— 校验必然对不上, 白跑一轮 → 只能垫底
+#   · 不同网络封的不一样: 有人的机器直连 github.com 是"卡死", CC 上则是
+#     raw.githubusercontent.com 被 reset 而 ghproxy 正常 —— 链要够长才都覆盖
 MIRROR_DIRS=(
   "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
-  "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
+  "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
+  "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
   "https://github.com/$REPO/raw/refs/heads/$REF/$SUBDIR"
+  "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
 )
 ARCHIVE_URL="${XBD_ARCHIVE:-${MIRROR_DIRS[0]}/$ARCHIVE_NAME}"
 
@@ -73,10 +81,13 @@ while [ $# -gt 0 ]; do
     --no-start) PASS_ARGS+=(--no-start); shift ;;
     --ref)
       REF="${2:-}"
+      # --ref 换分支时重建同一套镜像链（顺序理由见文件上方 MIRROR_DIRS 的注释）
       MIRROR_DIRS=(
         "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
-        "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
+        "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
+        "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
         "https://github.com/$REPO/raw/refs/heads/$REF/$SUBDIR"
+        "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
       )
       ARCHIVE_URL="${MIRROR_DIRS[0]}/$ARCHIVE_NAME"
       shift 2 ;;
