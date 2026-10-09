@@ -204,6 +204,15 @@ else
         || { print_error "证书库加载失败"; exit 1; }
 fi
 
+# 对外地址探测库 (单一实现) —— 本地优先, 否则从仓库取。
+# 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
+
 extract_cert_domain() {
     local crt="$1"
     if [[ -z "$crt" ]]; then echo ""; return 0; fi
@@ -633,11 +642,16 @@ add_config() {
 
     ensure_uuidgen
 
-    # 优先本机网卡 IP; 出口代理 IP 仅作兜底 (参考 install_info.env/PUBLIC_IP)
-    local_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | while read ip; do [[ "$ip" == 172.* || "$ip" == 10.* || "$ip" == 192.168.* ]] || echo "$ip"; done | head -1)
-    public_ip=$(curl -4 -s --max-time 8 ip.sb)
-    [[ -n "$public_ip" && "$public_ip" != "$local_ip" ]] && print_warn "出口IP($public_ip) != 网卡IP($local_ip), 可能走了代理, 默认用网卡IP"
-    default_ip="${local_ip:-$public_ip}"
+    # 对外地址交给 addr.sh (单一实现)。
+    #
+    # ★ 原来这里自己拼了一套: 手写私网前缀过滤 + 问 ip.sb + 两者不一致时警告。
+    #   三个都不够:
+    #     · 过滤只认 172/10/192.168 —— **不排除隧道虚拟网卡**, 也不排除
+    #       mihomo/Clash 的 fake-ip 段 198.18.0.0/15 (机器上跑着 TUN 时会挑中它)
+    #     · 问 ip.sb 拿到的是**出站出口**; 套了 WARP 时必然与网卡 IP 不同,
+    #       于是每次建节点都刷一条警告, 而结论本来就该用网卡 IP
+    #     · 没有"这个地址真在本机接口上吗"的自检
+    default_ip=$(x_public_addr "${XRAY_PUBLIC_IP:-}")
     server_ip=$(safe_read "服务器 IP" "$default_ip")
     [[ -z "$server_ip" ]] && { print_error "服务器 IP 不能为空"; return 1; }
 

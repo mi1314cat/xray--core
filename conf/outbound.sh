@@ -1170,12 +1170,23 @@ wizard_freedom() {
     write_outbound freedom
 }
 
-# 检测本机公网 IPv4（优先非私有、默认路由出口）
+# 对外地址探测库 (单一实现) —— 本地优先, 否则从仓库取。
+# 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
+
+# 检测本机对外 IPv4。
+#
+# ★ 以前这里只做"私网过滤", **不排除隧道/虚拟网卡** —— 而本机可能同时有
+#   WARP / HE-IPv6 / docker / awg, 只有真实网卡上的地址是客户端能直连的。
+#   也不校验"这个地址是不是真在本机接口上"。两件事现在都交给 addr.sh 统一做。
 detect_public_ipv4() {
-    local v4
-    v4=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | head -1)
-    [[ -z "$v4" ]] && v4=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
-    echo "$v4"
+    x_iface_public_addr 2>/dev/null || ip -4 -o addr show scope global 2>/dev/null |
+        awk '{print $4}' | cut -d/ -f1 | head -1
 }
 
 # 取/建 v4域名名单出站（只建一个，复用），返回 tag

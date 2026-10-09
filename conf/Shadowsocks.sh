@@ -81,6 +81,17 @@ else
     source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/ports.sh") \
         || { print_error "端口库加载失败"; exit 1; }
 fi
+
+# 对外地址探测库 —— 本地优先, 否则从仓库取。
+# ★ 原来这里直接 `hostname -I | awk '{print $1}'`: 取**第一个**地址, 完全不筛。
+#   本机可能同时有 WARP / docker / awg, 第一个未必是真实网卡 —— 而写进配置的
+#   地址客户端连不上时, 现场看起来一切正常。
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/lib/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
@@ -361,7 +372,7 @@ EOF
   "settings": {
     "servers": [
       {
-        "address": "$(hostname -I 2>/dev/null | awk '{print $1}')",
+        "address": "$(x_public_addr "${XRAY_PUBLIC_IP:-}")",
         "port": ${lport},
         "method": "$method",
         "password": "$PSK",
