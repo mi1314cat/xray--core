@@ -28,7 +28,53 @@ set -uo pipefail
 XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
 CONF_DIR="${XRAY_CONF_DIR:-$XRAY_BASE/conf}"
 SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
-LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib"
+XRAY_RAW="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
+
+# ---------------------------------------------------------------- 依赖定位
+# ★ 面板里每一项都是 `bash <(curl -Ls .../conf/xxx.sh)` 跑的 —— $BASH_SOURCE
+#   指向 /dev/fd/63, 于是 `dirname $BASH_SOURCE` = /dev/fd, 拼出来的
+#   /dev/fd/lib 永远不存在。实测原话:
+#       python3: can't open file '/dev/fd/lib/nodes.py': [Errno 2] ...
+#   这是**既有问题, 不只影响分享** —— 菜单 11 的 node.sh 同样报这个错。
+#
+#   所以依赖一律三级查找: 脚本旁边 (从仓库直接跑) -> 安装目录 -> 现拉。
+#   现拉用**本次运行的临时目录**, 不做长期缓存: 脚本本身每次都是新拉的,
+#   缓存住的库会和它版本不一致, 那种错更难查。
+_x_self_dir() { cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd; }
+
+_x_fetch() { # <仓库相对路径> <目标文件>
+    mkdir -p "$(dirname "$2")" 2>/dev/null || return 1
+    curl -fsSL --max-time 20 "$XRAY_RAW/$1" -o "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; return 1; }
+    mv -f "$2.tmp" "$2"
+}
+
+# 打印一个可用的 lib 目录 (含 nodes.py / share_payload.py 等)
+_x_ensure_lib() {
+    local d self; self=$(_x_self_dir)
+    for d in "$self/lib" "$XRAY_BASE/conf/lib" /root/catmi/xray/conf/lib; do
+        [[ -f "$d/nodes.py" && -f "$d/share_payload.py" && -f "$d/share_meta.py" ]] \
+            && { printf '%s' "$d"; return 0; }
+    done
+    local tmp; tmp=$(mktemp -d /tmp/.xshare-lib.XXXXXX) || return 1
+    local f
+    for f in nodes.py share_meta.py share_payload.py token_store.py; do
+        _x_fetch "conf/lib/$f" "$tmp/$f" || { rm -rf "$tmp"; return 1; }
+    done
+    printf '%s' "$tmp"
+}
+
+# 打印可用的 share_client.py
+_x_ensure_client() {
+    local d self; self=$(_x_self_dir)
+    for d in "$self" "$XRAY_BASE/conf" /root/catmi/xray/conf; do
+        [[ -f "$d/share_client.py" ]] && { printf '%s' "$d/share_client.py"; return 0; }
+    done
+    local tmp; tmp=$(mktemp -d /tmp/.xshare-cli.XXXXXX) || return 1
+    _x_fetch "conf/share_client.py" "$tmp/share_client.py" || { rm -rf "$tmp"; return 1; }
+    printf '%s' "$tmp/share_client.py"
+}
+
+LIB_DIR="$(_x_ensure_lib)" || LIB_DIR="$(_x_self_dir)/lib"
 SHARE_ADDR="${XRAY_SHARE_ADDR:-127.0.0.1}"
 
 _RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _DIM=$'\033[2m'; _RST=$'\033[0m'
@@ -50,7 +96,7 @@ list_nodes() {
 # ==============================================================
 # 公共分享服务适配层
 # ==============================================================
-SHARE_CLIENT="${SHARE_CLIENT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_client.py}"
+SHARE_CLIENT="${SHARE_CLIENT:-$(_x_ensure_client)}"
 
 # 公共服务实际端口 —— 它可能因端口回避而不是 9443, 绝不能写死。
 x_share_port() {

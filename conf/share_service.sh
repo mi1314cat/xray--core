@@ -24,7 +24,27 @@ set -uo pipefail
 XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
 SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
 SHARE_ADDR="${XRAY_SHARE_ADDR:-127.0.0.1}"
-SHARE_CLIENT="${SHARE_CLIENT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_client.py}"
+XRAY_RAW="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
+
+# ★ 本脚本在面板里是 `bash <(curl -Ls .../conf/share_service.sh) menu` 跑的 ——
+#   $BASH_SOURCE 指向 /dev/fd/63, "脚本旁边"永远是空的, 于是适配器找不到,
+#   状态一律显示"未运行" (而服务其实跑得好好的)。必须三级查找, 最后现拉。
+#   现拉用本次运行的临时目录, 不做长期缓存 —— 脚本每次都是新拉的, 缓存住的
+#   适配器会和它版本不一致。
+_resolve_client() {
+    local self d
+    self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    for d in "$self" "$XRAY_BASE/conf" /root/catmi/xray/conf; do
+        [[ -f "$d/share_client.py" ]] && { printf '%s' "$d/share_client.py"; return 0; }
+    done
+    local tmp; tmp=$(mktemp -d /tmp/.xshare-cli.XXXXXX) || return 1
+    if curl -fsSL --max-time 20 "$XRAY_RAW/conf/share_client.py" -o "$tmp/share_client.py" 2>/dev/null; then
+        printf '%s' "$tmp/share_client.py"; return 0
+    fi
+    rm -rf "$tmp"; return 1
+}
+
+SHARE_CLIENT="${SHARE_CLIENT:-$(_resolve_client)}"
 
 _RED=$'\033[31m'; _GRN=$'\033[32m'; _YEL=$'\033[33m'; _CYN=$'\033[36m'; _RST=$'\033[0m'
 [[ -t 2 ]] || { _RED=""; _GRN=""; _YEL=""; _CYN=""; _RST=""; }
