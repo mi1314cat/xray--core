@@ -64,6 +64,23 @@ fi
 
 python3 "$DIST/lib/genconfig.py" "${GEN_ARGS[@]}" >/tmp/.xbd_gen.$$ 2>&1
 GEN_RC=$?
+if [ "$GEN_RC" -ne 0 ] && [ "$WANT_BD" != "yes" ]; then
+  # 多出站生成失败 → 降级成单节点再试一次。
+  #
+  # 这条路径由 systemd 拉起，是"重启后能不能起来"的最后一关。多出站把所有
+  # 节点塞进同一份配置，一处不通整份就废；剔除坏节点只挡得住"节点写错"，
+  # 挡不住内核升级、字段改名这类整体性问题。到这一步还没有可用配置的话，
+  # 用户手里就只剩一个完全起不来的客户端了 —— 先让当前节点跑起来。
+  echo "多出站配置生成失败，降级为单节点" >&2
+  head -5 /tmp/.xbd_gen.$$ >&2
+  GEN_ARGS=(--node "$NODE" --dns "$DNS_MODE")
+  python3 "$DIST/lib/genconfig.py" "${GEN_ARGS[@]}" >/tmp/.xbd_gen.$$ 2>&1
+  GEN_RC=$?
+  WANT_BD="yes"     # 降级后就是单节点，后续按单节点收尾（不再导 balancer）
+  if [ "$GEN_RC" -eq 0 ]; then
+    echo "已降级为单节点：切换节点需重启" >&2
+  fi
+fi
 if [ "$GEN_RC" -ne 0 ]; then
   echo "配置生成失败:" >&2; cat /tmp/.xbd_gen.$$ >&2; rm -f /tmp/.xbd_gen.$$; exit 1
 fi

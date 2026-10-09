@@ -543,24 +543,27 @@ def _px_note(out):
 
 
 def act_takeover(mode):
-    """两种接管模式：不接管 / 接管本机。
+    """接管已下线，这里只保留"清理旧配置"这一个动作。
 
-    曾经的第三种「接管局域网」（透明网关）已移除 —— 设计与实测存档在
-    docs/mode3-lan-gateway/。局域网设备改为自己在代理设置里填 IP:端口。
+    原来有「不接管 / 接管本机」两种模式，另有已移除的「接管局域网」。
+    接管会往 /etc/profile.d、docker.service.d 写系统级代理配置，理由有两个：
+
+    一是风险：改一次影响全机，出问题极难定位。
+    二是耦合：为了写 docker 的代理，systemd 单元的 ReadWritePaths 里就得开
+    /etc/systemd/system/docker.service.d —— 而没装 Docker 的机器上该目录不存在，
+    systemd 会放弃整个单元，面板根本起不来（226/NAMESPACE）。为了一个可选
+    功能把主功能绑架了。
+
+    端口本身不动（PORT_HTTP / PORT_LAN_HTTP 仍是正常入口），只是不再自动往
+    系统里写。需要的人自己指定，或在客户端里填。
     """
     xbd = os.path.join(PREFIX, "bin", "xbd")
     if mode == "none":
-        out_msgs = []
-        for args in (["proxy", "off"],):
-            rc, o, e = sh([xbd] + args, timeout=180)
-            out_msgs.append(o or e or "")
-        return True, "已切换为「不接管」：只提供代理服务，不修改本机与局域网" + \
-            ("\n" + "\n".join(x.strip() for x in out_msgs if x.strip()) if out_msgs else "")
-    if mode == "local":
-        rc, out, err = sh([xbd, "proxy", "on"], timeout=300)
-        if rc != 0:
-            return False, out or err
-        return True, "已接管本机：docker / apt / curl 走我们的代理（局域网不受影响）" + _px_note(out)
+        return (True, "本客户端不再修改系统代理配置。代理入口照常提供："
+                "SOCKS5 / HTTP 按需在客户端或 shell 里指定即可。")
+    if mode == "clean":
+        rc, out, err = sh([xbd, "proxy", "clean"], timeout=180)
+        return rc == 0, (out or err or "").strip() or "已清理"
     return False, "未知模式"
 
 
@@ -1113,19 +1116,15 @@ display:none;font-size:13px;white-space:pre-wrap}
   </div>
 </div>
 
-<div class="card" style="margin-top:14px"><h2>接管模式</h2>
-  <div class="hint" style="margin:0 0 10px">控制这台服务器"被接管到什么程度"。默认不接管，只提供代理服务。</div>
-  <div class="modes">
-    <button id="tk-none" onclick="setTakeover('none')">
-      <b>不接管</b><span>只提供代理服务<br>本机与局域网都不改</span>
-    </button>
-    <button id="tk-local" onclick="setTakeover('local')">
-      <b>接管本机</b><span>docker / apt / curl 走代理<br>局域网不受影响</span>
-    </button>
-  </div>
-  <div class="hint" id="hint-takeover"></div>
-  <div class="row" style="margin-top:10px"><span class="k">代理入口</span>
+<div class="card" style="margin-top:14px"><h2>代理入口</h2>
+  <div class="hint" style="margin:0 0 10px">本客户端<strong>不修改系统代理配置</strong>。
+    下面这些入口照常提供，需要时在客户端或 shell 里指定即可。</div>
+  <div class="row"><span class="k">代理入口</span>
     <span class="v mono" id="entries">—</span></div>
+  <div class="hint" id="hint-takeover"></div>
+  <div class="row" style="margin-top:6px"><span class="k">旧版接管残留</span>
+    <span class="v"><button id="tk-clean" onclick="cleanTakeover()">清理系统代理配置</button>
+    <span class="hint" id="clean-note"></span></span></div>
 </div>
 
 <div class="card" style="margin-top:14px"><h2>连接配置（可直接复制）</h2>
@@ -1425,24 +1424,18 @@ async function load(){
             ? '当前节点由 Chromium 完成 TLS。点「停掉 Chromium」会先把它切到普通连接（Xray 自带 TLS）再关闭浏览器 —— 节点不会断，只是不再走浏览器。'
             : '⚠ 当前节点设置为走浏览器，但 Chromium 没在运行 —— 点「启动 Chromium」恢复。')
         : '当前节点走 Xray 自带 TLS，Chromium 关着即可（省约 890MB）。想改用浏览器指纹：在下面节点表点「BD 连接」。');
-  // 接管模式：三选一，如实反映当前状态
-  const tkl = !!ST.takeover_local;
-  const cur = tkl ? 'local' : 'none';
-  for (const m of ['none','local']) {
-    const b = document.getElementById('tk-'+m);
-    if (b) { b.className = (m === cur) ? 'sel' : ''; }
-  }
-  const pc = ST.ports_cfg || {};
-  const L = pc.listen || '';
-  $('entries').innerHTML =
-    `本机 <span class="mono">127.0.0.1:${pc.http}</span><br>` +
-    `LAN HTTP <span class="mono">${L}:${pc.lan_http}</span><br>` +
-    `LAN SOCKS <span class="mono">${L}:${pc.normal}</span><br>` +
-    `<span class="hint">两个入口都是全部节点通用，服务器按节点自动决定要不要用浏览器。</span>`;
-  $('hint-takeover').textContent = tkl
-    ? '当前：接管本机（docker / apt / curl 走代理）。'
-      + ((ST.takeover_local_files || []).length ? ' 配置在 ' + ST.takeover_local_files.join(' / ') : '')
-    : '当前：不接管。局域网设备在 WiFi/系统设置里手动填上面任一入口即可（本机不做任何改动）。';
+    // 代理入口照常展示（本客户端不再自动改系统配置）
+    const pc = ST.ports_cfg || {};
+    const L = pc.listen || '';
+    $('entries').innerHTML =
+      `本机 <span class="mono">127.0.0.1:${pc.http}</span><br>` +
+      `LAN HTTP <span class="mono">${L}:${pc.lan_http}</span><br>` +
+      `LAN SOCKS <span class="mono">${L}:${pc.normal}</span><br>` +
+      `<span class="hint">三个入口都是全部节点通用，服务器按节点自动决定走哪条。</span>`;
+    $('hint-takeover').textContent = ST.takeover_local
+      ? '⚠ 检测到本机还有旧版「接管本机」留下的配置（'+ (ST.takeover_local_files||[]).join('、')
+        + '）。不影响代理本身，但新开的 shell 会带着这些变量 —— 需要的话点右边清理。'
+      : '本机没有旧版接管残留，系统环境干净。';
 
   $('xver').textContent = ST.xray_ver || '未知';
 
@@ -1743,10 +1736,12 @@ async function setMode(m){
 }
 const useNode = (f, btn) => post('node_use', {ident:f}, '正在切换节点…', btn);
 const rmNode = f => { if(confirm('确认删除该节点？')) post('node_remove', {ident:f}); };
-async function setTakeover(mode, btn){
-  const labels = {none:'正在切换为「不接管」…', local:'正在接管本机（会重启 docker）…'};
-  const el = btn || document.getElementById('tk-'+mode);
-  await post('takeover', {mode}, labels[mode], el);
+async function cleanTakeover(){
+  if(!confirm('清理旧版「接管本机」写进系统的代理配置？\n'
+         + '会处理 /etc/profile.d/proxy.sh、docker 的代理覆盖、/etc/environment。\n'
+         + '不属于本客户端写的会跳过。\n\n继续？')) return;
+  const el = document.getElementById('tk-clean');
+  await post('takeover', {mode:'clean'}, '正在清理旧配置…', el);
 }
 
 async function xrayCheck(btn){ await post('xray_version', {}, '正在检查版本…', btn); }

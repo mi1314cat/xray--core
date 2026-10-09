@@ -942,13 +942,18 @@ cmd_apply() {
     --dns "${XBD_DNS_MODE:-off}"
     --validate-with "$XBD_XRAY"
   )
+  # validate-with 让 genconfig 自己把构建不出来的节点剔掉。多出站把所有节点塞进
+  # 同一份配置，一条坏节点就足以让整份配置通不过校验 —— 服务直接起不来。
   if [ "$want_bd" = "yes" ]; then
     gen_args+=(--node "$XBD_NODES/current")
   else
     gen_args+=(--all-nodes --nodes-dir "$XBD_NODES" --node "$XBD_NODES/current")
   fi
+  [ -x "$XBD_XRAY" ] && gen_args+=(--validate-with "$XBD_XRAY")
 
-  if python3 "$XBD_LIBDIR/genconfig.py" "${gen_args[@]}" 2>&1 | grep -q '"ok": true'; then
+  _gen_out=$(python3 "$XBD_LIBDIR/genconfig.py" "${gen_args[@]}" 2>&1)
+  if printf '%s' "$_gen_out" | grep -q '"ok": true'; then
+    printf '%s\n' "$_gen_out" | grep 'genconfig:' | while read -r l; do warn "  $l"; done
     if [ "$want_bd" = "yes" ]; then
       ok "xray-client.json（单节点 · 浏览器拨号）"
     else
@@ -958,7 +963,28 @@ try: print(len(json.load(open(sys.argv[1]))["tags"]))
 except Exception: print(0)' "$XBD_RUNTIME/xray-gen.json" 2>/dev/null || echo 0)
       ok "xray-client.json（$n 个节点常驻出站，切换不重启）"
     fi
+  elif [ "$want_bd" != "yes" ]; then
+    # 回退：多出站生成不出来，就退成单节点。
+    #
+    # 为什么必须有这条：多出站把所有节点塞进一份配置，任何一处不通都让整份配置
+    # 失败。剔除坏节点能挡住"节点本身写错"，但挡不住内核版本变化、字段改名之类
+    # 的整体性问题 —— 那种情况下生成会整个失败。如果失败就是 die，用户手里就
+    # 一个起不来的客户端，连临时用一下都不行。
+    #
+    # 单节点配置只含当前节点，能生成成功的概率高得多。先让它跑起来，比什么都强。
+    warn "多出站配置生成失败，自动降级为单节点模式"
+    printf '%s\n' "$_gen_out" | tail -3 | while read -r l; do [ -n "$l" ] && dim "  $l"; done
+    _fb=(--node "$XBD_NODES/current" --api-port "${XBD_API_PORT:-18085}"
+         --logs "$XBD_LOGS" --dns "${XBD_DNS_MODE:-off}" --port-normal "${XBD_PORT_NORMAL:-1080}"
+         --listen-addr "${XBD_LISTEN_ADDR:-127.0.0.1}" --loglevel "${XBD_LOGLEVEL:-warning}")
+    if python3 "$XBD_LIBDIR/genconfig.py" "${_fb[@]}" 2>&1 | grep -q '"ok": true'; then
+      ok "xray-client.json（单节点 · 已降级，切换节点需重启）"
+      warn "降级期间切换节点会断一次。想恢复多出站，先查上面的报错。"
+    else
+      die "xray-client.json 生成失败（单节点模式也一样），这是致命的"
+    fi
   else
+    printf '%s\n' "$_gen_out" | tail -5 >&2
     die "xray-client.json 生成失败，这是致命的"
   fi
 }
@@ -1574,6 +1600,7 @@ cmd_uninstall() {
 # 所以 on 时先探测"谁在接管"：探测到就**就地改写那一份**，并在 off 时按备份还原。
 XBD_PROFILE_FILE="/etc/profile.d/proxy.sh"
 XBD_DOCKER_PROXY="/etc/systemd/system/docker.service.d/http-proxy.conf"
+XBD_ENV_FILE="/etc/environment"
 XBD_PROXY_STATE="/var/lib/xbd-proxy"   # on 时备份原文件 + 记录归属，供 off 精确还原
 
 xbd_proxy_url_http() { printf 'http://127.0.0.1:%s' "$XBD_PORT_HTTP"; }
@@ -1776,10 +1803,10 @@ cmd_proxy() {
   local op="${1:-status}"
   case "$op" in
     on|enable)   xbd_proxy_on ;;
-    off|disable) xbd_proxy_off ;;
+    off|disable|clean) xbd_proxy_clean ;;
     status|"")   xbd_proxy_status ;;
     json)        xbd_proxy_json ;;
-    -h|--help)   info "用法: xbd proxy <on|off|status>   让本机进程（docker 等）走我们的代理" ;;
+    -h|--help)   info "用法: xbd proxy <status|clean>   查看入口 / 清理旧版接管留下的系统配置" ;;
     *) die "未知操作: $op" ;;
   esac
 }
@@ -1805,88 +1832,76 @@ xbd_proxy_status() {
 }
 
 xbd_proxy_on() {
-  need_root
+  # 「接管本机」已下线。
+  #
+  # 原来这个功能会往 /etc/profile.d/proxy.sh 和 docker.service.d 写代理变量，
+  # 让本机进程（shell / docker / apt / curl）默认走 Xray。去掉的理由有两个：
+  #
+  #   一是安全：接管要写系统级配置，改一次影响全机，出问题很难查。
+  #   二是耦合：为了写 docker 的代理，systemd 单元的 ReadWritePaths 里就得开
+  #   /etc/systemd/system/docker.service.d —— 而没装 Docker 的机器上这个目录
+  #   不存在，systemd 遇到不存在的 ReadWritePaths 会放弃整个单元，面板根本
+  #   起不来（226/NAMESPACE）。为了一个可选功能，把主功能绑架了。
+  #
+  # 端口本身不动：PORT_HTTP / PORT_LAN_HTTP 仍是 Xray 的正常入口，想要的人
+  # 自己 export 或在客户端里指定就行。不自动改系统，是留给用户的选择。
+  need_root 2>/dev/null || true
   xbd_load_ports
-  step "配置本机显式代理 → Xray"
-  local http nop others
-  http="$(xbd_proxy_url_http)"
-  nop="127.0.0.1,localhost,::1,$XBD_LISTEN_ADDR,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12"
-
-  # 依赖：常驻 Xray 的 HTTP 入站必须在听
-  if ! port_listening_tcp "$XBD_PORT_HTTP"; then
-    warn "HTTP 代理端口 $XBD_PORT_HTTP 未监听，先重启常驻 Xray 让新配置生效"
-    systemctl restart "$XBD_U_XRAY" 2>/dev/null || true
-    sleep 4
-  fi
-  if ! port_listening_tcp "$XBD_PORT_HTTP"; then
-    bad "HTTP 代理仍未监听，请检查: xbd diagnose"
-    return 1
-  fi
-  ok "HTTP 代理已就绪: $http"
-
-  others="$(xbd_proxy_owners || true)"
-  if [ -n "$others" ]; then
-    info "本机已有的代理接管点:"
-    while IFS='|' read -r st f; do info "  [$st] $f"; done <<< "$others"
-  else
-    info "本机没有别的代理接管点，将新建配置"
-  fi
-
-  _xbd_proxy_slot sh      "$XBD_PROFILE_FILE" _xbd_proxy_new_sh     "$http" "$nop" || return 1
-  _xbd_proxy_slot env     ""                  _xbd_proxy_new_sh     "$http" "$nop" || true
-  _xbd_proxy_slot systemd "$XBD_DOCKER_PROXY" _xbd_proxy_new_docker "$http" "$nop" || return 1
-
-  systemctl daemon-reload 2>/dev/null || true
-  if unit_active docker.service; then
-    warn "重启 docker 以加载代理（容器会短暂中断）"
-    systemctl restart docker.service && ok "docker 已重启" || warn "docker 重启失败，可稍后手动重启"
-  fi
-
+  warn "「接管本机」已下线：本客户端不再自动修改系统代理配置。"
   info ""
-  ok "显式代理已启用"
-  printf '  shell:  %s\n' "$(_xbd_proxy_where sh "$XBD_PORT_HTTP")"
-  printf '  docker: %s\n' "$(_xbd_proxy_where systemd "$XBD_PORT_HTTP")"
-  info "  新开的 shell 会自动带上代理变量"
-  info "  当前 shell 立即生效: 重新登录，或 source 上面那个文件"
-  info "  关闭: xbd proxy off（别人原来的配置会按备份还原）"
+  info "  仍可用的入口（按需自己指定，不会自动写进系统）："
+  info "    SOCKS5  $XBD_LISTEN_ADDR:$XBD_PORT_NORMAL"
+  info "    HTTP    $XBD_LISTEN_ADDR:$XBD_PORT_LAN_HTTP   (局域网)"
+  info "    HTTP    127.0.0.1:$XBD_PORT_HTTP              (仅本机)"
+  info ""
+  info "  单个命令临时走代理："
+  info "    curl -x http://127.0.0.1:$XBD_PORT_HTTP https://example.com"
+  info ""
+  if [ -f "$XBD_PROFILE_FILE" ] || [ -f "$XBD_DOCKER_PROXY" ]; then
+    info "  检测到本机还有旧版接管留下的配置，执行 'xbd proxy clean' 可清理。"
+  fi
 }
 
-xbd_proxy_off() {
+xbd_proxy_clean() {
+  # 清理旧版接管写进系统的代理配置。
+  #
+  # 用 xbd-proxy 那套原有的备份/归属记录来判断，而不是靠"文件内容像不像我们的"。
+  # 记录里区分了 created（这文件是我们新建的，删掉即可）和 edited（用户原本就有
+  # 我们只改了里面几行，删掉会连用户自己的设置一起弄丢 —— 要从 .orig 还原）。
+  # 没有记录的（别的程序写的、或被用户改过）一律不动，只提示。
   need_root
-  step "关闭本机显式代理"
-  local act path bak touched=0 f
-  if [ -s "$XBD_PROXY_STATE/manifest" ]; then
-    while IFS=$'\t' read -r act path; do
-      [ -n "${path:-}" ] || continue
-      bak="$XBD_PROXY_STATE/$(printf '%s' "$path" | tr '/' '_').orig"
-      if [ "$act" = edited ]; then
-        if [ -f "$bak" ] && [ -f "$path" ]; then
-          cp -a "$bak" "$path" && ok "已还原为原配置: $path" && touched=1
+  xbd_load_ports
+  step "清理旧版接管配置"
+  local n=0 f st orig
+  for f in "$XBD_PROFILE_FILE" "$XBD_DOCKER_PROXY" "$XBD_ENV_FILE"; do
+    [ -e "$f" ] || continue
+    orig="$XBD_PROXY_STATE/$(printf '%s' "$f" | tr '/' '_').orig"
+    st="$(_xbd_proxy_recorded "$f")"
+    case "$st" in
+      created) rm -f "$f"; ok "  已删除 $f（这文件是接管时新建的）"; n=$((n+1)) ;;
+      edited)
+        if [ -f "$orig" ]; then
+          mv "$orig" "$f"; ok "  已还原 $f（接管前的原内容）"; n=$((n+1))
         else
-          warn "跳过 $path（原备份或目标文件已不存在）"
-        fi
-      elif [ -f "$path" ]; then
-        rm -f "$path" && ok "已移除 $path" && touched=1
-      fi
-    done < "$XBD_PROXY_STATE/manifest"
-    rm -f "$XBD_PROXY_STATE/manifest"
-  fi
-  # 兼容早期版本留下的文件（当时没有 manifest）
-  for f in "$XBD_PROFILE_FILE" "$XBD_DOCKER_PROXY"; do
-    [ -f "$f" ] && rm -f "$f" && ok "已移除 $f" && touched=1
+          warn "  $f 曾被接管改写过，但原文件备份不在（$orig），已跳过，请人工确认"
+        fi ;;
+      *)
+        if grep -q "127.0.0.1:$XBD_PORT_HTTP" "$f" 2>/dev/null; then
+          warn "  $f 指向本项目端口但没有接管记录（可能是别处手工设的），已跳过，请人工确认"
+        else
+          warn "  $f 不带本项目代理，已跳过（不是接管留下的）"
+        fi ;;
+    esac
   done
-  if [ "$touched" = 1 ]; then
-    systemctl daemon-reload 2>/dev/null || true
-    if unit_active docker.service; then
-      warn "重启 docker 以清掉代理环境变量"
-      systemctl restart docker.service && ok "docker 已重启" || true
-    fi
-  fi
-  if [ "$touched" = 0 ]; then
-    info "本机本来就没有配置我们的代理，无需改动。"
+  [ -s "$XBD_PROXY_STATE/manifest" ] && rm -f "$XBD_PROXY_STATE/manifest"
+  systemctl daemon-reload 2>/dev/null || true
+  if [ "$n" -eq 0 ]; then
+    ok "  没有需要清理的配置"
   else
-    info "本机已恢复为直连；被接管的原配置已还原（备份留在 $XBD_PROXY_STATE）。"
+    ok "  清理完成（$n 处）。"
   fi
+  info "  注意：清理只影响之后的 shell。当前这个终端若还带着 http_proxy 等变量，"
+  info "        需手动 unset，或重新登录一次。"
 }
 
 # Xray 内核版本与更新（之前 cmd_update 只同步项目文件，从不更新二进制）
