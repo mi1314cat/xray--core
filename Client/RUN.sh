@@ -141,6 +141,13 @@ do_server() {
   exit 1
 }
 
+# 前面已经消费掉了 install 和 --vless/--no-start, 这里剩下的才是角色/子命令。
+# 之前忘了 shift, "bash RUN.sh install" 的 MODE 会拿到 "install" 本身,
+# 于是装完之后报一句"无效选项 install" —— 看着像安装失败, 其实是分发没清干净。
+while [ "${1:-}" = "install" ] || [ "${1:-}" = "--no-start" ] || [ "${1:-}" = "--vless" ]; do
+  shift
+done
+
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
   clear 2>/dev/null || true
