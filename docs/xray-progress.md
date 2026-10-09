@@ -13,7 +13,9 @@
 | 客户端 CLI + 菜单 | 🟢 **54/54 通过** | `Client/tools/interactive-test.sh` |
 | 客户端 Web UI | 🟡 **能用，但覆盖面不清** | 见 §四 |
 | 协议能力 | 🟢 优于 SB/M | 见 §三 |
-| 证书管理 | 🟢 已解耦第三方依赖 | `docs/sb-known-issues.md` |
+| 证书管理 | 🟢 已解耦第三方依赖 + 本轮修掉 3 处 | `docs/sb-known-issues.md` |
+| 分享 | 🟢 **已改走公共基础服务** (2026-10-09) | 见 §二之三 |
+| 通用库自检 | 🟡 `check_libs.sh` 253/254 | 唯一失败是**既有的**幽灵函数门禁, 见 §七 |
 
 **结论：主体功能是完成且可用的，不存在"半成品"。真正的问题是 Web UI
 覆盖度不透明，以及缺 4 类通用能力。**
@@ -50,6 +52,50 @@ bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf
 RN 上跑还是旧行为，push 之后才生效）。
 
 调试面板问题时，第一步应该是确认远程版本而不是本地版本。
+
+### 二之三、分享已改走公共基础服务（2026-10-09）
+
+**改动**：`conf/lib/share_server.py` + `xray-share.service` 已删除，
+分享的存储与生命周期归 **proxy-share-service**（M / SB / X 共用），
+provider 固定 `xray`。
+
+- `conf/share_client.py` —— 适配器（从 SB 那份参考实现复制，provider 改 xray）
+- `conf/lib/share_payload.py` —— 载荷构建（从 share_server.py 原样抽出，
+  创建与刷新共用**同一份**实现）
+- `conf/share.sh` —— 面板 6 项菜单与文案不变；菜单 6 改成管公共服务
+- `conf/share_service.sh` —— 菜单 19 改成管公共服务；**故意没有"停止/卸载"**
+  （公共服务的生命周期不属于任何单个内核，从 X 的面板停掉会连带打断 M/SB）
+- 收口点：`share_refresh_hook` 挂在面板层（协议脚本各写各的收尾，没有统一点；
+  而面板是唯一入口）
+
+**载荷格式一字未改**：base64 的订阅行。但**路径变了** —— 本地服务端发
+`/sub/<token>`，公共服务发 `/share/<token>`（与 M/SB 统一）。老链接失效。
+
+**实测（RN 真机）**：
+
+```
+载荷  纯 base64，解码后是 vless:// 订阅行
+计次  拉取一次 used 0→1；HEAD 不消耗
+保鲜  改节点元数据后 refresh，已发链接内容跟着变（token/URL 不变）
+隔离  mihomo=1 / sing-box=1 / xray=2；X 拿 M 的 token 读 → 404
+```
+
+**实测中修掉的三个问题**（都是"看起来正常、实际不通"那一类）：
+
+1. 链接主机名取的是 `api.ipify.org` 的答案 —— 那是**出站出口**。RN 上 WARP
+   开着，生成出来是 `104.28.201.80`，而入站是 `107.173.154.178`，客户端
+   照着连必然不通。改成取自节点自己的 `share_meta.host`。
+2. `share_list` 用了两条 stdin 重定向（heredoc + 进程替换），后者覆盖前者，
+   python 把 JSON 当脚本执行 → `name 'true' is not defined`。
+3. 适配器的 `update` 漏了 `--max-uses` / `--expires-at`（服务端 PUT 本来
+   就支持），于是"改次数上限 / 改有效期"**静默无效** —— argparse 报错退出，
+   调用方把 stderr 丢掉当成功了。
+
+**迁移**：`bash conf/share.sh migrate` —— 本地 token 搬进公共服务；
+**已过期/已用尽的直接删掉不搬**（搬过去也只是占地方，清理器下一轮会删）。
+RN 上没有历史分享，这条路径是干净的。
+
+---
 
 ## 三、协议能力（我们最强的一块）
 
@@ -118,6 +164,19 @@ browser-dialer-panel.service   active
 | 端口修改 | ✅ |
 | Server Pull | ✅ |
 
+### 与分享迁移的关系：**零耦合**（2026-10-09 核实）
+
+担心的是"改服务端分享会不会把自研 Web UI 弄坏"。核实结论：**不会**。
+
+- `panel.py` 是**薄 HTTP 壳** —— 动作都走 `sh(args)` 出去调客户端 CLI，
+  没有自己一套实现（所以服务端怎么改都碰不到它）
+- 它唯一与分享沾边的地方是 **Server Pull**：把「地址 + 路径」拼成一个 URL
+  丢给 `import`，**与 URL 形状无关**。而且它的占位符写的就是 `/share/xxx`
+  —— 迁移后反而**对上了**（旧的服务端路径是 `/sub/<token>`）
+- 它**不碰** `conf/lib/share_server.py`（那是服务端的分享服务，已删），
+  也不碰 `Client/lib/share_server.py`（那是**客户端自己**的内容分发，
+  发 `/share/<token>`，一行未动）
+
 ### 问题
 
 **没有独立的进度文档**，所以"什么进度"只能靠翻页面代码回答。
@@ -178,3 +237,31 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://<host>:18090/?token=<t>' # 预�
 # 浏览器 ECH 实证
 xbd ech
 ```
+
+---
+
+## 七、既有的门禁问题（本轮发现，未修）
+
+### `check_libs.sh` 唯一失败项：幽灵函数门禁有假阳性
+
+```
+库函数 49 个, 从用户入口可达 43 个, 不可达 6 个
+  幽灵: random_pass / random_path / random_token / random_user  (random.sh)
+  幽灵: xr_choice / xr_read                                       (read.sh)
+```
+
+**这 6 个在改动前就存在**（用 `git worktree add` 在干净 HEAD 上复跑确认过，
+两边都是 6 个），而且**至少 3 个是假阳性**：
+
+- `random_user` / `random_pass` 被 `conf/http.sh:198-199`、`conf/sock5.sh:198-199`
+  **实际调用**，而这两个脚本就挂在面板第 5 项的子菜单里（`xray-panel.sh:239/249`）
+- `xr_read` 被 `safe_read` 调用，而 `safe_read`/`clean_input` 全项目有 **264 处**引用
+
+根因在 `tools/check_wiring.py:97`：*"只有被 tools/check_libs.sh 直接 source
+的库才算入口"* —— 而这两个脚本是通过 `source "$_x_lib_dir/lib/random.sh"`
+（**变量路径**）加载的，检测器的 source 边解析不了这种形式，于是把整条链
+当成不可达。
+
+**影响**：门禁长期红着，人就学会忽略它 —— 真出现幽灵函数时没人看。
+**建议**：让 `sources_of()` 支持 `$VAR/lib/xxx.sh` 与 `source <(curl …)`
+两种形式；或至少在报告里区分"确认不可达"与"路径解析不了，无法判定"。
