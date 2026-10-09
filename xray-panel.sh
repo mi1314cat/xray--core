@@ -58,6 +58,7 @@ ${GREEN}16.${PLAIN} 预置批量生成（preset_batch）
 ${GREEN}17.${PLAIN} 证书管理（cert）
 ${GREEN}18.${PLAIN} Nginx 站点管理（nginx_site）
 ${GREEN}19.${PLAIN} 分享服务（share_service）
+    ${GREEN}20.${PLAIN} 端口体检（port_check）
 ${GREEN}0.${PLAIN} 退出脚本
 ----------------------
 xrayls 服务状态: ${xrayls_server_status_text}
@@ -87,6 +88,7 @@ xrayls 服务状态: ${xrayls_server_status_text}
         17) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/cert.sh) ;;
         18) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/nginx_site.sh) ;;
         19) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/conf/share_service.sh) menu ;;
+        20) bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/tools/port-check.sh) ;;
 
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac
