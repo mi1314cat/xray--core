@@ -210,11 +210,40 @@ try:
 except Exception: print("tcp")' "$f" 2>/dev/null)
     [[ -n "$port" ]] || { warn "读不到节点端口, 跳过 nginx 清理"; return 0; }
 
+    # location 路径: 与 deploy.py 插入时用的是同一个值 (ws/httpupgrade/xhttp/h2
+    # 才当路径用), 其余传输退回 "/" —— 插入与摘除必须同一个标识, 否则摘不到。
+    local npath
+    npath=$(py -c 'import json,sys
+try:
+    j=json.load(open(sys.argv[1]))
+    ss=j["inbounds"][0].get("streamSettings") or {}
+    net=ss.get("network") or "tcp"
+    p=""
+    if net=="ws": p=(ss.get("wsSettings") or {}).get("path","")
+    elif net=="httpupgrade": p=(ss.get("httpupgradeSettings") or {}).get("path","")
+    elif net=="xhttp": p=(ss.get("xhttpSettings") or {}).get("path","")
+    elif net=="h2": p=(ss.get("h2Settings") or {}).get("path","")
+    if p and not p.startswith("/"): p="/"+p
+    print(p if p else "/")
+except Exception: print("/")' "$f" 2>/dev/null)
+
     local pyf; pyf=$(_ng_apply_py) || { warn "拿不到 nginx_apply.py, 请手工摘除 $domain 的片段"; return 0; }
-    info "摘除 nginx 片段: $domain (port=$port transport=$transport)"
-    if py "$pyf" --domain "$domain" --port "$port" --transport "$transport" --remove; then
+    info "摘除 nginx 片段: $domain (port=$port transport=$transport path=$npath)"
+    # ★ 精确到 path: 删一个节点不该把同一个域名下别的隧道/节点一起带走。
+    #   老版本按 `location /` 插进去 (标记里只有域名), 所以带 path 找不到时
+    #   再按 "/" 试一次 —— 两种形态都是"我们自己插的那一段", 都是精确删除;
+    #   两次都找不到才说明确实没有可摘的, 这时不动站点 (也不会误删别人)。
+    local out rc=0
+    out=$(py "$pyf" --domain "$domain" --path "$npath" --remove 2>&1) || rc=$?
+    if (( rc == 0 )) && grep -q '没有找到' <<< "$out" && [[ "$npath" != "/" ]]; then
+        info "没有 $npath 的片段 (可能是旧版本按 / 插入的), 按 / 再试一次"
+        out=$(py "$pyf" --domain "$domain" --path / --remove 2>&1) || rc=$?
+    fi
+    if (( rc == 0 )); then
+        printf '%s\n' "$out" | sed 's/^/  /' >&2
         ok "nginx 片段已摘除 (不再有指向已删端口的 location)"
     else
+        printf '%s\n' "$out" | sed 's/^/  /' >&2
         warn "nginx 片段摘除失败 —— 站点里可能残留指向 $port 的 location (会表现为 CDN 回源 502)"
     fi
 }
@@ -250,8 +279,10 @@ for f in N.site_files(dk):
         raw = N.c_read(f, dk).decode('utf-8', 'replace')
     except Exception:
         continue
+    # tag 可能是 `域名` 或 `域名|/路径` —— 存活判断按**域名**做, 所以这里
+    # 只取竖线前面那半截。取整段的话带路径的片段会被永远当成孤儿。
     for m in re.finditer(r'>>>\s*xray-core\s+BEGIN\s+(\S+)', raw):
-        print(m.group(1))
+        print(N.tag_domain(m.group(1)))
 " 2>/dev/null | sort -u)
     if [[ -z "$marked" ]]; then
         ok "没有发现 xray-core 插入的 nginx 片段"
@@ -287,6 +318,23 @@ for f in glob.glob(os.path.join(d, '*.json')):
         ok "nginx 片段与节点一一对应, 没有孤儿"
     else
         warn "共 $orphan 个孤儿片段 (只报告, 未自动改动 — 站点文件是你自己的)"
+        # 给一条**可以照抄**的清理命令。清理走 nginx_apply 的 --prune-orphans:
+        # 它只认本工具的 BEGIN/END 标记段, 用户自己写的 location 一个都不碰
+        # (sing-box 的 cdn_prune 是按"顶层 location + proxy_pass 127.0.0.1:死端口"
+        #  的形状认领的 —— 那个形状正是用户手写反代的样子, 会误删)。
+        local live_csv
+        live_csv=$(printf '%s\n' "$live" | tr '\n' ',' | sed 's/,$//')
+        info "安全清理 (只删标记段, 不动你手写的 location):"
+        if [[ -n "$live_csv" ]]; then
+            printf '      python3 %s --prune-orphans %s\n' "$LIB_DIR/nginx_apply.py" "$live_csv" >&2
+        else
+            # 一个存活的 nginx 档节点都没有 -> 报告里列出的每一条都是孤儿。
+            # 这时**不**自动给命令: "把站点里所有标记段都删掉"是个大动作,
+            # 得让用户看着上面那份清单自己决定。
+            printf '      (当前没有存活的 nginx 档节点, 上面列出的都是孤儿)\n' >&2
+            printf '      确认后: python3 %s --prune-orphans "" --dry-run\n' "$LIB_DIR/nginx_apply.py" >&2
+        fi
+        printf '      先加 --dry-run 看它会删什么\n' >&2
     fi
     return 0
 }

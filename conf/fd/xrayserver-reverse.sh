@@ -136,11 +136,14 @@ nginx_wire() {
     } > "$blk"
 
     print_info "nginx 预览 (--dry-run, 确认无误再写入):"
-    python3 "$py" --domain "$domain" --block "$blk" --dry-run 2>&1 | sed 's/^/    /' >&2
+    # ★ --path 必须传: 它既是 location 的匹配前缀, 也是标记的一部分。
+    #   同一域名下开第二条隧道时, 不带 --path 会让第二条把第一条**替换掉**
+    #   (标记只按域名索引时两条隧道共用一个 tag), 而且删一条会连带删掉另一条。
+    python3 "$py" --domain "$domain" --path "$loc" --block "$blk" --dry-run 2>&1 | sed 's/^/    /' >&2
     local ans
     read -r -p "把上面这段写入 nginx 配置? [y/N]: " ans >&2
     if [[ "$ans" =~ ^[Yy]$ ]]; then
-        python3 "$py" --domain "$domain" --block "$blk" 2>&1 | sed 's/^/    /' >&2
+        python3 "$py" --domain "$domain" --path "$loc" --block "$blk" 2>&1 | sed 's/^/    /' >&2
         print_ok "nginx location $loc -> 127.0.0.1:$port 已写入"
     else
         print_info "已跳过。请手工把上面这段加进 nginx 站点配置。"
@@ -148,12 +151,25 @@ nginx_wire() {
     rm -f "$blk"
 }
 
-# nginx_unwire <域名>
+# nginx_unwire <域名> [location路径]
+#   给了路径就只摘那一条隧道; 没给就按域名收工 (旧版本就是这么做的,
+#   那时标记里只有域名, 没有路径可用)。
 nginx_unwire() {
-    local domain="$1"
+    local domain="$1" loc="${2:-}"
     [[ -z "$domain" ]] && return 0
     local py; py="$(_nginx_apply_py)" || return 0
-    python3 "$py" --domain "$domain" --remove 2>&1 | sed 's/^/    /' >&2
+    if [[ -n "$loc" ]]; then
+        local out
+        out=$(python3 "$py" --domain "$domain" --path "$loc" --remove 2>&1) || true
+        if grep -q '没有找到' <<< "$out"; then
+            # 老标记 (只有域名, 没有路径) —— 退回按域名整段摘, 这也是旧行为
+            python3 "$py" --domain "$domain" --remove 2>&1 | sed 's/^/    /' >&2
+        else
+            printf '%s\n' "$out" | sed 's/^/    /' >&2
+        fi
+    else
+        python3 "$py" --domain "$domain" --remove 2>&1 | sed 's/^/    /' >&2
+    fi
 }
 
 # ---------------- 生成家侧 reverse 配置片段 ----------------
@@ -385,7 +401,7 @@ del_tunnel() {
     printf "请输入要删除的编号: " >&2
     read -r num
     num=$(clean_input "$num")
-    local env id2 old_addr
+    local env id2 old_addr old_path
     env=$(env_file "$num")
     [ -f "$env" ] || { print_error "隧道 #$num 不存在"; return; }
     id2=$(printf '%02d' "$num")
@@ -400,9 +416,11 @@ del_tunnel() {
     if [[ -r "$env" ]]; then
         # shellcheck disable=SC1090
         old_addr="$(sed -n 's/^REV_SERVER_ADDR=//p' "$env" 2>/dev/null | tail -1)"
+        old_path="$(sed -n 's/^REV_SERVER_PATH=//p' "$env" 2>/dev/null | tail -1)"
     fi
     rm -f "$env"
-    [[ -n "$old_addr" ]] && nginx_unwire "$old_addr"
+    # 带路径删除: 同一个域名下还有别的隧道时, 按域名整段删会把它们一起带走
+    [[ -n "$old_addr" ]] && nginx_unwire "$old_addr" "$old_path"
     print_ok "已删除隧道 #$num"
 }
 

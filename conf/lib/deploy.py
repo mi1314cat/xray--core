@@ -127,6 +127,23 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
         meta["host_header"] = opts.get("host") or domain
 
     # ---- nginx ----
+    #
+    # ★ location 用**节点自己的 path**, 不再一律写 `location /`:
+    #   1. 站点里几乎一定有 `location /` (首页/伪静态/acme), 再插一个同名
+    #      location 会让 nginx 直接 `duplicate location "/"` —— 旧的写法在
+    #      这类站点上**永远配不进去**, 而且报的是一句看不懂的回滚;
+    #   2. `location /` 会把整个站点的流量吸到这个节点上, 用户在同域名下的
+    #      网站就没了;
+    #   3. 精确到 path 之后, 同一个域名下的多个节点可以各占一条, 删一个也
+    #      不会把另一个带走 —— mihomo 的 CDN 集成就是按节点 path 渲染 location。
+    #   只对"path 真的是 URI 路径"的传输这么做: ws / httpupgrade / xhttp / h2。
+    #   grpc 的 serviceName 不是路径 (且 gRPC 过 nginx 需要 grpc_pass, 是另一
+    #   件事), tcp/raw 根本没有 path —— 这两种仍用 `/`, 由 nginx_apply 的
+    #   同名检查兜底报错。
+    nginx_path = "/"
+    if transport in ("ws", "httpupgrade", "xhttp", "h2") and opts.get("path"):
+        nginx_path = opts["path"] if str(opts["path"]).startswith("/") else "/" + str(opts["path"])
+
     nginx = None
     if tier == ACCESS_NGINX:
         nginx = {
@@ -134,6 +151,7 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
             "port": port,
             "public_port": public_port,
             "transport": transport,
+            "path": nginx_path,
             "cdn": False,          # nginx 模式已经是"经过 CDN 之后"的形态
         }
 
@@ -169,6 +187,10 @@ def apply_plan(result, conf_dir, share_dir, nginx_apply=None, nginx_bin="-t"):
             "--port", str(n["port"]),
             "--transport", n["transport"],
             "--nginx", nginx_bin]
+    # 插入与摘除必须用**同一个 path**, 否则摘的时候按 `域名|/prefix` 找不到
+    # 当初按 `域名` 插进去的那段 —— 删除要精确, 前提就是标识一致。
+    if n.get("path") and n["path"] != "/":
+        argv += ["--path", n["path"]]
     r = subprocess.run(argv, capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stdout, file=sys.stderr)

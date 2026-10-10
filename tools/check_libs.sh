@@ -988,10 +988,14 @@ L1=$(printf '1\n0\n' | ngmenu | grep -c 't.example')
 assert_eq "$L1" "1" "列出站点: 显示 server_name 与文件名"
 
 # 插入 → 查看 → 幂等 → 摘除 的完整链路
-python3 "$LIB/nginx_apply.py" --domain t.example --port 23456 --transport ws --nginx none >/dev/null 2>&1
+# ★ 带 --path: 这个夹具站里**已经有** `location /` (真实站点几乎都有),
+#   而同一个 server 块里出现两个 `location /` 会让 nginx 直接 emerg
+#   (`duplicate location "/"` —— 真 nginx 1.26 实测)。所以插入必须单开前缀,
+#   这也正是 nginx 档节点现在的默认做法 (deploy.py 传节点自己的 path)。
+python3 "$LIB/nginx_apply.py" --domain t.example --path /node --port 23456 --transport ws --nginx none >/dev/null 2>&1
 NB=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf")
 assert_eq "$NB" "1" "插入反代: 生成一个标记块"
-python3 "$LIB/nginx_apply.py" --domain t.example --port 23456 --transport ws --nginx none >/dev/null 2>&1
+python3 "$LIB/nginx_apply.py" --domain t.example --path /node --port 23456 --transport ws --nginx none >/dev/null 2>&1
 NB2=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf")
 assert_eq "$NB2" "1" "重复插入仍只有一个标记块 (幂等)"
 
@@ -1697,7 +1701,7 @@ for t in ('python3', 'sh', 'grep', 'sed', 'cat', 'base64'):
         d = os.path.join('$TMP/nopath', t)
         if not os.path.exists(d): os.symlink(p, d)
 r = subprocess.run([sys.executable, '$LIB/nginx_apply.py', '--file', '$RB',
-                    '--domain', 'r.example', '--port', '8443'],
+                    '--domain', 'r.example', '--path', '/node', '--port', '8443'],
                    capture_output=True, text=True, env=env)
 sys.stdout.write(r.stdout + r.stderr)")
 case "$OUT" in
@@ -1764,6 +1768,174 @@ cp "$SITE.orig" "$SITE"
 PATH="$TMP/bin:$PATH" python3 "$LIB/nginx_apply.py" --file "$SITE" --domain d.example.com \
     --port 8443 --skip-precheck >/dev/null 2>&1
 if diff -q "$SITE.orig" "$SITE" >/dev/null 2>&1; then ok "--skip-precheck 走写入路径, 失败后照样回滚"; else bad "--skip-precheck 回滚失败"; fi
+
+# ---------------------------------------------------------------- 精确生命周期
+# 这一组守的是"删除/回收/插入"的**精确性**: 选对 server 块、认对自己那一段、
+# 不碰别人的东西、回收有上限。每一条都对应一个真实踩过的形态, 见
+# research/known-issues/x-nginx-and-ports.md 的三方对照表。
+group "nginx 生命周期: 选块 / 精确删除 / 回收 (nginx_apply.py)"
+
+# ① 站点文件里通常有两个同 server_name 的块: 80 的 301 跳转块在前, 443 的真站点
+#    在后。取"第一个 server 块"会把片段插进跳转块 —— `return 301` 先命中,
+#    location 永远到不了, 而 nginx -t 是绿的 (静默失效)。
+TWO="$TMP/two.conf"
+cat > "$TWO" <<'EOF'
+server {
+    listen 80;
+    server_name node.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name node.example.com;
+    ssl_certificate /tmp/fake.pem;
+    ssl_certificate_key /tmp/fake.pem;
+    # 注释里的大括号 { } 不该影响块识别
+    location / { return 404; }
+}
+EOF
+python3 "$LIB/nginx_apply.py" --file "$TWO" --domain node.example.com \
+    --path /node --port 23456 --nginx none >/dev/null 2>&1
+TL=$(grep -n 'xray-core BEGIN' "$TWO" | cut -d: -f1)
+SL=$(grep -n 'listen 443' "$TWO" | cut -d: -f1)
+if [[ -n "$TL" && "$TL" -gt "$SL" ]]; then ok "插进 443 的 server 块 (不是 80 跳转块)"
+else bad "插错了 server 块: 标记在第 $TL 行, 443 在第 $SL 行"; fi
+
+# ② 文件里还有**别人的**站点时, 只能插进自己域名那个块
+MV="$TMP/multi.conf"
+cat > "$MV" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name other.example.com;
+    location / { return 444; }
+}
+server {
+    listen 443 ssl;
+    server_name mine.example.com;
+    location / { return 445; }
+}
+EOF
+python3 "$LIB/nginx_apply.py" --file "$MV" --domain mine.example.com \
+    --path /node --port 23457 --nginx none >/dev/null 2>&1
+# 标记必须出现在 mine 的块里: mine 的块从第 6 行开始
+ML=$(grep -n 'xray-core BEGIN' "$MV" | cut -d: -f1)
+if [[ -n "$ML" && "$ML" -gt 6 ]]; then ok "多站点文件里插进目标域名的块 (没插进别人的站)"
+else bad "插进了别人的 server 块 (标记在第 $ML 行)"; fi
+
+# ③ 域名在文件里根本不存在 -> 拒绝, 且一个字都不写 (绝不猜)
+NT="$TMP/nothere.conf"
+printf 'server { listen 443 ssl; server_name a.example.com; }\nserver { listen 443 ssl; server_name b.example.com; }\n' > "$NT"
+cp "$NT" "$NT.orig"
+RC=0
+python3 "$LIB/nginx_apply.py" --file "$NT" --domain zzz.example.com --port 23456 --nginx none >/dev/null 2>&1 || RC=$?
+assert_eq "$RC" "3" "域名不在文件里时拒绝写入 (rc=3)"
+diff -q "$NT.orig" "$NT" >/dev/null 2>&1 && ok "拒绝时文件逐字节未动" || bad "拒绝时文件被改动"
+
+# ④ 同名 location: 再插一个会让 nginx 直接 emerg (duplicate location)。
+#    提前拒绝, 而不是"写进去 -> -t 失败 -> 回滚"给用户一条看不懂的日志。
+DUP="$TMP/dup.conf"
+printf 'server {\n    listen 443 ssl;\n    server_name c.example;\n    location / { return 444; }\n}\n' > "$DUP"
+cp "$DUP" "$DUP.orig"
+RC=0
+python3 "$LIB/nginx_apply.py" --file "$DUP" --domain c.example --port 1234 --nginx none >/dev/null 2>&1 || RC=$?
+assert_eq "$RC" "4" "同名 location 提前拒绝 (rc=4)"
+diff -q "$DUP.orig" "$DUP" >/dev/null 2>&1 && ok "同名冲突时文件未动" || bad "同名冲突时文件被改了"
+python3 "$LIB/nginx_apply.py" --file "$DUP" --domain c.example --port 1234 --nginx none --dry-run 2>/dev/null | grep 'proxy_pass' >/dev/null \
+    && ok "--dry-run 仍可预览 (不因冲突拒绝)" || bad "--dry-run 被冲突拦住, 用户看不到会插什么"
+
+# ⑤ 同一域名两条路径: 共存 + 精确删除 + 整域名收工 + 逐字节还原
+ID="$TMP/idem.conf"
+printf 'server {\n    listen 443 ssl;\n    server_name d.example;\n    location / { return 444; }\n}\n' > "$ID"
+cp "$ID" "$ID.orig"
+python3 "$LIB/nginx_apply.py" --file "$ID" --domain d.example --path /t1 --port 1111 --nginx none >/dev/null 2>&1
+python3 "$LIB/nginx_apply.py" --file "$ID" --domain d.example --path /t2 --port 2222 --nginx none >/dev/null 2>&1
+assert_eq "$(grep -c 'xray-core BEGIN' "$ID")" "2" "同域名两条路径各占一段 (不互相替换)"
+python3 "$LIB/nginx_apply.py" --file "$ID" --domain d.example --path /t1 --remove --nginx none >/dev/null 2>&1
+assert_eq "$(grep -c 'xray-core BEGIN' "$ID")" "1" "--path 只摘自己那一段 (另一条不动)"
+grep -q '2222' "$ID" && ok "另一条路径的片段完好" || bad "另一条被连坐删掉了"
+python3 "$LIB/nginx_apply.py" --file "$ID" --domain d.example --remove --nginx none >/dev/null 2>&1
+diff -q "$ID.orig" "$ID" >/dev/null 2>&1 && ok "默认 --remove 整域名收工并逐字节还原" || bad "整域名摘除后有残留"
+
+# ⑥ 删一个没插过的域名: 零副作用 —— 不写盘、不动备份、不 reload。
+#    (以前照样走完整套: 覆盖备份槽, 把"插入前的原件"抹掉, 幂等只剩文件内容一致)
+NZ="$TMP/noop.conf"
+printf 'server {\n    listen 443 ssl;\n    server_name e.example;\n}\n' > "$NZ"
+python3 "$LIB/nginx_apply.py" --file "$NZ" --domain e.example --path /x --port 1111 --nginx none >/dev/null 2>&1
+NZ_SUM=$(md5sum "$NZ" | cut -d' ' -f1)
+NZ_BAK=$(stat -c %Y "$NZ.xray-core-bak")
+sleep 1
+python3 "$LIB/nginx_apply.py" --file "$NZ" --domain nope.example --remove --nginx none >/dev/null 2>&1
+assert_eq "$(md5sum "$NZ" | cut -d' ' -f1)" "$NZ_SUM" "无可摘内容时文件不变"
+assert_eq "$(stat -c %Y "$NZ.xray-core-bak")" "$NZ_BAK" "无可摘内容时备份槽不被覆盖"
+
+# ⑦ 备份回收: 只回收**本工具自己的命名**, 保留最新 N 份, 站点文件没了就不碰
+BK="$TMP/bak.conf"
+printf 'server {\n    listen 443 ssl;\n    server_name f.example;\n    location / { return 444; }\n}\n' > "$BK"
+for i in 1 2 3 4 5 6; do
+    python3 "$LIB/nginx_apply.py" --file "$BK" --domain f.example --path /p --port 2400$i --nginx none >/dev/null 2>&1
+done
+# 别的工具/用户自己的备份, 一个都不能被回收
+touch "$BK.bak" "$BK.sbpanel-bak" "$BK.mihomo-core-cdn-bak"
+python3 "$LIB/nginx_apply.py" --file "$BK" --prune-backups --keep 2 >/dev/null 2>&1
+HIST=$(ls -1 "$BK.xray-core-bak".* 2>/dev/null | wc -l)
+[[ "$HIST" -le 2 ]] && ok "历史备份有上限 (回收后 $HIST 份 ≤ keep=2)" || bad "历史备份没有回收 (还有 $HIST 份)"
+[[ -f "$BK.xray-core-bak" ]] && ok "规范备份 (回滚依据) 永远保留" || bad "规范备份被回收了"
+[[ -f "$BK.bak" && -f "$BK.sbpanel-bak" && -f "$BK.mihomo-core-cdn-bak" ]] \
+    && ok "别人的备份一份都没动" || bad "回收碰了不属于自己的备份"
+mv "$BK" "$BK.gone"
+BEFORE=$(ls -1 "$BK.xray-core-bak".* 2>/dev/null | wc -l)
+python3 "$LIB/nginx_apply.py" --file "$BK" --prune-backups --keep 1 >/dev/null 2>&1
+AFTER=$(ls -1 "$BK.xray-core-bak".* 2>/dev/null | wc -l)
+assert_eq "$AFTER" "$BEFORE" "站点文件已不在时不回收备份 (可能是唯一副本)"
+
+# ⑧ 孤儿清理: 只删本工具的标记段, 用户手写的死反代必须原样留着
+#    (sing-box 的 cdn_prune 按"顶层 location + proxy_pass 127.0.0.1:死端口"的
+#     形状认领, 那个形状正是用户手写反代的样子 —— 判据是猜的就会误删)
+OR="$TMP/orph.conf"
+cat > "$OR" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name live.example;
+    location /myapp {
+        proxy_pass http://127.0.0.1:8080;
+    }
+    # >>> xray-core BEGIN live.example >>>
+    location / { proxy_pass http://127.0.0.1:22401; }
+    # <<< xray-core END live.example <<<
+    # >>> xray-core BEGIN dead.example|/p >>>
+    location /p { proxy_pass http://127.0.0.1:22402; }
+    # <<< xray-core END dead.example|/p <<<
+}
+EOF
+NGINX_CONF_ROOTS="$TMP" python3 "$LIB/nginx_apply.py" --file "$OR" --prune-orphans live.example --nginx none >/dev/null 2>&1
+assert_eq "$(grep -c 'dead.example' "$OR")" "0" "孤儿片段被清掉"
+assert_eq "$(grep -c 'BEGIN live.example' "$OR")" "1" "活着的片段保留"
+assert_eq "$(grep -c 'myapp' "$OR")" "1" "用户手写的 location 一个字符都没动"
+
+# ⑨ 旧标记 (只有域名) 升级: 用 --path 重插时不能留下两条同名 location
+LG="$TMP/legacy.conf"
+cat > "$LG" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name r.example;
+    # >>> xray-core BEGIN r.example >>>
+    location /HCaVHO3U {
+        proxy_pass http://127.0.0.1:25333;
+    }
+    # <<< xray-core END r.example <<<
+}
+EOF
+python3 "$LIB/nginx_apply.py" --file "$LG" --domain r.example --path /HCaVHO3U \
+    --port 45630 --nginx none >/dev/null 2>&1
+assert_eq "$(grep -c 'location /HCaVHO3U' "$LG")" "1" "旧标记升级后不留重复 location"
+grep -q '45630' "$LG" && ok "旧标记升级后端口是新值" || bad "旧标记升级后端口还是旧的"
+
+# ⑩ node.sh 删节点时按 path 精确摘除 (改回按域名整段删就会连坐同域名的隧道)
+grep -q -- '--path "\$npath" --remove' "$ROOT/conf/node.sh" \
+    && ok "node.sh 摘除带 --path (不连坐同域名别的段)" || bad "node.sh 仍按域名整段摘除"
+grep -q -- '--prune-orphans' "$ROOT/conf/node.sh" \
+    && ok "node.sh 孤儿检查给出安全清理命令" || bad "node.sh 没给出孤儿清理入口"
 
 # ★ 容器探测: 只认容器名 nginx / nginx-proxy 会漏掉"名字叫 web、镜像却是 nginx"
 #   的部署 —— 那时探测返回 None, 于是又去改宿主机上 nginx 根本不读的文件
@@ -1916,7 +2088,7 @@ print(len(N.list_sites('nginx')))")
 assert_eq "$LS" "1" "容器模式能读出 server_name"
 
 PATH="$CD/bin:$PATH" python3 "$LIB/nginx_apply.py" --docker nginx \
-  --domain c.example --port 34567 --transport ws --nginx none >/dev/null 2>&1
+  --domain c.example --path /node --port 34567 --transport ws --nginx none >/dev/null 2>&1
 CB=$(grep -c 'xray-core BEGIN' "$CD/ctr/conf.d/c.example.conf")
 assert_eq "$CB" "1" "容器模式插入写到了容器里的文件"
 PATH="$CD/bin:$PATH" python3 "$LIB/nginx_apply.py" --docker nginx \
