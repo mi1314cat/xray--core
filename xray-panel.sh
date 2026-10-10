@@ -118,6 +118,7 @@ _XRAY_LIB_FILES=(
     random.sh read.sh service.sh verify.sh
     deploy.py dns_edit.py nginx_apply.py naming.py node_build.py nodes.py
     share_meta.py share_payload.py token_store.py
+    interop.py native.py
 )
 
 # 把 conf/lib/ 铺到"脚本旁边", 也就是 $_XRAY_CACHE/lib/。

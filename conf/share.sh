@@ -224,6 +224,97 @@ PY
     printf '%s' "$out"
 }
 
+# ---------------------------------------------------------------- 三家互通
+# 原生产品 (Xray JSON) + **内核声明**。设计依据（字段定义 / 为什么声明写在
+# 地址上 / 决策规则与回退链 / 与 compat 的分工）:
+#     proxy-node-compat/docs/three-way-interop.md
+#
+# 为什么要原生产品: URI 那条路装不下的字段 (ECH / xhttp mode / grpc
+#   serviceName / 证书 pin …) 在 URI 上是**静默丢掉**的。同内核同发行版的
+#   客户端直接拉 Xray JSON 就没有这一层损失。
+# 为什么声明写在地址上: 公共服务的路由**先剥查询串**再分发
+#   (share_service.py:768 `path = self.path.split("?", 1)[0]`), 所以声明对
+#   第三方客户端零影响 —— 它们原样拉走这个地址, 拿到的仍是那份 URI 列表。
+#   响应头与独立 /meta 端点两条路都被冻结的公共服务堵死了 (设计文档 §1)。
+
+# 本机内核事实 (真探测)。探测不到发行版 → **不产出原生**: 不猜一个默认值。
+x_share_self_facts() {
+    python "$LIB_DIR/interop.py" self 2>/dev/null
+}
+
+x_share_fact() { # <facts json> <字段名>
+    printf '%s' "$1" | python -c 'import sys, json
+try: print((json.load(sys.stdin) or {}).get(sys.argv[1], ""))
+except Exception: print("")' "$2" 2>/dev/null
+}
+
+# 原生产品正文 → 临时文件 (与 x_share_build_payload 同形: 成功打印路径)
+x_share_build_native() {
+    local out; out=$(mktemp /tmp/.xnative.XXXXXX) || return 1
+    if ! python "$LIB_DIR/native.py" "$CONF_DIR" "$SHARE_DIR" "$@" >"$out" 2>/tmp/.xnative.err; then
+        rm -f "$out"; sed 's/^/    /' /tmp/.xnative.err >&2 2>/dev/null; return 1
+    fi
+    sed 's/^/    /' /tmp/.xnative.err >&2 2>/dev/null
+    printf '%s' "$out"
+}
+
+# 把声明并进订阅地址 —— 声明只有 interop.py 一处实现 (客户端读的是同一份定义)
+x_share_declare_url() { # <主地址> <发行版> <版本> [原生地址]
+    local url="$1" dist="$2" ver="$3" native="${4:-}"
+    local -a extra=()
+    [[ -n "$native" && -n "$dist" ]] && extra=(--url-"$dist" "$native")
+    python "$LIB_DIR/interop.py" declare --kernel xray --distribution "$dist" \
+        --version "$ver" --url "$url" "${extra[@]}" 2>/dev/null
+}
+
+# 一条分享记录 → 该给用户的**带声明地址**。
+# 地址**不落盘**, 每次现算: 地址族切换 (switch-family v4|v6) 会改节点的对外
+# host, 落盘地址会留着旧 host 而面板显示一切正常 —— 那就是一条死链。
+x_share_declared_url() { # <token> <名称> <逗号分隔 tags> [原生 token]
+    local tok="$1" _name="${2:-}" tags="${3:-}" native="${4:-}" port host=""
+    port=$(x_share_port)
+    host=$(LIB="$LIB_DIR" SHARE_DIR="$SHARE_DIR" TAGS="$tags" python -c '
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import share_meta
+for t in (os.environ.get("TAGS", "").split(",") or [""]):
+    m = share_meta.load(os.environ["SHARE_DIR"], t.strip()) or {}
+    if m.get("host"):
+        print(m["host"]); raise SystemExit
+' 2>/dev/null)
+    [[ -n "$host" ]] || host="<服务器IP>"
+    local url="http://$host:$port/share/$tok"
+    if [[ -z "$native" ]]; then
+        # 没有原生产物也要声明 —— 声明"我只提供普通话"比不声明更诚实:
+        # 客户端日志里会写"服务端清单里没有本机发行版", 而不是"地址上没有声明"。
+        local f0 ver0 d0
+        f0=$(x_share_self_facts)
+        ver0=$(x_share_fact "$f0" version)
+        d0=$(x_share_declare_url "$url" "" "$ver0" "")
+        printf '%s' "${d0:-$url}"
+        return 0
+    fi
+    local facts dist ver d
+    facts=$(x_share_self_facts)
+    dist=$(x_share_fact "$facts" distribution)
+    ver=$(x_share_fact "$facts" version)
+    d=$(x_share_declare_url "$url" "$dist" "$ver" "http://$host:$port/share/$native")
+    printf '%s' "${d:-$url}"
+}
+
+# 一条记录的原生产物 token（没有则空）
+x_share_native_of() { _x_share_field "$1" meta.native_token; }
+
+# 用户选中的 token 若是**原生产物**, 换成它的主记录 —— 两个方向都要能处理:
+# 列表里点的那条可能是任意一条, 而"停用/撤销"必须成对生效。
+x_share_primary_of() {
+    local tok="$1" role parent
+    role=$(_x_share_field "$tok" meta.role)
+    [[ "$role" == "native" ]] || { printf '%s' "$tok"; return 0; }
+    parent=$(_x_share_field "$tok" meta.parent)
+    printf '%s' "${parent:-$tok}"
+}
+
 # ---------------------------------------------------------------- 生成
 share_create() {
     local name="" max_uses=0 ttl_days=0
@@ -329,9 +420,73 @@ print(m.get("host", ""))
     [[ -n "$host" ]] || host="<服务器IP>"
     local url="http://$host:$port/share/$token"
 
+    # ---- 原生产品 + 内核声明 ----
+    # 普通话产品上面已经建好 (rec/token)。这里再建一条**原生产品**记录, 并把
+    # "我提供哪些格式、原生在哪取"写进**给用户的地址**。两条记录的 TTL 与
+    # 次数上限同源 —— 一条永久一条 24 小时会让用户以为原生"自己坏了"。
+    local facts dist ver native_tok="" declared="$url" nrec npayload meta2
+    facts=$(x_share_self_facts)
+    dist=$(x_share_fact "$facts" distribution)
+    ver=$(x_share_fact "$facts" version)
+    if [[ -z "$dist" ]]; then
+        warn "内核发行版探测不到 ($(x_share_fact "$facts" note)) —— 不产出原生, 只发普通话"
+    else
+        npayload=$(x_share_build_native "${tags[@]}") || npayload=""
+        if [[ -z "$npayload" ]]; then
+            warn "原生产品生成失败 —— 只发普通话(URI), 具体原因见上"
+        else
+            nrec=$(_x_share_api create --type node --content-type "application/json" \
+                     --content-file "$npayload" --ttl $((ttl_days * 86400)) \
+                     --max-uses "$max_uses" \
+                     --meta "$(python -c '
+import json, sys
+print(json.dumps({"name": sys.argv[1], "tags": sys.argv[2:-1], "interop": 1,
+                  "role": "native", "kernel": "xray",
+                  "parent": sys.argv[-1]}, ensure_ascii=False))
+' "$name (原生 $dist)" "${tags[@]}" "$token")" 2>&1) || nrec=""
+            rm -f "$npayload"
+            native_tok=$(printf '%s' "$nrec" | python -c 'import sys, json
+try: print(json.load(sys.stdin).get("token", ""))
+except Exception: print("")' 2>/dev/null)
+            if [[ -n "$native_tok" ]]; then
+                declared=$(x_share_declare_url "$url" "$dist" "$ver" \
+                             "http://$host:$port/share/$native_tok")
+            else
+                warn "原生产物的分享记录没建起来 —— 只发普通话(URI)"
+            fi
+        fi
+    fi
+    if [[ -z "$native_tok" ]]; then
+        # 没有原生也要声明 —— 声明"我只提供普通话"比不声明更诚实: 客户端日志
+        # 会写"服务端清单里没有本机发行版", 而不是"地址上没有内核声明"。
+        declared=$(x_share_declare_url "$url" "" "$ver" "")
+    fi
+    [[ -n "$declared" ]] || declared="$url"
+
+    # 声明与"原生产物在哪"记进主记录 meta —— 列表、刷新、吊销都要靠它。
+    # meta 是**整体替换**, 所以 name/tags 必须一起带上 (少带了下次就再也
+    # 重建不出内容)。
+    meta2=$(python -c '
+import json, sys
+name, dist, ver, ntok = sys.argv[1:5]
+tags = sys.argv[5:]
+print(json.dumps({"name": name, "tags": tags, "interop": 1, "role": "primary",
+                  "kernel": "xray", "distribution": dist, "kernel_version": ver,
+                  "formats": ["uri"] + ([dist] if ntok else []),
+                  "native_token": ntok}, ensure_ascii=False))
+' "$name" "$dist" "$ver" "$native_tok" "${tags[@]}")
+    _x_share_api update --token "$token" --meta "$meta2" >/dev/null 2>&1 \
+        || warn "声明没写进 meta (分享本身可用, 但列表里看不到声明与原生地址)"
+
     ok "分享已生成"
-    printf "\n    ${_GRN}%s${_RST}\n\n" "$url" >&2
+    printf "\n    ${_GRN}%s${_RST}\n\n" "$declared" >&2
     printf "    节点: %s\n" "${tags[*]}" >&2
+    if [[ -n "$native_tok" ]]; then
+        info "格式: 普通话(URI 列表) + 原生($dist) —— 同内核同发行版的客户端自动拉原生, 其余走普通话"
+        printf "    %s不带声明的地址(任何客户端都能拉): %s%s\n" "$_DIM" "$url" "$_RST" >&2
+    else
+        info "格式: 仅普通话(URI 列表) —— 地址上仍带声明, 客户端据此走通用格式"
+    fi
     printf "    %s次数: %s${_RST}   %s有效期: %s 天${_RST}\n" \
         "$_DIM" "$([[ "$max_uses" == 0 ]] && echo 不限 || echo "$max_uses")" \
         "$_DIM" "$([[ "$ttl_days" == 0 ]] && echo 永久 || echo "$ttl_days")" >&2
@@ -373,8 +528,8 @@ print(share_payload.PAYLOAD_SCHEMA)' 2>/dev/null)
 import os, sys, json, time
 recs = json.loads(os.environ["XJS"])
 want = os.environ.get("XWANT", "")
-fmt = "  %-5s%-20s%-16s%-11s%-12s%-8s%-7s%s"
-print(fmt % ("编号", "TOKEN", "名称", "已用/上限", "过期", "状态", "内容", "节点"), file=sys.stderr)
+fmt = "  %-5s%-20s%-16s%-11s%-12s%-8s%-8s%-7s%s"
+print(fmt % ("编号", "TOKEN", "名称", "已用/上限", "过期", "状态", "内容", "格式", "节点"), file=sys.stderr)
 stale = []
 for i, r in enumerate(recs, 1):
     m = r.get("meta") or {}
@@ -388,9 +543,18 @@ for i, r in enumerate(recs, 1):
     fresh = "最新" if (want and str(sch) == str(want)) else "陈旧!"
     if fresh != "最新":
         stale.append((str(r.get("token", ""))[:12], sch or "无", want or "?"))
+    role = m.get("role") or ""
+    fmts = m.get("formats") or []
+    if isinstance(fmts, str): fmts = [fmts]
+    if role == "native":
+        kind = "原生"
+    elif fmts:
+        kind = "普通话+" + ",".join(x for x in fmts if x != "uri")
+    else:
+        kind = "普通话"
     print(fmt % (i, str(r.get("token", ""))[:18], str(m.get("name", ""))[:15],
-                 uses, exps, r.get("state", ""), fresh, ",".join(tags)[:40]),
-                 file=sys.stderr)
+                 uses, exps, r.get("state", ""), fresh, kind,
+                 ",".join(tags)[:40]), file=sys.stderr)
 for tok, got, w in stale:
     print(file=sys.stderr)
     print("  [陈旧] %s… 的内容是旧版生成器建的 (schema=%s, 现为 %s) —— "
@@ -400,13 +564,41 @@ for tok, got, w in stale:
           "跑一次 `conf/share.sh refresh` 即可原地重建 (token 与地址不变)。",
           file=sys.stderr)
 '
+    # ★ 打印**带声明的地址** —— 用户从这里复制的地址才带内核声明; 复制的
+    #   若是裸地址, 客户端永远只能走普通话 (声明缺失), 而且没有任何报错。
+    #   地址每次现算, 不落盘: 地址族切换会改对外 host, 落盘的会变成死链。
     printf '\n' >&2
-    info "拉取地址: http://<服务器IP>:$(x_share_port)/share/<token>"
+    info "拉取地址 (带内核声明; 客户端据此决定拉原生还是普通话):"
+    local i=1 tok name tags ntok decl
+    while IFS=$'\t' read -r tok name tags ntok; do
+        [[ -n "$tok" ]] || continue
+        decl=$(x_share_declared_url "$tok" "$name" "$tags" "$ntok")
+        printf '    %s) %s\n' "$i" "$decl" >&2
+        i=$((i + 1))
+    done < <(printf '%s' "$js" | python -c '
+import sys, json
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    m = r.get("meta") or {}
+    if m.get("role") == "native":
+        continue                      # 原生产物是附带产物, 不作为独立入口列出
+    tags = m.get("tags") or []
+    if isinstance(tags, str): tags = [tags]
+    print("%s\t%s\t%s\t%s" % (r.get("token", ""), m.get("name", ""),
+                              ",".join(tags), m.get("native_token", "")))
+' 2>/dev/null)
+    info "（原生产物是附带记录, 不单独列出; 撤销/停用主记录会连带处理它）"
 }
 
 # ---------------------------------------------------------------- 启停 / 撤销
+# ★ 一条分享有**两条记录**: 普通话(主) 与 原生(附带)。停用/撤销/改次数必须
+#   成对处理 —— 只处理主记录的话, 原生产物**还活着**: 用户以为停了/撤了,
+#   带声明的地址却依然能拉到同一批节点。这个错误是静默的 (面板上主记录显示
+#   "已停用"), 所以这里一律连带。
 share_toggle() {
     local tok; tok=$(_x_share_find "$1") || die "找不到: $1"
+    tok=$(x_share_primary_of "$tok")
     local cur want
     cur=$(_x_share_field "$tok" enabled)
     [[ "$cur" == "True" ]] && want=false || want=true
@@ -416,17 +608,32 @@ share_toggle() {
     [[ "$(_x_share_field "$tok" enabled)" == "$([[ "$want" == true ]] && echo True || echo False)" ]] \
         || die "切换未生效"
     ok "$([[ "$want" == true ]] && echo 已启用 || echo 已停用) $tok"
+    local ntok; ntok=$(x_share_native_of "$tok")
+    if [[ -n "$ntok" ]]; then
+        _x_share_api update --token "$ntok" --enabled "$want" >/dev/null 2>&1 \
+            && ok "  连带: 原生产物 ${ntok:0:12}… 同样$([[ "$want" == true ]] && echo 启用 || echo 停用)" \
+            || warn "原生产物 ${ntok:0:12}… 没切换成功 —— 它还会应答, 建议手动检查"
+    fi
 }
 
 share_revoke() {
     local tok; tok=$(_x_share_find "$1") || die "找不到: $1"
+    tok=$(x_share_primary_of "$tok")      # 选中的若是原生产物, 换回主记录
+    local ntok; ntok=$(x_share_native_of "$tok")
     _x_share_api delete --token "$tok" >/dev/null 2>&1 || die "撤销失败"
     _x_share_api get --token "$tok" >/dev/null 2>&1 && die "撤销未生效 (记录还在)"
     ok "已撤销 $tok"
+    if [[ -n "$ntok" ]]; then
+        _x_share_api delete --token "$ntok" >/dev/null 2>&1 \
+            && ok "  连带: 已撤销原生产物 ${ntok:0:12}…" \
+            || warn "原生产物 ${ntok:0:12}… 撤销失败 —— 那个地址还能拉到节点"
+    fi
 }
 
 share_set() {
     local tok; tok=$(_x_share_find "$1") || die "找不到: $1"
+    tok=$(x_share_primary_of "$tok")      # 选中的若是原生产物, 换回主记录
+    local ntok; ntok=$(x_share_native_of "$tok")
     case "$2" in
         max_uses)   _x_share_api update --token "$tok" --max-uses "${3:-0}" >/dev/null 2>&1 \
                         || die "设置失败" ;;
@@ -438,6 +645,15 @@ share_set() {
         *) die "未知字段: $2" ;;
     esac
     ok "已更新 $tok"
+    # 次数/有效期对原生产物必须同源: 主记录限 1 次而原生不限次, 等于给了一个
+    # 绕开额度的后门 (地址就写在主记录的声明里)。
+    if [[ -n "$ntok" ]]; then
+        case "$2" in
+            max_uses)   _x_share_api update --token "$ntok" --max-uses "${3:-0}" >/dev/null 2>&1 ;;
+            expires_at) _x_share_api update --token "$ntok" --expires-at "${3:-0}" >/dev/null 2>&1 ;;
+        esac && ok "  连带: 原生产物 ${ntok:0:12}… 同步" \
+             || warn "原生产物 ${ntok:0:12}… 没同步成功 —— 额度/有效期会不一致"
+    fi
 }
 
 # ---------------------------------------------------------------- 内容保鲜
@@ -469,12 +685,21 @@ sys.path.insert(0, os.environ["LIB"])
 import share_payload
 print(share_payload.PAYLOAD_SCHEMA)' 2>/dev/null)
 
-    local n=0 nstale=0 tok name tags schema newh curh payload newmeta
-    while IFS=$'\t' read -r tok name tags schema; do
+    local n=0 nstale=0 tok name tags schema role newh curh payload newmeta
+    while IFS=$'\t' read -r tok name tags schema role; do
         [[ -n "$tok" ]] || continue
         [[ -n "$tags" ]] || continue
-        # shellcheck disable=SC2086
-        payload=$(x_share_build_payload $(printf '%s' "$tags" | tr ',' ' ')) || continue
+        # ★ 一条分享有两条记录, 内容**不同源**: 主记录是普通话(base64 URI),
+        #   附带记录是原生产物(Xray JSON)。这里按 role 分派 —— 不分的后果是
+        #   刷新时把原生产物**改写成 URI 列表**, 而地址上仍声明"原生在那边",
+        #   同内核客户端拉过去解析出 0 个节点 (看起来像"订阅空了")。
+        if [[ "$role" == "native" ]]; then
+            # shellcheck disable=SC2086
+            payload=$(x_share_build_native $(printf '%s' "$tags" | tr ',' ' ')) || continue
+        else
+            # shellcheck disable=SC2086
+            payload=$(x_share_build_payload $(printf '%s' "$tags" | tr ',' ' ')) || continue
+        fi
         newh=$(sha256sum "$payload" | awk '{print $1}')
         curh=$(_x_share_api get --token "$tok" 2>/dev/null \
                | python -c 'import sys,json
@@ -509,8 +734,9 @@ for r in recs:
     m = r.get("meta") or {}
     tags = m.get("tags") or []
     if isinstance(tags, list) and tags:
-        print("%s\t%s\t%s\t%s" % (r.get("token",""), m.get("name",""),
-                                  ",".join(tags), m.get("payload_schema","")))
+        print("%s\t%s\t%s\t%s\t%s" % (r.get("token",""), m.get("name",""),
+                                  ",".join(tags), m.get("payload_schema",""),
+                                  m.get("role","")))
 ' 2>/dev/null)
 
     (( n > 0 )) && info "已刷新 ${n} 条分享链接的内容 (token 与地址未变)"
