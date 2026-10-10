@@ -718,6 +718,10 @@ curl -Ls "https://raw.githubusercontent.com/mi1314cat/xray--core/<commit>/conf/s
 `nginx.sh`、`caddy.sh` 等，见 `Conversion.sh` / `ngcadall.sh`），属于**手动直跑**
 路径，面板菜单已经全部改走 `xray_run`，不受影响。留着不动。
 
+> **2026-10-10 补记**: 这 7 处兜底全在上面点名的 `Conversion.sh` /
+> `ngcadall.sh` / `VEVLRE*.sh` 里, 这些脚本已作为孤儿链**整体删除**
+> （清单与依据见 [legacy/README.md](legacy/README.md)），本条不再是遗留项。
+
 ### 4. 门禁
 
 新增 10 条断言（`面板取文件` 分组），其中两条是**防复发**的：

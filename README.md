@@ -45,6 +45,12 @@ bash <(curl -Ls .../install.sh) --status      # 只报告状态，什么都不�
 每一项背后仍是原来那些脚本（`conf/*.sh`、`tools/*.sh`），可以单独跑：
 `bash conf/nginx_site.sh`。面板只是把它们按用途归了组。
 
+> 早期 v2ray 独立套件（`VEVLRE.sh`、`VEVLRE6.sh`、`Conversion.sh`、
+> `ngcadall.sh`、`nginx.sh`、`caddy.sh`、`conf/cconf.sh`、`conf/nconf.sh`）
+> 与这套面板体系不是一条线，已于 2026-10-10 **整体删除**；删除前的实现在 git
+> 与旧仓库里可查（`git log --diff-filter=D --name-only`），不再随本仓库分发。
+> 依据与清单见 [docs/legacy/README.md](docs/legacy/README.md)。
+
 ## 反向代理的 nginx 联动
 
 反向代理隧道要能被外面访问，得有一条 nginx location 指向它。手工写的

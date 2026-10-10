@@ -357,8 +357,12 @@ test_server() {
   if [ ! -f "$PANEL" ]; then bad "xray-panel.sh 存在" "$PANEL"; return 1; fi
   ok "xray-panel.sh 存在"
 
-  # 语法先过一遍，否则后面全是噪音
-  for f in xray-panel.sh xargo.sh VEVLRE.sh VEVLRE6.sh caddy.sh nginx.sh; do
+  # 语法先过一遍，否则后面全是噪音。
+  # 清单只列**还在仓库里**的服务端脚本：v2ray 早期独立套件（VEVLRE*.sh /
+  # caddy.sh / nginx.sh）已整体删除，见 tools/check_libs.sh 的「孤儿链已移除」
+  # 门禁组与 docs/legacy/README.md。不复用已删文件名，否则这里会一直显示"通过"
+  # 而实际什么都没验。
+  for f in xray-panel.sh xargo.sh; do
     [ -f "$REPO/$f" ] || continue
     if bash -n "$REPO/$f" 2>/dev/null; then ok "$f 语法通过"
     else bad "$f 语法通过" "$(bash -n "$REPO/$f" 2>&1 | awk 'NR<=2' | tr '\n' ' ')"; fi

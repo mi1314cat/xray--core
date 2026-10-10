@@ -3279,6 +3279,80 @@ else
 fi
 
 
+# ---------------------------------------------------------------- 孤儿链已移除
+# v2ray 早期的**独立部署套件**曾在仓库根和 conf/ 下各留一份实现:
+#
+#   入口: VEVLRE.sh / VEVLRE6.sh / Conversion.sh / ngcadall.sh
+#   叶子: nginx.sh / caddy.sh / conf/cconf.sh / conf/nconf.sh (只被上面 4 个入口引用)
+#
+# 它与现行体系 (xray-panel.sh + conf/*.sh + conf/lib/*.py) **不是一条线**:
+# 4 个入口自己零外部引用, 叶子只被这几个入口引用, 而且入口跑起来是
+# `bash <(curl -Ls .../conf/nconf.sh)` 从 GitHub 现拉 —— 文件一旦离开仓库,
+# 这条路就不再自洽。conf/nconf.sh 硬编码 9998/9999/9997, 与现行
+# conf/XRevise.sh + 节点体系无关; caddy 那条路也已确认不作为主路径。
+#
+# 处置: 2026-10-10 整体删除 (决策依据 docs/audit/AUDIT-04.md:78 与
+# docs/audit/AUDIT-05-deadcode-matrix.md:88-98 的"孤儿链必须作为决策单元整体
+# 处理"; 处置记录 docs/legacy/README.md)。删除前的实现在 git 历史与旧仓库里
+# 可查, 需要时去那边取, 不在本仓库复活。
+#
+# 这组守两件事, 缺一不可:
+#   ① 8 个文件真的不在仓库里了 (防 revert / 从旧 tag 拷回);
+#   ② 现行脚本里没有**代码**再引用它们 —— 注释里的历史叙述不算,
+#      与上面"菜单编号不硬编码"那组同一条判据: 注释不是调用。
+group "孤儿链已移除 (防回归)"
+ORPHAN_FILES=(
+    VEVLRE.sh VEVLRE6.sh Conversion.sh ngcadall.sh
+    nginx.sh caddy.sh conf/cconf.sh conf/nconf.sh
+)
+for _of in "${ORPHAN_FILES[@]}"; do
+    if [[ -e "$ROOT/$_of" ]]; then
+        bad "已删除: $_of" "文件又回来了 —— 旧实现见 git 历史/旧仓库, 不要在主线复活"
+    elif command -v git >/dev/null 2>&1 && [[ -d "$ROOT/.git" ]] \
+         && git -C "$ROOT" ls-files --error-unmatch -- "$_of" >/dev/null 2>&1; then
+        bad "已删除: $_of" "工作区没有但 git 索引里还在 (git rm --cached 忘了提交?)"
+    else
+        ok "已删除: $_of"
+    fi
+done
+
+# 引用扫描: 全仓库 .sh/.py 的**非注释行**, 跳过本文件 (名单就写在这里) 与
+# docs/ (审计与历史记录里的提及是证据, 不是调用)。
+_orphan_ref=$(python3 - "$ROOT" <<'PY'
+import os, re, sys
+root = sys.argv[1]
+names = ["VEVLRE.sh", "VEVLRE6.sh", "Conversion.sh", "ngcadall.sh",
+         "nginx.sh", "caddy.sh", "cconf.sh", "nconf.sh"]
+pat = re.compile(r"(?<![A-Za-z0-9_.-])(" + "|".join(re.escape(n) for n in names)
+                 + r")(?![A-Za-z0-9_-])")
+hits = []
+for dp, dns, fns in os.walk(root):
+    dns[:] = [d for d in dns if d not in (".git", "docs")]
+    for fn in fns:
+        if not fn.endswith((".sh", ".py")):
+            continue
+        rel = os.path.relpath(os.path.join(dp, fn), root)
+        if rel == "tools/check_libs.sh":      # 本文件: 名单写在这里, 不算引用
+            continue
+        try:
+            lines = open(os.path.join(dp, fn), encoding="utf-8",
+                         errors="replace").read().splitlines()
+        except OSError:
+            continue
+        for i, ln in enumerate(lines, 1):
+            if ln.lstrip().startswith("#"):   # 注释: 历史叙述, 不是调用
+                continue
+            if pat.search(ln):
+                hits.append("%s:%d" % (rel, i))
+print(" ".join(hits))
+PY
+)
+if [[ -n "$_orphan_ref" ]]; then
+    bad "没有现行脚本引用孤儿链" "还有引用(非注释行): $_orphan_ref"
+else
+    ok "没有现行脚本引用孤儿链 (.sh/.py 非注释行)"
+fi
+
 # 门禁脚本自己也会骗人: 之前有两条检查调了根本**不存在**的断言函数
 # （assert_has / pass），bash 只往 stderr 丢一句 "command not found",
 # 检查项既不通过也不失败 —— 看起来全绿, 其实什么都没验。

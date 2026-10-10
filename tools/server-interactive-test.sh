@@ -97,8 +97,11 @@ printf '  时间: %s\n\n' "$(date '+%F %T')"
 # ---------------------------------------------------------- 静态检查
 printf '  \033[36m脚本静态检查\033[0m\n'
 n=0
-for f in xray-panel.sh xargo.sh VEVLRE.sh VEVLRE6.sh caddy.sh nginx.sh \
-         ngcadall.sh Conversion.sh; do
+# 清单只列**还在仓库里**的服务端脚本：v2ray 早期独立套件（VEVLRE*.sh /
+# Conversion.sh / ngcadall.sh / nginx.sh / caddy.sh）已整体删除，见
+# tools/check_libs.sh 的「孤儿链已移除」门禁组与 docs/legacy/README.md。
+# 删掉的文件名不要留在清单里：`[ -f ] || continue` 会让它静默跳过。
+for f in xray-panel.sh xargo.sh; do
   [ -f "$f" ] || { printf '    (缺少 %s)\n' "$f"; continue; }
   n=$((n+1))
   if bash -n "$f" 2>/dev/null; then ok "$f 语法通过"
