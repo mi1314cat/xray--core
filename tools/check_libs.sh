@@ -2987,7 +2987,298 @@ for f in "$ROOT/Client/tools/interactive-test.sh" "$ROOT/tools/server-interactiv
     fi
 done
 
-# ---------------------------------------------------------------- 自检
+# ================================================================ 本轮 4 个真 bug
+# 见 research/known-issues/x-kernel-fixes-round1.md（proxy-node-compat 仓库）。
+# 每条都先复现过、再修、再在这里锁住 —— 门禁只锁"修好的性质", 不复刻实现。
+
+# ---------------------------------------------------------------- P0-1 mux 策略
+#
+# 改动前：genconfig **无条件**给每个出站写 `mux:{enabled:true,concurrency:8}`，
+# 唯一开关是 `--no-mux`（默认 False=开）。后果：节点 JSON 里的 `mux:false` 被
+# 吞掉；XHTTP 节点也被开上 mux.cool（官方明确不建议），实测 CC 回环
+# mux 关 204 / mux 开 000。
+#
+# 现在三层：① --mux/--no-mux ② 节点 mux 字段 ③ 默认关；XHTTP/QUIC 一律拒绝。
+group "mux 策略 (P0-1: 默认关 / 节点字段生效 / XHTTP 拒开)"
+MX="$TMP/mux"; mkdir -p "$MX"
+mux_node() { # <文件> <transport> <mux 值>
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+json.dump({"protocol": "vless", "address": "a.example", "port": 443,
+           "uuid": "11111111-2222-3333-4444-555555555555", "transport": sys.argv[2],
+           "security": "tls", "sni": "a.example", "path": "/x",
+           "mux": sys.argv[3] == "true"}, open(sys.argv[1], "w"))
+PY
+}
+mux_gen() { # <节点文件> <输出> [额外参数...] -> 打印 mux 字段 (null 表示没写)
+  local nf="$1" out="$2"; shift 2
+  python3 "$ROOT/Client/lib/genconfig.py" --node "$nf" --output "$out" --mode normal \
+      --listen 127.0.0.1 --port-normal 1080 --logs "$MX" "$@" > "$MX/log-$(basename "$out").txt" 2>&1
+  python3 -c '
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    print("GEN_FAIL"); raise SystemExit
+print(json.dumps(next(o for o in d["outbounds"] if o.get("tag")=="proxy").get("mux")))
+' "$out" 2>/dev/null || echo "GEN_FAIL"
+}
+MUXT="$MX/t"; mkdir -p "$MUXT"
+mux_node "$MUXT/xhttp-nomux.json" xhttp false
+mux_node "$MUXT/xhttp-mux.json"   xhttp true
+mux_node "$MUXT/tcp-nomux.json"   tcp   false
+mux_node "$MUXT/tcp-mux.json"     tcp   true
+
+assert_eq "$(mux_gen "$MUXT/tcp-nomux.json" "$MUXT/o1.json")" "null" \
+    "节点 mux:false + 不给 --mux → 不写 mux（默认关，节点意图生效）"
+assert_eq "$(mux_gen "$MUXT/xhttp-nomux.json" "$MUXT/o2.json")" "null" \
+    "XHTTP 节点默认不写 mux"
+assert_eq "$(mux_gen "$MUXT/tcp-mux.json" "$MUXT/o3.json")" '{"enabled": true, "concurrency": 8}' \
+    "节点 mux:true（非 XHTTP）→ 真的开（不能一刀切砍功能）"
+assert_eq "$(mux_gen "$MUXT/xhttp-mux.json" "$MUXT/o4.json")" "null" \
+    "XHTTP + 节点 mux:true → 拒开（官方明确不建议同开）"
+grep -q 'mux' "$MX/log-o4.json.txt" && ok "拒开时在 stderr 说明原因" \
+    || bad "拒开时没吭声（用户会以为'我明明开了'）"
+assert_eq "$(mux_gen "$MUXT/tcp-nomux.json" "$MUXT/o5.json" --mux)" '{"enabled": true, "concurrency": 8}' \
+    "--mux 显式开（覆盖节点的 mux:false）"
+assert_eq "$(mux_gen "$MUXT/tcp-mux.json" "$MUXT/o6.json" --no-mux)" "null" \
+    "--no-mux 显式关（覆盖节点的 mux:true）"
+# 开的时候必须说风险（用户要求：要能开，但要在 stderr 说明风险）
+grep -q 'concurrency=8' "$MX/log-o3.json.txt" && ok "开 mux 时 stderr 给出风险提示" \
+    || bad "开 mux 时没有风险提示"
+# XHTTP 拒绝要写进 compat 的"运行期事实"，否则它对 XHTTP 节点的结论比现实悲观
+python3 - "$ROOT" <<'PY' > "$MX/compat_mux.txt"
+import importlib.util, os, sys
+root = sys.argv[1]
+spec = importlib.util.spec_from_file_location("c2", os.path.join(root, "Client/lib/compat2.py"))
+c2 = importlib.util.module_from_spec(spec); spec.loader.exec_module(c2)
+node = {"protocol": "vless", "transport": "xhttp", "security": "tls", "mux": True}
+on, why = c2.effective_mux(node)
+print("declined=%s" % (not on))
+print("tcp_on=%s" % c2.effective_mux({"protocol": "vless", "transport": "tcp", "mux": True})[0])
+print("default_off=%s" % (not c2.effective_mux({"protocol": "vless", "transport": "tcp", "mux": False})[0]))
+PY
+grep -q 'declined=True' "$MX/compat_mux.txt" && ok "compat2 认定 XHTTP 下 mux 被拒（与实际一致）" \
+    || bad "compat2 仍以为 XHTTP 会开 mux —— 两侧判据漂移"
+grep -q 'tcp_on=True' "$MX/compat_mux.txt" && ok "compat2 认定非 XHTTP 会开" || bad "compat2 漏判非 XHTTP 的 mux"
+grep -q 'default_off=True' "$MX/compat_mux.txt" && ok "compat2 默认不开（与 genconfig 一致）" \
+    || bad "compat2 默认还认为会开"
+# ★ 两侧判据是**抄的一份**（compat2 要能独立跑，不 import genconfig）。抄就得锁：
+#   一条门禁逐项比对键集合，漂移当场红。
+python3 - "$ROOT" <<'PY' > "$MX/mux_keys.txt"
+import importlib.util, os, sys
+root = sys.argv[1]
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+g = load("g", os.path.join(root, "Client/lib/genconfig.py"))
+c = load("c", os.path.join(root, "Client/lib/compat2.py"))
+gt, gp = set(g.MUX_FORBIDDEN_TRANSPORTS), set(g.MUX_FORBIDDEN_PROTOCOLS)
+ct, cp = set(c._MUX_FORBIDDEN_TRANSPORTS), set(c._MUX_FORBIDDEN_PROTOCOLS)
+print("same=%s" % (gt == ct and gp == cp))
+print("g=%s c=%s" % (sorted(gt | gp), sorted(ct | cp)))
+PY
+grep -q 'same=True' "$MX/mux_keys.txt" && ok "genconfig 与 compat2 的 mux 判据键集合一致（防漂移）" \
+    || bad "两处 mux 判据漂移: $(grep -m1 '^g=' "$MX/mux_keys.txt")"
+
+# 节点生成侧：mihomo 的 smux 是另一套协议，不能冒充 mux.cool
+python3 - "$ROOT" <<'PY' > "$MX/smux.txt"
+import importlib.util, json, os, sys
+root = sys.argv[1]
+spec = importlib.util.spec_from_file_location("nd", os.path.join(root, "Client/lib/node.py"))
+nd = importlib.util.module_from_spec(spec); spec.loader.exec_module(nd)
+off = nd.parse_mihomo_yaml(json.dumps({"proxies": [{"name": "n", "type": "vless", "server": "a.example",
+    "port": 443, "uuid": "u", "network": "xhttp", "tls": True,
+    "smux": {"enabled": False, "protocol": "smux"}}]}))
+on = nd.parse_mihomo_yaml(json.dumps({"proxies": [{"name": "n", "type": "vless", "server": "a.example",
+    "port": 443, "uuid": "u", "network": "xhttp", "tls": True,
+    "smux": {"enabled": True, "protocol": "smux"}}]}))
+print("smux_off_mux=%s smux_off_smux=%s" % (off["mux"], off["smux"]))
+print("smux_on_mux=%s smux_on_smux=%s" % (on["mux"], on["smux"]))
+PY
+grep -q 'smux_off_mux=False smux_off_smux=False' "$MX/smux.txt" \
+    && ok "mihomo smux:{enabled:false} 不再被读成'要开 mux'（字典恒真的老坑）" \
+    || bad "smux:{enabled:false} 被读成了要开 mux"
+grep -q 'smux_on_mux=False smux_on_smux=True' "$MX/smux.txt" \
+    && ok "mihomo smux:{enabled:true} 记进 smux 字段，不冒充 mux.cool" \
+    || bad "smux 仍被当成 mux.cool（另一个协议的字段）"
+
+# ---------------------------------------------------------------- P0-2 gen_psk + batch 退出码
+group "SS2022 PSK 与 batch 退出码 (P0-2)"
+grep -q '^gen_psk()' "$ROOT/conf/lib/random.sh" && ok "gen_psk 在 conf/lib/random.sh 里（被误删过一次）" \
+    || bad "gen_psk 又不见了 —— batch 会再次生成不出 SS2022"
+grep -q 'lib/random.sh' "$ROOT/conf/Shadowsocks.sh" && ok "Shadowsocks.sh 加载随机值库" \
+    || bad "Shadowsocks.sh 没有加载 random.sh"
+# 注意：**不能**写成 `echo "$PSKO" | grep -q ...` —— 本文件带 pipefail,
+# grep -q 命中即退出会让产出方吃 SIGPIPE(141)（本文件末尾那条门禁就抓这个）。
+# 落成文件再按行读, 判断才稳。
+PSKO=$(bash -c 'source "$1/conf/lib/random.sh"
+for m in 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305; do
+  p=$(gen_psk "$m"); printf "%s %s %s\n" "$m" "${#p}" "$(printf "%s" "$p" | openssl base64 -d -A 2>/dev/null | wc -c)"
+done' _ "$ROOT")
+printf '%s\n' "$PSKO" > "$TMP/psk.txt"
+psk_line() { awk -v m="$1" '$1==m {print $2" "$3}' "$TMP/psk.txt"; }
+assert_eq "$(psk_line 2022-blake3-aes-128-gcm)" "24 16" "gen_psk(aes-128-gcm) = 24 字符 / 16 字节"
+assert_eq "$(psk_line 2022-blake3-aes-256-gcm)" "44 32" "gen_psk(aes-256-gcm) = 44 字符 / 32 字节"
+assert_eq "$(psk_line 2022-blake3-chacha20-poly1305)" "44 32" "gen_psk(chacha20) = 44 字符 / 32 字节"
+
+# batch：**任何一个协议失败都要以非零退出码收尾**（原来无条件 return 0，
+# SS2022 明明失败了，汇总里印着 [失败]，脚本却还是 exit 0）。
+BT="$TMP/batch"; rm -rf "$BT"; mkdir -p "$BT/conf" "$BT/out"
+cp "$ROOT/conf/batch.sh" "$BT/batch.sh"
+for p in Reality Trojan Shadowsocks hysteria2; do
+    printf '#!/bin/bash\necho "stub $p fail" >&2\nexit 3\n' > "$BT/$p.sh"
+done
+printf '#!/bin/bash\ncase "${1:-}" in check) exit 0;; restart) exit 0;; esac\nexit 0\n' > "$BT/verify.sh"
+BOUT=$(XRAY_BASE_DIR="$BT" X_BATCH_LOG_DIR="$BT" bash "$BT/batch.sh" --auto 2>&1); BRC=$?
+assert_eq "$BRC" "1" "4 个协议全失败时 batch 退出码非 0（不再掩盖失败）"
+printf '%s\n' "$BOUT" > "$BT/out.txt"
+grep '失败(详情在日志末尾)' "$BT/out.txt" >/dev/null && ok "失败清单被打印" || bad "失败清单没有打印"
+grep '退出码 1' "$BT/out.txt" >/dev/null && ok "批量收尾明确指出退出码非 0" || bad "收尾没有指出退出码"
+# 反证：全部成功时必须是 0（不能为了非零把成功也判失败）
+for p in Reality Trojan Shadowsocks hysteria2; do
+    printf '#!/bin/bash\nexit 0\n' > "$BT/$p.sh"
+done
+printf '#!/bin/bash\necho "{\\"inbounds\\":[{\\"tag\\":\\"x\\",\\"port\\":1,\\"protocol\\":\\"vless\\"}]}" > "%s/conf/stub.json"\nexit 0\n' "$BT" > "$BT/Reality.sh"
+cp "$BT/Reality.sh" "$BT/Trojan.sh"; cp "$BT/Reality.sh" "$BT/Shadowsocks.sh"; cp "$BT/Reality.sh" "$BT/hysteria2.sh"
+XRAY_BASE_DIR="$BT" X_BATCH_LOG_DIR="$BT" bash "$BT/batch.sh" --auto >/dev/null 2>&1
+assert_eq "$?" "0" "全部成功时 batch 退出码仍是 0"
+
+# ---------------------------------------------------------------- P0-3 分享链接发布
+#
+# 生产 vless-xhttp-01/02/03 三条死链：入站只绑 127.0.0.1，分享链接却写
+# `公网IP:节点端口` —— 那个端口外部没人听。根因是 build_share_link **从来没看过
+# listen**。现在：绑回环 + 没有 nginx 档 → 拒绝发布并说明；有 nginx 档 → 按
+# 前端端口（默认 443）发布；元数据端口与片段不一致 → 提示（换了端口没重建）。
+group "分享链接发布 (P0-3: 回环节点不得按公网 host:port 发布)"
+python3 - "$LIB" <<'PY' > "$TMP/link_pub.txt"
+import sys
+sys.path.insert(0, sys.argv[1])
+import nodes as N
+def show(tag, n, meta):
+    notes = []
+    link = N.build_share_link(n, meta, notes=notes)
+    tgt = "-"
+    if link and "@" in link:
+        tgt = link.split("@", 1)[1].split("?", 1)[0].split("#", 1)[0]
+    print("%s\t%s\t%s" % (tag, tgt, " | ".join(notes)))
+base = {"protocol": "vless", "id": "u", "network": "xhttp", "security": "tls",
+        "server_names": [], "sni": "node.example", "path": "/x", "tag": "t"}
+show("loopback_nofront", dict(base, listen="127.0.0.1", port=45630),
+     {"host": "1.2.3.4", "port": 45630, "name": "n"})
+show("loopback_nginx", dict(base, listen="127.0.0.1", port=45630),
+     {"host": "node.example", "port": 45630, "name": "n", "tier": "nginx"})
+show("public_stale_meta", dict(base, listen="0.0.0.0", port=45630),
+     {"host": "1.2.3.4", "port": 25333, "name": "n"})
+show("public_ok", dict(base, listen="0.0.0.0", port=45630),
+     {"host": "1.2.3.4", "port": 45630, "name": "n"})
+PY
+LP() { grep -m1 "^$1	" "$TMP/link_pub.txt" | cut -f2; }
+LPN() { grep -m1 "^$1	" "$TMP/link_pub.txt" | cut -f3; }
+assert_eq "$(LP loopback_nofront)" "-" "只绑回环 + 没有 nginx 档 → 不发布（死链的根因）"
+[[ "$(LPN loopback_nofront)" == *"回环"* || "$(LPN loopback_nofront)" == *"127.0.0.1"* ]] \
+    && ok "拒发时说明原因（不是静默少一个节点）" || bad "拒发时没说原因: $(LPN loopback_nofront)"
+assert_eq "$(LP loopback_nginx)" "node.example:443" "回环 + nginx 档 → 按前端域名:443 发布"
+[[ "$(LPN loopback_nginx)" == *"回环端口"* ]] && ok "元数据拿回环端口当对外端口时给出提示" \
+    || bad "元数据陈旧却不吭声: $(LPN loopback_nginx)"
+assert_eq "$(LP public_ok)" "1.2.3.4:45630" "公网节点按元数据发布（原有行为不变）"
+[[ "$(LPN public_stale_meta)" == *"不一致"* ]] && ok "元数据端口与片段端口不一致时提示（换端口没重建）" \
+    || bad "端口不一致没有提示"
+# 老四元组接口仍然可用（share_service / 旧调用方不能被打断）
+python3 - "$LIB" "$TMP" <<'PY' > "$TMP/link_legacy.txt"
+import os, sys
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+os.environ.update(XRAY_CONF_DIR=os.path.join(d, "conf"), XRAY_SHARE_DIR=os.path.join(d, "share"))
+import share_payload as P
+print("four=%d" % len(P.build_payload(["good1"])))
+print("full=%d" % len(P.build_payload(["good1"], full=True)))
+PY
+grep -q 'four=4' "$TMP/link_legacy.txt" && ok "build_payload 老四元组接口未变（兼容旧调用方）" \
+    || bad "老接口被破坏: $(cat "$TMP/link_legacy.txt")"
+grep -q 'full=6' "$TMP/link_legacy.txt" && ok "full=True 才多出 refused/notes（新增细分）" \
+    || bad "full 接口不对: $(cat "$TMP/link_legacy.txt")"
+
+# ---------------------------------------------------------------- P0-4 旧格式字段
+#
+# 旧节点文件里 `"ech": true`（bool）被写进 tlsSettings.echConfigList，内核拒收
+# **整份**配置；而单节点模式此前不跑 --validate-with → 切到该节点整个实例起不来。
+# ech 已单独修（跳过 + 告知）；这里同时锁住"同类路径"：类型不对**明确报错**、
+# 数字字符串/数组这些旧写法要能正常走、写出前跑一次内核 -test。
+group "旧格式字段与新校验 (P0-4)"
+VT="$TMP/valid"; mkdir -p "$VT"
+python3 - "$VT" <<'PY'
+import json, sys
+d = sys.argv[1]
+def w(name, **kw):
+    n = {"protocol": "vless", "address": "a.example", "port": 443,
+         "uuid": "11111111-2222-3333-4444-555555555555", "transport": "xhttp",
+         "security": "tls", "sni": "a.example", "path": "/x"}
+    n.update(kw); json.dump(n, open("%s/%s.json" % (d, name), "w"))
+w("ech_bool", ech=True)
+w("ech_str", ech="cloudflare-ech.com+https://dns.alidns.com/dns-query")
+w("sni_bool", sni=True)
+w("legacy_ok", port="443", alpn=["h2", "http/1.1"])
+w("ws_ed_str", transport="websocket", ws_ed="2048")
+PY
+gen_try() { # <名字> -> 打印 rc
+  python3 "$ROOT/Client/lib/genconfig.py" --node "$VT/$1.json" --output "$VT/out-$1.json" \
+      --mode normal --listen 127.0.0.1 --port-normal 1080 --logs "$VT" \
+      > "$VT/log-$1.txt" 2>&1
+  echo $?
+}
+assert_eq "$(gen_try ech_bool)" "0" "ech:true（旧 bool）不再让生成失败"
+grep -q 'ech' "$VT/log-ech_bool.txt" && ok "跳过 ECH 时明确告知（不是静默丢）" || bad "跳过 ECH 没吭声"
+python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+ts=(d["outbounds"][0].get("streamSettings") or {}).get("tlsSettings") or {}
+print("no_ech_field=%s" % ("echConfigList" not in ts))' "$VT/out-ech_bool.json" > "$VT/ech_check.txt"
+grep -q 'no_ech_field=True' "$VT/ech_check.txt" && ok "bool 没有被写进 echConfigList（内核会拒收整份配置）" \
+    || bad "bool 仍被写进 echConfigList"
+assert_eq "$(gen_try ech_str)" "0" "ech 是合法字符串时照常生成"
+python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+print("ech=%s" % (((d["outbounds"][0]["streamSettings"]).get("tlsSettings") or {}).get("echConfigList")))' \
+  "$VT/out-ech_str.json" > "$VT/ech_str_check.txt"
+grep -q '^ech=cloudflare-ech.com' "$VT/ech_str_check.txt" && ok "ECHConfigList 原样下发" || bad "ECHConfigList 丢了"
+assert_eq "$(gen_try sni_bool)" "2" "sni:true（同类旧格式）→ 明确报错，不照写"
+[[ -f "$VT/out-sni_bool.json" ]] && bad "类型不符却还是写了配置（内核会因此起不来）" \
+    || ok "类型不符时不落盘（旧配置得以保留）"
+grep -q 'sni' "$VT/log-sni_bool.txt" && ok "报错里点名是哪个字段" || bad "报错没说是哪个字段"
+assert_eq "$(gen_try legacy_ok)" "0" "旧写法（port 字符串 + alpn 数组）能正常生成"
+python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+ts=d["outbounds"][0]["streamSettings"]["tlsSettings"]
+print("alpn=%s port=%s" % (ts.get("alpn"), d["outbounds"][0]["settings"]["vnext"][0]["port"]))' \
+  "$VT/out-legacy_ok.json" > "$VT/legacy_check.txt"
+grep -q "alpn=\['h2', 'http/1.1'\] port=443" "$VT/legacy_check.txt" \
+    && ok "alpn 数组没有被 str() 成 ['h2'] 垃圾值" || bad "alpn 处理不对: $(cat "$VT/legacy_check.txt")"
+assert_eq "$(gen_try ws_ed_str)" "0" "ws_ed 是数字字符串时不再 TypeError（旧文件常见）"
+grep -q 'ed=2048' "$VT/out-ws_ed_str.json" && ok "ws_ed 数字字符串被正确用上" || bad "ws_ed 没生效"
+# 单节点也跑内核校验：坏配置**不覆盖**已有文件（这是'切过去整个实例起不来'的防线）
+XK="${XRAY_BIN:-}"
+[[ -z "$XK" && -x /root/catmi/xray/xrayls ]] && XK=/root/catmi/xray/xrayls
+if [[ -n "$XK" && -x "$XK" ]]; then
+    python3 -c '
+import json,sys
+json.dump({"protocol":"vless","address":"a.example","port":443,
+  "uuid":"11111111-2222-3333-4444-555555555555","transport":"tcp","security":"reality",
+  "sni":"a.example","reality_public_key":"SHORT","reality_short_id":"aa",
+  "fingerprint":"chrome"}, open(sys.argv[1],"w"))' "$VT/bad_reality.json"
+    echo "PRESERVE" > "$VT/out-bad_reality.json"
+    python3 "$ROOT/Client/lib/genconfig.py" --node "$VT/bad_reality.json" \
+        --output "$VT/out-bad_reality.json" --mode normal --listen 127.0.0.1 \
+        --port-normal 1080 --logs "$VT" --validate-with "$XK" > "$VT/log-bad.txt" 2>&1
+    assert_eq "$?" "2" "单节点模式下内核校验失败 → 生成失败（不再照写）"
+    assert_eq "$(cat "$VT/out-bad_reality.json")" "PRESERVE" "失败时**不覆盖**已有配置"
+    grep -q '未覆盖' "$VT/log-bad.txt" && ok "明确说明没有覆盖旧配置" || bad "没说清楚有没有覆盖"
+else
+    ok "（跳过内核校验用例：本机没有 xray 二进制）"
+fi
+
+
 # 门禁脚本自己也会骗人: 之前有两条检查调了根本**不存在**的断言函数
 # （assert_has / pass），bash 只往 stderr 丢一句 "command not found",
 # 检查项既不通过也不失败 —— 看起来全绿, 其实什么都没验。
