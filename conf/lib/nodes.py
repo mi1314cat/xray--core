@@ -192,6 +192,7 @@ def extract(inbound, source_file):
         # 报 "cannot validate certificate for <IP> ... no IP SANs", 经分享
         # 链接根本连不上, 而服务端一切正常。
         "tls_domains": tls_domains(tls),
+        "alpn": ",".join(tls.get("alpn") or []) or None,
         # ---- 证书 ----
         "cert_files": [
             c.get("certificateFile")
@@ -292,6 +293,17 @@ def _qval(v):
 # 三条链接必然是死链。根因就是这里**从来没看过 listen**。
 LOOPBACK_LISTEN = {"127.0.0.1", "::1", "localhost", "[::1]", "127.0.0.2"}
 DEFAULT_FRONT_PORT = 443        # nginx 前端默认端口 (与 deploy.py 的 public_port 同义)
+
+# hysteria2 链接的带宽/ALPN 默认值。
+#
+# 与 conf/hysteria2.sh 生成同一个节点时写死的那组数一模一样
+# (链接里 upmbps=50&downmbps=200, 客户端 JSON 里 up:"50mbps"/down:"200mbps"),
+# 也与 mihomo 里 hysteria2 的默认 up/down 语义 (裸数字 = Mbps) 一致。
+# 分享层不能比节点自己的客户端产物少字段 —— 同一个节点从面板发出去和从
+# 脚本发出去必须描述同一件事。要改按节点走 share_meta 的 upmbps/downmbps。
+DEFAULT_HY2_UP = 50
+DEFAULT_HY2_DOWN = 200
+DEFAULT_HY2_ALPN = "h3"
 
 
 def is_loopback_bound(n) -> bool:
@@ -505,16 +517,37 @@ def build_share_link(n, meta=None, notes=None):
         # "hysteria" 也算进来 —— 漏了它, 内核实机跑出来的 hysteria2 节点
         # 一个都生成分享链接。
         #
-        # ★ sni 以前取的是 meta["host"], 生产上那是**连接地址** —— 实测生成过
-        #   `sni=107.173.154.178`, 客户端拿 IP 校验证书必然失败。现在取证书/
-        #   节点声明的域名, 拿不到就整个参数不写。
+        # ★ 参数名以**两家内核的解析器**为准 (实测 mihomo v1.19.32
+        #   common/convert/converter.go:72-116 与 sing-box 面板
+        #   src/conf/outbound_uri.py:441-509), 名字写错就是**静默忽略**:
+        #     alpn      —— 两家都认 (mihomo 逗号切分)
+        #     up/down   —— mihomo 认 (裸数字 = Mbps); sing-box 面板不认
+        #     upmbps/downmbps —— sing-box 面板与本项目 conf/hysteria2.sh 认;
+        #                        mihomo 只对已废弃的 hysteria v1 认这两个名字
+        #   所以两个写法都写: 各自的解析器取自己认识的那个, 不认识的是普通
+        #   未知参数 (mihomo 只看它认识的键, sing-box 面板同理, 都不会报错)。
+        #   只写一种是实测过的坑: 旧链接里 upmbps=50 被 mihomo 整条丢掉,
+        #   带宽提示等于没写。
+        #
+        #   sni 同理: 以前取的是 meta["host"], 生产上那是**连接地址** ——
+        #   实测生成过 `sni=107.173.154.178`, 客户端拿 IP 校验证书必然失败。
+        #   现在取证书/节点声明的域名, 拿不到就整个参数不写。
         q = {}
         sni = link_sni(n, meta)
         if sni:
             q["sni"] = sni
         q["insecure"] = "0"
-        if meta.get("alpn"):
-            q["alpn"] = meta["alpn"]
+        # hy2 走 QUIC, ALPN 必须是 h3 (节点自己的 tlsSettings.alpn 就是 h3);
+        # 不写的话客户端可能一个 ALPN 都不带, 服务端直接不应答。
+        q["alpn"] = n.get("alpn") or meta.get("alpn") or DEFAULT_HY2_ALPN
+        up = meta.get("upmbps") or meta.get("up") or DEFAULT_HY2_UP
+        down = meta.get("downmbps") or meta.get("down") or DEFAULT_HY2_DOWN
+        q["up"] = up
+        q["down"] = down
+        q["upmbps"] = up
+        q["downmbps"] = down
+        if meta.get("mport"):
+            q["mport"] = meta["mport"]
         qs = "&".join(f"{k}={_qval(v)}" for k, v in q.items() if v)
         return f"hysteria2://{_q(n.get('password') or n.get('id') or '')}@{_q(host)}:{port}?{qs}#{_q(name)}"
 
