@@ -261,6 +261,17 @@
       "where": "research/integration/x-client-integration.md §CC 实测",
       "limits": "只验证**出站**方向与 26.3.27 这一版；入站方向与更早版本未验证"
     }
+,
+  {
+   "id": "e-mihomo-trojan-uri-reality",
+   "type": "BEHAVIOR",
+   "confidence": "HIGH",
+   "date": "2026-10-10",
+   "claim": "mihomo (v1.19.32 与当前 Meta 分支) 的 trojan 分享链接解析器不读 security/pbk/sid → reality-opts 永远缺失, trojan+REALITY 链接导入后只按裸 TLS 拨号必然失败; 引擎本身支持(显式 reality-opts 的 YAML 实测 204)",
+   "how": "源码: common/convert/converter.go 的 `case \"trojan\"` 全文不出现 security/pbk/sid/reality(与 upstream Meta 分支逐字 diff 相同), 而 vless 走 common/convert/v.go handleVShareLink 会读 pbk/sid; 回环对照实验(RN 上 mihomo v1.19.32, 目标 127.0.0.1:29602): A 链接导入 provider → HTTP 000 且日志无任何 REALITY 行; B 同节点 YAML 显式 reality-opts → 日志 'REALITY Authentication: true' + HTTP 204; C 同一份 YAML 去掉 reality-opts(= URI 解析器产出的形状) → 000; D vless+REALITY 走同一条 URI 通道 → 日志出现 REALITY 行(证明 URI→reality 通道本身可用, 差别只在解析器读不读 pbk/sid)",
+   "where": "research/known-issues/x-hysteria-import-and-unlocated.md",
+   "limits": "只测 mihomo v1.19.32 与当前 Meta 分支源码; 未来版本是否补上未验证; 未测 vmess+reality 的 URI 路径"
+  }
   ],
   "rules": [
     {
@@ -2327,5 +2338,32 @@
         "e-vlessenc-runtime"
       ]
     }
+,
+  {
+   "uri_rule_id": "uri.trojan.reality@mihomo",
+   "scheme": "trojan",
+   "feature": "standard:reality",
+   "target_kernel": "mihomo",
+   "representation": "NONE",
+   "loss": [
+    {
+     "field": "standard:reality.public_key",
+     "what": "mihomo 的 trojan 分支解析器不读 pbk → 拿不到公钥"
+    },
+    {
+     "field": "standard:reality.short_id",
+     "what": "同上不读 sid → 拿不到 shortId"
+    },
+    {
+     "field": "standard:reality.server_names",
+     "what": "sni 读得到, 但没有 reality-opts 时只按**裸 TLS** 拨号: 握手完成(REALITY 服务端把未认证客户端转发给目标站), 流量却进了 fallback → 必然连不通, 且错误信息与\"节点挂了\"无从区分"
+    }
+   ],
+   "workaround": "改用 mihomo YAML 形态(reality-opts 显式写) —— 本项目 out/trojan-client-*.yaml 产物本来就是对的(逐字带 public-key/short-id)",
+   "note": "trojan:// 链接**本身**能表达 reality(vless/sing-box/Xray 都读); 表达不出的是 mihomo 的 URI 解析实现 → 这一行必须按内核分叉, 不能进全局 uri_rules(否则会把 Xray/sing-box 判错)。",
+   "evidence": [
+    "e-mihomo-trojan-uri-reality"
+   ]
+  }
   ]
 }

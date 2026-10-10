@@ -1960,6 +1960,81 @@ assert_eq "$(CH2 nobw_src)" "SKIPPED" "没读到带宽时来源为空, 不冒充
 assert_eq "$(CH2 unknown_proto)" "raised" "没把白名单放宽成\"什么都收\": 不认识的协议仍然报错"
 assert_eq "$(CH2 trojan_pin)" "abcdef01" "同一处共享改动: 非 hysteria 产物的 pin 也读到了(小写归一)"
 
+# ---- 跨内核 compat: 同一条链接在不同内核的**解析器**上表达力不同 ----
+#
+# 现场: TROJAN-03(trojan+REALITY) 链接本身带齐 pbk/sid, Xray/sing-box 都能用,
+# mihomo 却恒 000。根因(mihomo v1.19.32 回环对照 + 源码):
+#   common/convert/converter.go 的 `case "trojan"` 从不读 security/pbk/sid
+#   → reality-opts 永远缺失 → 只按**裸 TLS** 拨号(日志里连 REALITY 行都没有)。
+#   同一个节点写成 YAML 显式带 reality-opts → 204; YAML 去掉 reality-opts → 000。
+# 所以这是"URI 表达力"的第二层: 链接格式装得下(全局行), 但**这个内核的解析实现
+# 读不读**是逐内核的。规则行必须带 target_kernel, 且**不许外溢**(否则 Xray 会被判错)。
+group "跨内核 compat: mihomo 的 trojan 链接解析器丢 reality (逐内核规则不外溢)"
+CH3=$(python3 - "$ROOT" <<'PYEOF'
+import json, os, sys
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+from proxy_node_compat import check_node, Target, Registry, default_registry_path
+
+LINK = ("trojan://LV7CpzX9Jc8vWuhP0YV0@107.173.154.178:29602?security=reality&type=tcp"
+        "&sni=audio-ssl.itunes.apple.com&fp=chrome&sid=b860a9f0"
+        "&pbk=GiR4k0uVRhKEWlfD9oRjjv-C0STrp5M0uP3kRIT2pgU#TROJAN-03")
+out = []
+
+
+def ok(cond, desc):
+    out.append(("OK " if cond else "NO ") + desc)
+
+
+reg = Registry.load(default_registry_path())
+rows = [u for u in reg.uri_rules if u.get("uri_rule_id") == "uri.trojan.reality@mihomo"]
+ok(len(rows) == 1, "注册表里有 uri.trojan.reality@mihomo 这一行")
+row = rows[0] if rows else {}
+ok(row.get("target_kernel") == "mihomo", "该行带 target_kernel=mihomo(逐内核, 不是全局)")
+ok(row.get("representation") == "NONE", "representation=NONE(reality 参数一个都到不了 mihomo)")
+ok(len(row.get("loss") or []) >= 3, "loss 逐字段写清(pbk / sid / server_names 各一条)")
+ok(bool(row.get("workaround")), "给了 workaround(YAML 形态的 reality-opts)")
+ev = set(reg.evidence.keys())
+ok(all(i in ev for i in (row.get("evidence") or [])),
+   "证据 id 在 evidence 表里能解析(不是悬空引用)")
+
+r_m = check_node(LINK, Target(kernel="mihomo", distribution="upstream", version="1.19.32")).to_dict()
+ok(r_m["levels"].get("uri") == "SUPPORTED_WITH_LOSS",
+   "mihomo + trojan/REALITY 链接: uri 层判 SUPPORTED_WITH_LOSS(不再当作能连)")
+ok(any(l.get("rule") == "uri.trojan.reality@mihomo" for l in r_m.get("losses", [])),
+   "损失条目指向该规则(可审计)")
+ok(r_m.get("status") in ("SUPPORTED_WITH_LOSS", "UNSUPPORTED"),
+   "总判定至少带损失(status=%s)" % r_m.get("status"))
+
+r_x = check_node(LINK, Target(kernel="xray", distribution="upstream", version="26.3.27")).to_dict()
+ok(r_x["levels"].get("uri") != "SUPPORTED_WITH_LOSS",
+   "同一条链接在 xray 上**不被**这行波及(逐内核规则不许外溢)")
+ok(not any(l.get("rule") == "uri.trojan.reality@mihomo" for l in r_x.get("losses", [])),
+   "xray 的损失表里没有 mihomo 那条规则")
+ok(r_x.get("status") == "SUPPORTED", "xray 上仍是 SUPPORTED(与修复前逐字相同)")
+
+ok(reg.uri_rule("trojan", "standard:reality") is None,
+   "不给内核时取不到这颗逐内核行(不猜、不拿别家结论顶替)")
+ok((reg.uri_rule("trojan", "standard:reality", "mihomo") or {}).get("uri_rule_id")
+   == "uri.trojan.reality@mihomo", "给了 mihomo 才取到它")
+ok((reg.uri_rule("ss", "standard:reality", "mihomo") or {}).get("uri_rule_id") == "uri.ss.reality",
+   "全局行仍然是回退(ss 那条不受影响)")
+kernels = {u.get("target_kernel") for u in reg.uri_rules if u.get("target_kernel")}
+ok(kernels <= {"xray", "mihomo", "singbox"}, "所有 target_kernel 取值都是已知内核: %s" % sorted(kernels))
+legacy = [u for u in reg.uri_rules if not u.get("target_kernel")]
+ok(all(reg.uri_rule(u["scheme"], u["feature"]) is not None for u in legacy),
+   "旧调用形式对所有全局行仍然取得到(向后兼容)")
+for line in out:
+    print(line)
+PYEOF
+)
+while IFS= read -r ln; do
+    case "$ln" in
+        "OK "*) ok "${ln#OK }" ;;
+        "NO "*) bad "${ln#NO }" ;;
+    esac
+done <<< "$CH3"
+
 # 内核在就用真内核把"旧世代产物 → 配置"这一条验穿: 带宽搬到了 finalmask, 配置起得来
 XK2="${XRAY_BIN:-}"
 [[ -z "$XK2" && -x /root/catmi/xray/xrayls ]] && XK2=/root/catmi/xray/xrayls
