@@ -128,9 +128,18 @@ mk_ask_credential() {
 mk_run() {
     _mk_source preset.sh || return 1
     _mk_source ports.sh  || return 1
+    _mk_source naming.sh 2>/dev/null || true   # 显示名（旗帜 + 前缀）
     _mk_source deploy.sh 2>/dev/null || true   # 无 shell 版, 走 python
 
     _o "════════ 用预置创建节点 ════════"
+
+    # 服务器标识（旗帜 + 前缀）问一次。直接跑本脚本的人也要问到 ——
+    # 面板菜单 15 已经问过一遍, 这里是第二道口子(从终端直跑)。
+    # 已有答案时 x_ask_server_name 自己会跳过, 不会重复问。
+    if declare -f x_ask_server_name >/dev/null 2>&1; then
+        x_ask_server_name
+    fi
+
     local proto; proto=$(mk_ask_protocol) || return 1
     echo
 

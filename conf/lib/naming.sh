@@ -107,14 +107,89 @@ x_default_name() { # <协议> [编号] [安全] [cdn]
     x_node_tag "$@"
 }
 
+# ---------------------------------------------------------------- 显示名
+#
+# ★ 旗帜 + 服务器前缀 + 节点名（对照 sing-box-core 的 sb_server_name）。
+#   实现只有一份, 在 conf/lib/naming.py 里 —— 分享载荷是 python 拼的,
+#   两边各写一套必然漂移, 而漂移的表现是"面板里显示 🇺🇸 X-… ,
+#   客户端拿到的是 X-…", 很难查。
+#
+#   tag（内部标识）一个字都不改: 它要进配置、当文件名、进分享链接的
+#   fragment —— 必须是稳定 ASCII。旗帜只出现在**给人看的地方**。
+
+# 找一下 naming.py: 脚本旁边 → 安装目录 → 现拉（与其它 lib 同一套三级查找）
+_x_naming_py() {
+    local d self
+    self=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)
+    for d in "$self" "${XRAY_CONF_DIR:-${CONF_DIR:-/root/catmi/xray/conf}}/lib" \
+             /root/catmi/xray/conf/lib; do
+        [[ -f "$d/naming.py" ]] && { printf '%s' "$d/naming.py"; return 0; }
+    done
+    printf '%s' "$self/naming.py"
+}
+
+_x_naming() { # <子命令> [参数…]
+    local py; py=$(_x_naming_py)
+    [[ -f "$py" ]] || return 1
+    XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}" python3 "$py" "$@" 2>/dev/null
+}
+
+# 当前旗帜（可能是空串 —— 查不到就不带旗帜, 功能不受影响）
+x_flag() { _x_naming flag; }
+
+# 服务器前缀（环境变量 XRAY_SERVER_NAME → 缓存 → 默认 X）
+x_server_prefix() { _x_naming prefix; }
+
+# 给人看的完整服务器标识: 旗帜 + 前缀
+x_server_id() { _x_naming server; }
+
+# 节点显示名 = <旗帜> <前缀>-<节点名（去掉 x-）>
+x_display_name() { # <tag>
+    _x_naming display "${1:-}"
+}
+
+# 交互式问一次服务器标识。默认值就是当前值（旗帜 + 前缀）,
+# 用户只改名字时**旗帜要保住** —— 那是服务器的属性, 不该被改名顺带弄丢。
+#
+# 只在真的建节点时问, 且非交互（批量/管道）不打扰 —— 用默认值。
+x_ask_server_name() {
+    [[ -n "${XRAY_SERVER_NAME:-}" ]] && { export XRAY_SERVER_NAME; return 0; }
+    [[ -n "${XRAY_NO_NAME_PROMPT:-}" ]] && return 0
+    [[ -t 0 ]] || return 0
+    local cur def v
+    cur=$(_x_naming server)
+    def="${cur:-X}"
+    printf '\n  服务器标识（节点名前缀，多台服务器用它区分，避免客户端互相覆盖）\n' >&2
+    printf '  直接回车即用默认值。当前: %s\n' "$def" >&2
+    printf '  服务器标识 (默认: %s): ' "$def" >&2
+    if ! IFS= read -r v; then
+        printf '\n' >&2
+        return 0
+    fi
+    v="${v:-$def}"
+    v=$(_x_naming set "$v")
+    XRAY_SERVER_NAME="$v"
+    export XRAY_SERVER_NAME
+    printf '  节点名将是: %s\n' "$(x_display_name "x-vless01-TLS")" >&2
+}
+
 # ---------------------------------------------------------------- 直跑
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-demo}" in
-        tag)   shift; x_node_tag "$@" ;;
-        next)  shift; x_next_index "$@" ;;
-        name)  shift; x_default_name "$@" ;;
+        tag)     shift; x_node_tag "$@" ;;
+        next)    shift; x_next_index "$@" ;;
+        name)    shift; x_default_name "$@" ;;
+        flag)    x_flag ;;
+        prefix)  x_server_prefix ;;
+        server)  x_server_id ;;
+        display) shift; x_display_name "${1:-}" ;;
+        ask)     x_ask_server_name ;;
+        pycheck) python3 "$(_x_naming_py)" --check ;;
         demo)
-            printf '  约定: x-<协议><两位编号>-<安全>[-CDN]\n\n'
+            printf '  内部 tag: x-<协议><两位编号>-<安全>[-CDN]\n'
+            printf '  显示名  : <旗帜> <服务器前缀>-<节点名>\n'
+            printf '  当前服务器标识: %s   （例如显示名: %s）\n\n' \
+                "$(x_server_id)" "$(x_display_name x-vless01-TLS)"
             for a in "vless 1 tls" "vless 12 tls cdn" "trojan 2 reality" \
                      "vmess 1 tls cdn" "ss 3 none" "hysteria2 1 tls" "SS2022 4 none"; do
                 # shellcheck disable=SC2086

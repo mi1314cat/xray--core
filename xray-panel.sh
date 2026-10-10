@@ -116,7 +116,7 @@ xray_fetch() {
 _XRAY_LIB_FILES=(
     addr.sh cert.sh fetch.sh naming.sh ports.sh preset.sh print.sh
     random.sh read.sh service.sh verify.sh
-    deploy.py dns_edit.py nginx_apply.py node_build.py nodes.py
+    deploy.py dns_edit.py nginx_apply.py naming.py node_build.py nodes.py
     share_meta.py share_payload.py token_store.py
 )
 
@@ -257,17 +257,17 @@ xrayls 服务状态: ${xrayls_server_status_text}
         2) xray_run uninstall_xray.sh ;;
         3) show_xray_configs ;;
         4) systemctl status xrayls --no-pager ;;
-        5) add_node_menu; share_refresh_hook ;;
+        5) _xray_ask_server_name; add_node_menu; share_refresh_hook ;;
         6) xray_run conf/verify.sh ;;
         7) xray_run conf/outbound.sh ;;
         8) xray_run conf/split.sh ;;
         9) reverse_menu ;;
         10) xray_run conf/share.sh ;;
-        11) xray_run conf/node.sh; share_refresh_hook ;;
+        11) _xray_ask_server_name; xray_run conf/node.sh; share_refresh_hook ;;
         12) xray_run tools/check_libs.sh ;;
         13) xray_run conf/dns.sh ;;
         14) xray_run conf/logs.sh ;;
-        15) xray_run conf/mknode.sh; share_refresh_hook ;;
+        15) _xray_ask_server_name; xray_run conf/mknode.sh; share_refresh_hook ;;
         16) xray_run tools/preset_batch.sh --help; share_refresh_hook ;;
         17) xray_run conf/cert.sh ;;
         18) xray_run conf/nginx_site.sh ;;
@@ -374,6 +374,23 @@ show_xray_configs() {
         echo -e "\n===== $f ====="
         cat "$f"
     done
+}
+
+# 建节点之前问一次"服务器标识（节点名前缀）"。
+#
+# ★ 为什么挂在这里: 菜单 5 / 11 / 15 是三个不同的建节点入口, 各自是一堆
+#   独立脚本。在每个协议脚本里问一遍要改十几个文件, 而且用户会被反复问;
+#   挂在菜单入口上就是"每台机器问一次", 答案落盘到 share-state/server-name,
+#   之后所有节点(含批量)都用它。
+#
+#   对照 sing-box-core: 它的 sb_ask_server_name_hook 挂在 ask_server_addr
+#   后面, 同样是一次接入全覆盖。
+_xray_ask_server_name() {
+    xray_ensure_lib >/dev/null 2>&1
+    local lib="$_XRAY_CACHE/lib/naming.sh"
+    [[ -f "$lib" ]] || return 0
+    # shellcheck disable=SC1090
+    ( source "$lib" && x_ask_server_name ) || true
 }
 
 add_node_menu() {

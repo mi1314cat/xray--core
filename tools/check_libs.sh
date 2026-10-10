@@ -2266,6 +2266,145 @@ if [[ -f "$ROOT/install.sh" ]]; then
     install_has "install.sh 支持 --status（只看不改）" "--status"
 fi
 
+# ---------------------------------------------------------------- 节点命名
+# 用户的要求（对照 sing-box-core 的 sb_server_name / sb_flag_emoji）：
+#   "旗帜是必须要有的，然后在节点名称前面，我可以自定义一个名称"
+# 也就是 <旗帜> <服务器前缀>-<节点名>。这一组盯住三件事：
+#   1. 旗帜真的拼得出来（ISO → emoji），且查不到时不会把名字变成空的
+#   2. 前缀可自定义、不同前缀产生不同名字（多服务器防覆盖）
+#   3. 分享链接的 fragment 真的带上了它 —— 前面两点再对，
+#      没接到生成路径上也是白搭
+group "节点显示名 (旗帜 + 服务器前缀)"
+if [[ -f "$ROOT/conf/lib/naming.py" ]]; then
+    NAMING_PY="$ROOT/conf/lib/naming.py"
+    assert_eq "$(python3 "$NAMING_PY" --check >/dev/null 2>&1; echo $?)" "0" "naming.py 自检通过"
+
+    ISO_OUT=$(python3 - "$NAMING_PY" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("nm", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.iso_to_flag("US"), m.iso_to_flag("HK"), m.iso_to_flag("ZZZ"))
+PY
+)
+    assert_eq "$ISO_OUT" "🇺🇸 🇭🇰 " "ISO → 旗帜（非法值给空串，不瞎猜）"
+
+    # 显示名组合：默认前缀 / 自定义前缀 / 老形态 tag / 用户自带旗帜
+    NAME_OUT=$(python3 - "$NAMING_PY" <<'PY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("nm", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+tmp = "/tmp/xbd-name-check"; os.system("rm -rf " + tmp); os.makedirs(tmp, exist_ok=True)
+m.FLAG_CACHE = os.path.join(tmp, "flag"); m.NAME_CACHE = os.path.join(tmp, "server-name")
+m._write(m.FLAG_CACHE, "🇺🇸")
+out = [m.display_name("x-vless01-TLS"), m.display_name("REALITY-01"),
+       m.display_name("🇯🇵 我自己起的"), m.display_name("")]
+m._write(m.NAME_CACHE, "HK1")
+out.append(m.display_name("x-vless01-TLS"))
+os.system("rm -rf " + tmp)
+print(" | ".join(out))
+PY
+)
+    assert_eq "$NAME_OUT" \
+      "🇺🇸 X-vless01-TLS | 🇺🇸 X-REALITY-01 | 🇯🇵 我自己起的 | 🇺🇸 X-node | 🇺🇸 HK1-vless01-TLS" \
+      "显示名 = 旗帜 + 前缀 + 节点名（含自带旗帜与空名两种边界）"
+
+    # bash 侧包装必须能拿到同一份实现
+    BASH_NAME=$(bash -c "source '$ROOT/conf/lib/naming.sh'; XRAY_BASE=/tmp/xbd-name-check2 XRAY_SERVER_NAME=HK9 x_server_id; echo; XRAY_SERVER_NAME=HK9 x_display_name x-vless01-TLS" 2>/dev/null)
+    [[ "$BASH_NAME" == *"HK9-vless01-TLS" ]] && ok "naming.sh 包装与实际实现一致" \
+        || bad "naming.sh 包装与实际实现一致 (得到 $BASH_NAME)"
+
+    # ---- 端到端：分享链接的 fragment 必须带上旗帜与前缀 ----
+    # 这是"做对了但没接上"的典型位置：naming.py 全绿, 生成出来还是老样子。
+    FRAG=$(python3 - "$ROOT" <<'PY'
+import os, sys, tempfile, json, base64
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "conf", "lib"))
+tmp = tempfile.mkdtemp(prefix="xbd-frag-")
+conf = os.path.join(tmp, "conf"); share = os.path.join(tmp, "share")
+os.makedirs(conf, exist_ok=True); os.makedirs(share, exist_ok=True)
+json.dump({"inbounds": [{"tag": "x-vless01-TLS", "port": 8443, "protocol": "vless",
+    "settings": {"clients": [{"id": "u-1"}], "decryption": "none"},
+    "streamSettings": {"network": "tcp", "security": "tls",
+                       "tlsSettings": {"serverName": "a.example"}}}]},
+    open(os.path.join(conf, "vless-01.json"), "w"))
+json.dump({"host": "a.example", "port": 8443, "name": "x-vless01-TLS"},
+          open(os.path.join(share, "x-vless01-TLS.json"), "w"))
+os.environ["XRAY_CONF_DIR"] = conf
+os.environ["XRAY_SHARE_DIR"] = share
+os.environ["XRAY_BASE"] = tmp
+# 旗帜缓存写死, 不联网 —— 门禁必须离线可跑
+os.makedirs(os.path.join(tmp, "share-state"), exist_ok=True)
+open(os.path.join(tmp, "share-state", "flag"), "w").write("🇺🇸")
+import importlib.util
+spec = importlib.util.spec_from_file_location("sp", os.path.join(root, "conf", "lib", "share_payload.py"))
+sp = importlib.util.module_from_spec(spec); spec.loader.exec_module(sp)
+payload, missing, nometa, bad = sp.build_payload(["x-vless01-TLS"])
+line = base64.b64decode(payload).decode() if payload else ""
+import urllib.parse
+print(urllib.parse.unquote(line.rsplit("#", 1)[1]) if "#" in line else "")
+PY
+)
+    assert_eq "$FRAG" "🇺🇸 X-vless01-TLS" "分享链接 fragment 带上了旗帜与默认前缀 (X)"
+
+    # 前缀改了，fragment 跟着变（否则"自定义"是假的）
+    FRAG2=$(XRAY_SERVER_NAME=HK1 python3 - "$ROOT" <<'PY'
+import os, sys, tempfile, json, base64, urllib.parse
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "conf", "lib"))
+tmp = tempfile.mkdtemp(prefix="xbd-frag2-")
+conf = os.path.join(tmp, "conf"); share = os.path.join(tmp, "share")
+os.makedirs(conf, exist_ok=True); os.makedirs(share, exist_ok=True)
+json.dump({"inbounds": [{"tag": "x-vless01-TLS", "port": 8443, "protocol": "vless",
+    "settings": {"clients": [{"id": "u-1"}], "decryption": "none"},
+    "streamSettings": {"network": "tcp", "security": "tls",
+                       "tlsSettings": {"serverName": "a.example"}}}]},
+    open(os.path.join(conf, "vless-01.json"), "w"))
+json.dump({"host": "a.example", "port": 8443, "name": "x-vless01-TLS"},
+          open(os.path.join(share, "x-vless01-TLS.json"), "w"))
+os.environ["XRAY_CONF_DIR"] = conf; os.environ["XRAY_SHARE_DIR"] = share
+os.environ["XRAY_BASE"] = tmp
+os.makedirs(os.path.join(tmp, "share-state"), exist_ok=True)
+open(os.path.join(tmp, "share-state", "flag"), "w").write("🇺🇸")
+import importlib.util
+spec = importlib.util.spec_from_file_location("sp2", os.path.join(root, "conf", "lib", "share_payload.py"))
+sp = importlib.util.module_from_spec(spec); spec.loader.exec_module(sp)
+payload, *_ = sp.build_payload(["x-vless01-TLS"])
+line = base64.b64decode(payload).decode() if payload else ""
+print(urllib.parse.unquote(line.rsplit("#", 1)[1]) if "#" in line else "")
+PY
+)
+    assert_eq "$FRAG2" "🇺🇸 HK1-vless01-TLS" "前缀可自定义（XRAY_SERVER_NAME）并体现在 fragment 里"
+
+    # 关掉旗帜也要有名字（离线机器不该连名字都没了）
+    FRAG3=$(XRAY_SKIP_FLAG=1 python3 - "$ROOT" <<'PY'
+import os, sys, tempfile, json, base64, urllib.parse
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "conf", "lib"))
+tmp = tempfile.mkdtemp(prefix="xbd-frag3-")
+conf = os.path.join(tmp, "conf"); share = os.path.join(tmp, "share")
+os.makedirs(conf, exist_ok=True); os.makedirs(share, exist_ok=True)
+json.dump({"inbounds": [{"tag": "x-vless01-TLS", "port": 8443, "protocol": "vless",
+    "settings": {"clients": [{"id": "u-1"}], "decryption": "none"},
+    "streamSettings": {"network": "tcp", "security": "tls",
+                       "tlsSettings": {"serverName": "a.example"}}}]},
+    open(os.path.join(conf, "vless-01.json"), "w"))
+json.dump({"host": "a.example", "port": 8443, "name": "x-vless01-TLS"},
+          open(os.path.join(share, "x-vless01-TLS.json"), "w"))
+os.environ["XRAY_CONF_DIR"] = conf; os.environ["XRAY_SHARE_DIR"] = share
+os.environ["XRAY_BASE"] = tmp
+import importlib.util
+spec = importlib.util.spec_from_file_location("sp3", os.path.join(root, "conf", "lib", "share_payload.py"))
+sp = importlib.util.module_from_spec(spec); spec.loader.exec_module(sp)
+payload, *_ = sp.build_payload(["x-vless01-TLS"])
+line = base64.b64decode(payload).decode() if payload else ""
+print(urllib.parse.unquote(line.rsplit("#", 1)[1]) if "#" in line else "")
+PY
+)
+    assert_eq "$FRAG3" "X-vless01-TLS" "关掉旗帜时仍带前缀（不是空名字）"
+else
+    bad "conf/lib/naming.py 不存在"
+fi
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

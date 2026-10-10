@@ -25,6 +25,14 @@ import json
 import os
 import sys
 
+# 显示名（旗帜 + 服务器前缀）实现在 naming.py —— 只有一份，
+# bash 侧 conf/lib/naming.sh 也调它。两边各写一套必然漂移。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import naming  # noqa: E402
+except Exception:                                                # noqa: BLE001
+    naming = None
+
 
 def _client_field(inbound, field):
     """从 inbound 里取客户端凭据, 兼容有 clients 数组和单用户两种写法。"""
@@ -186,6 +194,16 @@ def build_share_link(n, meta=None):
     # 兜底到端口, 保证任何情况下 fragment 都非空。
     if not name:
         name = f"{proto or 'node'}-{port or 'x'}"
+
+    # ★ 旗帜 + 服务器前缀。对照 sing-box-core 的做法 (sb_server_name):
+    #   tag 是内部标识 (稳定 ASCII), 给人看的名字要有"哪台机器"这一层 ——
+    #   否则两台服务器各跑一份全协议时, 客户端里两组节点名字一模一样,
+    #   导入第二条直接覆盖第一条 (Client 的节点文件名带名字), 静默少节点。
+    #
+    # 在这里做而不是在 share_payload 里: 面板创建时与节点变动后刷新时
+    # 都必须带上, 而两处都走这个函数。
+    if naming is not None:
+        name = naming.display_name(name)
 
     if not host or not port:
         # 没有对外地址就没法生成分享链接 —— 但不静默返回 None 让上层
