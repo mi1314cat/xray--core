@@ -144,6 +144,110 @@ def fail(msg: str) -> None:
     sys.exit(2)
 
 
+# ---------------------------------------------------------------------------
+# 节点字段类型体检（写出配置之前）
+# ---------------------------------------------------------------------------
+#
+# 为什么需要这一道：内核的配置 schema 是**严格类型**的，一个字段类型不对，
+# 它拒收的是**整份配置**，而不是那一个字段。实测原文（26.3.27）：
+#
+#   cannot unmarshal bool into Go struct field TLSConfig.outbounds[0].
+#   streamSettings.tlsSettings.echConfigList of type string
+#
+# 典型来源是**旧节点文件**：早期 node.py 把 mihomo 的 `ech-opts.enable: true`
+# 落成了 `"ech": true`（bool）。而单节点模式此前不跑 --validate-with，于是
+# 这份写坏的配置直接落盘 → 内核起不来 → **切到那个节点整个客户端全挂**。
+# ech 这一条已经单独修掉了（见 build_stream 里的 ech 处理），但同一类
+# "旧格式字段被直接写进内核配置"的路径还有别的：sni/path/host 若被写成
+# bool、port 写成非数字串、ws_ed 写成字符串（`ed <= 0` 当场 TypeError）。
+#
+# 所以这里做一次**全字段类型体检**，并且区分两种处置：
+#   · ech 是**已知的历史格式**：跳过该字段 + 在 stderr 说清楚（不阻断，
+#     因为"没有 ECH 也能用"，而"整个客户端起不来"严重得多）；
+#   · 其余字段：**明确报错**，绝不照写 —— 单节点模式下调用方会保留旧配置，
+#     用户看到的是"哪一行、哪个字段、什么类型"。
+_NODE_STR_FIELDS = (
+    "name", "protocol", "address", "uuid", "password", "method", "encryption",
+    "flow", "transport", "transport_raw", "security", "sni", "fingerprint",
+    "path", "host", "mode", "extra", "service_name", "header_type",
+    "reality_public_key", "reality_short_id", "reality_spider_x",
+    "pinned_cert_sha256", "username", "source",
+)
+_NODE_INT_FIELDS = ("port", "ws_ed")
+_NODE_BOOL_FIELDS = ("allow_insecure", "mux", "smux", "udp", "use_browser",
+                     "ech_declared")
+
+
+def _as_int(v, default=0):
+    """宽松取整：None/""→default；数字字符串→int；其他→None（表示类型不对）。"""
+    if v is None or v == "":
+        return default
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        return int(s) if s.lstrip("-").isdigit() else None
+    return None
+
+
+def _alpn_list(v) -> list:
+    """alpn 归一成数组。节点里两种写法都见过：`"h2,http/1.1"` 与 `["h2"]`。
+    直接 str(list) 会写成 `"['h2']"` 这种垃圾值 —— 内核照收，握手必失败。"""
+    if isinstance(v, list):
+        return [str(a) for a in v if str(a)]
+    return [a for a in str(v).split(",") if a]
+
+
+def _node_port(node: dict, default: int) -> int:
+    """端口取值：数字/数字字符串都认。类型不对返回 default（类型问题由
+    node_type_problems 提前报错，这里只负责不抛异常）。"""
+    v = _as_int(node.get("port"), default)
+    return default if v is None else v
+
+
+def node_type_problems(node: dict) -> tuple:
+    """节点字段体检，返回 (problems, warnings)。
+
+    problems 里的每一条都必须让调用方**拒收这个节点**（单节点=报错退出，
+    多出站=剔除该节点并说明），绝不带着它去写内核配置。
+    """
+    problems, warnings = [], []
+    for k in _NODE_STR_FIELDS:
+        v = node.get(k)
+        if v in (None, ""):
+            continue
+        if not isinstance(v, str):
+            problems.append(f"{k}={v!r}（{type(v).__name__}，内核要 string）")
+    for k in _NODE_INT_FIELDS:
+        v = node.get(k)
+        if v in (None, ""):
+            continue
+        if _as_int(v, None) is None:
+            problems.append(f"{k}={v!r}（{type(v).__name__}，内核要整数）")
+    for k in _NODE_BOOL_FIELDS:
+        v = node.get(k)
+        if v is None or isinstance(v, (bool, dict, int)):
+            continue
+        if isinstance(v, str) and v.strip().lower() in ("true", "false", "0", "1",
+                                                        "yes", "no", "on", "off"):
+            continue
+        problems.append(f"{k}={v!r}（{type(v).__name__}，内核要布尔）")
+    # alpn：内核要数组。节点里两种写法都见过（"h2,http/1.1" 与 ["h2"]），
+    # 两种都能正确下发；数字/对象才是类型不对。
+    alpn = node.get("alpn")
+    if alpn not in (None, "") and not isinstance(alpn, (str, list)):
+        problems.append(f"alpn={alpn!r}（{type(alpn).__name__}，内核要字符串或数组）")
+    # ech 是**已知的历史格式**，见上面注释：跳过 + 告知，不阻断。
+    ech = node.get("ech")
+    if ech not in (None, "") and not isinstance(ech, str):
+        warnings.append(f"ech={ech!r}（{type(ech).__name__}，内核要 string）—— "
+                        "已跳过 ECH（旧节点文件里 mihomo 的 enable 会落成 bool）；"
+                        "证书校验请用 pinned_cert_sha256")
+    return problems, warnings
+
+
 def build_stream(node: dict, mode: str) -> dict:
     transport = (node.get("transport") or "tcp").lower()
     security = (node.get("security") or "none").lower()
@@ -172,7 +276,7 @@ def build_stream(node: dict, mode: str) -> dict:
             # hysteria2 默认就是 TLS（QUIC 自带），按官方示例给 tlsSettings
             tls_h: dict = {"serverName": node.get("sni") or node.get("address", "")}
             if node.get("alpn"):
-                tls_h["alpn"] = [a for a in str(node["alpn"]).split(",") if a]
+                tls_h["alpn"] = _alpn_list(node["alpn"])
             # hysteria2 的 TLS 配置走这个分支，pinning 也必须在这里加 ——
             # 之前只加在主 TLS 分支，hysteria2 节点永远读不到指纹。
             if node.get("pinned_cert_sha256"):
@@ -201,7 +305,7 @@ def build_stream(node: dict, mode: str) -> dict:
     if security == "tls":
         tls: dict = {"serverName": node.get("sni") or node.get("address", "")}
         if node.get("alpn"):
-            tls["alpn"] = [a for a in str(node["alpn"]).split(",") if a]
+            tls["alpn"] = _alpn_list(node["alpn"])
         if node.get("fingerprint") and mode == NORMAL:
             # dialer 模式下指纹无意义（Chromium 自带真实指纹）
             tls["fingerprint"] = node["fingerprint"]
@@ -280,7 +384,7 @@ def build_stream(node: dict, mode: str) -> dict:
         # 实测：同一个节点 path 不带 ed 必失败、带 ?ed=2048 立刻出网；原生路径两者都正常。
         # ed 只能通过 URL 查询串生效（实测：wsSettings.ed / earlyData / edMax 等字段全部无效），
         # 所以这里拼到 path 上。原生路径下也验证可用，不会造成回归。
-        ed = node.get("ws_ed") or 0
+        ed = _as_int(node.get("ws_ed"), 0)
         if ed <= 0:
             ed = WS_ED_DEFAULT
         if ed > 0 and "ed=" not in str(ws["path"]):
@@ -315,7 +419,7 @@ def build_outbound(node: dict, mode: str, mux, tag: str = "proxy") -> dict:
             users["security"] = node.get("encryption") or "auto"
         settings = {"vnext": [{
             "address": node.get("address", ""),
-            "port": int(node.get("port") or 443),
+            "port": _node_port(node, 443),
             "users": [users],
         }]}
     elif proto == "hysteria2":
@@ -324,18 +428,18 @@ def build_outbound(node: dict, mode: str, mux, tag: str = "proxy") -> dict:
         settings = {
             "version": 2,
             "address": node.get("address", ""),
-            "port": int(node.get("port") or 443),
+            "port": _node_port(node, 443),
         }
     elif proto == "trojan":
         settings = {"servers": [{
             "address": node.get("address", ""),
-            "port": int(node.get("port") or 443),
+            "port": _node_port(node, 443),
             "password": node.get("password", ""),
         }]}
     elif proto == "shadowsocks":
         settings = {"servers": [{
             "address": node.get("address", ""),
-            "port": int(node.get("port") or 8388),
+            "port": _node_port(node, 8388),
             "method": node.get("method", ""),
             "password": node.get("password", ""),
         }]}
@@ -344,7 +448,7 @@ def build_outbound(node: dict, mode: str, mux, tag: str = "proxy") -> dict:
         # 官方 Xray 的 socks/http 出站形状都是 servers 数组；认证是可选的，
         # 留空就完全不写 users 字段 —— 写了空 users 反而会被内核当成"要认证"。
         srv = {"address": node.get("address", ""),
-               "port": int(node.get("port") or (1080 if proto == "socks" else 8080))}
+               "port": _node_port(node, 1080 if proto == "socks" else 8080)}
         user = (node.get("username") or "").strip()
         if user:
             srv["users"] = [{"user": user, "pass": node.get("password") or ""}]
@@ -927,6 +1031,25 @@ def main() -> int:
         nodes, cur = load_nodes(args.nodes_dir, args.node)
         if not nodes:
             fail(f"节点目录里没有可用节点: {args.nodes_dir}")
+        # 先做**类型体检**再交给内核: 类型不对的字段内核会拒收整份配置,
+        # 而 prune_unbuildable 只能从内核报错里认出"哪个 tag"—— 认出之前
+        # 已经白跑一轮, 且多出站下这一条坏节点会把所有人的切换能力拖住。
+        # 两类问题的处置不同(见 node_type_problems): 类型错=剔除, ech 旧格式=跳过+告知。
+        typed_ok, type_dropped = [], []
+        for n in nodes:
+            problems, warnings = node_type_problems(n)
+            for w in warnings:
+                print(f"genconfig: {n['__id']}: {w}", file=sys.stderr)
+            if problems:
+                type_dropped.append((n["__id"], problems))
+            else:
+                typed_ok.append(n)
+        for fid, problems in type_dropped:
+            print(f"genconfig: 已剔除字段类型不符的节点 {fid} —— " + "; ".join(problems),
+                  file=sys.stderr)
+        nodes = typed_ok
+        if not nodes:
+            fail("所有节点的字段类型都不符合内核要求（见上面每条的说明）")
         xbin = getattr(args, "validate_with", "") or ""
         if xbin and os.access(xbin, os.X_OK):
             def _mk(ns):
@@ -949,6 +1072,18 @@ def main() -> int:
         for key in ("address", "port", "protocol"):
             if not node.get(key):
                 fail(f"节点缺少字段 {key!r}")
+        # ★ 单节点模式的类型体检**必须报错退出**, 不能照写。
+        #   这里正是 P0-4 那个 bug 的现场: 旧节点文件里 `ech: true`, 单节点模式
+        #   不跑 --validate-with, 于是 bool 被写进 echConfigList → 内核拒收整份
+        #   配置 → 切到该节点**整个实例起不来**。ech 已单独处理(跳过+告知),
+        #   其余字段在这里明确失败: 调用方会保留旧配置, 用户看到具体是哪个字段。
+        problems, warnings = node_type_problems(node)
+        for w in warnings:
+            print(f"genconfig: {os.path.basename(args.node)}: {w}", file=sys.stderr)
+        if problems:
+            fail(f"节点 {os.path.basename(args.node)} 有字段类型不符合内核要求，"
+                 f"不写配置（照写会让内核拒收**整份**配置）：\n  - "
+                 + "\n  - ".join(problems))
         cfg = build(node, args)
         tags = {}
         cur_id = None
@@ -959,6 +1094,44 @@ def main() -> int:
     out_dir = os.path.dirname(os.path.abspath(args.output))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+
+    # ---- 写出前的最后一道：让内核自己看一遍 ----
+    #
+    # ★ 单节点模式以前**不跑**这一步（只有多出站走 prune_unbuildable），
+    #   而单节点正是"当前选中的那个节点" —— 它写坏了的后果是把在跑的实例
+    #   整个搞挂（重启后起不来），比多出站还严重。
+    #
+    # 做法：先落临时文件 → 内核 -test → 通过才原子替换到 $output。
+    # 失败时**不覆盖**已有配置：调用方 die 之后，旧配置继续跑，客户端不会
+    # 因为切一个坏节点而全掉。内核原始的报错原样打出来 —— 它是唯一能指出
+    # "哪个字段"的信息。
+    xbin = getattr(args, "validate_with", "") or ""
+    if xbin and os.access(xbin, os.X_OK):
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=out_dir or ".", prefix=".gencfg-", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2, ensure_ascii=False)
+                fh.write("\n")
+            p = subprocess.run([xbin, "run", "-test", "-c", tmp],
+                               capture_output=True, text=True, timeout=60)
+            if p.returncode != 0:
+                err = ((p.stderr or "") + (p.stdout or "")).strip()
+                print(f"genconfig: 生成的配置没通过内核校验（{os.path.basename(xbin)} "
+                      f"run -test），**未覆盖** {args.output}", file=sys.stderr)
+                for line in err.splitlines()[-6:]:
+                    print("  " + line, file=sys.stderr)
+                return 2
+        except (OSError, subprocess.SubprocessError) as e:
+            # 校验跑不起来（没有内核/超时）不能让生成失败 —— 那是"校验不到"，
+            # 不是"配置坏了"；说清楚就行，后面的 --validate-with 由调用方决定。
+            print(f"genconfig: 内核校验未能执行（{e}），跳过", file=sys.stderr)
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     with open(args.output, "w") as fh:
         json.dump(cfg, fh, indent=2, ensure_ascii=False)
