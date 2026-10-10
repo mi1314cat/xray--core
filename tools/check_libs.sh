@@ -17,6 +17,16 @@ ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$*"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$*"; }
 group(){ printf '\n\033[36m%s\033[0m\n' "$*"; }
 
+# 静默跳过检测: 见文件末尾"门禁自检"。子 shell 里的 FAIL 会丢, 所以
+# 直接落文件, 末尾按文件判定。
+GHOST_LOG="$(mktemp -t cl-ghost.XXXXXX)"
+trap 'rm -f "$GHOST_LOG"' EXIT
+command_not_found_handle() {
+    printf '%s\n' "$1" >>"$GHOST_LOG"
+    printf '  \033[31m✗\033[0m 不存在的命令: %s\n' "$1" >&2
+    return 127
+}
+
 # assert_eq <实际> <期望> <描述>
 assert_eq() { [[ "$1" == "$2" ]] && ok "$3" || bad "$3 (得到 '$1', 期望 '$2')"; }
 assert_true() { [[ "$1" == "true" ]] && ok "$2" || bad "$2"; }
@@ -2546,6 +2556,61 @@ if [[ -f "$ROOT/Client/lib/actions.sh" ]]; then
     panel_has "$ROOT/Client/lib/web/panel.py" 'id="p-url"' "配置页有网页面板卡片"
 fi
 
+# ---------------------------------------------------------------- 管道早退
+# `set -euo pipefail` + 命令替换里的早退读取器 = 随机猝死。
+#
+# 实测: `ver=$("$XBD_XRAY" version | head -1)` 在 12 次里死了 4 次 —— head
+# 拿到第一行就退出, xray 还在写第二行, 于是 xray 吃 SIGPIPE（141）,
+# pipefail 让整条管道非零, 赋值失败, set -e 当场杀掉脚本。用户看到的是
+# "菜单只闪了一下版本号就回到命令行", 时好时坏, 根本没法复现。
+#
+# 早退读取器: head / grep -q / grep -m / tail -f 之外的都不早退
+# （awk、sed、sort、tail -n 都会读完输入）—— 所以判据很干净。
+group "管道早退 (set -e 下不许让被调用方吃 SIGPIPE)"
+SIGPIPE_HITS=$(python3 - "$ROOT" <<'PYEOF'
+import os, re, sys
+root = sys.argv[1]
+files = ["Client/bin/xbd", "xargo.sh", "xray-panel.sh"]
+files += ["Client/lib/" + f for f in sorted(os.listdir(os.path.join(root, "Client/lib")))
+          if f.endswith(".sh")]
+files += ["conf/" + f for f in sorted(os.listdir(os.path.join(root, "conf")))
+          if f.endswith(".sh")]
+# 早退读取器（读完就退出, 让上游吃 SIGPIPE）
+# 必须是"读取位置"的早退读取器: 前面是单个 `|`（不是 `||`）。
+# `openssl rand ... || head -c 12 /dev/urandom | od` 里的 head 是**产出方**
+# （它自己读 /dev/urandom）, 拿它当读取器是误报。
+EARLY = re.compile(r"(?<!\|)\|(?!\|)\s*(?:head\b|grep\s+-[a-zA-Z]*[qm]\b)")
+# 变量赋值形式: var=$(...) / local var=$(...)。local 形式不会杀掉脚本,
+# 但同样会拿到空值 —— 一起报, 提示里说清楚区别。
+ASSIGN = re.compile(r"^\s*(?:local\s+)?[A-Za-z_][A-Za-z0-9_]*=\$\(.*")
+hits = []
+for rel in files:
+    p = os.path.join(root, rel)
+    if not os.path.exists(p):
+        continue
+    try:
+        lines = open(p, encoding="utf-8").read().splitlines()
+    except Exception:
+        continue
+    head30 = "\n".join(lines[:30])
+    if not re.search(r"^set -[a-z]*e", head30, re.M):
+        continue          # 没有 errexit, 就不是这类事故
+    for i, line in enumerate(lines, 1):
+        if line.lstrip().startswith("#"):
+            continue
+        if "|| true" in line:
+            continue          # 显式吞掉, 安全
+        if ASSIGN.match(line) and EARLY.search(line):
+            hits.append(f"{rel}:{i}")
+print(" ".join(hits))
+PYEOF
+)
+if [[ -n "$SIGPIPE_HITS" ]]; then
+    bad "set -e 文件里没有早退管道" "$SIGPIPE_HITS —— 上游会吃 SIGPIPE(141), set -e 随机杀脚本; 改成先读完再切行（core.sh 的 first_line / xray_ver）"
+else
+    ok "set -e 文件里没有早退管道（不会随机吃 SIGPIPE 猝死）"
+fi
+
 # ---------------------------------------------------------------- 面板覆盖面
 # 用户的要求: "客户端面板（TUI/CLI）的功能，最好都能接进我们自研的这个 UI"。
 #
@@ -2598,6 +2663,83 @@ for pair in "应用配置按钮|applyConfig" \
         panel_has "$ROOT/Client/lib/web/panel.py" "${pair#*|}" "${pair%%|*}"
     fi
 done
+
+# ---------------------------------------------------------------- 测试导航
+# 验证台是靠"往菜单里敲数字"来点的。菜单一重排, 这些数字就指向别的项:
+# 客户端那边实测过 —— 节点子菜单重排后, 测试里的 8) 从「浏览器拨号」
+# 变成了「删除节点」, 只读模式救了一命, 全量跑就真删了。
+#
+# 所以: 不许出现**多级**硬编码导航（'1\n8\n...' 这种写死两层编号的）。
+# 单级的 '0\n'（退出）、'99\n0\n'（非法输入）这类不涉及"点哪一项",
+# 不受排版影响, 放行。
+group "测试导航不硬编码菜单编号"
+# 真正的"硬编码"长这样: printf '1\n8\n0\n0\n' —— 第一层写死 1, 第二层写死 8。
+# 第二层的 0 不算: 0 在所有菜单里都是"返回/退出"（进哪一层都一样）, 不受
+# 排版影响。`99\n0\n`（非法输入后退出）同理放行。
+# 变量版（"$M_SVC\n0\n0\n"、printf "1\n%s\n..."）也放行 —— 那正是我们要的写法。
+_hard=$(python3 - "$ROOT" <<'PY'
+import os, re, sys
+root = sys.argv[1]
+bad = []
+for rel in ("Client/tools/interactive-test.sh", "tools/server-interactive-test.sh"):
+    p = os.path.join(root, rel)
+    if not os.path.exists(p):
+        continue
+    for i, line in enumerate(open(p, encoding="utf-8"), 1):
+        if line.lstrip().startswith("#"):
+            continue          # 注释里引用旧 bug 的写法不算
+        for lit in re.findall(r"'([^']*)'|\"([^\"]*)\"", line):
+            s = lit[0] or lit[1]
+            if "\\n" not in s:
+                continue
+            parts = s.split("\\n")
+            # 找"第一层是数字、紧接着第二层也是数字且非 0"的写法
+            for a, b in zip(parts, parts[1:]):
+                if a.isdigit() and b.isdigit() and b != "0":
+                    bad.append(f"{rel}:{i}: '{s}'")
+print(" ".join(bad))
+PY
+)
+if [[ -n "$_hard" ]]; then
+    bad "验证台没有写死的多级菜单导航" "写死: $_hard —— 菜单一重排就会点到别的项（客户端实测: 8) 从「浏览器拨号」变成「删除节点」）"
+else
+     ok "验证台没有写死的多级菜单导航（编号都从菜单文本现查）"
+fi
+for f in "$ROOT/Client/tools/interactive-test.sh" "$ROOT/tools/server-interactive-test.sh"; do
+    [[ -f "$f" ]] || continue
+    # 反向: 必须能从菜单文本里现查编号, 否则上面的检查无从落地
+    for helper in menu_idx menu_block; do
+        if grep -q "^$helper() {" "$f" 2>/dev/null; then
+             ok "$(basename "$f") 有 $helper（编号现查）"
+        else
+            bad "$(basename "$f") 有 $helper（编号现查）" "缺了它就只能回去写死编号"
+        fi
+    done
+    # menu_block 必须真的被用来截块。主菜单和子菜单有同名项
+    # （客户端主菜单也有「浏览器拨号」；服务端主菜单把子菜单三项的名字写进了
+    # 说明列），不对着截出来的块查就会命中主菜单的编号, 敲进去等于没进子菜单。
+    if grep -qE 'menu_block [^>]*>"\$[A-Z_]+"' "$f" 2>/dev/null; then
+         ok "$(basename "$f") 子菜单编号在截出的块里查（不会被主菜单同名项带偏）"
+    else
+        bad "$(basename "$f") 子菜单编号在截出的块里查" "只见 menu_block 定义, 没见拿它截块给 menu_idx 用"
+    fi
+done
+
+# ---------------------------------------------------------------- 自检
+# 门禁脚本自己也会骗人: 之前有两条检查调了根本**不存在**的断言函数
+# （assert_has / pass），bash 只往 stderr 丢一句 "command not found",
+# 检查项既不通过也不失败 —— 看起来全绿, 其实什么都没验。
+#
+# 静态扫源码抓不准（本文件里嵌着一堆给别的检查用的 shell/python 片段）,
+# 所以改成运行时兜: bash 找不到命令时会走 command_not_found_handle,
+# 谁被静默跳过当场就记账。子 shell 里加的 FAIL 会丢, 所以落一份文件,
+# 最后按文件判定。
+group "门禁自检 (没有静默跳过的检查)"
+if [[ -s "$GHOST_LOG" ]]; then
+    bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
+else
+    ok "门禁没有调用不存在的命令（没有检查被静默跳过）"
+fi
 
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"

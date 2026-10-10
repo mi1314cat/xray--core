@@ -221,7 +221,7 @@ EOF
 menu_xray_ensure() {
   step "Xray 二进制"
   if [ -x "$XBD_XRAY" ]; then
-    ok "已就绪: $("$XBD_XRAY" version 2>/dev/null | head -1)"
+    ok "已就绪: $(first_line "$XBD_XRAY" version)"
     return 0
   fi
 
@@ -240,7 +240,7 @@ menu_xray_ensure() {
   mkdir -p "$XBD_BIN"
   if python3 "$XBD_LIBDIR/xrayup.py" update 2>&1 | sed 's/^/  /'; then
     if [ -x "$XBD_XRAY" ]; then
-      ok "Xray 安装完成: $("$XBD_XRAY" version 2>/dev/null | head -1)"
+      ok "Xray 安装完成: $(first_line "$XBD_XRAY" version)"
       return 0
     fi
   fi
@@ -1783,7 +1783,7 @@ cmd_diagnose() {
   esac; }
 
   _d "架构/发行版" PASS "$(uname -m) / $(. /etc/os-release 2>/dev/null; printf '%s' "$PRETTY_NAME")"
-  [ -x "$XBD_XRAY" ] && _d "Xray 二进制" PASS "$("$XBD_XRAY" version 2>/dev/null | head -1 | cut -c1-40)" || _d "Xray 二进制" FAIL "缺失"
+  [ -x "$XBD_XRAY" ] && _d "Xray 二进制" PASS "$(first_line "$XBD_XRAY" version | cut -c1-40)" || _d "Xray 二进制" FAIL "缺失"
   if BROWSER=$(detect_browser); then _d "浏览器" PASS "$(browser_version | cut -c1-40)"; else _d "浏览器" WARN "未安装（依赖浏览器拨号的节点会不可用，其余节点不受影响）"; fi
 
   local node; node=$(current_node_file 2>/dev/null || true)
@@ -1807,7 +1807,9 @@ cmd_diagnose() {
 
   # 同一端口被两个进程绑定 = 当年双实例拆分留下的坑，必须报出来
   local dup
-  dup=$(ss -H -lntH 2>/dev/null | awk '{print $4}' | sort | uniq -d | head -3 | tr '\n' ' ')
+  # 用 awk 收尾而不是 `head -3 | tr`: head 一到 3 行就退出, sort 还在写就被
+  # SIGPIPE 杀掉（141）, pipefail + set -e 会直接把 xbd diagnose 掀翻。
+  dup=$(ss -H -lntH 2>/dev/null | awk '{print $4}' | sort | uniq -d | awk 'NR<=3{printf "%s ", $0}')
   [ -z "$dup" ] && _d "端口重复绑定" PASS "无" || _d "端口重复绑定" FAIL "$dup"
 
   # Browser Dialer 的运行时依赖：节点需要它时必须在跑
@@ -2406,7 +2408,7 @@ PYIN
   fi
   printf '%s
 ' "$out" | sed 's/^/  /'
-  fp=$(printf '%s' "$out" | grep -oE '[0-9a-f]{64}' | head -1)
+  fp=$(printf '%s' "$out" | grep -oE '[0-9a-f]{64}' | awk 'NR==1')
   [ -n "$fp" ] || { warn "未取到证书指纹；可手动 xbd cert <编号> 重试"; return 0; }
 
   python3 - "$path" "$fp" <<'PYIN'
@@ -2476,7 +2478,7 @@ print(1 if (d.get("allow_insecure") or d.get("skip_cert_verify")) and not d.get(
 
   local fp
   # 输出形如 "      SHA256 =4cdbca..."（等号前后可能没空格），所以只匹配 64 位十六进制
-  fp=$(printf '%s' "$out" | grep -oE '[0-9a-f]{64}' | head -1)
+  fp=$(printf '%s' "$out" | grep -oE '[0-9a-f]{64}' | awk 'NR==1')
   [ -n "$fp" ] || die "未能取到证书指纹（节点可能不响应 QUIC/TLS）"
 
   python3 - "$path" "$fp" <<'PY'
@@ -2668,7 +2670,7 @@ _mmenu_header() {
   ui_title "Xray Client  v${XBD_VERSION:-?}"
   local st ver n cur panel_host panel_port
   st=$(systemctl is-active "$XBD_U_XRAY" 2>/dev/null || echo inactive)
-  ver=$("$XBD_XRAY" version 2>/dev/null | head -1 | awk '{print $2}')
+  ver=$(xray_ver)
   n=$(ls "$XBD_NODES"/node-*.json 2>/dev/null | wc -l | tr -d ' ')
   # ★ 显示节点**真名**（JSON 里的 name），不是文件名。
   #   文件名形如 node-001-ccsmhysteria2-01.json，直接剥前缀显示出来是

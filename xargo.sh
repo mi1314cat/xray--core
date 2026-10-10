@@ -68,7 +68,11 @@ create_temp_tunnel() {
     fi
 
     for i in {1..20}; do
-        URL=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" "$TEMP_LOG" | head -n 1)
+        # 别用 `grep ... | head -n 1`: head 拿到一行就退出, 日志还在长的话
+        # grep 会被 SIGPIPE 杀掉（141）, 本脚本开着 set -e, 整个取 URL 的
+        # 循环会当场中止 —— 用户看到的是"隧道起来了但没给出地址"。
+        # awk 读完所有输入才结束, 所以这里不会早退。
+        URL=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" "$TEMP_LOG" 2>/dev/null | awk 'NR==1')
         [[ -n "$URL" ]] && break
         sleep 1
     done

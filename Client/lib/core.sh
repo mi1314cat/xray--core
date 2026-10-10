@@ -224,6 +224,31 @@ current_node_file() {
   readlink -f "$XBD_NODES/current"
 }
 
+# --------------------------------------------------- 不早退地读外部命令输出 ----
+#
+# 别写 `ver=$("$XBD_XRAY" version | head -1)`: head 拿到第一行就退出,
+# xray 还在写第二行, 于是 xray 被 SIGPIPE 杀掉（退出码 141）。xbd 开着
+# `set -euo pipefail`, 管道整体非零 → 赋值失败 → set -e 当场把脚本杀掉。
+#
+# 这不是理论风险: 实测 `xray version | head -1` 12 次里死 4 次。用户看到的是
+# "菜单只闪了一下版本号就回到命令行", 时好时坏 —— 因为 xray 写完第一行和
+# head 退出之间是竞态, 谁先谁后看调度。
+#
+# 正确做法: **先把输出整个读完**（被调用方正常写完正常退出, 不可能吃
+# SIGPIPE）, 再在本地对字符串切行。awk 读完所有输入才结束, 所以这里不早退。
+first_line() {  # first_line <命令...>   取输出的第一行（不早退、不吃 SIGPIPE）
+  local out
+  out=$("$@" 2>/dev/null || true)
+  printf '%s\n' "$out" | awk 'NR==1'
+}
+
+# xray 版本号（`xray version` 第二列, 如 26.3.27）。同理不早退。
+xray_ver() {
+  local out
+  out=$("$XBD_XRAY" version 2>/dev/null || true)
+  printf '%s\n' "$out" | awk 'NR==1{print $2}'
+}
+
 require_current_node() {
   local f
   f=$(current_node_file) || die "尚未选择节点。用: xbd node add \"<uri>\""

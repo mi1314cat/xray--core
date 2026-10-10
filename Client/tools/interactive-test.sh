@@ -36,7 +36,8 @@ done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TMPO="$(mktemp -t xbd-iv-out.XXXXXX)"
-trap 'rm -f "$TMPO"' EXIT
+TMPB="$(mktemp -t xbd-iv-blk.XXXXXX)"
+trap 'rm -f "$TMPO" "$TMPB"' EXIT
 
 # 捕获一段命令的输出到 $TMPO。不用 $(...): 命令替换会丢 NUL 字节, 而且
 # 60KB+ 的页面在 $( ) 里会被截断 —— 症状是"断言全挂", 但功能其实是好的。
@@ -59,6 +60,42 @@ hasntf() {
   if grep -qaE -- "$2" "$TMPO"; then
     bad "$1" "${3:-不该出现「$2」} 实际: $(head -c 160 "$TMPO" | tr '\n' ' ')"
   else ok "$1"; fi
+}
+
+# 从菜单文本里现查某一项的编号, 别在测试里硬编码数字。
+#
+# 这不是洁癖: 节点子菜单按用途重排过一次, 原来的 8) 浏览器拨号 变成 9),
+# 而 8) 的位置换成了「删除节点」—— 测试里的 '1\n8\n0\n0' 于是从"看一眼
+# 拨号菜单"变成了"对着删除菜单敲回车"。断言失败是看得见的, 全量跑时
+# 真的删掉一个节点是看不见的。
+#
+# 用法: IDX=$(menu_idx "$TMPO" 浏览器拨号)
+#
+# 用 awk 而不是 sed: 选项名里有 `/`（安装 / 更新内核）, 拿 / 当分隔符
+# 会把表达式拆坏 —— 抓不到编号却不报错, 于是脚本退回硬编码的旧数字。
+menu_idx() {  # menu_idx <含菜单的文本文件> <关键字>
+  awk -v pat="$2" '
+    { line = $0; gsub(/\033\[[0-9;]*m/, "", line) }
+    line ~ /^[[:space:]]*[0-9]+[).][[:space:]]/ {
+      if (index(line, pat) > 0) {
+        sub(/^[[:space:]]*/, "", line); sub(/[).].*$/, "", line); print line; exit
+      }
+    }' "$1"
+}
+
+# 只截出某个子菜单盒子里的行。
+#
+# 必须做这层: 主菜单上也有「浏览器拨号」和「分组管理」两个顶层快捷项,
+# 直接对整个输出查标签会命中主菜单那一行 —— 拿到的 3 是主菜单的编号,
+# 敲进节点子菜单就是「测速」。子菜单标题只出现在子菜单盒子里, 且以
+# 「0) 返回」收尾, 用这两头夹出来才是稳的。
+menu_block() {  # menu_block <含菜单的文本文件> <子菜单标题>
+  awk -v title="$2" '
+    { line = $0; gsub(/\033\[[0-9;]*m/, "", line) }
+    seen && line ~ /^[[:space:]]*0\)[[:space:]]*(返回|退出)/ { print buf; exit }
+    seen { buf = buf line "\n"; next }
+    line ~ ("^[[:space:]]*" title "[[:space:]]*$") { seen = 1 }
+  ' "$1"
 }
 
 # ============================================================ 客户端
@@ -165,9 +202,22 @@ test_client() {
   # ---------------------------------------------------------- Browser Dialer
   printf '\n  \033[36m浏览器拨号\033[0m\n'
   # 菜单入口: 之前 node browser 只能敲命令行, 菜单里没有
-  printf '1\n8\n0\n0\n' | timeout 90 "$XBD" menu >"$TMPO" 2>&1
-  hasf "节点菜单含「浏览器拨号」" "浏览器拨号" ""
-  printf '1\n8\n0\n0\n' | timeout 90 "$XBD" menu >"$TMPO" 2>&1
+  # 先只进节点子菜单, 读出「浏览器拨号」这一项的真实编号再往下走。
+  printf '1\n0\n0\n' | timeout 90 "$XBD" menu >"$TMPO" 2>&1
+  menu_block "$TMPO" "节点管理" >"$TMPB"
+  DIALER_IDX=$(menu_idx "$TMPB" "浏览器拨号")
+  if [ -n "$DIALER_IDX" ]; then
+    ok "节点菜单含「浏览器拨号」(第 ${DIALER_IDX} 项)"
+    # 顺带把"别把删除当拨号"钉死: 这两项挨着, 混了代价最大
+    DEL_IDX=$(menu_idx "$TMPB" "删除节点")
+    if [ "$DIALER_IDX" = "$DEL_IDX" ]; then
+      bad "「浏览器拨号」和「删除节点」不是同一项" "编号都是 $DIALER_IDX"
+    else ok "「浏览器拨号」和「删除节点」是两项（$DIALER_IDX / $DEL_IDX）"; fi
+  else
+    bad "节点菜单含「浏览器拨号」" "节点子菜单里找不到该项: $(head -20 "$TMPB" | tr '\n' ' ')"
+    DIALER_IDX=9
+  fi
+  printf "1\n%s\n0\n0\n" "$DIALER_IDX" | timeout 90 "$XBD" menu >"$TMPO" 2>&1
   hasf "浏览器拨号菜单列出每个节点" "可浏览器" ""
   # 不支持的节点也要列出来 —— 用户要能看出"为什么这个没开关"
   hasf "浏览器拨号菜单说明能力边界" "xhttp/websocket" ""

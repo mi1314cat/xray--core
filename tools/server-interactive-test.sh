@@ -26,7 +26,15 @@ cd "$REPO" || exit 1
 
 PASS=0; FAIL=0; FAILED_NAMES=()
 TMPO="$(mktemp -t xbd-srv-XXXXXX)"
-trap 'rm -f "$TMPO"' EXIT
+# 主菜单文本单独存一份: poke 会反复覆盖 TMPO, 而编号查询要一直能对着
+# 主菜单原文查（下面好几处 loop 都要）。
+MENU_TXT="$(mktemp -t xbd-srv-menu-XXXXXX)"
+# 子菜单文本又是另一份: 查主菜单编号时不能被它覆盖掉（下面"危险项"那组
+# 还要回头对主菜单查 7 个选项名）。
+SUB_TXT="$(mktemp -t xbd-srv-sub-XXXXXX)"
+# 子菜单盒子截出来的那一段（查子菜单内部编号时对着它查）。
+BLK_TXT="$(mktemp -t xbd-srv-blk-XXXXXX)"
+trap 'rm -f "$TMPO" "$MENU_TXT" "$SUB_TXT" "$BLK_TXT"' EXIT
 
 ok()  { PASS=$((PASS+1)); printf '    \033[32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); FAILED_NAMES+=("$1"); printf '    \033[31m✗\033[0m %s\n' "$1"
@@ -47,6 +55,40 @@ poke() { # poke <说明> <超时秒> <按键...>
   local rc=$?
   if [ $rc -eq 124 ]; then bad "$name（不卡死）" "超时 ${tmo}s 没退出"
   else ok "$name（能退出, rc=$rc）"; fi
+}
+
+# 从菜单文本里现查某一项的编号, 别硬编码。
+#
+# 主菜单刚按用途重排过一次; 客户端那边的同类硬编码就出过事 ——
+# 节点子菜单重排后测试里的 8) 从「浏览器拨号」变成了「删除节点」。
+# 服务端这边 8) 是「安装 / 更新内核」, 点错虽然不删东西, 但断言会全部
+# 悄悄变成"验的是另一个菜单", 比红更糟。
+#
+# 用 awk 而不是 sed: 选项名里有 `/`（安装 / 更新内核）, 拿 / 当分隔符
+# 会把表达式拆坏, 结果抓不到编号却不报错。
+menu_idx() {  # menu_idx <含菜单的文本文件> <关键字>
+  awk -v pat="$2" '
+    { line = $0; gsub(/\033\[[0-9;]*m/, "", line) }
+    line ~ /^[[:space:]]*[0-9]+[).][[:space:]]/ {
+      if (index(line, pat) > 0) {
+        sub(/^[[:space:]]*/, "", line); sub(/[).].*$/, "", line); print line; exit
+      }
+    }' "$1"
+}
+
+# 只截出某个子菜单盒子里的行。
+#
+# 必须做这层: 主菜单那一行 `9) 服务与配置  查询状态 / 校验并重载 / 查看客户端配置`
+# 把子菜单三项的名字当**说明文字**写进去了 —— 直接对整个输出查
+# 「查看客户端配置」会命中主菜单的 9, 敲进去还是在主菜单里打转。
+# 子菜单标题只出现在子菜单盒子里, 且以「0) 返回」收尾, 两头夹出来才稳。
+menu_block() {  # menu_block <含菜单的文本文件> <子菜单标题>
+  awk -v title="$2" '
+    { line = $0; gsub(/\033\[[0-9;]*m/, "", line) }
+    seen && line ~ /^[[:space:]]*0\)[[:space:]]*(返回|退出)/ { print buf; exit }
+    seen { buf = buf line "\n"; next }
+    line ~ ("^[[:space:]]*" title "[[:space:]]*$") { seen = 1 }
+  ' "$1"
 }
 
 printf '  仓库: %s\n' "$REPO"
@@ -87,19 +129,36 @@ for it in "节点" "分享" "站点与证书" "内核与服务" "维护" \
 done
 
 # 子菜单内容: 分组之后这些能力挪进了子菜单，必须点进去还在
-poke "路由与出站子菜单" 30 '3\n0\n0\n'
+# 编号一律从主菜单文本里现查 —— 见 menu_idx 上面的说明。
+# 注意「内核与服务」「维护」是**分组标题**, 不带编号; 要抓的是组里那一项
+# （安装 / 更新内核 = 8, 自检与体检 = 12）。抓标题会得到空串。
+printf '0\n' | timeout 30 bash "$REPO/xray-panel.sh" >"$MENU_TXT" 2>&1
+M_ROUTE=$(menu_idx "$MENU_TXT" "路由与出站")
+M_KERNEL=$(menu_idx "$MENU_TXT" "安装 / 更新内核")
+M_SVC=$(menu_idx "$MENU_TXT" "服务与配置")
+M_MAINT=$(menu_idx "$MENU_TXT" "自检与体检")
+M_MISSING=""
+for pair in "路由与出站:$M_ROUTE" "安装 / 更新内核:$M_KERNEL" \
+            "服务与配置:$M_SVC" "自检与体检:$M_MAINT"; do
+  [ -n "${pair#*:}" ] || M_MISSING="$M_MISSING ${pair%%:*}"
+done
+if [ -n "$M_MISSING" ]; then
+  bad "主菜单编号能从选项名查到" "查不到:$M_MISSING —— 下面的子菜单断言会验错菜单"
+else ok "主菜单编号从选项名查到（路由 $M_ROUTE / 内核 $M_KERNEL / 服务 $M_SVC / 维护 $M_MAINT）"; fi
+
+poke "路由与出站子菜单" 30 "$M_ROUTE\n0\n0\n"
 for it in "出站管理" "分流规则" "反向代理"; do
   hasf "路由与出站含「$it」" "$it" ""
 done
-poke "内核子菜单" 30 '8\n0\n0\n'
+poke "内核子菜单" 30 "$M_KERNEL\n0\n0\n"
 for it in "安装 / 更新" "回退内核" "卸载内核"; do
   hasf "内核子菜单含「$it」" "$it" ""
 done
-poke "服务与配置子菜单" 30 '9\n0\n0\n'
+poke "服务与配置子菜单" 30 "$M_SVC\n0\n0\n"
 for it in "查询服务状态" "校验配置并重载" "查看客户端配置"; do
   hasf "服务与配置含「$it」" "$it" ""
 done
-poke "维护子菜单" 30 '12\n0\n0\n'
+poke "维护子菜单" 30 "$M_MAINT\n0\n0\n"
 for it in "能力自检" "端口体检" "片段体检"; do
   hasf "维护含「$it」" "$it" ""
 done
@@ -133,20 +192,32 @@ hasntf "stdin 关闭时干净退出（不刷错）" "line [0-9]+: read:" 2>/dev/
 
 # ---------------------------------------------------------- 只读菜单项
 printf '\n  \033[36m只读菜单项（真正点进去）\033[0m\n'
-# 新编号: 9) 服务与配置 → 1) 查询服务状态 / 2) 校验并重载 / 3) 查看客户端配置
-poke "服务与配置 → 查询服务状态 (9,1)" 45 '9\n1\n\n0\n'
+# 「服务与配置」里的三项: 编号也从子菜单文本现查, 别记 1/2/3 ——
+# 子菜单内部重排过一次, 记数字就等于把断言绑在排版上。
+printf '%s\n0\n0\n' "$M_SVC" | timeout 45 bash "$REPO/xray-panel.sh" >"$SUB_TXT" 2>&1
+menu_block "$SUB_TXT" "服务与配置" >"$BLK_TXT"
+SVC_STATUS=$(menu_idx "$BLK_TXT" "查询服务状态")
+SVC_RELOAD=$(menu_idx "$BLK_TXT" "校验配置并重载")
+SVC_CLIENT=$(menu_idx "$BLK_TXT" "查看客户端配置")
+for pair in "查询服务状态:$SVC_STATUS" "校验配置并重载:$SVC_RELOAD" "查看客户端配置:$SVC_CLIENT"; do
+  [ -n "${pair#*:}" ] || bad "服务与配置里能找到「${pair%%:*}」" "抓不到编号, 下面点的会是别的项"
+done
+
+poke "服务与配置 → 查询服务状态 ($M_SVC,$SVC_STATUS)" 45 "$M_SVC\n$SVC_STATUS\n\n0\n"
 if [ -s "$TMPO" ]; then ok "「查询服务状态」有内容"; else bad "「查询服务状态」有内容" "空"; fi
 
-poke "服务与配置 → 查看客户端配置 (9,3)" 45 '9\n3\n\n0\n'
+poke "服务与配置 → 查看客户端配置 ($M_SVC,$SVC_CLIENT)" 45 "$M_SVC\n$SVC_CLIENT\n\n0\n"
 if [ -s "$TMPO" ]; then ok "「查看客户端配置」有内容"; else bad "「查看客户端配置」有内容" "空"; fi
 
 # 「校验配置」只做校验不重启, 是安全可点的
-poke "服务与配置 → 校验并重载 (9,2)" 90 '9\n2\n\n0\n'
+poke "服务与配置 → 校验并重载 ($M_SVC,$SVC_RELOAD)" 90 "$M_SVC\n$SVC_RELOAD\n\n0\n"
 if [ -s "$TMPO" ]; then ok "「校验配置」有内容"; else bad "「校验配置」有内容" "空"; fi
 
-# 分组子菜单本身要能进能出（新结构：3 路由与出站 / 8 内核 / 9 服务 / 12 维护）
-for pair in "3:路由与出站" "8:安装与更新内核" "12:自检与体检"; do
+# 分组子菜单本身要能进能出
+for pair in "$M_ROUTE:路由与出站" "$M_KERNEL:安装 / 更新内核" \
+            "$M_MAINT:自检与体检"; do
   n="${pair%%:*}"; label="${pair#*:}"
+  [ -n "$n" ] || continue
   poke "$label ($n) 能进能出" 30 "$n\n0\n0\n"
   if [ -s "$TMPO" ]; then ok "「$label」有内容"; else bad "「$label」有内容" "空"; fi
 done
@@ -154,11 +225,15 @@ done
 # ---------------------------------------------------------- 危险项：只验证能取消
 printf '\n  \033[36m会改配置的菜单项（只验证能加载与安全取消）\033[0m\n'
 # 这些项会 curl 远端脚本或写配置。我们只喂取消/空回车, 确认不会在无确认下执行。
-# 注意: 7/8 走 `bash <(curl ...conf/outbound.sh)`, 拿的是 GitHub 上的版本。
-# 本地改完没推送之前, 这里会超时 —— 那是预期结果, 不是回归。
-# 推完再跑一次就绿了。
-for pair in "1:添加节点" "2:节点管理" "4:分享管理" "5:分享服务" "6:证书" "7:Nginx站点" "10:DNS"; do
-  n="${pair%%:*}"; label="${pair#*:}"
+# 注意: 这几项走 `bash <(curl ...conf/xxx.sh)`, 拿的是 GitHub 上的版本。
+# 本地改完没推送之前, 这里会超时 —— 那是预期结果, 不是回归。推完再跑一次就绿了。
+for label in "添加节点" "节点管理" "分享管理" "分享服务" "证书管理" \
+             "Nginx 站点管理" "DNS 管理"; do
+  n=$(menu_idx "$MENU_TXT" "$label")
+  if [ -z "$n" ]; then
+    bad "主菜单里能找到「$label」" "抓不到编号, 该项这轮没验到"
+    continue
+  fi
   poke "$label ($n) 能加载并安全取消" 45 "$n\n\n\n\n0\n"
 done
 
