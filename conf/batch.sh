@@ -241,6 +241,18 @@ batch_main() {
     fi
 
     batch_summary "$reloaded"
+    # ★ 失败必须以非零退出码收尾 —— 这是"一键全协议"最重要的一条契约。
+    #
+    #   原来这里无条件 return 0: SS2022 因为 gen_psk 未定义生成失败, 汇总里
+    #   老老实实印着 [失败], 但脚本退出码是 0。任何自动化(面板、install.sh、
+    #   CI、`bash batch.sh --auto && 下一步`)都把这一批当成成功 ——
+    #   "四个协议里少了一个"要等到用户导入客户端才发现。
+    #   失败清单在 batch_summary 里已经逐条打印(含日志末尾 3 行), 这里只补退出码。
+    if ((${#fail_list[@]} > 0)); then
+        print_error "本批有 ${#fail_list[@]} 个协议失败: ${fail_list[*]} —— 退出码 1"
+        print_info "失败详情: $LOG_DIR/x-batch-<协议>.log"
+        return 1
+    fi
     print_ok "全协议一键生成流程结束"
     return 0
 }

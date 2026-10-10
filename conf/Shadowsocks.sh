@@ -64,7 +64,10 @@ PROTO="ss2022"
 XRAY_BASE="${XRAY_BASE_DIR:-/root/catmi/xray}"
 CONF_DIR="$XRAY_BASE/conf"
 OUT_DIR="$XRAY_BASE/out"
-INSTALL_DIR="/root/catmi/xray"
+# 安装目录: 生产默认 /root/catmi/xray; 可用 XRAY_INSTALL_DIR 指到别处
+# (与 install.sh / verify.sh 同一个变量名), 也可跟随 XRAY_BASE_DIR 沙箱化 ——
+# 否则沙箱里生成的片段永远过不了 -test(找不到 xrayls), 而失败原因看起来是"配置错"。
+INSTALL_DIR="${XRAY_INSTALL_DIR:-${XRAY_BASE_DIR:-/root/catmi/xray}}"
 XRAY_BIN="$INSTALL_DIR/xrayls"
 mkdir -p "$CONF_DIR" "$OUT_DIR"
 
@@ -92,6 +95,21 @@ else
     source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh") \
         || { print_error "地址库加载失败"; exit 1; }
 fi
+
+# 随机值库 (gen_psk 在这里) —— 本地优先, 否则从仓库取。
+# ★ PSK 生成曾经长在本脚本里, 被 1ef13f2 误删后 add_config 直接拿空串去校验,
+#   于是"一键全协议"永远生成不出 SS2022。收进 lib/ 之后与 random_pass 同级,
+#   不会再被"删重复实现"这类重构误伤。
+if [[ -r "$_x_lib_dir/lib/random.sh" ]]; then
+    source "$_x_lib_dir/lib/random.sh"
+else
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/random.sh") \
+        || { print_error "随机值库加载失败"; exit 1; }
+fi
+# 加载失败必须当场说清楚, 不能等到 PSK 校验时报"长度错误" ——
+# 那个报错指向的是长度, 与真正的原因(函数没加载)相距很远。
+declare -f gen_psk >/dev/null 2>&1 \
+    || { print_error "gen_psk 未定义 (lib/random.sh 未加载或缺少该函数)"; exit 1; }
 # ================================
 # 安全输入（过滤控制字符）
 # ================================

@@ -18,7 +18,10 @@ print_warn() {
     echo -e "${YELLOW}[Warn]${PLAIN} $1"
 }
 
-INSTALL_DIR="/root/catmi/xray"
+# 安装目录: 生产默认 /root/catmi/xray; 可用 XRAY_INSTALL_DIR 覆盖
+# (与 install.sh / verify.sh / 协议脚本同一个变量名), 沙箱测试才能
+# 真的取到 xrayls 生成 x25519 密钥 —— 否则报"未找到 xrayls", 看起来像安装坏了。
+INSTALL_DIR="${XRAY_INSTALL_DIR:-/root/catmi/xray}"
 ENV_FILE="$INSTALL_DIR/install_info.env"
 xrayls_DTR="$INSTALL_DIR/xrayls"
 

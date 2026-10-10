@@ -57,3 +57,29 @@ random_user() {
 random_token() {
     echo "$(tr -dc A-Za-z0-9 </dev/urandom | head -c 32)"
 }
+
+# gen_psk —— Shadowsocks-2022 的 PSK (SIP022: 密码学安全随机 base64)
+#
+# ★ 这个函数被删过一次, 代价是"一键全协议"永远生成不出 SS2022:
+#   1ef13f2 把端口分配收敛到 lib/ports.sh 时连同本函数一起删了 —— 它当时长在
+#   Shadowsocks.sh 的"随机生成函数"块里, 与端口无关, 属于误删。调用点留着:
+#   `PSK=$(gen_psk "$method")` → bash 报 `gen_psk: command not found`, 变量为空,
+#   紧接着的长度校验报 "PSK 长度错误：2022-blake3-aes-256-gcm 需要 32 字节
+#   (获得 0 字节)" —— 而 batch 汇总时又以退出码 0 收尾, 失败被完全掩盖。
+#
+#   放这里而不是各协议脚本里: 它是"随机值生成"这一类, 与 random_pass 同级;
+#   当年散在各脚本里正是这次误删的成因。
+#
+# 长度由**算法**决定, 不能一律 32 字节:
+#   2022-blake3-aes-128-gcm -> 16 字节原文 (base64 24 字符)
+#   2022-blake3-aes-256-gcm / 2022-blake3-chacha20-poly1305 -> 32 字节 (44 字符)
+# openssl rand -base64 的输出**带 '=' 填充**, 不能为了"干净"去掉:
+# 去掉后 base64 解码不再对齐, 内核报 illegal base64 或长度不符。
+gen_psk() {
+    local method="${1:-}" bytes=32
+    case "$method" in
+        2022-blake3-aes-128-gcm) bytes=16 ;;
+        *) bytes=32 ;;   # aes-256-gcm / chacha20-poly1305 / 未给方法
+    esac
+    openssl rand -base64 "$bytes" | tr -d '\n'
+}

@@ -56,7 +56,10 @@ PROTO="reality"
 XRAY_BASE="${XRAY_BASE_DIR:-/root/catmi/xray}"
 CONF_DIR="$XRAY_BASE/conf"
 OUT_DIR="$XRAY_BASE/out"
-INSTALL_DIR="/root/catmi/xray"
+# 安装目录: 生产默认 /root/catmi/xray; 可用 XRAY_INSTALL_DIR 指到别处
+# (与 install.sh / verify.sh 同一个变量名), 也可跟随 XRAY_BASE_DIR 沙箱化 ——
+# 否则沙箱里生成的片段永远过不了 -test(找不到 xrayls), 而失败原因看起来是"配置错"。
+INSTALL_DIR="${XRAY_INSTALL_DIR:-${XRAY_BASE_DIR:-/root/catmi/xray}}"
 XRAY_BIN="$INSTALL_DIR/xrayls"
 mkdir -p "$CONF_DIR" "$OUT_DIR"
 
