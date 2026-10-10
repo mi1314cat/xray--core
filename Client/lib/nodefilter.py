@@ -72,7 +72,19 @@ def main(argv) -> int:
     for n in incoming:
         caps = m.check_all(n)
         if not caps.get("can_use_xray") and not keep:
-            skipped.append((n.get("name"), f"Xray 内核不支持该协议（{n.get('protocol')}）"))
+            # ★ 原因必须来自**判定本身**，不能一律写"内核不支持该协议"。
+            #   实测（E2E 分享订阅 5 个只导入 4 个）：trojan+REALITY 只是链接里的
+            #   pbk/sid 没被解析出来（见 node.py: parse_trojan），旧文案却告诉用户
+            #   "Xray 内核不支持该协议（trojan）"—— 内核恰恰原生支持 trojan，
+            #   照那句话排查等于南辕北辙，换内核也解决不了。
+            #   真实原因由 compat.blocking_reason() 从判定结果里取。
+            reason = ""
+            try:
+                reason = m.blocking_reason(n, caps)
+            except Exception:                                     # noqa: BLE001
+                reason = ""
+            reason = reason or f"Xray 内核不支持该节点（{n.get('protocol')}）"
+            skipped.append((n.get("name"), reason))
             continue
         k = ident(n)
         if k in seen:

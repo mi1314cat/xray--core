@@ -534,6 +534,40 @@ def capability_tags(node: dict, xray: dict, dialer: dict) -> list[str]:
     return tags
 
 
+def blocking_reason(node: dict, result: dict = None) -> str:
+    """这个节点**为什么**用不了 Xray 内核 —— 一句话, 且必须是真实原因。
+
+    为什么单独有这个函数
+    --------------------
+    `nodefilter.py` 原来把任何 `can_use_xray=False` 都写成
+        Xray 内核不支持该协议（trojan）
+    实测 (E2E: 分享订阅 5 个节点只导入 4 个) 那句话是**错的**: trojan 是内核
+    原生支持的协议, 该节点被丢掉的真实原因是"链接里的 pbk 没被解析出来 →
+    security=reality 却缺 REALITY 公钥"。用户照那句提示去查"内核为什么不支持
+    trojan", 方向完全错了 —— 而且换个内核也解决不了。
+
+    所以判据是: **协议这一项是否本身不可用**。
+      · 协议就不支持            -> 说"内核不支持该协议"
+      · 协议支持、某项参数缺失  -> 逐条点名缺的是什么 (可执行的修复方向)
+    """
+    result = result if result is not None else check_all(node)
+    xray = (result or {}).get("xray") or {}
+    checks = xray.get("checks") or []
+    # "内核兼容性 SUPPORTED / compat" 是适配层加进来的**汇总行**, 不是一条具体
+    # 判据 —— 把它当原因念出来只会让人更糊涂 (实测原文:
+    # "…：内核兼容性 —— SUPPORTED / compat; Reality 公钥 —— security=reality 但缺少 pbk")。
+    bad = [c for c in checks
+           if c.get("verdict") == NO and c.get("item") != "内核兼容性"]
+    if not bad:
+        return ""
+    proto = node.get("protocol") or "?"
+    proto_bad = [c for c in bad if c.get("item") == "协议"]
+    if proto_bad:
+        return f"Xray 内核不支持该协议（{proto}）：{proto_bad[0].get('detail') or ''}".rstrip("：")
+    detail = "; ".join(f"{c.get('item')} —— {c.get('detail')}" for c in bad)
+    return (f"节点参数不完整，不是内核不支持 {proto}（{proto} 是内核原生支持的协议）：{detail}")
+
+
 def want_browser_dialer(node: dict) -> bool:
     """这个节点要不要用浏览器完成 TLS —— **唯一**判定入口。
 

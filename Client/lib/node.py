@@ -222,7 +222,22 @@ def parse_trojan(uri: str) -> dict:
         "service_name": q.get("serviceName") or "",
         "fingerprint": q.get("fp") or "",
         "alpn": q.get("alpn") or "",
+        # ★ REALITY 的三个参数必须一起收。
+        #
+        #   实测 (E2E: RN 生成 5 节点 → 分享订阅 → CC 导入): trojan+REALITY 的链接
+        #   带齐了 `pbk/sid/spx`, 但这里没往 reality_* 里写 —— 于是 compat 看到
+        #   `security=reality` 且 `reality_public_key` 为空, 判 NOT_SUPPORTED,
+        #   nodefilter 直接**静默丢掉**这个节点 (5 个节点只进来 4 个), 而且给出的
+        #   原因还是"Xray 内核不支持该协议（trojan）"—— 内核原生支持 trojan,
+        #   真实原因只是"这条链接的参数没被采到"。
+        #   parse_vless 一直是写了的, 差别只在协议分支, 所以只在 trojan 上炸。
+        "reality_public_key": q.get("pbk") or "",
+        "reality_short_id": q.get("sid") or "",
+        "reality_spider_x": q.get("spx") or "",
         "allow_insecure": str(q.get("allowInsecure", "")).lower() in ("1", "true"),
+        # hysteria2 用的证书钉扎 (pin=) 在 trojan 链接里也出现过 (本项目 hy2 分享
+        # 链接同族), 原样收下 —— 丢了它节点会被判"声明跳过证书校验却没有 pin"。
+        "pinned_cert_sha256": (q.get("pin") or "").strip().lower(),
         "source": "trojan-uri",
         "raw_params": q,
         "raw": uri,
@@ -999,6 +1014,12 @@ def build_link(node: dict) -> str:
             q.append(("encryption", node["encryption"]))
         if node.get("flow"):
             q.append(("flow", node["flow"]))
+    # ★ REALITY 参数与协议无关, 不能只写在 vless 分支里。
+    #   实测: trojan+REALITY 的节点在客户端里"手工建/导出成链接"时会丢掉
+    #   pbk/sid/spx, 再导入回来就变成"security=reality 但缺少 pbk" —— 与
+    #   parse_trojan 漏收这几个键是同一件事的两面 (那条导致了分享订阅 5 个
+    #   节点只导入 4 个)。自己定的规矩: 解析器认识哪些键, 生成就得写哪些键。
+    if security == "reality":
         if node.get("reality_public_key"):
             q.append(("pbk", node["reality_public_key"]))
         if node.get("reality_short_id"):
