@@ -281,6 +281,44 @@ def act_panel_restart():
     return True, "面板已重启（刷新本页即可，令牌不变）"
 
 
+def act_apply_config():
+    """重新生成运行配置并重启（= xbd apply）。改完端口/节点之后手动应用的入口。"""
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "apply"], timeout=300)
+    tail = [ln for ln in (out or err or "").splitlines() if ln.strip()][-3:]
+    return rc == 0, ("\n".join(tail) or "完成")
+
+
+def act_cert_fix():
+    """批量补齐节点证书指纹（= xbd cert --missing）。
+
+    自签证书节点在 Xray 26.x 上必须固定指纹，否则连不上；导入时被中断过的
+    节点就会缺这一项，面板上"看着有节点、就是连不上"。
+    """
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "cert", "--missing"], timeout=1200)
+    tail = [ln for ln in (out or err or "").splitlines() if ln.strip()][-4:]
+    return rc == 0, ("\n".join(tail) or "完成")
+
+
+def act_export_all():
+    """导出连接配置到 generated/（= xbd export）。"""
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "export"], timeout=180)
+    gen = os.path.join(PREFIX, "generated")
+    files = sorted(os.listdir(gen))[:6] if os.path.isdir(gen) else []
+    msg = "已导出到 generated/：" + ("、".join(files) if files else "（目录为空）")
+    return rc == 0, msg
+
+
+def act_selftest():
+    """内置自检（= xbd selftest）: 解析器 / 能力判定 / 配置生成。"""
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "selftest"], timeout=300)
+    txt = (out or "") + (("\n" + err) if err else "")
+    return rc == 0, txt.strip()[-2000:]
+
+
 def act_build_link(p):
     """手动添加表单 → 分享链接。
 
@@ -1312,6 +1350,10 @@ DISPATCH = {
     "build_link": lambda p: act_build_link(p),
     "node_simple": lambda p: act_node_simple(p),
     "browser_install": lambda p: act_browser_install(),
+    "apply_config": lambda p: act_apply_config(),
+    "cert_fix": lambda p: act_cert_fix(),
+    "export_all": lambda p: act_export_all(),
+    "selftest": lambda p: act_selftest(),
     "panel_restart": lambda p: act_panel_restart(),
     "group_create": lambda p: act_group_create(str(p.get("name", "")).strip()),
     "group_delete": lambda p: act_group_delete(str(p.get("key", "")).strip()),
@@ -2077,6 +2119,18 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   </div>
   <div class="hint">「自动重新分配」只改被别的服务占用的那些端口，不会动正常的。</div>
 </div>
+<div class="card"><h2>维护操作</h2>
+  <div class="hint" style="margin:0 0 10px">这三件事命令行里分别是
+    <code>xbd apply</code> / <code>xbd cert --missing</code> / <code>xbd export</code>，
+    这里给同样的入口 —— 命令行能做的，面板上不该找不到。</div>
+  <div class="bar">
+    <button onclick="applyConfig(this)">重新生成配置并重启</button>
+    <button onclick="certFix(this)">批量补齐证书指纹</button>
+    <button onclick="doExport(this)">导出连接配置</button>
+  </div>
+  <div class="hint" id="ops-note">「导出」写在 <code>generated/</code> 下（Mihomo YAML / 链接 / 环境变量），
+    方便直接拷走。</div>
+</div>
 <div class="card"><h2>网页面板（就是本页）</h2>
   <div class="hint" style="margin:0 0 10px">这是自研面板，不需要另外下载 Web UI。
     面板由 <code>xray-client</code> 旁边的独立服务提供；改端口去「端口设置」。</div>
@@ -2117,6 +2171,13 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
     <button class="pri" onclick="xrayUpgrade(this)">更新内核</button>
   </div>
   <div class="hint">只更新本项目自己的副本（$PREFIX/bin/xray），不碰系统 Xray。下载后会校验官方 SHA256。</div>
+  <div class="bar">
+    <button onclick="runSelftest(this)">运行内置自检</button>
+    <button onclick="updateScripts(this)">更新项目脚本</button>
+  </div>
+  <div class="hint">自检覆盖解析器 / 能力判定 / 配置生成（命令行等价写法: <code>xbd selftest</code>）；
+    更新脚本会同步 <code>xbd</code> 与各模块并重启服务。</div>
+  <pre id="selftest-out" style="display:none"></pre>
 </div>
     </section>
   </main>
@@ -3030,6 +3091,36 @@ function installBrowser(btn){
 function panelRestart(btn){
   if (!confirm('重启面板服务？本页会断开几秒，刷新即可回来。')) return;
   post('panel_restart', {}, '正在重启面板…', btn);
+}
+
+// ---- 维护操作：命令行能做的，面板上也要能找到 ----
+// 每个函数都只是转调同一个 xbd 子命令 —— 面板另写一套逻辑的话，
+// "面板和命令行行为不一致"几乎必然发生。
+async function applyConfig(btn){
+  if (!confirm('重新生成运行配置并重启 Xray？期间连接会短暂中断（约 3 秒）。')) return;
+  post('apply_config', {}, '正在生成配置并重启…', btn);
+}
+
+async function certFix(btn){
+  const j = await post('cert_fix', {}, '正在补齐证书指纹…', btn);
+  if (j.ok) load();
+}
+
+async function doExport(btn){
+  post('export_all', {}, '正在导出到 generated/ …', btn);
+}
+
+async function runSelftest(btn){
+  const j = await post('selftest', {}, '正在自检…', btn);
+  const el = $('selftest-out');
+  if (!el) return;
+  el.style.display = '';
+  el.textContent = j.message || '';
+}
+
+async function updateScripts(btn){
+  if (!confirm('更新项目脚本？会同步 xbd 与各模块并重启服务（配置与节点不动）。')) return;
+  post('config_update', {}, '正在更新项目脚本…', btn);
 }
 
 async function loadConn(btn){

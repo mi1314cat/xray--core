@@ -2715,28 +2715,36 @@ _mmenu_node() {
   while :; do
     echo
     ui_title "节点管理"
+    ui_sec "看与切"
     ui_menu 1 "列出全部节点        名字 / 地址 / 延迟 / 能力标签"
-    ui_menu 2 "添加节点            分享链接 / 订阅 / Xray JSON / Mihomo YAML"
-    ui_menu 3 "导入订阅并命名成组"
-    ui_menu 4 "切换当前节点"
-    ui_menu 5 "测速（全部节点）"
-    ui_menu 6 "删除节点"
+    ui_menu 2 "切换当前节点"
+    ui_menu 3 "测速（全部节点）"
+    echo
+    ui_sec "添加"
+    ui_menu 4 "粘贴导入            分享链接 / 订阅 / Xray JSON / Mihomo YAML"
+    ui_menu 5 "导入订阅并命名成组"
+    ui_menu 6 "简易 SOCKS/HTTP 出站  把本机或局域网里别的内核当上游"
+    echo
+    ui_sec "整理"
     ui_menu 7 "分组管理            新建 / 改名 / 整组删除"
-    ui_menu 8 "浏览器拨号          逐节点开关（省内存）"
+    ui_menu 8 "删除节点"
+    ui_menu 9 "浏览器拨号          逐节点开关（省内存）"
     ui_menu 0 "返回"
     echo
+    ui_hint "面板里也能做同样的事: xbd panel（地址与令牌）"
     printf "  %s请选择%s: " "$C_B" "$C_0"
     read -r c || return 0
     case "$c" in
       1) xbd node list ;;
-      2) xbd node add ;;
-      3) _mmenu_sub_add ;;
-      4) _mmenu_use ;;
-      5) xbd node latency ;;
-      6) _mmenu_del ;;
+      2) _mmenu_use ;;
+      3) xbd node latency ;;
+      4) xbd node add ;;
+      5) _mmenu_sub_add ;;
+      6) xbd node simple ;;
       7) _mmenu_group ;;
-      8) _mmenu_browser ;;
-      0) return ;;
+      8) _mmenu_del ;;
+      9) _mmenu_browser ;;
+      0|"") return 0 ;;
       *) ui_invalid "$c" ;;
     esac
     _mmenu_pause

@@ -2546,6 +2546,59 @@ if [[ -f "$ROOT/Client/lib/actions.sh" ]]; then
     panel_has "$ROOT/Client/lib/web/panel.py" 'id="p-url"' "配置页有网页面板卡片"
 fi
 
+# ---------------------------------------------------------------- 面板覆盖面
+# 用户的要求: "客户端面板（TUI/CLI）的功能，最好都能接进我们自研的这个 UI"。
+#
+# 这类"两边功能表"最靠不住的就是人记得对齐 —— 加了命令行忘了面板，用户就会
+# 觉得"面板不好用"。这条闸门把**命令行顶层命令**与**面板动作**列出来做差集:
+# 命令行有、面板没有的, 必须出现在白名单里（带理由）。
+group "面板覆盖面 (命令行 vs 网页 UI)"
+MISS=$(python3 - "$ROOT" <<'PY'
+import os, re, sys
+root = sys.argv[1]
+cli = open(os.path.join(root, "Client/lib/actions.sh"), encoding="utf-8").read()
+panel = open(os.path.join(root, "Client/lib/web/panel.py"), encoding="utf-8").read()
+m = re.search(r"xbd_main\(\) \{(.*?)\n\}", cli, re.S)
+cmds = set()
+for name in re.findall(r"^\s{4}([a-z][\w|-]*)\)", m.group(1), re.M):
+    cmds.update(name.split("|"))
+acts = set(re.findall(r'"([a-z_]+)":\s*lambda', panel))
+MAP = {"status": "state", "apply": "apply_config", "cert": "cert_fix",
+       "export": "export_all", "selftest": "selftest", "browser": "browser_install",
+       "panel": "panel_restart", "node": "node_use", "port": "port",
+       "ports": "ports_check", "share": "share_status", "xray": "xray_version",
+       "dialer": "mode", "proxy": "takeover"}
+# status 走的是 GET /api/state（面板每次轮询就调它），不是 action
+if "api/state" in panel:
+    acts.add("state")
+ALLOW = {"install", "uninstall", "menu", "update", "start", "stop", "restart",
+         "family", "multi", "diagnose", "ech"}
+miss = [c for c in sorted(cmds)
+        if c not in ALLOW and c not in acts and MAP.get(c) not in acts]
+print(" ".join(miss))
+PY
+)
+if [[ -z "$MISS" ]]; then
+    ok "命令行能做的事，面板上都有入口"
+else
+    bad "面板缺这些命令的入口: $MISS（要么补上，要么加进白名单并写理由）"
+fi
+
+# 四个"维护动作"必须真的在界面上有按钮（不是只有后端动作）
+for pair in "应用配置按钮|applyConfig" \
+            "批量补指纹按钮|certFix" \
+            "导出按钮|doExport" \
+            "自检按钮|runSelftest" \
+            "更新脚本按钮|updateScripts" \
+            "简易出站进 TUI 菜单|xbd node simple" \
+            "TUI 节点菜单有分组|ui_sec \"添加\""; do
+    if [[ "${pair#*|}" == "xbd node simple" || "${pair#*|}" == 'ui_sec "添加"' ]]; then
+        panel_has "$ROOT/Client/lib/actions.sh" "${pair#*|}" "${pair%%|*}"
+    else
+        panel_has "$ROOT/Client/lib/web/panel.py" "${pair#*|}" "${pair%%|*}"
+    fi
+done
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
