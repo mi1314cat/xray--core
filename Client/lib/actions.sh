@@ -684,17 +684,86 @@ cmd_node_import_file() {
   cmd_node_import_one "$(cat "$f")"
 }
 
+# ---------------------------------------------------------------- 三家互通
+# 订阅地址上的**内核声明** → 这次拉哪一份产品。设计（字段定义 / 决策规则与
+# 回退链 / 与 compat 的分工）: proxy-node-compat/docs/three-way-interop.md
+#
+#   同内核**同发行版** → 原生（Xray JSON, URI 装不下的字段不丢）
+#   跨内核 / 声明缺失 / 声明不认识 / 发行版不在清单 → 普通话（base64 URI 列表）
+#
+# 决策只看**地址本身**: 不额外发请求、不看 User-Agent、不做任何协商。
+# 服务端声明用的是查询串, 而公共分享服务的路由先剥查询串再分发
+# （share_service.py:768）—— 所以带声明的地址对第三方客户端零影响。
+_sub_interop_decide() {   # <订阅地址> → 一行 JSON（拿不到打印空串）
+  python3 "$XBD_LIBDIR/interop.py" decide "$1" 2>/dev/null || true
+}
+
+_sub_interop_field() {    # <JSON> <字段>
+  printf '%s' "$1" | python3 -c 'import sys, json
+try: print((json.load(sys.stdin) or {}).get(sys.argv[1], "") or "")
+except Exception: print("")' "$2" 2>/dev/null || true
+}
+
+# 拉一个地址并解析成节点列表。打印**节点数**（失败 0）; 结果写进 $2。
+# 永远返回 0: 调用方按"节点数"判断, 不靠退出码 —— 本文件是 `set -e`,
+# 让 helper 带非 0 退出会在赋值处直接把整个命令打断。
+_sub_fetch_nodes() {      # <地址> <输出json文件>
+  local url="$1" out="$2" body=""
+  : > "$out"
+  body=$(curl -sL --max-time 60 "$url" 2>/dev/null) || body=""
+  [ -n "$body" ] || { printf '0'; return 0; }
+  printf '%s' "$body" | python3 "$XBD_LIBDIR/node.py" subscription - > "$out" 2>/dev/null || true
+  python3 -c 'import json,sys
+try: print(len(json.load(open(sys.argv[1]))))
+except Exception: print(0)' "$out" 2>/dev/null || printf '0'
+}
+
+# 按声明取产品 → 解析。打印 "<模式>\t<节点数>\t<说明>", 节点写进 $2。
+#   模式 = native（原生）/ uri（普通话）
+# **原生取件失败自动回退普通话**, 并把原因留在说明里 —— 不许静默降级。
+_sub_fetch_by_declaration() {   # <订阅地址> <输出json文件>
+  local url="$1" out="$2" pick choice reason rurl detail n=0
+  pick=$(_sub_interop_decide "$url")
+  choice=$(_sub_interop_field "$pick" choice); [ -n "$choice" ] || choice=uri
+  reason=$(_sub_interop_field "$pick" reason)
+  rurl=$(_sub_interop_field "$pick" url)
+  detail=$(_sub_interop_field "$pick" detail)
+  if [ "$choice" = "native" ] && [ -n "$rurl" ]; then
+    n=$(_sub_fetch_nodes "$rurl" "$out")
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+      printf 'native\t%s\t%s' "$n" "$detail"
+      return 0
+    fi
+    # 回退: 声明说原生在那边, 但那边取不到/解析不出 → 回到最通用的普通话。
+    detail="${detail}；原生取件失败(${rurl}) → 回退"
+    [ -n "$reason" ] || reason=native-fetch-failed
+  fi
+  n=$(_sub_fetch_nodes "$url" "$out")
+  printf 'uri\t%s\t%s' "$n" "$detail"
+  return 0
+}
+
+# 把"这次拉的是哪种"打到 stderr（用户要能一眼看出原生还是普通话）
+_sub_report_choice() {    # <模式> <节点数> <说明>
+  case "${1:-}" in
+    native) ok "本次拉取: 原生 Xray JSON —— ${3:-}" ;;
+    *)      info "本次拉取: 普通话 URI 列表 —— ${3:-}" ;;
+  esac
+}
+
 cmd_node_subscription() {
   local url="${1:-}" sub_name="${2:-}"
   [ -n "$url" ] || die "用法: xbd node sub <订阅URL> [组名]"
   step "下载订阅"
-  local body; body=$(curl -sL --max-time 60 "$url") || die "下载失败"
-  [ -n "$body" ] || die "订阅内容为空"
 
   local tmp; tmp=$(mktemp)
-  printf '%s' "$body" | python3 "$XBD_LIBDIR/node.py" subscription - > "$tmp" 2>/dev/null || true
-  local n; n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "$tmp" 2>/dev/null || echo 0)
-  [ "$n" -gt 0 ] || { rm -f "$tmp"; die "订阅里没有解析出节点"; }
+  local line mode n detail
+  line=$(_sub_fetch_by_declaration "$url" "$tmp")
+  mode=$(printf '%s' "$line" | cut -f1)
+  n=$(printf '%s' "$line" | cut -f2)
+  detail=$(printf '%s' "$line" | cut -f3)
+  [ "${n:-0}" -gt 0 ] 2>/dev/null || { rm -f "$tmp"; die "订阅里没有解析出节点"; }
+  _sub_report_choice "$mode" "$n" "$detail"
   ok "解析出 $n 个节点"
 
   # 先记下已有哪些节点文件，后面据此判断"哪些是这次新增的"。
@@ -764,18 +833,22 @@ PY
     local url="${1:-}"
     [ -n "$url" ] || die "用法: xbd node sub-refresh <订阅URL>"
     step "刷新订阅"
-    local body
-    body=$(curl -sL --max-time 60 "$url") || { err "下载失败, 保留现有节点"; return 1; }
-    [ -n "$body" ] || { err "订阅内容为空, 保留现有节点"; return 1; }
 
+    # 与导入走**同一套**声明决策与回退链（_sub_fetch_by_declaration）——
+    # 两处各写一遍的话, 表现会是"导入时走原生、刷新时走普通话"（或反过来）,
+    # 而两边都不报错。
     local tmp; tmp=$(mktemp)
-    printf '%s' "$body" | python3 "$XBD_LIBDIR/node.py" subscription - > "$tmp" 2>/dev/null || true
-    local n; n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))))' "$tmp" 2>/dev/null || echo 0)
-    if [ "$n" -le 0 ]; then
+    local line mode n detail
+    line=$(_sub_fetch_by_declaration "$url" "$tmp")
+    mode=$(printf '%s' "$line" | cut -f1)
+    n=$(printf '%s' "$line" | cut -f2)
+    detail=$(printf '%s' "$line" | cut -f3)
+    if [ "${n:-0}" -le 0 ] 2>/dev/null; then
       rm -f "$tmp"
       err "订阅里没有解析出节点, 保留现有节点"
       return 1
     fi
+    _sub_report_choice "$mode" "$n" "$detail"
     ok "解析出 $n 个节点"
 
     _sub_filter "$tmp" 0 > /tmp/.xbd_ref_kept.jsonl 2>/dev/null || true

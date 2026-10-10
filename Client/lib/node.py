@@ -583,6 +583,13 @@ def parse_xray_json(text: str) -> dict:
     n["service_name"] = grpc.get("serviceName") or ""
     n["reality_public_key"] = reality.get("publicKey") or ""
     n["reality_short_id"] = reality.get("shortId") or ""
+    # ★ spiderX 以前没读：realitySettings 里它是官方的"爬虫路径"字段，
+    #   URI 路径 (parse_vless 的 spx=) 一直读得到，Xray JSON 路径读不到 ——
+    #   于是**同一条链接**走链接导入有 spx、走 Xray JSON 导入就没有，
+    #   而 genconfig 生成配置时会写 realitySettings.spiderX：自己写出去的东西
+    #   自己读不回来。三家互通的原生路径正是 Xray JSON，这个洞会直接表现为
+    #   "原生比普通话少一个字段"（原本该是反过来的）。
+    n["reality_spider_x"] = reality.get("spiderX") or ""
     # Xray JSON 里的 `mux:{enabled:…}` 就是 mux.cool 本身 —— 这里读它是**对的**，
     # 与 mihomo 的 smux 不是一回事。字典要读 enabled（见 _flag）。
     n["mux"] = _flag(ob.get("mux")) if ob.get("mux") is not None else False
@@ -893,10 +900,44 @@ def parse_node(text: str) -> dict:
                      "Xray JSON、Mihomo YAML）")
 
 
+def parse_xray_json_many(text: str):
+    """Xray JSON **文档** → 节点列表（可能含多个出站）。不是这种文档返回 None。
+
+    为什么单独一个函数：`parse_xray_json()` 只看**第一个**可识别出站，而订阅路径
+    (`parse_many` / `parse_subscription`) 是按行拆再逐行解析的 —— 多出站的 JSON
+    文档按行拆开，每一行都不是合法 JSON，于是**一个节点都解析不出来**。
+    结果是：服务端声明"原生在这条地址上"、客户端也拉到了正确的 JSON，
+    却报"订阅里没有解析出节点"（看起来像订阅空了）。这是三家互通里
+    X→X 走原生那条路的关键一环。
+    """
+    t = (text or "").strip()
+    if not t.startswith("{"):
+        return None
+    try:
+        d = json.loads(t)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or not isinstance(d.get("outbounds"), list):
+        return None
+    out = []
+    for ob in d["outbounds"]:
+        if not isinstance(ob, dict):
+            continue
+        # 逐个出站单独喂给 parse_xray_json —— 解析规则只有那一处实现，
+        # 这里不做第二次字段映射（两份映射必然漂移）。
+        try:
+            out.append(parse_xray_json(json.dumps({"outbounds": [ob]},
+                                                  ensure_ascii=False)))
+        except Exception:
+            continue
+    return out
+
+
 def parse_many(text: str) -> list[dict]:
     """解析可能包含多个节点的输入。
 
-    支持三种形态：
+    支持四种形态：
+      0) 原生产品：Xray JSON 文档（可能多个出站）—— 三家互通的原生路径
       1) 一段 mihomo YAML（含多个 - name: 条目）—— 必须整段解析，
          按行拆开会把多行结构拆散（这是之前的 bug）
       2) 多行 URI（每行一个 vless:// 等）
@@ -905,6 +946,11 @@ def parse_many(text: str) -> list[dict]:
     body = text.strip()
     if not body:
         return []
+
+    # 形态 0：Xray JSON 文档（含多出站）
+    native = parse_xray_json_many(body)
+    if native is not None:
+        return native
 
     # 形态 1：YAML 文档 / 列表
     looks_yaml = (
@@ -995,8 +1041,13 @@ def _parse_yaml_all(text: str) -> list[dict]:
 
 
 def parse_subscription(text: str) -> list[dict]:
-    """订阅内容 → 节点列表。自动识别 base64 编码与多行文本。"""
+    """订阅内容 → 节点列表。自动识别 base64 编码、多行文本与**原生产品**。"""
     body = text.strip()
+    # 原生产品（Xray JSON 文档）：订阅路径必须认它，否则同内核走原生这条路
+    # 会以"订阅里没有解析出节点"告终（而内容其实完全正确）。
+    native = parse_xray_json_many(body)
+    if native is not None:
+        return native
     decoded = _b64decode(body) if not is_uri(body) and "\n" not in body else ""
     if decoded and is_uri(decoded):
         body = decoded
