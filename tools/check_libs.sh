@@ -4345,6 +4345,139 @@ else
     ok "没有现行脚本引用孤儿链 (.sh/.py 非注释行)"
 fi
 
+# ---------------------------------------------------------------- 三家互通
+#
+# 服务端在**分享地址**上声明内核/发行版/可用格式, 客户端据此单方面决定拉原生
+# 还是拉普通话。设计: proxy-node-compat/docs/three-way-interop.md
+#
+# 这一组锁四件事。缺任何一件, "看起来能用"都会盖住静默失效:
+#   ① 决策规则: 同内核同发行版→原生; 跨内核/声明缺失/声明不认识/发行版不在
+#      清单→普通话（不猜）。
+#   ② 两份 interop.py **逐字节相同**（服务端 conf/lib 与客户端 Client/lib 各
+#      一份 vendored 副本）—— 字段名对不上时, 表现是"静默全部走普通话",
+#      没有任何报错。
+#   ③ 端到端（tools/interop-e2e.sh）: 真 share.sh create + 真客户端 xbd
+#      node sub, 含"同内核走原生 / 声明缺失回退 / 原生 404 回退"三条路径,
+#      以及"带声明与裸地址逐字节相同"（第三方客户端零影响）。
+#   ④ 两条产品逐字段一致（URI ⊆ 原生）—— 见 e2e 的第 8 步。
+group "三家互通 (内核声明 → 原生/普通话)"
+XRAY_INTEROP="$LIB/interop.py"
+XRAY_INTEROP_C="$ROOT/Client/lib/interop.py"
+[[ -f "$XRAY_INTEROP" ]] && ok "服务端 conf/lib/interop.py 存在" || bad "缺 conf/lib/interop.py"
+[[ -f "$XRAY_INTEROP_C" ]] && ok "客户端 Client/lib/interop.py 存在" || bad "缺 Client/lib/interop.py"
+assert_eq "$(sha256sum "$XRAY_INTEROP" 2>/dev/null | awk '{print $1}')" \
+          "$(sha256sum "$XRAY_INTEROP_C" 2>/dev/null | awk '{print $1}')" \
+          "两份 interop.py 逐字节相同（服务端/客户端同一份定义）"
+
+# ---- ① 决策规则（纯函数, 不依赖网络与内核）----
+DEC() { # <订阅地址> <本机内核> <本机发行版> → "内核|原因"
+    python3 - "$XRAY_INTEROP" "$@" <<'PY'
+import sys, os
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import interop
+decl = interop.parse_declaration(sys.argv[2])
+choice, reason, url, _d = interop.decide(decl, sys.argv[3], sys.argv[4])
+print("%s|%s" % (choice, reason))
+PY
+}
+SAME_URL='http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=http%3A%2F%2Fh%3A9443%2Fshare%2Fbbbb'
+assert_eq "$(DEC "$SAME_URL" xray xray)" "native|native-listed" \
+    "同内核同发行版 → 原生"
+assert_eq "$(DEC "$SAME_URL" sing-box sing-box)" "uri|cross-kernel" \
+    "跨内核（SB 客户端遇到 X 服务端）→ 普通话"
+assert_eq "$(DEC 'http://h:9443/share/aaaa' xray xray)" "uri|no-declaration" \
+    "声明缺失 → 普通话（不是报错）"
+assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=9&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=http%3A%2F%2Fh%2Fb' xray xray)" \
+    "uri|unknown-schema" "声明规范版本不认识 → 普通话"
+assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=v2ray&distribution=v2ray&formats=uri' xray xray)" \
+    "uri|unknown-kernel" "声明的内核不在词表里 → 普通话"
+assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray-lx&formats=uri%2Cxray-lx&url-xray-lx=http%3A%2F%2Fh%2Fb' xray xray)" \
+    "uri|distribution-not-listed" "同内核但发行版(fork)不在清单 → 普通话（不猜原生）"
+assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray' xray xray)" \
+    "uri|no-url-for-format" "声明了格式却没给地址 → 普通话"
+assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=file%3A%2F%2F%2Fetc%2Fpasswd' xray xray)" \
+    "uri|bad-native-url" "原生地址不是 http(s) → 普通话（不去取 file://）"
+assert_eq "$(DEC "$SAME_URL" "" "")" "uri|self-unknown" \
+    "本机发行版探测不出来 → 普通话（不猜自己是官方版）"
+# 「给了地址」= 「声明这个格式」: 只写 url-xray 而 formats 里没有它, 是自相矛盾的
+# 声明 —— 生成器必须补齐, 否则客户端永远走普通话而地址上明明挂着原生。
+DECL_Q=$(python3 - "$XRAY_INTEROP" <<'PY'
+import sys, os
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import interop
+d = interop.build_declaration("xray", "xray", "26.3.27", formats=("uri",),
+                              urls={"xray": "http://h/b"})
+print(",".join(d["formats"]))
+PY
+)
+assert_eq "$DECL_Q" "uri,xray" "只给 url-xray 时 formats 自动补上 xray"
+
+# ---- ② 声明只读查询串（片段里的同名字段不许当声明）----
+FRAG_ONLY=$(DEC 'http://h:9443/share/aaaa#interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray' xray xray)
+assert_eq "$FRAG_ONLY" "uri|no-declaration" "片段里的同名字段不算声明（载体只有查询串）"
+# 生成声明时保留地址上原有的第三方参数（有些面板会带自己的参数）
+KEEPQ=$(python3 - "$XRAY_INTEROP" <<'PY'
+import sys, os
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import interop
+u = interop.declare_url("http://h:9443/share/a?token=zzz",
+                        interop.build_declaration("xray", "xray"))
+print("token=zzz" in u and "interop=1" in u and u.count("interop=1") == 1)
+PY
+)
+assert_eq "$KEEPQ" "True" "并声明时保留地址上原有的其它参数, 且不重复叠加"
+
+# ---- ③ 原生产品生成器的边界 ----
+NATIVE_PY="$LIB/native.py"
+[[ -f "$NATIVE_PY" ]] && ok "conf/lib/native.py（原生产品生成器）存在" || bad "缺 conf/lib/native.py"
+ECHV=$(python3 - "$NATIVE_PY" <<'PY'
+import sys, os
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import native
+# RN 生产 vless-xhttp08 的真值对（`xray tls ech -i` 现验过, 见 §报告）
+K = ("ACAeHgJriV0xujYELoel7l+Avsa2y7yjytil2vOQSlCdLgBl/g0AYQAAIAAgP6zoBwcqbFn"
+     "Pyw2P1mY5ivBpuY6XvO+omOwChaYR3QIAJAABAAEAAQACAAEAAwACAAEAAgACAAIAAwAD"
+     "AAEAAwACAAMAAwASbW9vbnR2LjY4OTY2OTgueHl6AAA=")
+WANT = ("AGX+DQBhAAAgACA/rOgHBypsWc/LDY/WZjmK8Gm5jpe876iY7AKFphHdAgAkAAEAAQABAAIA"
+        "AQADAAIAAQACAAIAAgADAAMAAQADAAIAAwADABJtb29udHYuNjg5NjY5OC54eXoAAA==")
+print(native.ech_config_list(K) == WANT)
+print("|".join([native.ech_config_list(""), native.ech_config_list("not-base64!!")]))
+print("|".join([native._bandwidth(50), native._bandwidth("1.5g"),
+                native._bandwidth("bogus")]))
+PY
+)
+assert_eq "$(printf '%s' "$ECHV" | sed -n 1p)" "True" \
+    "echServerKeys → ECHConfigList（与 xray tls ech -i 逐字节相同）"
+assert_eq "$(printf '%s' "$ECHV" | sed -n 2p)" "|" \
+    "坏/空 echServerKeys 不猜值（返回空）"
+assert_eq "$(printf '%s' "$ECHV" | sed -n 3p)" "50 mbps|1.5 gbps|" \
+    "链接侧带宽 → Xray Bandwidth 语法（裸数字=Mbps; 认不出留空）"
+
+# ---- ④ 端到端（真 share.sh + 真分享服务 + 真 xbd 入口）----
+# 需要 proxy-share-service 的源码（公共组件, 独立端口/独立数据目录, 不碰生产）。
+# 它退出 3 = 找不到服务源码 → 这一条**必须失败**, 不能算通过: 端到端没跑就是没跑。
+E2E_OUT=$(TW_XRAY_VERSION="${XBD_XRAY_VERSION:-26.3.27}" \
+          TW_WORK="${TMP:-/tmp}/interop-e2e" TW_PORT=0 \
+          bash "$ROOT/tools/interop-e2e.sh" 2>&1)
+E2E_RC=$?
+E2E_SUM=$(printf '%s' "$E2E_OUT" | grep -oE '结果: [0-9]+ 通过, [0-9]+ 失败' | tail -1)
+if [[ $E2E_RC -eq 0 && "$E2E_SUM" == *", 0 失败"* ]]; then
+    ok "端到端: $E2E_SUM"
+else
+    bad "端到端: ${E2E_SUM:-没跑起来(rc=$E2E_RC)}"
+    printf '%s\n' "$E2E_OUT" | tail -25 | sed 's/^/      /'
+fi
+# 三条路径要单独可见 —— 汇总为 0 失败时仍然要确认它们真的都断言过
+for _k in '本次拉取: 原生' '本次拉取: 普通话' '逐字节相同' 'URI ⊆ 原生'; do
+    # 用 >/dev/null 而不是 grep -q: -q 命中即退出会让上游 printf 吃 SIGPIPE,
+    # 在 pipefail 下整条命令变成 141（随机判反）。
+    if printf '%s' "$E2E_OUT" | grep "$_k" >/dev/null; then
+        ok "端到端覆盖: $_k"
+    else
+        bad "端到端没有覆盖: $_k"
+    fi
+done
+
 # 门禁脚本自己也会骗人: 之前有两条检查调了根本**不存在**的断言函数
 # （assert_has / pass），bash 只往 stderr 丢一句 "command not found",
 # 检查项既不通过也不失败 —— 看起来全绿, 其实什么都没验。
