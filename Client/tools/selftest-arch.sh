@@ -76,7 +76,7 @@ if [ "${n:-0}" -eq 1 ]; then
     *)      bad "该 PID 不是 Xray: $prog" ;;
   esac
   has_bd=no
-  tr '\0' '\n' < "/proc/$holders/environ" 2>/dev/null | grep -q '^XRAY_BROWSER_DIALER=' && has_bd=yes
+  tr '\0' '\n' < "/proc/$holders/environ" 2>/dev/null | grep '^XRAY_BROWSER_DIALER=' >/dev/null && has_bd=yes
   case "$WANT_BD:$has_bd" in
     yes:yes) ok "当前节点要浏览器，实例也带着 XRAY_BROWSER_DIALER（节点属性，不是模式）" ;;
     no:no)   ok "当前节点不要浏览器，实例也**没有** XRAY_BROWSER_DIALER（进程级开关跟着节点走）" ;;
@@ -151,7 +151,7 @@ for f in sorted(os.listdir(ndir)):
         print(p)
 PY
 )
-  plain=$(printf '%s\n' "$plain_all" | head -1)
+  plain=$(printf '%s\n' "$plain_all" | awk 'NR==1')
   if [ -z "$plain" ]; then
     echo "  （没有「不需要浏览器」的节点可供切换，跳过这条）"
   else

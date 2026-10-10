@@ -118,7 +118,7 @@ echo
 echo "  新增 $new / 修改 $mod / 未变 $same"
 if [ -s "$CHANGED" ]; then
   echo "  --- 将要写入（全部在 $PREFIX_PATH/ 下）---"
-  awk -F'\t' '{printf "    %-6s %s\n", $1, $2}' "$CHANGED" | head -60
+  awk -F'\t' '{printf "    %-6s %s\n", $1, $2}' "$CHANGED" | awk 'NR<=60'
 else
   echo "  没有变化，无需推送"; exit 0
 fi

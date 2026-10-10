@@ -151,14 +151,14 @@ detect_browser() {
 }
 browser_version() {
   local b; b=$(detect_browser) || { printf '未安装'; return; }
-  "$b" --version 2>/dev/null | head -1
+  "$b" --version 2>/dev/null | awk 'NR==1'
 }
 
 has_systemd() { [ -d /run/systemd/system ]; }
 
 port_holder() { ss -H -tlnp 2>/dev/null | awk -v p=":$1\$" '$4 ~ p {print $NF; exit}'; }
 port_in_use() { [ -n "$(port_holder "$1")" ]; }
-port_listening_tcp() { ss -H -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
+port_listening_tcp() { ss -H -tln 2>/dev/null | awk '{print $4}' | grep -E "[:.]$1\$" >/dev/null; }
 conn_count() { ss -tnH 2>/dev/null | grep -c "$1" || true; }
 
 unit_active()  { systemctl is-active  --quiet "$1" 2>/dev/null; }

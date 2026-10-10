@@ -288,7 +288,7 @@ print(m.get("host", ""))
 ' 2>/dev/null)
     if [[ -z "$host" ]]; then
         # 退一步: 本机第一个非回环地址。依然不问外部服务。
-        host=$(hostname -I 2>/dev/null | tr " " "\n" | grep -vE "^(127\.|::1|$)" | head -1)
+        host=$(hostname -I 2>/dev/null | tr " " "\n" | grep -vE "^(127\.|::1|$)" | awk 'NR==1')
     fi
     [[ -n "$host" ]] || host="<服务器IP>"
     local url="http://$host:$port/share/$token"
@@ -520,7 +520,7 @@ share_affected() {
     fi
     local n; n=$(printf '%s\n' "$toks" | grep -c . )
     printf '  ${_YEL}受影响分享: %s 条 (删除成功后将自动吊销)${_RST}\n' "$n" >&2
-    printf '%s\n' "$toks" | head -5 | while IFS= read -r t; do
+    printf '%s\n' "$toks" | awk 'NR<=5' | while IFS= read -r t; do
         printf '    %s\n' "$t" >&2
     done
     (( n > 5 )) && printf '    ... 还有 %s 条\n' "$((n - 5))" >&2

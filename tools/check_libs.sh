@@ -71,7 +71,7 @@ if [[ -n "$X" ]]; then
         ok "完整链路 $n 种协议/传输全部打通"
     else
         bad "完整链路未全通过"
-        printf '%s\n' "$out" | grep '✗' | head -6 | sed 's/^/        /'
+        printf '%s\n' "$out" | grep '✗' | awk 'NR<=6' | sed 's/^/        /'
     fi
 else
     printf '  - 完整链路验证需要 Xray 内核 (本机没有, 已在实机跑过)\n'
@@ -156,15 +156,15 @@ else:
     print("pure_b64=%s" % all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" for c in payload))
 PY
 )
-echo "$PO" | grep -q 'payload_is_none=False' && ok "好节点存在时仍构建出载荷" || bad "载荷构建失败"
-echo "$PO" | grep -q 'has_good1=True' && ok "坏片段不影响好节点 (good1)" || bad "好节点丢失"
-echo "$PO" | grep -q 'has_good2=True' && ok "坏片段不影响好节点 (good2)" || bad "好节点丢失"
-echo "$PO" | grep -q 'has_broken=False' && ok "坏片段被跳过而非混入" || bad "坏片段混进订阅 (客户端会整段解析失败)"
-echo "$PO" | grep -q 'has_nometa=False' && ok "缺对外地址的节点不混入" || bad "缺元数据的节点混进订阅"
-echo "$PO" | grep -q 'pure_b64=True' && ok "载荷仍是纯 base64" || bad "载荷混入非 base64 内容"
-echo "$PO" | grep -q 'bad_count=1' && ok "坏片段数量被单独报出" || bad "坏片段没有单独报出"
-echo "$PO" | grep -q 'missing=gone' && ok "已删节点单独报出 (与缺元数据区分)" || bad "已删节点没有单独报出"
-echo "$PO" | grep -q 'nometa=nometa' && ok "缺元数据单独报出 (与已删区分)" || bad "缺元数据没有单独报出"
+echo "$PO" | grep 'payload_is_none=False' >/dev/null && ok "好节点存在时仍构建出载荷" || bad "载荷构建失败"
+echo "$PO" | grep 'has_good1=True' >/dev/null && ok "坏片段不影响好节点 (good1)" || bad "好节点丢失"
+echo "$PO" | grep 'has_good2=True' >/dev/null && ok "坏片段不影响好节点 (good2)" || bad "好节点丢失"
+echo "$PO" | grep 'has_broken=False' >/dev/null && ok "坏片段被跳过而非混入" || bad "坏片段混进订阅 (客户端会整段解析失败)"
+echo "$PO" | grep 'has_nometa=False' >/dev/null && ok "缺对外地址的节点不混入" || bad "缺元数据的节点混进订阅"
+echo "$PO" | grep 'pure_b64=True' >/dev/null && ok "载荷仍是纯 base64" || bad "载荷混入非 base64 内容"
+echo "$PO" | grep 'bad_count=1' >/dev/null && ok "坏片段数量被单独报出" || bad "坏片段没有单独报出"
+echo "$PO" | grep 'missing=gone' >/dev/null && ok "已删节点单独报出 (与缺元数据区分)" || bad "已删节点没有单独报出"
+echo "$PO" | grep 'nometa=nometa' >/dev/null && ok "缺元数据单独报出 (与已删区分)" || bad "缺元数据没有单独报出"
 
 # ---------------------------------------------------------------- 面板降级
 # 公共基础服务不存在/没跑时, 面板必须**说清楚**, 不能装作一切正常。
@@ -186,9 +186,9 @@ DL=$(SHARE_CLIENT="$ROOT/conf/share_client.py" SHARE_PORT=19499 \
      SHARE_PORT_FILE=/nonexistent SHARE_ETC=/nonexistent \
      XRAY_BASE="$DEG" XRAY_CONF_DIR="$DEG/conf" XRAY_SHARE_DIR="$DEG/share" \
      bash "$ROOT/conf/share.sh" list 2>&1; echo "rc=$?")
-echo "$DL" | grep -q 'rc=1' && ok "服务不可达时 list 返回非 0" || bad "服务不可达时 list 仍返回 0"
-echo "$DL" | grep -q '不可达' && ok "服务不可达被明确说出来" || bad "服务不可达没有说清楚"
-echo "$DL" | grep -qv '还没有生成分享' && ok "没有把'服务挂了'说成'没有分享'" || bad "把服务故障误报成没有分享"
+echo "$DL" | grep 'rc=1' >/dev/null && ok "服务不可达时 list 返回非 0" || bad "服务不可达时 list 仍返回 0"
+echo "$DL" | grep '不可达' >/dev/null && ok "服务不可达被明确说出来" || bad "服务不可达没有说清楚"
+echo "$DL" | grep -v '还没有生成分享' >/dev/null && ok "没有把'服务挂了'说成'没有分享'" || bad "把服务故障误报成没有分享"
 
 # ---------------------------------------------------------------- 证书管理
 # cert.sh 此前只有库没有用户入口。证书问题在现场的表现恰恰最难自查:
@@ -360,7 +360,7 @@ out=$(bash -c "source '$LIB/print.sh'; ok A; info B; warn C; err D" 2>/dev/null)
 
 # 非终端不上色 (命令替换里一定不是终端)
 out=$(bash -c "source '$LIB/print.sh'; ok A; warn B; err C; info D" 2>&1)
-if printf '%s' "$out" | grep -q $'\033'; then
+if printf '%s' "$out" | grep $'\033' >/dev/null; then
     bad "非终端下仍带 ANSI 转义序列 (重定向到日志会全是垃圾)"
 else
     ok "非终端下不上色"
@@ -383,8 +383,8 @@ done
 # 真的能加载 (跑一个未知子命令, 走它自己的 usage 分支就说明库加载过了)
 for f in conf/node.sh conf/share.sh conf/share_service.sh; do
     out=$(bash "$ROOT/$f" __probe__ 2>&1 || true)
-    if printf '%s' "$out" | grep -qi "command not found"; then
-        bad "$f 加载提示库失败: $(printf '%s' "$out" | head -1)"
+    if printf '%s' "$out" | grep -i "command not found" >/dev/null; then
+        bad "$f 加载提示库失败: $(printf '%s' "$out" | awk 'NR==1')"
     elif [[ -z "$out" ]]; then
         bad "$f 未知子命令没有任何输出 (库可能没加载)"
     else
@@ -395,8 +395,8 @@ done
 # 顺序回归: share.sh 里 addr.sh 的失败分支要调 warn,
 # warn 必须在那之前就定义好 —— 原来定义在它后面, 那条分支一旦走到
 # 就是 "warn: command not found"。
-a=$(grep -n 'source "\$LIB_DIR/print.sh"' "$ROOT/conf/share.sh" | head -1 | cut -d: -f1)
-b=$(grep -n 'source "\$LIB_DIR/addr.sh"' "$ROOT/conf/share.sh" | head -1 | cut -d: -f1)
+a=$(grep -n 'source "\$LIB_DIR/print.sh"' "$ROOT/conf/share.sh" | awk 'NR==1' | cut -d: -f1)
+b=$(grep -n 'source "\$LIB_DIR/addr.sh"' "$ROOT/conf/share.sh" | awk 'NR==1' | cut -d: -f1)
 if [[ -n "$a" && -n "$b" && "$a" -lt "$b" ]]; then
     ok "share.sh: print.sh 在 addr.sh 之前加载 (warn 已可用)"
 else
@@ -489,9 +489,9 @@ NO=$(SHARE_DIR="$TMP/ngshare" XRAY_BASE="$NG_T" bash -c "
   py() { python3 \"\$@\"; }
   info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
   check_orphan_nginx" 2>&1)
-echo "$NO" | grep -q 'orphan.example.com' && ok "查出孤儿片段 (会报出域名)" || bad "没查出孤儿片段"
-echo "$NO" | grep -q '502' && ok "告警里说明了后果 (CDN 回源 502)" || bad "告警没说清后果"
-echo "$NO" | grep -q '没有发现' && bad "明明有孤儿却报'没有发现'" || ok "没有误报"
+echo "$NO" | grep 'orphan.example.com' >/dev/null && ok "查出孤儿片段 (会报出域名)" || bad "没查出孤儿片段"
+echo "$NO" | grep '502' >/dev/null && ok "告警里说明了后果 (CDN 回源 502)" || bad "告警没说清后果"
+echo "$NO" | grep '没有发现' >/dev/null && bad "明明有孤儿却报'没有发现'" || ok "没有误报"
 # 空目录 -> 必须报"没有发现", 不能凭空造出孤儿
 mkdir -p "$NG_T/empty"
 NE=$(XRAY_BASE="$NG_T" bash -c "
@@ -500,7 +500,7 @@ NE=$(XRAY_BASE="$NG_T" bash -c "
   py() { python3 \"\$@\"; }
   info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
   check_orphan_nginx" 2>&1)
-echo "$NE" | grep -q '没有发现' && ok "无片段时如实报告 (不凭空造孤儿)" || bad "无片段时报告不正确"
+echo "$NE" | grep '没有发现' >/dev/null && ok "无片段时如实报告 (不凭空造孤儿)" || bad "无片段时报告不正确"
 
 # ---------------------------------------------------------------- 地址族判定
 # 守的是"向导告诉用户有没有 IPv6"这件事。旧写法两处不对称:
@@ -514,14 +514,14 @@ AD="$ROOT/conf/lib/addr.sh"
 # 两个函数必须都引用隧道正则 —— 防止有人只改一个
 for fn in x_has_v4 x_has_v6; do
     body=$(sed -n "/^${fn}()/,/^}/p" "$AD")
-    echo "$body" | grep -q 'X_TUNNEL_IFACE_RE' \
+    echo "$body" | grep 'X_TUNNEL_IFACE_RE' >/dev/null \
         && ok "$fn 排除隧道接口 (与另一个对称)" \
         || bad "$fn 没有排除隧道接口 —— 只有 WARP 的机器会被误判成'有'"
 done
 # 也不能只看接口就下结论: 必须逐条按 dev 过滤
 for fn in x_has_v4 x_has_v6; do
     body=$(sed -n "/^${fn}()/,/^}/p" "$AD")
-    echo "$body" | grep -qE 'read -r dev cidr' \
+    echo "$body" | grep -E 'read -r dev cidr' >/dev/null \
         && ok "$fn 逐接口判定 (不是整表 grep 一下就算)" \
         || bad "$fn 没有逐接口判定"
 done
@@ -554,7 +554,7 @@ grep -q 'backup_current_core >/dev/null 2>&1' "$RB/block.sh" \
 # 只找**真正的调用**(行首命令), 不找提示文案里那句
 # "确认无误后再重启：systemctl restart ..." —— 那句话是故意留的, 要告诉用户
 # 怎么切。用 'systemctl restart' 直接 grep 会把文案也算进去 (实测误报过一次)。
-if sed -n '/^rollback_core()/,/^}/p' "$RB/block.sh" | grep -qE '^[[:space:]]*systemctl[[:space:]]+restart'; then
+if sed -n '/^rollback_core()/,/^}/p' "$RB/block.sh" | grep -E '^[[:space:]]*systemctl[[:space:]]+restart' >/dev/null; then
     bad "rollback_core 会自动重启服务 (应只校验, 让用户决定)"
 else
     ok "rollback_core 只做校验不自动重启 (文案里的提示命令不算调用)"
@@ -578,8 +578,8 @@ RR=$(BIN="$RBIN" CORE_BACKUP_DIR="$RB/backup" bash -c "
   source '$RB/block.sh' 2>/dev/null || true
   list_core_backups
   rollback_core 99.9.9 >/dev/null 2>&1; echo rc=\$?" 2>&1)
-echo "$RR" | grep -q '还没有内核备份' && ok "空目录时如实报告 (不假装有备份)" || bad "空目录时报告不正确"
-echo "$RR" | grep -q 'rc=1' && ok "回退不存在的版本返回非 0" || bad "回退不存在的版本没报错"
+echo "$RR" | grep '还没有内核备份' >/dev/null && ok "空目录时如实报告 (不假装有备份)" || bad "空目录时报告不正确"
+echo "$RR" | grep 'rc=1' >/dev/null && ok "回退不存在的版本返回非 0" || bad "回退不存在的版本没报错"
 
 # ---------------------------------------------------------------- 预置推荐档
 # 守的是"推荐配置是不是当前官方方向"。官方已把 websocket / grpc /
@@ -598,8 +598,8 @@ done
 # 弃用的传输必须仍在表里 (兼容老节点), 但说明里要写明官方弃用
 for proto_tr in "vless|ws" "vless|grpc" "vless|httpupgrade" "trojan|ws" "vmess|ws"; do
     pr="${proto_tr%%|*}"; tr="${proto_tr##*|}"
-    body=$(grep -E "^\s*\"$pr\|$tr\|" "$LIB/preset.sh" | head -1)
-    echo "$body" | grep -q '弃用' \
+    body=$(grep -E "^\s*\"$pr\|$tr\|" "$LIB/preset.sh" | awk 'NR==1')
+    echo "$body" | grep '弃用' >/dev/null \
         && ok "$pr + $tr 仍在表里且标注了官方弃用" \
         || bad "$pr + $tr 没标注官方弃用 (用户看不出它正在被淘汰)"
 done
@@ -678,11 +678,11 @@ print("HOSTS=" + ",".join(hosts))
 PYP
 DRV
 AFR=$(bash "$AF/drive.sh" "$AF/share" "$LIB" "$AF/fn.sh" v4 2>&1)
-echo "$AFR" | grep -q 'HOSTS=9.9.9.9' && ok "v4 切换把全部节点改到目标地址" \
+echo "$AFR" | grep 'HOSTS=9.9.9.9' >/dev/null && ok "v4 切换把全部节点改到目标地址" \
     || bad "v4 切换结果不对: $(echo "$AFR" | grep HOSTS || echo 无输出)"
-echo "$AFR" | grep -q '已切换 3 个节点' && ok "报告了改动的节点数 (3 个)" || bad "没报告改动条数"
+echo "$AFR" | grep '已切换 3 个节点' >/dev/null && ok "报告了改动的节点数 (3 个)" || bad "没报告改动条数"
 # 全表只有两个旧地址且都指向 1.1.1.1, 切完必须只剩一个值
-echo "$AFR" | grep -q ',' && bad "切换后仍存在多个不同 host —— 有节点被漏改" \
+echo "$AFR" | grep ',' >/dev/null && bad "切换后仍存在多个不同 host —— 有节点被漏改" \
     || ok "切换后 host 唯一 (没有漏改的节点)"
 
 # 非法参数必须拒绝
@@ -705,7 +705,7 @@ x_switch_addr_family bogus
 echo "rc=$?"
 DRV
 AFB=$(bash "$AF/drive2.sh" "$AF/share" "$LIB" "$AF/fn.sh" 2>&1)
-echo "$AFB" | grep -q 'rc=1' && ok "非法地址族返回非 0" || bad "非法地址族没被拒绝"
+echo "$AFB" | grep 'rc=1' >/dev/null && ok "非法地址族返回非 0" || bad "非法地址族没被拒绝"
 
 group "节点命名 (naming.sh)"
 # 协议名规范化: 各处的写法收敛成一种
@@ -854,7 +854,7 @@ liblist=$(sed -n '/^_XRAY_LIB_FILES=(/,/^)/p' "$PAN" \
           | tr ' \t' '\n\n' | grep -oE '^[A-Za-z0-9_.]+\.(sh|py)$')
 missing=""
 for f in $(ls "$ROOT/conf/lib" | grep -v __pycache__); do
-    printf '%s\n' "$liblist" | grep -qx "$f" || missing="$missing $f"
+    printf '%s\n' "$liblist" | grep -x "$f" >/dev/null || missing="$missing $f"
 done
 [[ -z "$missing" ]] && ok "_XRAY_LIB_FILES 覆盖 conf/lib/ 全部文件" \
     || bad "_XRAY_LIB_FILES 漏了:$missing"
@@ -869,19 +869,19 @@ done
 # xray_run 必须铺 lib, 否则每个菜单项都会掉进脚本自己的 github 兜底
 grep -q 'xray_ensure_lib' "$PAN" && ok "xray_run 会铺 lib" || bad "xray_run 没调 xray_ensure_lib"
 # 而且要把可用的源交给子脚本
-sed -n '/^xray_run()/,/^}/p' "$PAN" | grep -q 'XRAY_RAW="\$base" bash' \
+sed -n '/^xray_run()/,/^}/p' "$PAN" | grep 'XRAY_RAW="\$base" bash' >/dev/null \
     && ok "xray_run 把可用源通过 XRAY_RAW 交给子脚本" \
     || bad "xray_run 没有把可用源交给子脚本 (兜底仍会走写死的 github)"
 
 # ★ 回归守卫: 这条警告必须在 stderr。打在 stdout 会被 $(xray_pick_source) 一起
 #   捕获, 拼出的 URL 前面挂着一行带 ANSI 码的提示, curl 必然失败。
-sed -n '/^xray_pick_source()/,/^}/p' "$PAN" | grep -q '已选用镜像.*>&2' \
+sed -n '/^xray_pick_source()/,/^}/p' "$PAN" | grep '已选用镜像.*>&2' >/dev/null \
     && ok "xray_pick_source 的警告走 stderr" \
     || bad "xray_pick_source 的警告又打到 stdout 了 —— 会污染 \$(...) 捕获"
 
 # ★ 404 短路: 仓库只有一份, 这个源说没有别的源也不会有。
 #   逐个重试既慢, 又把"文件不存在"报成"镜像链全不通"。
-sed -n '/^xray_fetch_to()/,/^}/p' "$PAN" | grep -q '404' \
+sed -n '/^xray_fetch_to()/,/^}/p' "$PAN" | grep '404' >/dev/null \
     && ok "xray_fetch_to 对 404 短路" || bad "xray_fetch_to 没有 404 短路 (会白试所有镜像)"
 
 # 每个脚本内部的 github 兜底都要能被 XRAY_RAW 覆盖。
@@ -961,8 +961,8 @@ assert_eq "$n" "2" "表格把两个节点都列出来了 (一个都不少)"
 miss=""
 for fn in _xbd_browser_table _xbd_browser_pick _xbd_browser_bulk; do
   body=$(sed -n "/^${fn}()/,/^}/p" "$ROOT/Client/lib/actions.sh")
-  printf '%s' "$body" | grep -q 'compat.py" json' || continue
-  printf '%s' "$body" | grep -q '2>/dev/null || true)' || miss="$miss $fn"
+  printf '%s' "$body" | grep 'compat.py" json' >/dev/null || continue
+  printf '%s' "$body" | grep '2>/dev/null || true)' >/dev/null || miss="$miss $fn"
 done
 [[ -z "$miss" ]] && ok "三个拨号菜单函数都容忍 compat.py 的退出码 1" \
     || bad "这些函数没容错, 菜单会被 set -e 杀掉:$miss"
@@ -986,7 +986,7 @@ group "apply 健康路径 (set -e 与 pipefail)"
 ACT="$ROOT/Client/lib/actions.sh"
 
 # 语句 1: grep 无匹配时不能杀脚本
-STMT=$(grep -n "printf '%s\\\\n' \"\$_gen_out\" | grep 'genconfig:'" "$ACT" | head -1 | cut -d: -f2-)
+STMT=$(grep -n "printf '%s\\\\n' \"\$_gen_out\" | grep 'genconfig:'" "$ACT" | awk 'NR==1' | cut -d: -f2-)
 [[ -n "$STMT" ]] && ok "找到 genconfig 警告输出那一行" || bad "找不到那一行(可能被改写, 请更新本测试)"
 run_stmt() { # $1=语句  $2=喂给 _gen_out 的内容
   # 被抽出来的语句会调 warn/dim —— 它们是 actions.sh 里的函数, 独立夹具里没有。
@@ -1119,7 +1119,7 @@ mkdir -p "$FAMT/rt" && cp "$FAMT/rd6.json" "$FAMT/rt/xray-client.json"
 got=$(_strategy_of "$FAMT/rt/xray-client.json")
 assert_eq "$got" "UseIPv6" "回读函数能从**格式化 JSON** 里读出 direct 的 domainStrategy"
 # 反证：grep 那种写法在这份文件上确实读不到（保住这条注释的依据）
-g=$(grep -o '"tag": *"direct"[^}]*}' "$FAMT/rt/xray-client.json" 2>/dev/null | head -1 || true)
+g=$(grep -o '"tag": *"direct"[^}]*}' "$FAMT/rt/xray-client.json" 2>/dev/null | awk 'NR==1' || true)
 [[ -z "$g" ]] && ok "（反证）单纯的 grep 跨行读不到 —— 所以必须用解析" \
               || bad "（反证）grep 竟然读到了，注释里的理由需要更新"
 rm -rf "$FAMT"
@@ -1179,7 +1179,7 @@ for k, v in res:
     print("%s\t%r" % (k, v))
 PY
 )
-chk() { printf '%s' "$out" | grep -q "^$1	$2$" && ok "$3" || bad "$3" "$(printf '%s' "$out" | grep "^$1	" | head -1)"; }
+chk() { printf '%s' "$out" | grep "^$1	$2$" >/dev/null && ok "$3" || bad "$3" "$(printf '%s' "$out" | grep "^$1	" | awk 'NR==1')"; }
 chk rename        True  "分组可重命名"
 chk renamed       True  "改名后注册表里是新名字"
 chk rename-bad-id False "对不存在的分组改名返回 False（不是假装成功）"
@@ -1608,9 +1608,9 @@ EOF
 chmod +x "$TMP/jbin/journalctl"
 EX=$(PATH="$TMP/jbin:$PATH" bash -c "source '$LIB/service.sh'; x_svc_explain_errors" 2>&1)
 [[ -n "$EX" ]] && ok "报错解释有输出" || bad "报错解释有输出"
-echo "$EX" | grep -qi 'port\|端口' && ok "识别出端口冲突" || bad "识别出端口冲突"
-echo "$EX" | grep -qi 'unknown field\|字段' && ok "识别出未知字段" || bad "识别出未知字段"
-echo "$EX" | grep -qi 'config' && ok "识别出配置文件问题" || bad "识别出配置文件问题"
+echo "$EX" | grep -i 'port\|端口' >/dev/null && ok "识别出端口冲突" || bad "识别出端口冲突"
+echo "$EX" | grep -i 'unknown field\|字段' >/dev/null && ok "识别出未知字段" || bad "识别出未知字段"
+echo "$EX" | grep -i 'config' >/dev/null && ok "识别出配置文件问题" || bad "识别出配置文件问题"
 # logs.sh 各入口在无 systemd 时不得挂死
 T0=$(date +%s%N)
 timeout 15 bash -c "source '$ROOT/conf/logs.sh'; log_status >/dev/null 2>&1; log_explain >/dev/null 2>&1; log_lines 5 >/dev/null 2>&1"
@@ -1775,7 +1775,7 @@ for p in vless trojan vmess shadowsocks hysteria2 socks http; do
 done
 assert_eq "$PBAD" "0" "预置表与 node_build 的 REALITY 限制一致"
 # 无预置协议必须明确报错而非静默
-NU=$(bash -c "source '$LIB/preset.sh'; x_preset_ask tuic </dev/null" 2>&1 | head -1)
+NU=$(bash -c "source '$LIB/preset.sh'; x_preset_ask tuic </dev/null" 2>&1 | awk 'NR==1')
 [[ "$NU" == *"没有预置"* ]] && ok "无预置协议明确报错" || bad "无预置协议明确报错"
 
 # ---------------------------------------------------------------- 预置建节点
@@ -2082,7 +2082,7 @@ group "幽灵函数 (check_wiring.py)"
 WG=$(timeout 60 python3 "$ROOT/tools/check_wiring.py" 2>&1)
 WRC=$?
 if [[ "$WRC" == "0" ]]; then
-    ok "$(echo "$WG" | head -1)"
+    ok "$(echo "$WG" | awk 'NR==1')"
 else
     bad "存在不可达的库函数:"
     echo "$WG" | sed 's/^/       /'
@@ -2108,9 +2108,9 @@ printf 'bash %s/conf/entry.sh\n' "$_cw" > "$_cw/xray-panel.sh"
 CWO=$(cd "$_cw" && timeout 30 python3 tools/check_wiring.py 2>&1)
 CWR=$(cd "$_cw" && timeout 30 python3 tools/check_wiring.py >/dev/null 2>&1; echo $?)
 assert_eq "$CWR" "1" "检查器能抓到幽灵函数 (不是永远返回 0)"
-echo "$CWO" | grep -q 'x_ghost_fn' && ok "幽灵函数被点名" || bad "幽灵函数被点名"
+echo "$CWO" | grep 'x_ghost_fn' >/dev/null && ok "幽灵函数被点名" || bad "幽灵函数被点名"
 # 可达函数绝不能出现在幽灵名单里 —— 误报比漏报更烦人, 会逼人去删活代码
-if echo "$CWO" | grep '幽灵:' | grep -q 'x_reachable_fn'; then
+if echo "$CWO" | grep '幽灵:' | grep 'x_reachable_fn' >/dev/null; then
     bad "可达函数被误报为幽灵"
 else
     ok "可达函数未被误报"
@@ -2200,9 +2200,9 @@ fi
 group "镜像顺序 (实时源优先于 CDN)"
 for f in "$ROOT/Client/l.sh"; do
     [[ -f "$f" ]] || continue
-    first=$(sed -n '/^MIRROR_DIRS=(/,/^)/p' "$f" | grep -oE '"[^"]+"' | head -1)
+    first=$(sed -n '/^MIRROR_DIRS=(/,/^)/p' "$f" | grep -oE '"[^"]+"' | awk 'NR==1')
     assert_has_mirror() { # <说明> <期望子串>
-        if printf '%s' "$first" | grep -q "$2"; then ok "$1"; else bad "$1（首个镜像: $first）"; fi
+        if printf '%s' "$first" | grep "$2" >/dev/null; then ok "$1"; else bad "$1（首个镜像: $first）"; fi
     }
     assert_has_mirror "第一个镜像走实时回源的代理" "ghproxy"
     # 只数"裸的" raw 入口（代理形式里也含 raw.githubusercontent.com，
@@ -2488,7 +2488,7 @@ print("OK" if not out else "BAD " + " ".join(out))
 print(n["name"], n["protocol"], n["security"], n["transport"])
 PY
 )
-    assert_eq "$(printf '%s' "$GUARD" | head -1)" "OK" "简易出站拦住非法输入（类型/监听地址/端口）"
+    assert_eq "$(printf '%s' "$GUARD" | awk 'NR==1')" "OK" "简易出站拦住非法输入（类型/监听地址/端口）"
     assert_eq "$(printf '%s' "$GUARD" | tail -1)" "SOCKS5-127.0.0.1-1080 socks none tcp" \
         "简易出站默认名与字段（对齐 M/SB 的 SOCKS5-地址-端口）"
 
@@ -2557,58 +2557,56 @@ if [[ -f "$ROOT/Client/lib/actions.sh" ]]; then
 fi
 
 # ---------------------------------------------------------------- 管道早退
-# `set -euo pipefail` + 命令替换里的早退读取器 = 随机猝死。
+# 两种症状, 同一个根因: 管道末尾用了"早退读取器"（head / grep -q / grep -m）,
+# 它拿到想要的东西就退出, 产出方还在写就吃 SIGPIPE（退出码 141）。
 #
-# 实测: `ver=$("$XBD_XRAY" version | head -1)` 在 12 次里死了 4 次 —— head
-# 拿到第一行就退出, xray 还在写第二行, 于是 xray 吃 SIGPIPE（141）,
-# pipefail 让整条管道非零, 赋值失败, set -e 当场杀掉脚本。用户看到的是
-# "菜单只闪了一下版本号就回到命令行", 时好时坏, 根本没法复现。
+#   1. 开着 `set -e` 时 —— **随机猝死**。实测 `ver=$(xray version | head -1)`
+#      12 次里死 4 次: 菜单只闪一下版本号就回到命令行, 时好时坏没法复现。
+#   2. 开着 `pipefail` 时 —— **判断反了**。`if cmd | grep -q X` 明明命中,
+#      管道整体却是 141, if 走"没命中"的分支。实测复现（`NOMATCH`）。
 #
-# 早退读取器: head / grep -q / grep -m / tail -f 之外的都不早退
-# （awk、sed、sort、tail -n 都会读完输入）—— 所以判据很干净。
-group "管道早退 (set -e 下不许让被调用方吃 SIGPIPE)"
+# 注意触发条件是 pipefail, 不是 -e: 只有 pipefail 才会把 141 变成"整条管道
+# 失败"。所以判据按 pipefail 走。
+#
+# 修法: 换掉早退的读取方, 别动产出方。
+#   `| grep -q PAT`  →  `| grep PAT >/dev/null`（不带 -q 会读完输入）
+#   `| head -1`      →  先 out=$(cmd), 再切行（见 core.sh 的 first_line / xray_ver）
+group "管道早退 (pipefail 下不许让产出方吃 SIGPIPE)"
 SIGPIPE_HITS=$(python3 - "$ROOT" <<'PYEOF'
 import os, re, sys
 root = sys.argv[1]
-files = ["Client/bin/xbd", "xargo.sh", "xray-panel.sh"]
-files += ["Client/lib/" + f for f in sorted(os.listdir(os.path.join(root, "Client/lib")))
-          if f.endswith(".sh")]
-files += ["conf/" + f for f in sorted(os.listdir(os.path.join(root, "conf")))
-          if f.endswith(".sh")]
-# 早退读取器（读完就退出, 让上游吃 SIGPIPE）
-# 必须是"读取位置"的早退读取器: 前面是单个 `|`（不是 `||`）。
-# `openssl rand ... || head -c 12 /dev/urandom | od` 里的 head 是**产出方**
-# （它自己读 /dev/urandom）, 拿它当读取器是误报。
-EARLY = re.compile(r"(?<!\|)\|(?!\|)\s*(?:head\b|grep\s+-[a-zA-Z]*[qm]\b)")
-# 变量赋值形式: var=$(...) / local var=$(...)。local 形式不会杀掉脚本,
-# 但同样会拿到空值 —— 一起报, 提示里说清楚区别。
-ASSIGN = re.compile(r"^\s*(?:local\s+)?[A-Za-z_][A-Za-z0-9_]*=\$\(.*")
+# 早退读取器: 前面是单个 `|`（不是 `||`, 那是产出方位置）
+EARLY = re.compile(r"(?<!\|)\|(?!\|)\s*(?:head\b|grep\s+-[A-Za-z]*[qm]\b)")
+FILES = []
+for dp, dn, fn in os.walk(root):
+    dn[:] = [d for d in dn if d not in (".git", "node_modules", "out",
+                                        "xbd-dist", "dist", "archive")]
+    for f in fn:
+        if f.endswith(".sh") or f == "xbd":
+            FILES.append(os.path.join(dp, f))
 hits = []
-for rel in files:
-    p = os.path.join(root, rel)
-    if not os.path.exists(p):
-        continue
+for p in sorted(FILES):
     try:
         lines = open(p, encoding="utf-8").read().splitlines()
     except Exception:
         continue
-    head30 = "\n".join(lines[:30])
-    if not re.search(r"^set -[a-z]*e", head30, re.M):
-        continue          # 没有 errexit, 就不是这类事故
+    head40 = "\n".join(lines[:40])
+    if "pipefail" not in head40:
+        continue
     for i, line in enumerate(lines, 1):
         if line.lstrip().startswith("#"):
             continue
         if "|| true" in line:
-            continue          # 显式吞掉, 安全
-        if ASSIGN.match(line) and EARLY.search(line):
-            hits.append(f"{rel}:{i}")
+            continue
+        if EARLY.search(line):
+            hits.append(f"{os.path.relpath(p, root)}:{i}")
 print(" ".join(hits))
 PYEOF
 )
 if [[ -n "$SIGPIPE_HITS" ]]; then
-    bad "set -e 文件里没有早退管道" "$SIGPIPE_HITS —— 上游会吃 SIGPIPE(141), set -e 随机杀脚本; 改成先读完再切行（core.sh 的 first_line / xray_ver）"
+    bad "pipefail 脚本里没有早退管道" "$SIGPIPE_HITS —— 产出方会吃 SIGPIPE(141): 有 set -e 就随机猝死, 没有就判断反; grep 去掉 -q 加 >/dev/null 即可"
 else
-    ok "set -e 文件里没有早退管道（不会随机吃 SIGPIPE 猝死）"
+    ok "pipefail 脚本里没有早退管道（不会猝死、不会判断反）"
 fi
 
 # ---------------------------------------------------------------- 面板覆盖面

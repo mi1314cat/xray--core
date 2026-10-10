@@ -19,7 +19,7 @@ ADDR=$(awk -F= '/^DIALER_ADDR=/{print $2; exit}' "$PREFIX/config/ports.env" 2>/d
 ADDR=${ADDR:-127.0.0.1:18081}
 
 systemctl is-active --quiet "$U_XRAY" || exit 0
-ss -tlnH 2>/dev/null | grep -q ":${ADDR##*:}" || exit 0   # Xray 没在监听 -> 不是浏览器的问题
+ss -tlnH 2>/dev/null | grep ":${ADDR##*:}" >/dev/null || exit 0   # Xray 没在监听 -> 不是浏览器的问题
 
 # 要不要浏览器：唯一判定入口在 compat.py（与 run-xray.sh 同一套语义）
 need_bd() {
@@ -33,7 +33,7 @@ if ! systemctl is-active --quiet "$U_CHROMIUM"; then
   exit 0
 fi
 
-ss -tnH 2>/dev/null | grep -q "$ADDR" && exit 0           # 已有 WS 连接 -> 健康
+ss -tnH 2>/dev/null | grep "$ADDR" >/dev/null && exit 0           # 已有 WS 连接 -> 健康
 need_bd || exit 0
 logger -t xbd-health "BD 通道无 WS 连接，重启 $U_CHROMIUM"
 systemctl restart "$U_CHROMIUM" 2>/dev/null || true

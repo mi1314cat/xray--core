@@ -43,7 +43,10 @@ trap 'rm -f "$TMPO" "$TMPB"' EXIT
 # 60KB+ 的页面在 $( ) 里会被截断 —— 症状是"断言全挂", 但功能其实是好的。
 # 之前面板那一组就是这么误判的。
 cap() { "$@" >"$TMPO" 2>&1; CAP_RC=$?; return 0; }
-capstr() { grep -a . "$TMPO" 2>/dev/null | head -c 2000; }
+# 按**行**截断, 不按字节 —— `| head -c 2000` 会让 grep 吃 SIGPIPE(141),
+# 而本脚本开着 pipefail, 于是"取一段输出贴到失败信息里"本身就可能失败。
+# awk 读完输入才结束, 没有早退方。
+capstr() { grep -a . "$TMPO" 2>/dev/null | awk 'NR<=200'; }
 
 ok()   { PASS=$((PASS+1)); printf '    \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); FAILED_NAMES+=("$1"); printf '    \033[31m✗\033[0m %s\n' "$1"
@@ -166,7 +169,7 @@ test_client() {
 
   if [ "$READ_ONLY" -eq 0 ]; then
     # 切节点会重写配置并重启 —— 生产机上不做, 除非显式要求
-    first=$(ls "$PREFIX"/nodes/node-*.json 2>/dev/null | head -1 | xargs -r basename)
+    first=$(ls "$PREFIX"/nodes/node-*.json 2>/dev/null | awk 'NR==1' | xargs -r basename)
     [ -n "$first" ] && timeout 90 "$XBD" node use "${first%.json}" >"$TMPO" 2>&1
     hasf "切节点能成功" "当前|✓" ""
   else
@@ -185,7 +188,7 @@ test_client() {
 
   if [ "$READ_ONLY" -eq 0 ]; then
     # 切多出站会重启 xray 并改配置 —— 生产机上默认不碰
-    before=$(awk -F= '$1=="MULTI_OUTBOUND"{print $2}' "$PREFIX/config/multi.env" 2>/dev/null | head -1)
+    before=$(awk -F= '$1=="MULTI_OUTBOUND"{print $2}' "$PREFIX/config/multi.env" 2>/dev/null | awk 'NR==1')
     timeout 180 "$XBD" multi on >"$TMPO" 2>&1
     hasf "multi on 能开启" "多出站|✓|已" ""
     timeout 60 "$XBD" multi status >"$TMPO" 2>&1
@@ -279,8 +282,8 @@ except Exception: print("no")' 2>/dev/null)
   printf '\n  \033[36mWeb 面板\033[0m\n'
   PANEL_ENV="$PREFIX/config/panel.env"
   if [ -f "$PANEL_ENV" ]; then
-    PT=$(awk -F= '$1=="PANEL_TOKEN"{print $2}' "$PANEL_ENV" | head -1)
-    PH=$(awk -F= '$1=="PANEL_HOST"{print $2}' "$PANEL_ENV" | head -1)
+    PT=$(awk -F= '$1=="PANEL_TOKEN"{print $2}' "$PANEL_ENV" | awk 'NR==1')
+    PH=$(awk -F= '$1=="PANEL_HOST"{print $2}' "$PANEL_ENV" | awk 'NR==1')
     url="http://$PH:18090"          # BIND_PORT 在 panel.py 里是 18090
     curl -s -m 20 "$url/?token=$PT" -o "$TMPO" 2>/dev/null
     if [ -s "$TMPO" ]; then
@@ -314,7 +317,7 @@ PY
 
   # ---------------------------------------------------------- 代理
   printf '\n  \033[36m代理可用性\033[0m\n'
-  PORT=$(awk -F= '$1=="PORT_NORMAL"{print $2}' "$PREFIX/config/ports.env" 2>/dev/null | head -1)
+  PORT=$(awk -F= '$1=="PORT_NORMAL"{print $2}' "$PREFIX/config/ports.env" 2>/dev/null | awk 'NR==1')
   PORT="${PORT:-1080}"
 
   # 监听地址必须从实际生成的配置里读, 不能假设 127.0.0.1。
@@ -334,7 +337,7 @@ for i in d.get("inbounds",[]):
   case "$BIND" in ""|0.0.0.0|::) ADDR="127.0.0.1" ;; *) ADDR="$BIND" ;; esac
   printf '    (SOCKS: %s —— 生成配置绑定 %s)\n' "$ADDR:$PORT" "${BIND:-未找到}"
 
-  if command -v ss >/dev/null && ss -tln 2>/dev/null | grep -q ":$PORT "; then
+  if command -v ss >/dev/null && ss -tln 2>/dev/null | grep ":$PORT " >/dev/null; then
     ok "SOCKS $PORT 在监听"
   else bad "SOCKS $PORT 在监听" "没监听"; fi
 
@@ -358,7 +361,7 @@ test_server() {
   for f in xray-panel.sh xargo.sh VEVLRE.sh VEVLRE6.sh caddy.sh nginx.sh; do
     [ -f "$REPO/$f" ] || continue
     if bash -n "$REPO/$f" 2>/dev/null; then ok "$f 语法通过"
-    else bad "$f 语法通过" "$(bash -n "$REPO/$f" 2>&1 | head -2 | tr '\n' ' ')"; fi
+    else bad "$f 语法通过" "$(bash -n "$REPO/$f" 2>&1 | awk 'NR<=2' | tr '\n' ' ')"; fi
   done
 
   # 主菜单：用 0 退出，不能卡死

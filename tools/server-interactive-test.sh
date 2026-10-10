@@ -102,7 +102,7 @@ for f in xray-panel.sh xargo.sh VEVLRE.sh VEVLRE6.sh caddy.sh nginx.sh \
   [ -f "$f" ] || { printf '    (缺少 %s)\n' "$f"; continue; }
   n=$((n+1))
   if bash -n "$f" 2>/dev/null; then ok "$f 语法通过"
-  else bad "$f 语法通过" "$(bash -n "$f" 2>&1 | head -2 | tr '\n' ' ')"; fi
+  else bad "$f 语法通过" "$(bash -n "$f" 2>&1 | awk 'NR<=2' | tr '\n' ' ')"; fi
 done
 [ "$n" -gt 0 ] || bad "至少找到一个服务端脚本" "$REPO 下没有 .sh"
 

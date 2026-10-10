@@ -111,7 +111,7 @@ if [ -e "$GLOBAL_BIN" ]; then
     REMOVE_FILES+=("$GLOBAL_BIN")
   else
     # 指向别的路径（比如已删除的旧安装）—— 也属于本项目产物，但要提示
-    target=$(grep -oE '/[^ "]*/bin/xbd' "$GLOBAL_BIN" 2>/dev/null | head -1)
+    target=$(grep -oE '/[^ "]*/bin/xbd' "$GLOBAL_BIN" 2>/dev/null | awk 'NR==1')
     if [ -n "$target" ]; then
       REMOVE_FILES+=("$GLOBAL_BIN")
       WARNINGS+=("$GLOBAL_BIN 指向 $target（不是当前安装），也会一并清理")
@@ -245,7 +245,7 @@ done
 # 确认进程真的退出（尤其 Chromium 会有很多子进程）
 if [ ${#REMOVE_UNITS[@]} -gt 0 ]; then
   for i in 1 2 3 4 5 6 7 8; do
-    n=$(pgrep -c -f "$PREFIX" 2>/dev/null | head -1 || true)
+    n=$(pgrep -c -f "$PREFIX" 2>/dev/null | awk 'NR==1' || true)
     [ "${n:-0}" -eq 0 ] && break
     sleep 1
   done
@@ -317,7 +317,7 @@ step "验证"
 leftover=0
 
 for u in "${REMOVE_UNITS[@]}"; do
-  if systemctl list-unit-files 2>/dev/null | grep -q "^$u"; then
+  if systemctl list-unit-files 2>/dev/null | grep "^$u" >/dev/null; then
     bad "单元仍存在: $u"; leftover=1
   fi
 done

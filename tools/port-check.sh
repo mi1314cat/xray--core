@@ -118,7 +118,7 @@ report() {
         if [[ -z "${LISTENER[$p]:-}" ]]; then
             # 可能是这个片段自己没跑起来, 也可能是端口被别人抢了
             local occupied
-            occupied=$(grep -l ":${p}[[:space:]]" /proc/net/tcp /proc/net/udp 2>/dev/null | head -1)
+            occupied=$(grep -l ":${p}[[:space:]]" /proc/net/tcp /proc/net/udp 2>/dev/null | awk 'NR==1')
             if [[ -n "$occupied" ]]; then
                 bad "  [缺失] 端口 $p 被声明 (${DECLARED[$p]}) 但未监听, 且被其它程序占用"
             else

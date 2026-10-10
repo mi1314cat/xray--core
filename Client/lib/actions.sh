@@ -320,7 +320,7 @@ cmd_node_add() {
   case "$raw" in
     --keep-unsupported) keep_unsup=1; raw="${2:-}" ;;
   esac
-  if printf '%s' "${*:-}" | grep -q -- '--keep-unsupported'; then keep_unsup=1; raw="${raw/--keep-unsupported/}" ; fi
+  if printf '%s' "${*:-}" | grep -- '--keep-unsupported' >/dev/null; then keep_unsup=1; raw="${raw/--keep-unsupported/}" ; fi
   if [ "$keep_unsup" = "1" ]; then export XBD_KEEP_UNSUPPORTED=1; fi
   if [ -z "$raw" ] && [ ! -t 0 ]; then raw=$(cat); fi
   if [ -z "$raw" ]; then
@@ -331,7 +331,7 @@ cmd_node_add() {
 
   # 订阅 URL：先下载再解析。第二个参数是组名，必须透传 ——
   # 漏掉的话面板上填的名字会静默失效，节点改按名字推断出一个别的组。
-  if printf '%s' "$raw" | grep -qE '^https?://'; then
+  if printf '%s' "$raw" | grep -E '^https?://' >/dev/null; then
     cmd_node_subscription "$raw" "${2:-}"
     return $?
   fi
@@ -598,7 +598,7 @@ cmd_node_import_one() {  # 解析一个节点并落盘；成功返回 0
   local raw="$1" tmp
   tmp=$(mktemp)
   if ! printf '%s' "$raw" | python3 "$XBD_LIBDIR/node.py" parse - > "$tmp" 2>/tmp/.xbd_node_err; then
-    bad "解析失败: $(cat /tmp/.xbd_node_err 2>/dev/null | head -1)"
+    bad "解析失败: $(cat /tmp/.xbd_node_err 2>/dev/null | awk 'NR==1')"
     rm -f "$tmp"; return 1
   fi
 
@@ -809,7 +809,7 @@ xbd_node_path() {
     path=$(ls -1 "$XBD_NODES"/node-*.json 2>/dev/null | sed -n "${t}p" || true)
   else
     [ -e "$XBD_NODES/$t" ] && path="$XBD_NODES/$t"
-    [ -n "$path" ] || path=$(ls -1 "$XBD_NODES"/*"$t"* 2>/dev/null | head -1 || true)
+    [ -n "$path" ] || path=$(ls -1 "$XBD_NODES"/*"$t"* 2>/dev/null | awk 'NR==1' || true)
     [ -n "$path" ] || path=$(python3 - "$XBD_NODES" "$t" <<'PY' 2>/dev/null || true
 import json, os, sys
 ndir, want = sys.argv[1], sys.argv[2].strip().lower()
@@ -1045,7 +1045,7 @@ _xbd_sync_xray_with_node() {   # $1=force 时无条件重启（换节点用）
   _xbd_node_needs_dialer && want="yes"
   local pid have="no"
   pid=$(systemctl show -p MainPID --value "$XBD_U_XRAY" 2>/dev/null || echo 0)
-  if [ "${pid:-0}" -gt 0 ] && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -q '^XRAY_BROWSER_DIALER='; then
+  if [ "${pid:-0}" -gt 0 ] && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^XRAY_BROWSER_DIALER=' >/dev/null; then
     have="yes"
   fi
   [ "${1:-}" != "force" ] && [ "$want" = "$have" ] && return 0
@@ -1171,7 +1171,7 @@ cmd_apply() {
   [ -x "$XBD_XRAY" ] && gen_args+=(--validate-with "$XBD_XRAY")
 
   _gen_out=$(python3 "$XBD_LIBDIR/genconfig.py" "${gen_args[@]}" 2>&1)
-  if printf '%s' "$_gen_out" | grep -q '"ok": true'; then
+  if printf '%s' "$_gen_out" | grep '"ok": true' >/dev/null; then
     # ★ `|| true` 不能省。genconfig 成功、没有警告行时 grep **无匹配返回 1**,
     #   pipefail 让整条管道非零, set -e 会在这里杀掉脚本 —— 而且是"健康路径上
     #   才炸"：配置已经写好了, 但后面的重启永远不执行, 表现成"改了配置不生效
@@ -1211,7 +1211,7 @@ except Exception: print(0)' "$XBD_RUNTIME/xray-gen.json" 2>/dev/null || echo 0)
          --logs "$XBD_LOGS" --dns "${XBD_DNS_MODE:-off}" --port-normal "${XBD_PORT_NORMAL:-1080}"
          --family "${XBD_ADDR_FAMILY:-auto}"
          --listen-addr "${XBD_LISTEN_ADDR:-127.0.0.1}" --loglevel "${XBD_LOGLEVEL:-warning}")
-    if python3 "$XBD_LIBDIR/genconfig.py" "${_fb[@]}" 2>&1 | grep -q '"ok": true'; then
+    if python3 "$XBD_LIBDIR/genconfig.py" "${_fb[@]}" 2>&1 | grep '"ok": true' >/dev/null; then
       ok "xray-client.json（单节点 · 已降级，切换节点需重启）"
       warn "降级期间切换节点会断一次。想恢复多出站，先查上面的报错。"
     else
@@ -1393,7 +1393,7 @@ _xbd_node_may_use_browser() {
   [ -n "$node" ] && [ -e "$node" ] || return 1
   python3 "$XBD_LIBDIR/compat.py" json "$node" 2>/dev/null \
     | python3 -c 'import sys,json;print(json.load(sys.stdin).get("protocol_may_dialer"))' 2>/dev/null \
-    | grep -qx True
+    | grep -x True >/dev/null
 }
 
 # 该节点能不能用浏览器（用于面板置灰）。与"要不要用"分开，因为要区分
@@ -1403,7 +1403,7 @@ _xbd_node_can_dialer() {
   [ -n "$node" ] && [ -e "$node" ] || return 1
   python3 "$XBD_LIBDIR/compat.py" json "$node" 2>/dev/null \
     | python3 -c 'import sys,json;print(json.load(sys.stdin).get("can_use_dialer"))' 2>/dev/null \
-    | grep -qx True
+    | grep -x True >/dev/null
 }
 
 xbd_dialer_status() {
@@ -1621,7 +1621,7 @@ _xbd_set_port() {
   [ "$new" = "$cur" ] && { ok "端口已经是 $new"; return 0; }
   holder=$(port_holder "$new")
   # 自己占着的端口允许改（例如重启后重新分配）
-  if [ -n "$holder" ] && ! printf '%s' "$holder" | grep -q xray; then
+  if [ -n "$holder" ] && ! printf '%s' "$holder" | grep xray >/dev/null; then
     die "端口 $new 已被占用（${holder:0:70}）"
   fi
   cfg_set "$file" "$key" "$new"
@@ -1839,8 +1839,8 @@ cmd_diagnose() {
     fi
 
     local loop=0
-    ip -o link show type tun 2>/dev/null | grep -q . && { _d "本机 TUN" WARN "存在"; loop=1; } || _d "本机 TUN" PASS "无"
-    iptables -t nat -S 2>/dev/null | grep -qE 'REDIRECT' && { _d "透明重定向" WARN "存在 NAT REDIRECT"; loop=1; } || _d "透明重定向" PASS "无"
+    ip -o link show type tun 2>/dev/null | grep . >/dev/null && { _d "本机 TUN" WARN "存在"; loop=1; } || _d "本机 TUN" PASS "无"
+    iptables -t nat -S 2>/dev/null | grep -E 'REDIRECT' >/dev/null && { _d "透明重定向" WARN "存在 NAT REDIRECT"; loop=1; } || _d "透明重定向" PASS "无"
     # 旧版本的"接管局域网"模式会留下这张表，即使工具已经不提供那个模式也必须报出来：
     # 残留规则会继续劫持局域网的 80/443 与 DNS，而界面上完全看不出来。
     if nft list table ip xbd_takeover >/dev/null 2>&1 || nft list table ip6 xbd_takeover >/dev/null 2>&1; then
@@ -1850,7 +1850,7 @@ cmd_diagnose() {
     else
       _d "nft 透明接管残留" PASS "无"
     fi
-    iptables -t mangle -S 2>/dev/null | grep -qE 'TPROXY' && { _d "TPROXY" WARN "存在"; loop=1; } || _d "TPROXY" PASS "无"
+    iptables -t mangle -S 2>/dev/null | grep -E 'TPROXY' >/dev/null && { _d "TPROXY" WARN "存在"; loop=1; } || _d "TPROXY" PASS "无"
     local pe; pe=$(env | grep -cE '^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY)=' || true)
     [ "${pe:-0}" -eq 0 ] && _d "代理环境变量" PASS "干净" || { _d "代理环境变量" FAIL "存在"; loop=1; }
     [ "$loop" -eq 0 ] && _d "代理环路风险" PASS "无环路迹象" || _d "代理环路风险" WARN "见上"
@@ -3193,7 +3193,7 @@ print(t)")
   systemctl enable --now "$XBD_U_SHARE" >/dev/null 2>&1 \
     || systemctl restart "$XBD_U_SHARE" >/dev/null 2>&1 || true
   sleep 1
-  if ! ss -tln 2>/dev/null | grep -q ":$port "; then
+  if ! ss -tln 2>/dev/null | grep ":$port " >/dev/null; then
     warn "分享服务没起来 —— $host:$port 可能被别的服务抢占了 (本机还有别的 share_server 时常见)"
     info "  换端口重试: xbd share off ${tok:0:8}...  然后重新 xbd share new"
     info "  或直接看日志: journalctl -u $XBD_U_SHARE -n 20"
@@ -3401,7 +3401,7 @@ _xbd_multi_set() {
   #    整条管道返回 1, set -e 当场退出脚本 —— 而我们恰恰要频繁问"有没有
   #    balancer"(单节点模式答案就是 0)。所以 || true 必须有。
   # 2) 命中多个文件时 grep -c 会逐文件输出一串数字, 要 head -1 取第一个。
-  now_bal=$(grep -c 'balancerTag' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | head -1 || true)
+  now_bal=$(grep -c 'balancerTag' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | awk 'NR==1' || true)
   now_bal=${now_bal:-0}
   if [ "$want_bal" != "$now_bal" ]; then
     warn "配置生成不符合预期（期望 balancerTag $want_bal，实际 $now_bal）"
@@ -3429,7 +3429,7 @@ _xbd_multi_status() {
     ok "多出站已开启  所有节点常驻一份配置，切换节点不用重启"
     # 同样要 || true: 单节点模式下匹配数不为 0, 但文件不存在时 grep 会返回 1,
     # 在 pipefail 下配合 set -e 会让整个 status 命令失败。
-    printf '  出站数: %s\n' "$(grep -c '"tag":' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | head -1 || true)"
+    printf '  出站数: %s\n' "$(grep -c '"tag":' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | awk 'NR==1' || true)"
   else
     printf '  %s单节点模式%s  当前配置只有当前节点，切换节点需要重启\n' "$C_B" "$C_0"
   fi

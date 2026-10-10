@@ -287,7 +287,7 @@ UNIT
     systemctl daemon-reload
     systemctl enable --now cert-sync.timer
     echo "  已安装 cert-sync.timer, 下次运行:"
-    systemctl list-timers cert-sync.timer --no-pager 2>/dev/null | head -2 | sed 's/^/    /'
+    systemctl list-timers cert-sync.timer --no-pager 2>/dev/null | awk 'NR<=2' | sed 's/^/    /'
 }
 
 case "${1:-}" in

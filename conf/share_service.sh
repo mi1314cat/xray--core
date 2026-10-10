@@ -151,15 +151,15 @@ upgrade_share() {
 # 而"外网连不上"十有八九确实是这里, 但决定权在用户。
 check_firewall() {
     local port="$1"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ufw status 2>/dev/null | grep -qE "^${port}\b"; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep "Status: active" >/dev/null; then
+        if ufw status 2>/dev/null | grep -E "^${port}\b" >/dev/null; then
             ok "ufw 已放行 $port"
         else
             warn "ufw 未放行 $port, 外网会连不上。手动放行: ufw allow ${port}/tcp"
         fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        if firewall-cmd --list-ports 2>/dev/null | grep -qE "(^| )${port}/tcp( |$)"; then
+        if firewall-cmd --list-ports 2>/dev/null | grep -E "(^| )${port}/tcp( |$)" >/dev/null; then
             ok "firewalld 已放行 $port/tcp"
         else
             warn "firewalld 未放行 $port/tcp。手动放行: firewall-cmd --add-port=${port}/tcp --permanent && firewall-cmd --reload"
