@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 # 显示名（旗帜 + 服务器前缀）实现在 naming.py —— 只有一份，
 # bash 侧 conf/lib/naming.sh 也调它。两边各写一套必然漂移。
@@ -127,16 +128,23 @@ def cert_domain(cert_file):
     return dom
 
 
-def tls_domains(tls):
+def tls_domains(tls, declared=None):
     """TLS 节点上"该用哪个域名做 SNI"的候选, 按可靠程度排。
 
-    1. tlsSettings.serverName —— 节点自己的显式声明, 最直接
-    2. 证书文件里的 SAN/CN  —— 客户端真的要校验的那个名字
-    3. certificates[].domain —— 生成脚本写在证书项里的域名 (hy2 脚本会写)
+    1. 片段自带的 `_serverName` —— 生成它的脚本写在片段根上的"这个节点是
+       为哪个域名建的"。conf/vlessxhttpecn.sh 的 rebuild_one() 就是**优先**
+       用它 (`CERT_DOMAIN=$(extract_cert_domain ...)` 之后被 `_serverName`
+       覆盖) —— 订阅载荷要与 per-node 产物同源, 这一条必须在候选里,
+       否则"证书文件在别的机器上读不到"时载荷会没 sni 而产物有。
+    2. tlsSettings.serverName —— 节点自己的显式声明
+    3. 证书文件里的 SAN/CN  —— 客户端真的要校验的那个名字
+    4. certificates[].domain —— 生成脚本写在证书项里的域名 (hy2 脚本会写)
 
     刻意**不**把"连接地址"算进来: 它就是 IP, 写进 sni 必然校验失败。
     """
     out = []
+    if isinstance(declared, str) and declared.strip():
+        out.append(declared.strip())
     sn = tls.get("serverName")
     if isinstance(sn, str) and sn.strip():
         out.append(sn.strip())
@@ -151,15 +159,25 @@ def tls_domains(tls):
     return out
 
 
-def extract(inbound, source_file):
-    """从单个 inbound 抽出统一节点视图。"""
+def extract(inbound, source_file, frag=None):
+    """从单个 inbound 抽出统一节点视图。
+
+    frag 是整个片段的顶层对象 —— `_serverName` / `_clientEncryption` 这类
+    "给人看、内核不认"的字段写在根上 (Xray 配置是严格 schema, 塞进 inbound
+    会让 `xray run -test` 失败), 所以抽取时要把根一起传进来。
+    """
     if not isinstance(inbound, dict):
         return None
+    frag = frag if isinstance(frag, dict) else {}
     ss = inbound.get("streamSettings") or {}
     tls = ss.get("tlsSettings") or {}
     reality = ss.get("realitySettings") or {}
     ws = ss.get("wsSettings") or {}
     xhttp = ss.get("xhttpSettings") or {}
+    declared = frag.get("_serverName")
+    declared = declared.strip() if isinstance(declared, str) and declared.strip() else None
+    ech_keys = tls.get("echServerKeys")
+    ech_keys = ech_keys.strip() if isinstance(ech_keys, str) and ech_keys.strip() else None
 
     proto = inbound.get("protocol")
     node = {
@@ -185,13 +203,14 @@ def extract(inbound, source_file):
         "server_names": reality.get("serverNames") or [],
         "path": ws.get("path") or xhttp.get("path") or "",
         "sni": None,
-        # TLS 节点的 SNI 候选 (serverName / 证书 SAN·CN / 证书项 domain)。
-        # 旧版本只从 realitySettings.serverNames 取 sni, 于是**所有 tls 节点
-        # 的分享链接都没有 sni=** —— 实测 (RN 真实节点 vless-xhttp07/08):
-        # 链接里 security=tls 却没有 sni, 客户端拿连接地址(公网 IP)当 SNI,
-        # 报 "cannot validate certificate for <IP> ... no IP SANs", 经分享
-        # 链接根本连不上, 而服务端一切正常。
-        "tls_domains": tls_domains(tls),
+        # TLS 节点的 SNI 候选 (片段 _serverName / serverName / 证书 SAN·CN /
+        # 证书项 domain)。
+        "tls_domains": tls_domains(tls, declared),
+        # 片段自己的域名声明 —— 也是"这个节点支持 ECH"的来源标记
+        # (只有 conf/vlessxhttpecn.sh 会写它, 而它的 ECH 形态只有 cdn/direct)。
+        "declared_server_name": declared,
+        # 直连 ECH 的服务端密钥 (有它 = 本节点自己终结 TLS 且开了 ECH)
+        "ech_server_keys": ech_keys,
         "alpn": ",".join(tls.get("alpn") or []) or None,
         # ---- 证书 ----
         "cert_files": [
@@ -225,7 +244,7 @@ def collect(conf_dir):
             bad.append((os.path.basename(f), "顶层不是对象"))
             continue
         for ib in d.get("inbounds") or []:
-            n = extract(ib, f)
+            n = extract(ib, f, frag=d)
             if n:
                 nodes.append(n)
     return nodes, bad
@@ -372,6 +391,74 @@ def reality_sni(n):
     return sni if sni and not is_ip_literal(sni) else ""
 
 
+# ================================================================ ECH
+#
+# 为什么分享层必须懂 ECH
+# ----------------------
+# per-node 产物 (conf/vlessxhttpecn.sh 的 render_client/rebuild_one) 写的链接里
+# **带 `ech=`**, 而订阅载荷这条路径此前对它一无所知 —— 于是同一个节点:
+#
+#     out/vless-xhttp_share-08.txt  vless://…?…&ech=AGX%2BDQBhACA…
+#     订阅载荷里的同一条            vless://…?…            ← ech 整段丢失
+#
+# 症状是静默的: 客户端照样导入、照样连, 只是 ECH 没开 —— 而 ECH 正是这个节点
+# 存在的理由 (CDN-ECH 档 / 直连 ECH 档)。所以取值判据必须与脚本侧**同一套**。
+ECH_CDN_DISCOVERY = "cloudflare-ech.com+https://dns.alidns.com/dns-query"
+_ECH_KEYS_LEN_BYTES = 2
+
+
+def ech_config_list(server_keys):
+    """从 tlsSettings.echServerKeys 还原客户端可 pin 的 ECHConfigList。
+
+    `xray tls ech` 生成的 server keys 是**两段拼起来的**:
+        2 字节(大端)私钥长度 + 私钥 + ECHConfigList
+    客户端要的是后半段, 这正是 `xray tls ech -i <keys>` 打印的
+    "ECH config list:" 那一行。
+
+    实测对齐 (RN 生产 vless-xhttp08.json): 这里算出来的字符串与
+    `xrayls tls ech -i <keys>` 的输出**逐字节相同** —— 所以分享层不需要
+    依赖 xray 二进制, 也能与脚本产物写出同一个值。
+    """
+    if not isinstance(server_keys, str) or not server_keys.strip():
+        return ""
+    try:
+        raw = base64.b64decode(server_keys.strip(), validate=True)
+    except Exception:                                        # noqa: BLE001
+        return ""
+    # 结构必须是 "2 字节密钥长度 + 密钥 + 至少 1 字节配置":
+    # 长度不合法就返回空 —— 返回半截配置会让客户端拿一个解析不了的
+    # ECHConfigList 去握手, 比"没有 ECH"更糟。
+    if len(raw) <= _ECH_KEYS_LEN_BYTES:
+        return ""
+    klen = int.from_bytes(raw[:_ECH_KEYS_LEN_BYTES], "big")
+    if klen <= 0 or _ECH_KEYS_LEN_BYTES + klen >= len(raw):
+        return ""
+    rest = raw[_ECH_KEYS_LEN_BYTES + klen:]
+    return base64.b64encode(rest).decode()
+
+
+def ech_param(n, host=None):
+    """这个节点的分享链接该不该写 `ech=`, 写什么值。取不到返回 ""。
+
+    **ECH 是端到端绑定的** —— 客户端发出去的 ECH 只有"它以为在连的那个
+    服务端"能解开:
+      · 片段里有 echServerKeys  → 本节点自己终结 TLS 且开了 ECH,
+        值 = 由服务端密钥还原出的 ECHConfigList (与脚本产物同值);
+      · 没有 echServerKeys, 但片段自带 _serverName (由
+        conf/vlessxhttpecn.sh 生成 —— 它的 ECH 形态只有 cdn/direct 两种),
+        **且这次发布连的就是 CDN 边缘**(host 是域名而不是 IP) → CDN-ECH,
+        值 = 官方的 DNS 查询串 (Cloudflare 边缘处理 ECH);
+      · 其余 → **不写**。直连源站而源站没开 ECH 时写 CDN 的配置,
+        等于让客户端发一个源站解不开的 ClientHello —— 握手必失败。
+    """
+    cl = ech_config_list(n.get("ech_server_keys"))
+    if cl:
+        return cl
+    if n.get("declared_server_name") and host and not is_ip_literal(host):
+        return ECH_CDN_DISCOVERY
+    return ""
+
+
 def link_sni(n, meta=None):
     """TLS 类节点该写进分享链接的 sni。取不到返回 "" (整个参数不写)。
 
@@ -471,6 +558,11 @@ def build_share_link(n, meta=None, notes=None):
             sni = link_sni(n, meta)
             if sni:
                 q["sni"] = sni
+            # ★ ech 与 sni 同源同命: 脚本产物里有、这里整段丢, 客户端就
+            #   静默退化成"没开 ECH"。判据与值都在 ech_param() 一处实现。
+            ech = ech_param(n, host)
+            if ech:
+                q["ech"] = ech
             if n.get("path"):
                 q["path"] = n["path"]
             if n.get("network") == "ws":
@@ -497,6 +589,9 @@ def build_share_link(n, meta=None, notes=None):
             sni = link_sni(n, meta)
             if sni:
                 q["sni"] = sni
+            ech = ech_param(n, host)
+            if ech:
+                q["ech"] = ech
             if n.get("network") == "ws" and n.get("path"):
                 # 原样放进 q, 转义交给下面的 _qval 统一做 ——
                 # 这里再 _q 一次会变成 %252F, 路径里出现字面量 "%252F"。
@@ -575,8 +670,221 @@ def build_share_link(n, meta=None, notes=None):
             "tls": "tls" if n.get("security") in ("tls", "reality") else "",
             "sni": reality_sni(n) if n.get("security") == "reality"
             else link_sni(n, meta),
+            "ech": "" if n.get("security") == "reality" else ech_param(n, host),
         }
         b = base64.b64encode(json.dumps(obj, ensure_ascii=False).encode()).decode()
         return f"vmess://{b}"
 
     return None
+
+
+# =============================================== 载荷 ↔ per-node 产物 一致性
+#
+# 为什么必须有这道闸门
+# --------------------
+# 同一个节点有**两条**生成链接的路径, 它们各写各的:
+#
+#   A. per-node 产物  out/<proto>_share-<NN>.txt
+#      —— 由各协议脚本 (conf/vlessxhttpecn.sh / conf/hysteria2.sh /
+#      conf/Trojan.sh …) 在创建节点时写, 字段来自脚本自己的变量。
+#   B. 订阅载荷       conf/lib/share_payload.py → build_share_link()
+#      —— 只读 conf/*.json 片段 + out/share/<tag>.json 元数据**重建**。
+#
+# 实测事故 (RN 生产, 2026-10-10): 同一个 vless-xhttp08 节点,
+#   A: vless://…&sni=moontv.6896698.xyz&…&ech=AGX%2BDQBhACA…
+#   B: vless://…(没有 sni)(没有 ech)          ← 客户端静默退化成用 IP 当 SNI
+# 而 hy2 的 B 把 sni 写成了节点 IP —— 三家客户端同时报
+#   x509: cannot validate certificate for 107.173.154.178 … no IP SANs
+#
+# 所以: 载荷里每一条链接, 都必须与它**同名节点的 per-node 产物**在关键字段上
+# 一致; 不一致就**拒发这一条并说明差在哪**, 而不是把两条互相矛盾的链接
+# 分别交给不同的人。
+#
+# 只比对"两边都该有确定值"的字段, 不比对显示名 (载荷带旗帜+服务器前缀,
+# 产物不带 —— 那是有意的, 见 build_share_link 里的 naming 说明)。
+# 产物命名在四个协议脚本里**不统一**: hy2_share-04.txt / vless-xhttp_share-07.txt
+# 用下划线, ss2022-share-02.txt / trojan-share-03.txt / reality-share-01.txt 用连字符。
+# 只写 `*_share-*.txt` 会漏掉后一半 (实测: SS2022-02 / TROJAN-03 被判"无产物可比对")。
+PRODUCT_GLOB = "*share-*.txt"
+
+# 双方**任一**声明了就必须相等的字段。
+#   缺失也是不一致: "产物有 sni、载荷没有"正是上面那个事故的形态。
+CRITICAL_FIELDS = ("security", "type", "sni", "ech", "alpn", "path",
+                   "pbk", "sid", "fp")
+# 只在两边都声明时比对 (值本身是提示性的, 缺一个不算故障)。
+SOFT_FIELDS = ("spx", "host", "insecure", "mport", "flow", "encryption")
+# 带宽在两家内核里是两个名字 (up/upmbps), 同一件事。
+ALIASES = {"up": ("up", "upmbps"), "down": ("down", "downmbps")}
+
+_URI_RX = re.compile(
+    r"^(?P<scheme>[a-zA-Z0-9]+)://(?P<userinfo>[^@]*)@"
+    r"(?P<host>\[[^\]]*\]|[^:/?#]+):(?P<port>\d+)(?P<rest>[^#]*)(?:#(?P<frag>.*))?$")
+
+
+def _split_uri(link):
+    """把分享链接拆成 (scheme, credential, host, port, query, fragment)。
+
+    vmess:// 是 base64 的 JSON, 不是 URI 形态 → 返回 None, 调用方跳过比对
+    (它没有"host:port?query"可拆, 硬拆会得到假的差异)。
+    """
+    m = _URI_RX.match((link or "").strip())
+    if not m:
+        return None
+    q = {}
+    rest = m.group("rest") or ""
+    if rest.startswith("?"):
+        for kv in rest[1:].split("&"):
+            if not kv:
+                continue
+            k, _, v = kv.partition("=")
+            q[urllib.parse.unquote(k)] = urllib.parse.unquote(v)
+    return {
+        "scheme": m.group("scheme").lower(),
+        "credential": urllib.parse.unquote(m.group("userinfo")),
+        "host": m.group("host"),
+        "port": m.group("port"),
+        "query": q,
+        "fragment": urllib.parse.unquote(m.group("frag") or ""),
+    }
+
+
+def node_credential(n):
+    """节点在链接 userinfo 里的凭据 —— 用它把 tag 与 per-node 产物对上。
+
+    产物文件名 (<proto>_share-<NN>.txt) 与 tag 之间**没有**可靠的机械映射
+    (hy2 ↔ hysteria-04, SS2022-02 ↔ ss2022-share-02.txt, vless-xhttp07 ↔
+    vless-xhttp_share-07.txt), 按文件名猜迟早会配错。凭据是唯一的:
+    vless/vmess 是 uuid, trojan/hy2 是密码, ss 是 base64(method:password)。
+    """
+    if n.get("protocol") == "shadowsocks":
+        raw = f"{n.get('method') or ''}:{n.get('password') or ''}".encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return str(n.get("id") or n.get("password") or "")
+
+
+def product_links(out_dir):
+    """扫描 per-node 产物目录, 返回 ({凭据: (文件名, 链接)}, 坏行列表)。"""
+    index, bad = {}, []
+    if not out_dir or not os.path.isdir(out_dir):
+        return index, bad
+    for f in sorted(glob.glob(os.path.join(out_dir, PRODUCT_GLOB))):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                line = next((x.strip() for x in fh if x.strip()), "")
+        except OSError as e:
+            bad.append((os.path.basename(f), str(e)[:80]))
+            continue
+        u = _split_uri(line)
+        if not u:
+            continue                    # vmess / 非 URI 形态: 不参与比对
+        index.setdefault(u["credential"], (os.path.basename(f), line, u))
+    return index, bad
+
+
+def _field(u, key):
+    """取一个字段的值, 带宽类走别名。返回 "" 表示这一侧没有声明。"""
+    q = u["query"]
+    for name in ALIASES.get(key, (key,)):
+        v = q.get(name)
+        if v not in (None, ""):
+            return str(v)
+    return ""
+
+
+def compare_payload_link(link, product):
+    """载荷链接 vs per-node 产物链接 —— 返回 (verdict, [原因…])。
+
+    verdict:
+      · "ok"                    关键字段全一致
+      · "endpoint-cdn-vs-origin" 端点不同, 但正是"CDN 边缘 ↔ 直连源站"这一对
+                                (产物写域名:443, 载荷写源站 IP:端口)。这一对
+                                是**允许**的, 但每次都要说出来, 不能沉默;
+                                此时 ech 随端点绑定 —— 连源站时 CDN 的 ECH
+                                配置必须不写。
+      · "mismatch"              有实质冲突 → 调用方必须拒发这一条
+    """
+    pu = _split_uri(link)
+    if pu is None or product is None:
+        return "ok", []                 # 无法比对 (vmess) → 不假装比过, 由调用方记数
+    pr = product[2] if isinstance(product, tuple) and len(product) > 2 else product
+    notes, bad = [], []
+
+    same_endpoint = (pu["host"] == pr["host"] and pu["port"] == pr["port"])
+    cdn_pair = False
+    if not same_endpoint:
+        # 产物是域名 + 载荷是 IP ⇒ CDN 回源 vs 直连源站
+        cdn_pair = (not is_ip_literal(pr["host"])) and is_ip_literal(pu["host"])
+        msg = (f"端点不同: 产物 {pr['host']}:{pr['port']} / 载荷 "
+               f"{pu['host']}:{pu['port']}")
+        if cdn_pair:
+            notes.append(msg + " —— 按既有规则允许 (CDN 边缘 ↔ 直连源站), "
+                               "但两者可达性不同, 这里必须留痕")
+        else:
+            bad.append(msg)
+
+    for key in CRITICAL_FIELDS:
+        a, b = _field(pu, key), _field(pr, key)
+        if key == "ech" and cdn_pair:
+            # ECH 与端点绑定: 连源站时不该带 CDN 的 ECH 配置。
+            if a:
+                bad.append(f"ech: 载荷连的是源站却给 CDN 的 ECH 配置 ({a[:24]}…)")
+            else:
+                notes.append(f"ech: 产物为 CDN 形态 ({b[:24]}…), 载荷连源站故不写 —— "
+                             "符合规则")
+            continue
+        if a == b:
+            continue
+        if a and b:
+            bad.append(f"{key}: 载荷={a} 产物={b}")
+        else:
+            bad.append(f"{key}: 载荷={'有' if a else '缺'} 产物={'有' if b else '缺'}"
+                       f" ({a or b})")
+    for key in SOFT_FIELDS:
+        a, b = _field(pu, key), _field(pr, key)
+        if a != b:
+            notes.append(f"{key}: 载荷={a or '(无)'} 产物={b or '(无)'}")
+    if not bad:
+        return ("endpoint-cdn-vs-origin" if cdn_pair else "ok"), notes
+    return "mismatch", bad + notes
+
+
+def verify_against_products(items, out_dir, notes=None):
+    """把载荷链接逐条与 per-node 产物核对。
+
+    items: [(tag, link)] —— 拒发的链接返回在 refused 里, 并给出**差在哪**。
+    返回 (kept_items, refused, checked, unchecked) —— unchecked 是"没有产物
+    可比对"的 tag 列表: 不比对上就少一条防线, 必须报出来而不是静默通过。
+    """
+    index, bad_files = product_links(out_dir)
+    if notes is not None:
+        for f, e in bad_files:
+            notes.append(f"{f}: per-node 产物读不出来 ({e}) —— 未参与一致性校验")
+    kept, refused, checked, unchecked = [], [], [], []
+    for tag, link in items:
+        cred = ""
+        # 凭据从链接本身取, 不要求调用方再传节点视图 (少一处可能漂移的输入)
+        u = _split_uri(link)
+        if u:
+            cred = u["credential"]
+        product = index.get(cred)
+        if not u or product is None:
+            # ★ 没有产物可比对 ≠ 不一致: 保持发布 (否则"没有 per-node 产物的
+            #   部署"会一条都发不出去), 但**记进 unchecked 报出来** ——
+            #   少一条防线这件事不能被静默吞掉。
+            unchecked.append(tag)
+            kept.append((tag, link))
+            continue
+        checked.append(tag)
+        verdict, why = compare_payload_link(link, product)
+        if verdict == "mismatch":
+            refused.append((tag, f"与 per-node 产物 {product[0]} 不一致 —— "
+                                 + "; ".join(why)))
+            if notes is not None:
+                notes.append(f"{tag}: 拒发 —— 载荷与 {product[0]} 不一致: "
+                             + "; ".join(why))
+            continue
+        if notes is not None and why:
+            notes.append(f"{tag}: 与 {product[0]} 核对通过 ({verdict}); "
+                         + "; ".join(why))
+        kept.append((tag, link))
+    return kept, refused, checked, unchecked

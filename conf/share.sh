@@ -28,6 +28,8 @@ set -uo pipefail
 XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
 CONF_DIR="${XRAY_CONF_DIR:-$XRAY_BASE/conf}"
 SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
+# per-node 产物目录 —— 一致性校验的参照物 (out/<proto>_share-<NN>.txt)。
+OUT_DIR="${XRAY_OUT_DIR:-$XRAY_BASE/out}"
 XRAY_RAW="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
 
 # ---------------------------------------------------------------- 依赖定位
@@ -176,22 +178,26 @@ print(v if v is not None else "")
 #   抄一遍必然漂移, 表现是"新建的链接对、刷新过的链接少个节点"。
 x_share_build_payload() {
     local out; out=$(mktemp /tmp/.xshare.XXXXXX) || return 1
-    if ! python - "$LIB_DIR" "$CONF_DIR" "$SHARE_DIR" "$out" "$@" <<'PY' 2>/tmp/.xshare.err
+    if ! python - "$LIB_DIR" "$CONF_DIR" "$SHARE_DIR" "$OUT_DIR" "$out" "$@" <<'PY' 2>/tmp/.xshare.err
 import sys, os
-lib_dir, conf_dir, share_dir, out = sys.argv[1:5]
-tags = sys.argv[5:]
+lib_dir, conf_dir, share_dir, out_dir, out = sys.argv[1:6]
+tags = sys.argv[6:]
 os.environ["XRAY_CONF_DIR"] = conf_dir
 os.environ["XRAY_SHARE_DIR"] = share_dir
+os.environ["XRAY_OUT_DIR"] = out_dir
 sys.path.insert(0, lib_dir)
 import share_payload
-payload, missing, nometa, bad, refused, notes = share_payload.build_payload(tags, full=True)
+payload, missing, nometa, bad, refused, notes, inconsistent = \
+    share_payload.build_payload(tags, full=True)
 if payload is None:
     print("无可分发内容 (片段没了? 缺对外地址? 只绑了回环?)", file=sys.stderr)
     raise SystemExit(1)
 with open(out, "w", encoding="utf-8") as fh:
     fh.write(payload)
-# 四类"没发出去"分开报 —— 合并成一条就查不出是哪一种
-for label, items in (("节点已删", missing), ("缺分享元数据", nometa)):
+print("payload_schema=%d" % share_payload.PAYLOAD_SCHEMA, file=sys.stderr)
+# 五类"没发出去"分开报 —— 合并成一条就查不出是哪一种
+for label, items in (("节点已删", missing), ("缺分享元数据", nometa),
+                     ("载荷与产物不一致", [t for t, _ in inconsistent])):
     if items:
         print("%s: %s" % (label, ",".join(items)), file=sys.stderr)
 # ★ 「不该发布」是**新分开的一类**, 最要命的一类:
@@ -200,6 +206,11 @@ for label, items in (("节点已删", missing), ("缺分享元数据", nometa)):
 #   vless-xhttp-01/02/03 三条死链就是这么发出去的。
 for t, why in refused:
     print("不该对外发布: %s —— %s" % (t, why), file=sys.stderr)
+# ★ 「载荷与产物不一致」: 同一个节点有两条生成链接的路径, 它们漂移了。
+#   实测事故 = 产物有 sni/ech、载荷没有, 三家客户端同时连不上而面板全绿。
+#   这一条**必须拒发**, 而且必须把差在哪个字段、跟哪个产物文件说出来。
+for t, why in inconsistent:
+    print("载荷与产物不一致, 已拒发: %s —— %s" % (t, why), file=sys.stderr)
 for n in notes:
     print("提示: %s" % n, file=sys.stderr)
 if bad:
@@ -262,11 +273,22 @@ print('\n'.join(x['tag'] for x in n))")
 
     # tags / name 存进 meta —— 刷新时要靠它重建内容。
     # 公共服务只存不读, 这是"内核用它记自己的东西"的正当用法。
+    #
+    # ★ payload_schema 也写进去: 载荷生成逻辑的版本号。它让"服务端修好了
+    #   分享层, 但用户手里还是旧订阅"这件事**从静默变成可检测** ——
+    #   刷新时版本不同就重建, 列表里也直接标出来。实测事故 (2026-10-10):
+    #   conf/lib/nodes.py 的 SNI 修复在 22:33 落地, 而 20:47 建的那条分享
+    #   到 23:28 还在发 `sni=<IP>` / 无 sni 无 ech 的旧内容, 三家客户端
+    #   同时连不上, 而面板上一切正常。
     local meta
-    meta=$(python -c '
-import json, sys
+    meta=$(LIB="$LIB_DIR" python -c '
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import share_payload
 tags = sys.argv[1:]
-print(json.dumps({"name": tags[0], "tags": tags[1:]}, ensure_ascii=False))
+print(json.dumps({"name": tags[0], "tags": tags[1:],
+                  "payload_schema": share_payload.PAYLOAD_SCHEMA},
+                 ensure_ascii=False))
 ' "$name" "${tags[@]}")
 
     local rec token
@@ -337,11 +359,23 @@ share_list() {
     #   后一条会把前一条覆盖掉, 于是 python 拿到的是 **JSON 当脚本**,
     #   报 `name 'true' is not defined` 这种跟业务毫无关系的错。
     #   走环境变量最稳。
-    XJS="$js" python -c '
+    #
+    # ★ 「陈旧」必须显示出来。实测事故: 分享层修好之后 (SNI/ECH), 20:47 建的
+    #   那条分享到 23:28 还在发旧内容 —— 面板列表里一切正常, 链接也打得开,
+    #   唯一的现象是"客户端连不上"。判据是 meta.payload_schema 与当前
+    #   生成器版本不一致 (老记录没有这个字段 = 旧版建的)。
+    local want; want=$(LIB="$LIB_DIR" python -c '
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import share_payload
+print(share_payload.PAYLOAD_SCHEMA)' 2>/dev/null)
+    XJS="$js" XWANT="$want" python -c '
 import os, sys, json, time
 recs = json.loads(os.environ["XJS"])
-fmt = "  %-5s%-20s%-16s%-11s%-12s%-7s%s"
-print(fmt % ("编号", "TOKEN", "名称", "已用/上限", "过期", "状态", "节点"), file=sys.stderr)
+want = os.environ.get("XWANT", "")
+fmt = "  %-5s%-20s%-16s%-11s%-12s%-8s%-7s%s"
+print(fmt % ("编号", "TOKEN", "名称", "已用/上限", "过期", "状态", "内容", "节点"), file=sys.stderr)
+stale = []
 for i, r in enumerate(recs, 1):
     m = r.get("meta") or {}
     exp = int(r.get("expires_at", 0))
@@ -350,8 +384,21 @@ for i, r in enumerate(recs, 1):
     uses = "%d/%s" % (used, maxu if maxu else "∞")
     tags = m.get("tags") or []
     if isinstance(tags, str): tags = [tags]
+    sch = m.get("payload_schema", "")
+    fresh = "最新" if (want and str(sch) == str(want)) else "陈旧!"
+    if fresh != "最新":
+        stale.append((str(r.get("token", ""))[:12], sch or "无", want or "?"))
     print(fmt % (i, str(r.get("token", ""))[:18], str(m.get("name", ""))[:15],
-                 uses, exps, r.get("state", ""), ",".join(tags)[:40]), file=sys.stderr)
+                 uses, exps, r.get("state", ""), fresh, ",".join(tags)[:40]),
+                 file=sys.stderr)
+for tok, got, w in stale:
+    print(file=sys.stderr)
+    print("  [陈旧] %s… 的内容是旧版生成器建的 (schema=%s, 现为 %s) —— "
+          "里面可能带着已经修掉的缺陷 (丢 sni / 丢 ech / sni 写成 IP)。"
+          % (tok, got, w), file=sys.stderr)
+    print("         客户端拉到的是老内容, 而列表/链接看起来一切正常; "
+          "跑一次 `conf/share.sh refresh` 即可原地重建 (token 与地址不变)。",
+          file=sys.stderr)
 '
     printf '\n' >&2
     info "拉取地址: http://<服务器IP>:$(x_share_port)/share/<token>"
@@ -399,6 +446,12 @@ share_set() {
 #
 # ★ 不做这件事的后果是静默的: 面板显示一切正常, 链接也能打开,
 #   只是少了一个节点 / 还留着已删的节点, 没人会发现。
+#
+# ★ 判据有**两个**, 缺一个就会漏掉一整类:
+#   ① 内容哈希不同 —— 节点增删改了内容;
+#   ② payload_schema 不同 —— 节点没变, 但**生成载荷的代码变了**
+#      (2026-10-10 事故: SNI/ECH 修复落地后, 旧分享继续发老内容, 哈希
+#      当然也不同, 但没人跑过刷新; 有 schema 之后 list 会直接标陈旧)。
 share_refresh_all() {
     local js; js=$(_x_share_list)
     [[ -z "$js" || "$js" == "[]" ]] && return 0
@@ -410,8 +463,14 @@ share_refresh_all() {
         return 0
     fi
 
-    local n=0 tok name tags newh curh payload
-    while IFS=$'\t' read -r tok name tags; do
+    local want; want=$(LIB="$LIB_DIR" python -c '
+import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import share_payload
+print(share_payload.PAYLOAD_SCHEMA)' 2>/dev/null)
+
+    local n=0 nstale=0 tok name tags schema newh curh payload newmeta
+    while IFS=$'\t' read -r tok name tags schema; do
         [[ -n "$tok" ]] || continue
         [[ -n "$tags" ]] || continue
         # shellcheck disable=SC2086
@@ -421,9 +480,25 @@ share_refresh_all() {
                | python -c 'import sys,json
 try: print(json.load(sys.stdin).get("content_sha256",""))
 except Exception: print("")' 2>/dev/null)
-        if [[ "$newh" != "$curh" ]]; then
-            _x_share_api update --token "$tok" --content-file "$payload" >/dev/null 2>&1 \
-                && n=$((n + 1))
+        if [[ -n "$want" && "$schema" != "$want" ]]; then
+            nstale=$((nstale + 1))
+            info "分享 ${tok:0:12}… 是旧版生成器建的 (schema=${schema:-无}, 现为 $want), 重建内容"
+        fi
+        if [[ "$newh" != "$curh" || ( -n "$want" && "$schema" != "$want" ) ]]; then
+            # ★ meta 是**整体替换**不是 merge (share_service.py: `rec["meta"] = data["meta"]`),
+            #   所以这里必须把 name/tags 一起带上 —— 只发 payload_schema 会把
+            #   刷新用的 tags 抹掉, 下一次刷新就再也重建不出内容了。
+            newmeta=$(python -c '
+import json, sys
+name, tags, sch = sys.argv[1], sys.argv[2].split(","), sys.argv[3]
+m = {"name": name, "tags": tags}
+if sch:
+    m["payload_schema"] = int(sch)
+print(json.dumps(m, ensure_ascii=False))' "$name" "$tags" "${want:-$schema}")
+            if _x_share_api update --token "$tok" --content-file "$payload" \
+                   --meta "$newmeta" >/dev/null 2>&1; then
+                n=$((n + 1))
+            fi
         fi
         rm -f "$payload"
     done < <(printf '%s' "$js" | python -c '
@@ -434,10 +509,12 @@ for r in recs:
     m = r.get("meta") or {}
     tags = m.get("tags") or []
     if isinstance(tags, list) and tags:
-        print("%s\t%s\t%s" % (r.get("token",""), m.get("name",""), ",".join(tags)))
+        print("%s\t%s\t%s\t%s" % (r.get("token",""), m.get("name",""),
+                                  ",".join(tags), m.get("payload_schema","")))
 ' 2>/dev/null)
 
     (( n > 0 )) && info "已刷新 ${n} 条分享链接的内容 (token 与地址未变)"
+    (( nstale > 0 && n == 0 )) && warn "有 ${nstale} 条是旧版生成器建的, 但内容没能更新 —— 见上面的报错"
     return 0
 }
 

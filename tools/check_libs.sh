@@ -166,6 +166,229 @@ echo "$PO" | grep 'bad_count=1' >/dev/null && ok "坏片段数量被单独报出
 echo "$PO" | grep 'missing=gone' >/dev/null && ok "已删节点单独报出 (与缺元数据区分)" || bad "已删节点没有单独报出"
 echo "$PO" | grep 'nometa=nometa' >/dev/null && ok "缺元数据单独报出 (与已删区分)" || bad "缺元数据没有单独报出"
 
+# ---------------------------------------------------------------- 载荷 ↔ 产物
+#
+# 同一个节点的链接有**两条**生成路径: 各协议脚本写的 per-node 产物
+# (out/<proto>_share-<NN>.txt) 与订阅载荷 (share_payload → nodes.build_share_link)。
+# 2026-10-10 实测事故: 同一个 vless-xhttp08, 产物有 sni+ech, 载荷两个都丢 ——
+# 三家客户端同时连不上, 而面板/链接看起来完全正常。
+#
+# 这一组锁三件事:
+#   ① 取值逻辑同源 (片段 _serverName 参与 SNI; ECH 从 echServerKeys 还原,
+#      与 `xray tls ech -i` 逐字节相同);
+#   ② ECH 与端点绑定 (连 CDN 边缘才写 CDN 形式; 连源站不写);
+#   ③ 与 per-node 产物做一致性校验,**不一致就拒发并说明差在哪个字段**。
+group "载荷 ↔ per-node 产物一致性 + ECH 同源"
+ET="$TMP/echlink"; mkdir -p "$ET/conf" "$ET/share" "$ET/out"
+# 生产真值对 (RN, 2026-10-10): vless-xhttp-08.json 的 echServerKeys 与
+# `xrayls tls ech -i` 打印的 ECH config list。公开值, 不含私钥以外的秘密。
+ECH_KEYS='ACAeHgJriV0xujYELoel7l+Avsa2y7yjytil2vOQSlCdLgBl/g0AYQAAIAAgP6zoBwcqbFnPyw2P1mY5ivBpuY6XvO+omOwChaYR3QIAJAABAAEAAQACAAEAAwACAAEAAgACAAIAAwADAAEAAwACAAMAAwASbW9vbnR2LjY4OTY2OTgueHl6AAA='
+ECH_WANT='AGX+DQBhAAAgACA/rOgHBypsWc/LDY/WZjmK8Gm5jpe876iY7AKFphHdAgAkAAEAAQABAAIAAQADAAIAAQACAAIAAgADAAMAAQADAAIAAwADABJtb29udHYuNjg5NjY5OC54eXoAAA=='
+python3 - "$LIB" "$ET" "$ECH_KEYS" <<'PY'
+import json, sys, os
+sys.path.insert(0, sys.argv[1]); d, keys = sys.argv[2], sys.argv[3]
+def frag(name, port, net, path, keys=None):
+    tls = {"minVersion": "1.3",
+           "certificates": [{"certificateFile": "/nonexistent/x.pem"}]}
+    if keys:
+        tls["echServerKeys"] = keys
+    ss = {"network": net, "security": "tls", "tlsSettings": tls}
+    ss[("xhttpSettings" if net == "xhttp" else "wsSettings")] = {"path": path}
+    return {"inbounds": [{"tag": name, "listen": "0.0.0.0", "port": port,
+      "protocol": "vless", "settings": {"clients": [{"id": "uuid-" + name}],
+      "decryption": "none"}, "streamSettings": ss}], "_serverName": "a.example"}
+# 直连 ECH 节点 (片段自带服务端密钥, TLS 在本节点终结)
+json.dump(frag("n-direct", 29601, "ws", "/p1", keys),
+          open(os.path.join(d, "conf", "n-direct.json"), "w"))
+# CDN-ECH 节点 (有 _serverName, 没有 echServerKeys)
+json.dump(frag("n-cdn", 8443, "xhttp", "/p2"),
+          open(os.path.join(d, "conf", "n-cdn.json"), "w"))
+def meta(tag, host, port, name):
+    json.dump({"host": host, "port": port, "name": name},
+              open(os.path.join(d, "share", tag + ".json"), "w"))
+# 直连 ECH 节点: 元数据 host 是本机公网 IP (与产物端点一致)
+meta("n-direct", "203.0.113.9", 29601, "n-direct")
+meta("n-cdn", "203.0.113.9", 8443, "n-cdn")
+PY
+
+# ① ECHConfigList 还原 == xray 的值 (逐字节)
+ECHGOT=$(python3 - "$LIB" "$ECH_KEYS" <<'PY'
+import sys, os
+sys.path.insert(0, sys.argv[1])
+import nodes
+print(nodes.ech_config_list(sys.argv[2]))
+PY
+)
+assert_eq "$ECHGOT" "$ECH_WANT" "echServerKeys → ECHConfigList（与 xray tls ech -i 逐字节相同）"
+ECHBAD=$(python3 - "$LIB" <<'PY'
+import sys, os
+sys.path.insert(0, sys.argv[1])
+import nodes
+print("|".join([nodes.ech_config_list(""), nodes.ech_config_list("not-base64!!"),
+                nodes.ech_config_list("AAAA")]))
+PY
+)
+assert_eq "$ECHBAD" "||" "坏/空 echServerKeys 不猜值（返回空而不是半截配置）"
+
+# ② 真实产物 → 载荷: sni 来自 _serverName, ech 来自 echServerKeys
+PAY=$(python3 - "$LIB" "$ET" "$ECH_WANT" <<'PY'
+import sys, os, json, base64, urllib.parse
+sys.path.insert(0, sys.argv[1]); d, want = sys.argv[2], sys.argv[3]
+os.environ.update(XRAY_CONF_DIR=os.path.join(d, "conf"),
+                  XRAY_SHARE_DIR=os.path.join(d, "share"),
+                  XRAY_OUT_DIR=os.path.join(d, "out"), XRAY_BASE=d)
+import share_payload as P
+# 先放"正确"的 per-node 产物 (与节点自身一致)
+open(os.path.join(d, "out", "vless-xhttp_share-direct.txt"), "w").write(
+    "vless://uuid-n-direct@203.0.113.9:29601?encryption=none&security=tls"
+    "&sni=a.example&type=ws&path=/p1&ech=%s#n-direct\n" % urllib.parse.quote(want, safe=""))
+open(os.path.join(d, "out", "vless-xhttp-share-cdn.txt"), "w").write(
+    "vless://uuid-n-cdn@cdn.example:443?encryption=none&security=tls"
+    "&sni=a.example&type=xhttp&path=/p2"
+    "&ech=cloudflare-ech.com%2Bhttps%3A%2F%2Fdns.alidns.com%2Fdns-query#n-cdn\n")
+payload, missing, nometa, bad, refused, notes, inc = P.build_payload(
+    ["n-direct", "n-cdn"], full=True)
+print("has_sni=%s" % ("sni=a.example" in urllib.parse.unquote(
+      base64.b64decode(payload).decode() if payload else "")))
+print("has_ech=%s" % (want in urllib.parse.unquote(
+      base64.b64decode(payload).decode() if payload else "")))
+print("inc=%d" % len(inc))
+print("checked_line=%s" % any("一致性校验" in n for n in notes))
+PY
+)
+echo "$PAY" | grep 'has_sni=True' >/dev/null && ok "TLS 节点链接带上 sni（片段 _serverName 参与取值）" \
+    || bad "载荷又丢 sni: $(echo "$PAY" | tr '\n' ' ')"
+echo "$PAY" | grep 'has_ech=True' >/dev/null && ok "直连 ECH 节点链接带上 ech（与产物同值）" \
+    || bad "载荷又丢 ech: $(echo "$PAY" | tr '\n' ' ')"
+echo "$PAY" | grep 'inc=0' >/dev/null && ok "与产物一致的节点不被误拒" \
+    || bad "一致却被拒发: $(echo "$PAY" | tr '\n' ' ')"
+echo "$PAY" | grep 'checked_line=True' >/dev/null && ok "一致性校验的结果有报出（不是静默通过）" \
+    || bad "校验结果没报出"
+
+# ③ 端点: 连 CDN 边缘才写 CDN 形式的 ECH; 连源站不写
+CDNPAY=$(python3 - "$LIB" "$ET" <<'PY'
+import sys, os, json, base64, urllib.parse
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+os.environ.update(XRAY_CONF_DIR=os.path.join(d, "conf"),
+                  XRAY_SHARE_DIR=os.path.join(d, "share"),
+                  XRAY_OUT_DIR=os.path.join(d, "out"), XRAY_BASE=d)
+import share_meta as M, share_payload as P
+# 同一个 CDN-ECH 节点: 元数据 host 改成域名 (= 发布 CDN 边缘)
+M.save(os.path.join(d, "share"), "n-cdn",
+       {"host": "cdn.example", "port": 443, "name": "n-cdn"})
+payload, *_ = P.build_payload(["n-cdn"], full=True)
+txt = urllib.parse.unquote(base64.b64decode(payload).decode()) if payload else ""
+print("cdn_edge_ech=%s" % ("ech=cloudflare-ech.com+https://dns.alidns.com/dns-query" in txt))
+# 再改回源站 IP
+M.save(os.path.join(d, "share"), "n-cdn",
+       {"host": "203.0.113.9", "port": 8443, "name": "n-cdn"})
+payload, missing, nometa, bad, refused, notes, inc = P.build_payload(["n-cdn"], full=True)
+txt = urllib.parse.unquote(base64.b64decode(payload).decode()) if payload else ""
+print("origin_no_ech=%s" % ("&ech=" not in txt))
+print("origin_note=%s" % any("端点不同" in n for n in notes))
+PY
+)
+echo "$CDNPAY" | grep 'cdn_edge_ech=True' >/dev/null && ok "发布 CDN 边缘时写 CDN-ECH（与产物同值）" \
+    || bad "CDN 端点的 ech 丢了: $(echo "$CDNPAY" | tr '\n' ' ')"
+echo "$CDNPAY" | grep 'origin_no_ech=True' >/dev/null && ok "发布源站时不写 CDN 的 ECH（ECH 与端点绑定）" \
+    || bad "给源站发了 CDN 的 ECH 配置（握手必失败）: $(echo "$CDNPAY" | tr '\n' ' ')"
+echo "$CDNPAY" | grep 'origin_note=True' >/dev/null && ok "CDN 边缘 ↔ 直连源站的端点差异被留痕" \
+    || bad "端点不同却沉默: $(echo "$CDNPAY" | tr '\n' ' ')"
+
+# ④ 反向验证: 产物有 sni/ech、载荷缺 → 必须拒发, 且原因里点出字段名
+#    这里直接用"事故当时的真实载荷形态"(sni 缺 / ech 缺 / sni 写成 IP)。
+BADGOT=$(python3 - "$LIB" "$ET" "$ECH_WANT" <<'PY'
+import sys, os, urllib.parse
+sys.path.insert(0, sys.argv[1]); d, want = sys.argv[2], sys.argv[3]
+import nodes as N
+prod = os.path.join(d, "out")
+items = [
+  ("n-direct", "vless://uuid-n-direct@203.0.113.9:29601?encryption=none"
+               "&security=tls&type=ws&path=/p1#n-direct"),          # 丢 sni + 丢 ech
+  ("n-cdn",    "vless://uuid-n-cdn@203.0.113.9:8443?encryption=none"
+               "&security=tls&type=xhttp&path=/p2&sni=203.0.113.9#n-cdn"),  # sni 写成 IP
+  ("n-ok",     "vless://uuid-n-direct@203.0.113.9:29601?encryption=none"
+               "&security=tls&sni=a.example&type=ws&path=/p1&ech=%s#n-direct"
+               % urllib.parse.quote(want, safe="")),               # 正确的那条
+]
+kept, refused, checked, unchecked = N.verify_against_products(items, prod)
+print("kept=%s" % ",".join(t for t, _ in kept))
+print("refused=%s" % ",".join(t for t, _ in refused))
+for t, why in refused:
+    print("why_%s=%s" % (t, why))
+PY
+)
+echo "$BADGOT" | grep 'refused=n-direct,n-cdn' >/dev/null && ok "丢 sni/ech 的载荷被拒发（正是事故形态）" \
+    || bad "该拒发的没拒: $(echo "$BADGOT" | tr '\n' ' ')"
+echo "$BADGOT" | grep 'kept=n-ok' >/dev/null && ok "正确的那条照常发布（拒发只针对坏的那条）" \
+    || bad "把好的也拒了: $(echo "$BADGOT" | tr '\n' ' ')"
+echo "$BADGOT" | grep -E 'why_n-direct=.*(sni|ech)' >/dev/null && ok "拒发原因点出字段名（不是只给一句'不一致'）" \
+    || bad "拒发原因没说清差在哪: $(echo "$BADGOT" | tr '\n' ' ')"
+echo "$BADGOT" | grep -E 'why_n-cdn=.*sni' >/dev/null && ok "sni 被写成 IP 时也被拒（不是只判空值）" \
+    || bad "sni=IP 没被拦住: $(echo "$BADGOT" | tr '\n' ' ')"
+
+# ⑤ 产物命名两种风格都要认（下划线 / 连字符）—— 只认一种会静默漏掉一半节点
+NAMED=$(python3 - "$LIB" "$ET" "$ECH_WANT" <<'PY'
+import sys, os, urllib.parse
+sys.path.insert(0, sys.argv[1]); d, want = sys.argv[2], sys.argv[3]
+import nodes as N
+idx, bad = N.product_links(os.path.join(d, "out"))
+print("files=%d" % len(idx))
+print("has_hyphen=%s" % any(f.startswith("vless-xhttp-share-") for f, _, _ in idx.values()))
+print("has_underscore=%s" % any(f.startswith("vless-xhttp_share-") for f, _, _ in idx.values()))
+PY
+)
+echo "$NAMED" | grep 'has_hyphen=True' >/dev/null && ok "连字符命名的产物 (ss2022-share-02.txt 那种) 也参与校验" \
+    || bad "连字符命名的产物被漏掉: $(echo "$NAMED" | tr '\n' ' ')"
+echo "$NAMED" | grep 'has_underscore=True' >/dev/null && ok "下划线命名的产物参与校验" \
+    || bad "下划线命名的产物被漏掉: $(echo "$NAMED" | tr '\n' ' ')"
+
+# ⑥ 没有 per-node 产物的部署不能被这道闸门搞成"一条都发不出去"
+NOPROD=$(python3 - "$LIB" "$ET" <<'PY'
+import sys, os, base64
+sys.path.insert(0, sys.argv[1]); d = sys.argv[2]
+empty = os.path.join(d, "out-empty"); os.makedirs(empty, exist_ok=True)
+os.environ.update(XRAY_CONF_DIR=os.path.join(d, "conf"),
+                  XRAY_SHARE_DIR=os.path.join(d, "share"),
+                  XRAY_OUT_DIR=empty, XRAY_BASE=d)
+import share_payload as P
+payload, missing, nometa, bad, refused, notes, inc = P.build_payload(["n-direct"], full=True)
+print("payload_ok=%s" % (payload is not None))
+print("reported_unchecked=%s" % any("未校验" in n for n in notes))
+PY
+)
+echo "$NOPROD" | grep 'payload_ok=True' >/dev/null && ok "没有产物时照常发布（不因为没法校验就拒发）" \
+    || bad "没有产物时把节点全拒了: $(echo "$NOPROD" | tr '\n' ' ')"
+echo "$NOPROD" | grep 'reported_unchecked=True' >/dev/null && ok "没有产物可比对这件事被报出来（不是静默通过）" \
+    || bad "没产物却装作校验过了: $(echo "$NOPROD" | tr '\n' ' ')"
+
+# ⑦ 已发出的分享"内容陈旧"必须看得见 —— 实测事故: 生成器修好了, 20:47 建的
+#    分享到 23:28 还在发旧内容, 面板列表里一切正常, 只有客户端连不上。
+#    share.sh 是 shell, 所以把它的 _x_share_api/_x_share_list 换成桩来跑真代码。
+STALE=$(
+  ST="$TMP/stale"; mkdir -p "$ST/share"
+  printf 'x' > "$ST/payload"
+  SCHEMA_NOW=$(python3 -c "import sys; sys.path.insert(0, '$LIB'); import share_payload; print(share_payload.PAYLOAD_SCHEMA)" 2>/dev/null || echo 0)
+  XSCHEMA="$SCHEMA_NOW" bash -c '
+    set -uo pipefail
+    source "$1" >/dev/null 2>&1
+    _x_share_api() { return 0; }                       # health 永远正常
+    _x_share_list() {
+      python3 -c "
+import json, os
+recs = [{\"token\": \"aaaa1111bbbb2222\", \"state\": \"active\",
+         \"meta\": {\"name\": \"旧分享\", \"tags\": [\"t1\"], \"payload_schema\": 1}},
+        {\"token\": \"cccc3333dddd4444\", \"state\": \"active\",
+         \"meta\": {\"name\": \"新分享\", \"tags\": [\"t2\"],
+                  \"payload_schema\": int(os.environ[\"XSCHEMA\"])}}]
+print(json.dumps(recs))"
+    }
+    share_list 2>&1 | grep -E "陈旧|最新" | sed "s/[^[:print:]]//g"
+  ' _ "$ROOT/conf/share.sh" "$ST"
+)
+echo "$STALE" | grep '陈旧' >/dev/null && ok "旧版生成器建的分享被标成陈旧" || bad "陈旧分享没被标出来: $STALE"
+echo "$STALE" | grep '最新' >/dev/null && ok "当前版本的分享不被误标（陈旧判定不是恒真）" || bad "新分享被误标陈旧: $STALE"
+
 # ---------------------------------------------------------------- 面板降级
 # 公共基础服务不存在/没跑时, 面板必须**说清楚**, 不能装作一切正常。
 #   share_list 若把"服务不可达"报成"还没有生成分享" —— 用户会以为链接被谁删了;
@@ -3964,7 +4187,7 @@ print("full=%d" % len(P.build_payload(["good1"], full=True)))
 PY
 grep -q 'four=4' "$TMP/link_legacy.txt" && ok "build_payload 老四元组接口未变（兼容旧调用方）" \
     || bad "老接口被破坏: $(cat "$TMP/link_legacy.txt")"
-grep -q 'full=6' "$TMP/link_legacy.txt" && ok "full=True 才多出 refused/notes（新增细分）" \
+grep -q 'full=7' "$TMP/link_legacy.txt" && ok "full=True 才多出 refused/notes/inconsistent（新增细分）" \
     || bad "full 接口不对: $(cat "$TMP/link_legacy.txt")"
 
 # ---------------------------------------------------------------- P0-4 旧格式字段
