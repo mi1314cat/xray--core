@@ -181,10 +181,25 @@ def build_state(deep: bool = True) -> dict:
     # 内核版本：面板里有这一行, 命令行也得有 —— 用户排查时最常问的就是
     # "我这是哪个版本"。本地二进制, 调用开销可忽略（已实测 <20ms）。
     xray_ver = ""
+    # 浏览器运行时：Browser Dialer 的依赖。装没装、哪个版本 —— 面板要显示。
+    browser_path, browser_ver = "", ""
     try:
         rc, out, _ = sh([os.path.join(PREFIX, "bin", "xray"), "version"], timeout=10)
         if rc == 0 and len(out.split()) > 1:
             xray_ver = out.split()[1]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    try:
+        import shutil as _sh
+        for _c in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+            _p = _sh.which(_c)
+            if _p:
+                browser_path = _p
+                break
+        if browser_path:
+            _rc, _out, _ = sh([browser_path, "--version"], timeout=10)
+            browser_ver = (_out or "").strip().splitlines()[0] if _rc == 0 else ""
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -224,6 +239,8 @@ def build_state(deep: bool = True) -> dict:
     result = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "xray_ver": xray_ver,
+        "browser_path": browser_path,
+        "browser_ver": browser_ver,
         "mode": mode,
         "mode_label": MODE_LABEL[mode],
         # 一句话说清当前到底在跑什么、当前节点走哪条路 —— 不写死"Xray + Chromium"，
@@ -379,6 +396,12 @@ def cmd_status_text(state: dict) -> str:
         ch_txt += _c("d", "（当前节点不需要：走 Xray 自带 TLS）")
     rows.append(("浏览器拨号", ch_txt))
 
+    if state.get("browser_path"):
+        rows.append(("浏览器", f'{state["browser_path"]}'
+                     + (f'  {state["browser_ver"]}' if state.get("browser_ver") else '')))
+    else:
+        rows.append(("浏览器", _c("y", "未安装 —— 依赖浏览器拨号的节点会不可用")
+                     + _c("d", "（xbd browser install）")))
     rows.append(("出口 IP", state["exit_ip"] or _c("d", "（未探测）")))
     panel_host = cfg_get(os.path.join(PREFIX, "config", "panel.env"), "PANEL_HOST", "127.0.0.1")
     panel_port = cfg_get(os.path.join(PREFIX, "config", "panel.env"), "PANEL_PORT", "18090")

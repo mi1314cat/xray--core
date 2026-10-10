@@ -234,6 +234,53 @@ def _existing_node_names():
     return names
 
 
+def act_node_simple(p):
+    """面板里添加简易 SOCKS5 / HTTP 出站（把本机或局域网里别的内核当上游）。
+
+    实现复用命令行那一份（`xbd node simple`）—— 面板和命令行各写一套的话，
+    "两个入口行为不一致"几乎是必然，而这类节点最容易出的错就是地址/端口填反。
+    """
+    proto = str(p.get("proto") or "socks").strip().lower()
+    host = str(p.get("host") or "").strip()
+    port = str(p.get("port") or "").strip()
+    user = str(p.get("username") or "").strip()
+    password = str(p.get("password") or "").strip()
+    name = str(p.get("name") or "").strip()
+    if proto not in ("socks", "http"):
+        return False, "类型只能是 socks 或 http"
+    if not host:
+        return False, "请填目标地址（本机就是 127.0.0.1）"
+    if not port.isdigit() or not (1 <= int(port) <= 65535):
+        return False, "端口必须是 1-65535 的数字"
+    if host in ("0.0.0.0", "::"):
+        return False, ("%s 是监听地址，不能当连接目标 —— 本机请填 127.0.0.1" % host)
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "node", "simple", proto, host, port, user, password, name],
+                      timeout=180)
+    # 命令行的输出里有能力卡片（多行），把最后几行当提示还回去
+    tail = [ln for ln in (out or "").splitlines() if ln.strip()][-3:]
+    return rc == 0, ("\n".join(tail) if tail else (err or "添加失败"))
+
+
+def act_browser_install():
+    """安装浏览器（Browser Dialer 的运行依赖）。
+
+    面板上点按钮 = 用户明确同意下载几百 MB。命令行同一实现:
+    `xbd browser install --yes`。
+    """
+    xbd = os.path.join(PREFIX, "bin", "xbd")
+    rc, out, err = sh([xbd, "browser", "install", "--yes"], timeout=1800)
+    return rc == 0, (out or err or "安装失败").strip()[-400:]
+
+
+def act_panel_restart():
+    """重启网页面板服务。令牌不变，本页刷新即可回来。"""
+    rc, out, err = sh(["systemctl", "restart", U_PANEL], timeout=60)
+    if rc != 0:
+        return False, (err or out or "重启失败").strip()
+    return True, "面板已重启（刷新本页即可，令牌不变）"
+
+
 def act_build_link(p):
     """手动添加表单 → 分享链接。
 
@@ -1263,6 +1310,9 @@ DISPATCH = {
         "import": lambda p: act_import(str(p.get("uri", "")).strip(),
                                         str(p.get("sub_name", "")).strip()),
     "build_link": lambda p: act_build_link(p),
+    "node_simple": lambda p: act_node_simple(p),
+    "browser_install": lambda p: act_browser_install(),
+    "panel_restart": lambda p: act_panel_restart(),
     "group_create": lambda p: act_group_create(str(p.get("name", "")).strip()),
     "group_delete": lambda p: act_group_delete(str(p.get("key", "")).strip()),
     "group_rename": lambda p: act_group_rename(str(p.get("key", "")).strip(),
@@ -1917,10 +1967,13 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
     <div class="row"><span class="k">Chromium 运行时</span><span class="v" id="s-chromium">—</span></div>
     <div class="row"><span class="k">浏览器连接数</span><span class="v" id="s-ws">—</span></div>
     <div class="row"><span class="k">Chromium 进程</span><span class="v" id="s-chromium-procs">—</span></div>
+    <div class="row"><span class="k">浏览器</span><span class="v mono" id="s-browser">—</span></div>
     <div class="mode-pick">
       <button id="m-dialer" onclick="setMode('browser_dialer')">启动 Chromium</button>
       <button id="m-normal" onclick="setMode('normal')"
               title="会把当前节点切到普通连接（Xray 自带 TLS）并停掉 Chromium，释放约 890MB">停掉 Chromium</button>
+      <button id="m-browser-install" onclick="installBrowser(this)"
+              title="Browser Dialer 需要浏览器；默认不自动装（几百 MB，且 Debian 上可能是 snap 壳）">安装浏览器</button>
     </div>
     <div class="hint" id="hint-dialer"></div>
   </div>
@@ -2024,6 +2077,17 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   </div>
   <div class="hint">「自动重新分配」只改被别的服务占用的那些端口，不会动正常的。</div>
 </div>
+<div class="card"><h2>网页面板（就是本页）</h2>
+  <div class="hint" style="margin:0 0 10px">这是自研面板，不需要另外下载 Web UI。
+    面板由 <code>xray-client</code> 旁边的独立服务提供；改端口去「端口设置」。</div>
+  <div class="row"><span class="k">访问地址</span><span class="v mono" id="p-url">—</span></div>
+  <div class="row"><span class="k">服务状态</span><span class="v" id="p-state">—</span></div>
+  <div class="bar">
+    <button onclick="panelRestart(this)">重启面板服务</button>
+    <button onclick="load()">刷新状态</button>
+  </div>
+  <div class="hint">重启期间本页会断开几秒，刷新即可回来（令牌不变）。</div>
+</div>
 <div class="card"><h2>连接配置（可直接复制）</h2>
   <div class="hint" style="margin:0 0 10px">在需要代理的设备上使用。所有内容按当前端口实时生成，改端口后点「刷新配置」即可。</div>
   <div class="bar">
@@ -2071,6 +2135,9 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
      <button class="mitem" onclick="pickProto('trojan')">Trojan</button>
      <button class="mitem" onclick="pickProto('shadowsocks')">Shadowsocks</button>
      <button class="mitem" onclick="pickProto('hysteria2')">Hysteria2</button>
+     <div class="mgroup">简易出站（把本机 / 局域网里别的内核当上游）</div>
+     <button class="mitem" onclick="pickSimple('socks')">SOCKS5 <span class="tr">把本机/局域网里的 socks5 口当上游</span></button>
+     <button class="mitem" onclick="pickSimple('http')">HTTP <span class="tr">上游只提供 HTTP 代理时用</span></button>
      <div class="mgroup">直接粘贴</div>
      <button class="mitem" onclick="pickPaste()">分享链接</button>
      <button class="mitem" onclick="pickPaste()">订阅地址</button>
@@ -2102,6 +2169,19 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
        <input id="f-ech" placeholder="客户端 ECH 配置（服务端分享链接里的 ech=…，留空=不用）"></div>
      <div class="mfoot"><button class="sm" onclick="openAdd()">返回</button>
        <button class="pri" onclick="submitNode()">生成并导入</button></div>
+   </div>
+   <div id="add-simple" style="display:none">
+     <div class="mrow"><label>类型</label><span id="s-proto" class="mono"></span></div>
+     <div class="mrow"><label>地址</label><input id="s-host" value="127.0.0.1"
+        placeholder="本机 127.0.0.1；局域网里别的设备填它的 IP"></div>
+     <div class="mrow"><label>端口</label><input id="s-port" inputmode="numeric"
+        placeholder="socks5 常见 1080；http 常见 7890 / 8080"></div>
+     <div class="mrow"><label>用户名</label><input id="s-user" placeholder="留空 = 不认证"></div>
+     <div class="mrow"><label>密码</label><input id="s-pass" placeholder="留空 = 不认证"></div>
+     <div class="mrow"><label>名称</label><input id="s-name" placeholder="留空自动生成，如 SOCKS5-127.0.0.1-1080"></div>
+     <div class="hint" id="s-note"></div>
+     <div class="mfoot"><button class="sm" onclick="openAdd()">返回</button>
+       <button class="pri" onclick="submitSimple()">添加</button></div>
    </div>
    <div id="add-paste" style="display:none">
      <div class="mgroup">把链接、订阅地址、Xray JSON 或 Mihomo YAML 整段贴进来</div>
@@ -2335,6 +2415,7 @@ function go(v){
   document.querySelectorAll('#nav button').forEach(b =>
     b.classList.toggle('on', b.dataset.view === v));
   const t = $('view-title'); if(t) t.textContent = VIEWS[v];
+  renderRuntime();
   try { localStorage.setItem(VIEW_KEY, v); } catch(e){}
   renderTop();
   // 分享页的数据要现查（systemctl is-active + 端口探测），不进 5 秒轮询；
@@ -2345,6 +2426,23 @@ function go(v){
 // 顶栏状态条：Xray / 当前节点 / 出口 IP。
 // 这些值本来在「运行状态」card 里占了一整屏第一位置 —— 但它们是**状态**，
 // 属于应用级信息，应该常驻在顶栏；节点列表才是这一屏的主角。
+// 运行时信息（浏览器 / 面板）—— 放在顶栏渲染里顺带更新，
+// 这样 5 秒轮询会自动把它们刷新，不需要额外的定时器。
+function renderRuntime(){
+  const b = $('s-browser');
+  if (b) {
+    b.textContent = ST.browser_path
+      ? (ST.browser_path + (ST.browser_ver ? '  ' + ST.browser_ver : ''))
+      : '未安装（依赖浏览器拨号的节点会不可用）';
+    b.style.color = ST.browser_path ? '' : 'var(--warn-text)';
+  }
+  const p = document.getElementById('p-url');
+  if (p) p.textContent = location.origin + '/';
+  const ps = $('p-state');
+  if (ps) ps.innerHTML = (ST.services && ST.services.panel && ST.services.panel.active)
+    ? '<span class="dot ok"></span>运行中' : '<span class="dot idle"></span>未运行';
+}
+
 function renderTop(){
   const box = $('top-chips'); if(!box) return;
   const svc = (ST.services||{}).xray || {};
@@ -2921,6 +3019,19 @@ async function sharePreview(btn){
   $('sh-preview-note').textContent = d.url + ' → ' + d.bytes + ' 字节，' + d.note;
 }
 
+// 浏览器运行时：面板只显示状态 + 给一个"装"的按钮。
+// 为什么不自动装：几百 MB，而且 Debian 的 chromium 包可能是 snap 壳
+// （装完也起不来）—— 用户点了才算明确同意。
+function installBrowser(btn){
+  if (!confirm('将用系统包管理器安装 Chromium（几百 MB）。继续？')) return;
+  post('browser_install', {}, '正在安装浏览器（可能要几分钟）…', btn);
+}
+
+function panelRestart(btn){
+  if (!confirm('重启面板服务？本页会断开几秒，刷新即可回来。')) return;
+  post('panel_restart', {}, '正在重启面板…', btn);
+}
+
 async function loadConn(btn){
   // ★ 这里**不能**用 post(): 它会把返回的 message 原样显示在页面顶部。
   //   conninfo 的 message 是整份配置的 JSON（好几百字符），于是每次打开面板
@@ -3136,7 +3247,7 @@ const ADD = {proto:''};
 
 function openAdd(){
   $('add-modal').classList.add('show');
-  ['add-menu','add-form','add-paste','add-qr','add-pull'].forEach(i=>$(i).style.display = (i==='add-menu')?'':'none');
+  ['add-menu','add-form','add-simple','add-paste','add-qr','add-pull'].forEach(i=>$(i).style.display = (i==='add-menu')?'':'none');
 }
 function closeAdd(){ $('add-modal').classList.remove('show'); }
 
@@ -3197,7 +3308,7 @@ function pickPreset(id){
 
 function pickProto(p){
   ADD.proto = p;
-  ['add-menu','add-form','add-paste','add-qr','add-pull'].forEach(i=>$(i).style.display = (i==='add-form')?'':'none');
+  ['add-menu','add-form','add-simple','add-paste','add-qr','add-pull'].forEach(i=>$(i).style.display = (i==='add-form')?'':'none');
   $('f-proto').textContent = p;
   $('f-cred').innerHTML = (p==='vless'||p==='vmess')
     ? row('UUID', `<input id="f-uuid" placeholder="${p==='vmess'?'VMess UUID':'VLESS UUID'}">`)
@@ -3252,10 +3363,33 @@ function renderFields(){
   $('f-security-fields').innerHTML = '';
 }
 
+// 简易出站：把本机/局域网里别的内核当上游。
+// 与 M/SB 同一功能；提示里把两个最常见的坑写清楚（监听地址不是连接目标、
+// 别指向本机自己的入口）。
+function pickSimple(proto){
+  ADD.simple = proto;
+  show1('add-simple');
+  const P = $('s-proto'); if (P) P.textContent = (proto === 'http' ? 'HTTP' : 'SOCKS5');
+  const port = $('s-port');
+  if (port) port.placeholder = proto === 'http' ? '常见 7890 / 8080' : '常见 1080';
+  const note = $('s-note');
+  if (note) note.textContent = '方向是"本客户端连出去"：把另一个内核的代理口当上游用。'
+    + '注意 0.0.0.0 是监听地址，不能当目标；也别填本客户端自己的入口端口（会死循环）。';
+}
+
+async function submitSimple(btn){
+  const v = id => { const e = $(id); return e ? e.value.trim() : ''; };
+  const j = await post('node_simple', {
+    proto: ADD.simple || 'socks', host: v('s-host') || '127.0.0.1',
+    port: v('s-port'), username: v('s-user'), password: v('s-pass'), name: v('s-name')
+  }, '正在添加简易出站…', btn);
+  if (j.ok) { closeAdd(); load(); }
+}
+
 function pickPaste(){ show1('add-paste'); $('add-sub-name-row').style.display=''; }
 function pickQR(){ show1('add-qr'); }
 function pickPull(){ show1('add-pull'); }
-function show1(id){ ['add-menu','add-form','add-paste','add-qr','add-pull'].forEach(i=>$(i).style.display = (i===id)?'':'none'); }
+function show1(id){ ['add-menu','add-form','add-simple','add-paste','add-qr','add-pull'].forEach(i=>$(i).style.display = (i===id)?'':'none'); }
 
 function collect(){
   const v = id => { const e=$(id); return e ? e.value.trim() : ''; };

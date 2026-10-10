@@ -173,20 +173,21 @@ share_service_menu() {
         local port st="未运行"
         port=$(share_port)
         xapi health >/dev/null 2>&1 && st="运行中"
-        cat >&2 <<EOF
-  当前状态: $st    端口 $port
-  说明: 这是 **M/SB/X 共用的公共基础服务**, 本面板只能确保它在位, 不能停它
-        (停掉会连带打断另外两个内核已经发出去的链接)
-
-  1) 确保在位 (安装 / 修复)
-  2) 启动 / 重启      (仅当未运行; 不动数据)
-  3) 查看状态
-  4) 各内核分享统计
-  5) 升级服务代码
-  6) 检查防火墙放行
-  0) 返回
-EOF
-        printf "  选择: " >&2
+        printf '\n' >&2
+        ui_title "分享服务（公共基础服务）"
+        ui_kv "当前状态" "$st"
+        ui_kv "端口" "$port"
+        ui_hint "三个内核共用的基础服务：本面板只确保它在位，不提供停止"
+        ui_hint "（停掉会连带打断另外两个内核已经发出去的链接）"
+        echo >&2
+        ui_menu 1 "确保在位        安装 / 修复"
+        ui_menu 2 "启动 / 重启     仅当未运行时；不动数据"
+        ui_menu 3 "查看状态"
+        ui_menu 4 "各内核分享统计"
+        ui_menu 5 "升级服务代码"
+        ui_menu 6 "检查防火墙放行"
+        ui_menu 0 "返回"
+        printf '\n  请选择: ' >&2
         read -r c || return 0
         case "$c" in
             1) ensure_share ;;

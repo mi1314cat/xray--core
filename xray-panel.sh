@@ -196,84 +196,232 @@ _srv_clear() {
   if [ -t 1 ] && [ -n "${TERM:-}" ]; then clear; fi
 }
 
-show_menu() {
-    # 获取服务状态
-    xrayls_server_status=$(systemctl is-active xrayls.service 2>/dev/null || echo "inactive")
-
-    # 生成状态文本
-    if [[ "$xrayls_server_status" == "active" ]]; then
-        xrayls_server_status_text="${GREEN}启动${PLAIN}"
-    else
-        xrayls_server_status_text="${RED}未启动${PLAIN}"
+# 面板排版用的 ui_* 在 conf/lib/print.sh 里（与子菜单脚本共用一套）。
+# 拿不到就退化成朴素输出 —— 排版失败不该让整个面板打不开。
+_xray_load_ui() {
+    local self f
+    self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    if [[ -r "$self/conf/lib/print.sh" ]]; then
+        # shellcheck source=/dev/null
+        source "$self/conf/lib/print.sh"
+        return 0
     fi
+    f=$(xray_fetch "conf/lib/print.sh" 2>/dev/null) && source "$f" && return 0
+    return 1
+}
+if ! _xray_load_ui || ! declare -F ui_menu >/dev/null 2>&1; then
+    # 兜底：只有最朴素的版本，但菜单不会因此消失
+    ui_rule() { printf '%s\n' "----------------------------------------" >&2; }
+    ui_title() { ui_rule; printf ' %s\n' "$1" >&2; ui_rule; }
+    ui_sec()  { printf '\n %s\n' "$1" >&2; }
+    ui_menu() { printf '  %2s) %s\n' "$1" "$2" >&2; }
+    ui_hint() { printf '  %s\n' "$1" >&2; }
+    ui_tip()  { printf '  提示: %s\n' "$1" >&2; }
+    ui_invalid() { printf '  无效选项: %s\n' "$1" >&2; }
+    ui_pause() { printf '\n'; read -r -p "  按回车返回..." _ || true; }
+    ui_banner() { printf '\n   catmi.xrayls\n\n' >&2; }
+    ui_kv() { printf '   %s: %s\n' "$1" "$2" >&2; }
+    ui_pad() { printf '%s' "$1"; }
+fi
 
-    # 使用单引号和here-doc格式避免转义问题
+# 建节点之前问一次"服务器标识（节点名前缀）"（旗帜由 naming 负责）。
+_srv_ask_name() {
+    xray_ensure_lib >/dev/null 2>&1
+    local lib="$_XRAY_CACHE/lib/naming.sh"
+    [[ -f "$lib" ]] || return 0
+    # shellcheck disable=SC1090
+    ( source "$lib" && x_ask_server_name ) || true
+}
+
+# ---------------------------------------------------------------- 状态取值
+# 菜单每操作一步都会重画, 这三个值必须**便宜**: 不走网络、不调 python。
+xray_panel_version() {   # 内核版本（拿不到就空）
+    local bin="${INSTALL_DIR:-/root/catmi/xray}/xrayls"
+    [[ -x "$bin" ]] || bin="/root/catmi/xray/xrayls"
+    [[ -x "$bin" ]] || return 0
+    "$bin" version 2>/dev/null | head -1 | awk '{print $2}'
+}
+xray_node_count() {      # 节点片段数（含 inbounds 的 JSON）
+    local dir="${CONF_DIR:-/root/catmi/xray/conf}"
+    [[ -d "$dir" ]] || { printf '0'; return 0; }
+    grep -l '"inbounds"' "$dir"/*.json 2>/dev/null | wc -l | tr -d ' '
+}
+
+# ---------------------------------------------------------------- 子菜单
+# 把 21 项平铺收成 5 组。用户的原话是"这一列太多了, 那两个内核都把功能分开"。
+# 每组里的项仍是原来那些脚本, 只是不再堆在同一列里。
+_route_menu_dispatch() {
+    case "$1" in
+        1) xray_run conf/outbound.sh ;;
+        2) xray_run conf/split.sh ;;
+        3) reverse_menu ;;
+        *) return 1 ;;
+    esac
+}
+
+route_menu() {
+    local c
+    while :; do
+        _srv_clear; ui_title "路由与出站"
+        ui_menu 1 "出站管理        自建/外部出站（direct / reject / socks5 / http）"
+        ui_menu 2 "分流规则管理    按域名 / IP 决定走哪个出站"
+        ui_menu 3 "反向代理管理    家宽落地与回连侧"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
+            0|"") return 0 ;;
+            *) _route_menu_dispatch "$c" || ui_invalid "$c" ;;
+        esac
+        ui_pause
+    done
+}
+
+kernel_menu() {
+    local c
+    while :; do
+        _srv_clear; ui_title "安装 / 更新内核"
+        local v; v=$(xray_panel_version)
+        ui_kv "当前版本" "${v:-未安装}"
+        echo >&2
+        ui_menu 1 "安装 / 更新     自动检测版本：旧版升级，已是最新则跳过"
+        ui_menu 2 "回退内核        列出版本备份并切换（更新失败时的退路）"
+        ui_menu 3 "卸载内核        只删本工具装的那一份，不动系统其它 xray"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
+            0|"") return 0 ;;
+            1) run_xray_install ;;
+            2) run_xray_rollback ;;
+            3) xray_run uninstall_xray.sh ;;
+            *) ui_invalid "$c" ;;
+        esac
+        ui_pause
+    done
+}
+
+service_menu() {
+    local c
+    while :; do
+        _srv_clear; ui_title "服务与配置"
+        ui_menu 1 "查询服务状态    systemctl status xrayls"
+        ui_menu 2 "校验配置并重载  合并 → 字段 → 内核三道关，过了才重启"
+        ui_menu 3 "查看客户端配置  当前生效的入站、端口与分享内容"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
+            0|"") return 0 ;;
+            1) systemctl status xrayls --no-pager ;;
+            2) xray_run conf/verify.sh ;;
+            3) show_xray_configs ;;
+            *) ui_invalid "$c" ;;
+        esac
+        ui_pause
+    done
+}
+
+maint_menu() {
+    local c
+    while :; do
+        _srv_clear; ui_title "自检与体检"
+        ui_menu 1 "能力自检        通用能力校验（有内核时另跑协议链路）"
+        ui_menu 2 "端口体检        占用 / 冲突 / 放行建议"
+        ui_menu 3 "配置片段体检    逐个片段 JSON 合法性"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
+            0|"") return 0 ;;
+            1) xray_run tools/check_libs.sh ;;
+            2) xray_run tools/port-check.sh ;;
+            3) _srv_check_fragments ;;
+            *) ui_invalid "$c" ;;
+        esac
+        ui_pause
+    done
+}
+
+# 片段体检：坏一个片段 xrayls 就起不来, 而这在面板上完全看不出来。
+_srv_check_fragments() {
+    local dir="${CONF_DIR:-/root/catmi/xray/conf}" f bad=0 n=0
+    [[ -d "$dir" ]] || { warn "配置目录不存在: $dir"; return 1; }
+    for f in "$dir"/*.json; do
+        [[ -f "$f" ]] || continue
+        n=$((n + 1))
+        if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$f" 2>/dev/null; then
+            :
+        else
+            bad=$((bad + 1)); err "$(basename "$f") 不是合法 JSON"
+        fi
+    done
+    (( bad == 0 )) && ok "全部 $n 个片段都是合法 JSON" || err "$bad / $n 个片段有问题"
+    return $(( bad > 0 ))
+}
+
+show_menu() {
+    local st st_txt xver nnodes
+    st=$(systemctl is-active xrayls.service 2>/dev/null || echo inactive)
+    if [[ "$st" == "active" ]]; then st_txt="${_GRN}● 启动${_RST}"; else st_txt="${_RED}○ 未启动（$st）${_RST}"; fi
+    xver=$(xray_panel_version 2>/dev/null || true)
+    nnodes=$(xray_node_count 2>/dev/null || echo 0)
+
     _srv_clear
-    cat << "EOF"
+    ui_banner "catmi.xrayls"
+    ui_title "xrayls 管理脚本"
+    ui_kv "服务状态" "$st_txt"
+    ui_kv "内核版本" "${xver:-未知}"
+    ui_kv "节点数量" "$nnodes"
+    echo >&2
 
-                       |\__/,|   (\
-                     _.|o o  |_   ) )
-       -------------(((---(((-------------------
-                   catmi.xrayls
-       -----------------------------------------
-
-EOF
-    echo -e "
-${GREEN}xrayls 管理脚本${PLAIN}
-----------------------
-${GREEN}1.${PLAIN} 安装/更新 xray（自动检测版本：旧版升级、最新则跳过）
-${GREEN}1b.${PLAIN} 回退内核（列出版本备份并切换）
-${GREEN}2.${PLAIN} 卸载 xray
-${GREEN}3.${PLAIN} 查看客户端配置
-${GREEN}4.${PLAIN} 查询服务状态
-${GREEN}5.${PLAIN} 添加节点
-${GREEN}6.${PLAIN} 校验配置/重启服务
-${GREEN}7.${PLAIN} 出站管理（outbound）
-${GREEN}8.${PLAIN} 分流规则管理（split）
-${GREEN}9.${PLAIN} 反向代理管理（reverse）
-${GREEN}10.${PLAIN} 分享管理（share）
-${GREEN}11.${PLAIN} 节点管理（node）
-${GREEN}12.${PLAIN} 自检（校验通用能力）
-${GREEN}13.${PLAIN} DNS 管理（dns）
-${GREEN}14.${PLAIN} 日志（logs）
-${GREEN}15.${PLAIN} 预置建节点（mknode）
-${GREEN}16.${PLAIN} 预置批量生成（preset_batch）
-${GREEN}17.${PLAIN} 证书管理（cert）
-${GREEN}18.${PLAIN} Nginx 站点管理（nginx_site）
-${GREEN}19.${PLAIN} 分享服务（share_service）
-    ${GREEN}20.${PLAIN} 端口体检（port_check）
-${GREEN}0.${PLAIN} 退出脚本
-----------------------
-xrayls 服务状态: ${xrayls_server_status_text}
-----------------------"
+    ui_sec "节点"
+    ui_menu 1 "添加节点        单协议 / 全协议一键生成 / 预置档位"
+    ui_menu 2 "节点管理        列出 / 查看 / 改名 / 删除 / 改端口"
+    ui_menu 3 "路由与出站      出站 / 分流规则 / 反向代理"
+    echo >&2
+    ui_sec "分享"
+    ui_menu 4 "分享管理        生成 / 列表 / 启停 / 改次数 / 改有效期"
+    ui_menu 5 "分享服务        公共基础服务（安装 / 升级 / 状态）"
+    echo >&2
+    ui_sec "站点与证书"
+    ui_menu 6 "证书管理        申请 / 续期 / 同步 / 信任链体检"
+    ui_menu 7 "Nginx 站点管理  列出 / 校验 / 摘除 / CDN 回源"
+    echo >&2
+    ui_sec "内核与服务"
+    ui_menu 8 "安装 / 更新内核  含回退到旧版本、卸载"
+    ui_menu 9 "服务与配置      查询状态 / 校验并重载 / 查看客户端配置"
+    echo >&2
+    ui_sec "维护"
+    ui_menu 10 "DNS 管理        解析模式 / 加密 DNS / 防泄漏"
+    ui_menu 11 "日志            实时 / 错误 / 清空 / 最近"
+    ui_menu 12 "自检与体检      通用能力自检 / 端口体检"
+    ui_menu 0 "退出"
+    echo >&2
+    ui_hint "回车 = 退出；每一项都能单独跑: bash conf/<名字>.sh"
+    printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
 
     # 同理: 按键用尽时退出, 不要拿空 choice 反复重画
     read -r -p "请输入选项 [0-9]: " choice || exit 0
 
     case "${choice}" in
-        0) _srv_clear; exit 0 ;;
-        1) run_xray_install ;;
-        1b|1B) run_xray_rollback ;;
-        2) xray_run uninstall_xray.sh ;;
-        3) show_xray_configs ;;
-        4) systemctl status xrayls --no-pager ;;
-        5) _xray_ask_server_name; add_node_menu; share_refresh_hook ;;
-        6) xray_run conf/verify.sh ;;
-        7) xray_run conf/outbound.sh ;;
-        8) xray_run conf/split.sh ;;
-        9) reverse_menu ;;
-        10) xray_run conf/share.sh ;;
-        11) _xray_ask_server_name; xray_run conf/node.sh; share_refresh_hook ;;
-        12) xray_run tools/check_libs.sh ;;
-        13) xray_run conf/dns.sh ;;
-        14) xray_run conf/logs.sh ;;
-        15) _xray_ask_server_name; xray_run conf/mknode.sh; share_refresh_hook ;;
-        16) xray_run tools/preset_batch.sh --help; share_refresh_hook ;;
-        17) xray_run conf/cert.sh ;;
-        18) xray_run conf/nginx_site.sh ;;
-        19) xray_run conf/share_service.sh menu ;;
-        20) xray_run tools/port-check.sh ;;
-
+        0|"") _srv_clear; exit 0 ;;
+        1) _srv_ask_name; add_node_menu; share_refresh_hook ;;
+        2) _srv_ask_name; xray_run conf/node.sh; share_refresh_hook ;;
+        3) route_menu ;;
+        4) xray_run conf/share.sh ;;
+        5) xray_run conf/share_service.sh menu ;;
+        6) xray_run conf/cert.sh ;;
+        7) xray_run conf/nginx_site.sh ;;
+        8) kernel_menu ;;
+        9) service_menu ;;
+        10) xray_run conf/dns.sh ;;
+        11) xray_run conf/logs.sh ;;
+        12) maint_menu ;;
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac
 
@@ -291,26 +439,25 @@ xrayls 服务状态: ${xrayls_server_status_text}
 
 # 反向代理管理子菜单（reverse）
 reverse_menu() {
-    while true; do
+    local c
+    while :; do
         _srv_clear
-        echo -e "
-${GREEN}反向代理管理 (reverse)${PLAIN}
-----------------------
-${GREEN}1.${PLAIN} 服务端管理（xrayserver-reverse，运行在家/入口侧）
-${GREEN}2.${PLAIN} 客户端管理（xrayclient-reverse，运行在RN/回连侧）
-${GREEN}0.${PLAIN} 返回主菜单
-----------------------"
-        # EOF 当退出, 否则按键用尽后无限重画子菜单
-        read -r -p "请输入选项 [0-2]: " rc || return
-        case "${rc}" in
+        ui_title "反向代理管理"
+        ui_hint "把家宽/内网的入口侧与回连侧接起来，两个脚本各跑在对应那一端"
+        echo >&2
+        ui_menu 1 "服务端管理    xrayserver-reverse（跑在家宽 / 入口侧）"
+        ui_menu 2 "客户端管理    xrayclient-reverse（跑在回连侧）"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
             1) xray_run conf/fd/xrayserver-reverse.sh ;;
             2) xray_run conf/fd/xrayclient-reverse.sh ;;
-            0) return ;;
-            *) echo -e "${RED}无效的选项 ${rc}${PLAIN}" ;;
+            0|"") return 0 ;;
+            *) ui_invalid "$c" ;;
         esac
-        echo
-        read -r -p "按回车键返回子菜单..." _ || return
-        echo
+        ui_pause
     done
 }
 
@@ -376,51 +523,36 @@ show_xray_configs() {
     done
 }
 
-# 建节点之前问一次"服务器标识（节点名前缀）"。
-#
-# ★ 为什么挂在这里: 菜单 5 / 11 / 15 是三个不同的建节点入口, 各自是一堆
-#   独立脚本。在每个协议脚本里问一遍要改十几个文件, 而且用户会被反复问;
-#   挂在菜单入口上就是"每台机器问一次", 答案落盘到 share-state/server-name,
-#   之后所有节点(含批量)都用它。
-#
-#   对照 sing-box-core: 它的 sb_ask_server_name_hook 挂在 ask_server_addr
-#   后面, 同样是一次接入全覆盖。
-_xray_ask_server_name() {
-    xray_ensure_lib >/dev/null 2>&1
-    local lib="$_XRAY_CACHE/lib/naming.sh"
-    [[ -f "$lib" ]] || return 0
-    # shellcheck disable=SC1090
-    ( source "$lib" && x_ask_server_name ) || true
-}
-
 add_node_menu() {
-    _srv_clear
-    echo -e "
-${GREEN}添加节点${PLAIN}
-----------------------
-${GREEN}1.${PLAIN} 添加 Tunnel 节点
-${GREEN}2.${PLAIN} 添加 Hysteria2 节点
-${GREEN}3.${PLAIN} 添加 SOCKS5 节点（无加密）
-${GREEN}4.${PLAIN} 添加 VLESS-ECN 节点（tcp传输）
-${GREEN}5.${PLAIN} 添加 HTTP 节点（无加密）
-${GREEN}6.${PLAIN} 添加 VLESS-xHTTP TLS 节点
-${GREEN}7.${PLAIN} 添加 Reality 节点（vision + ML-KEM-768，最高配置）
-${GREEN}8.${PLAIN} 添加 Shadowsocks-2022 节点（aes-256-gcm，最高配置）
-${GREEN}9.${PLAIN} 添加 Trojan 节点（Reality 安全层，最高配置）
+    local c
+    while :; do
+        _srv_clear
+        ui_title "添加节点"
+        ui_sec "单协议"
+        ui_menu 1 "Tunnel"
+        ui_menu 2 "Hysteria2"
+        ui_menu 3 "SOCKS5（无加密，接其它内核/本机代理用）"
+        ui_menu 4 "HTTP（无加密，同上）"
+        ui_menu 5 "VLESS-ECN（tcp 传输 + ML-KEM-768）"
+        ui_menu 6 "VLESS-xHTTP（TLS，走 CDN 首选）"
+        ui_menu 7 "Reality（vision + ML-KEM-768，最高配置）"
+        ui_menu 8 "Shadowsocks-2022（aes-256-gcm，最高配置）"
+        ui_menu 9 "Trojan（REALITY 安全层，最高配置）"
+        echo >&2
+        ui_sec "Argo 隧道"
+        ui_menu 10 "固定 Argo（域名固定，推荐）"
+        ui_menu 11 "临时 Argo（每次随机域名）"
+        echo >&2
+        ui_sec "批量与预置"
+        ui_menu 12 "全协议一键生成    自动分配端口，统一校验，只重载一次"
+        ui_menu 13 "预置档位建节点    25 个预置（协议 × TLS × 传输）任选"
+        ui_menu 14 "预置批量生成      一次生成多个（支持 vless:2 trojan:3）"
+        ui_menu 0 "返回主菜单"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r nchoice || return 0
+        case "${nchoice}" in
 
----------------------- Argo 节点 ----------------------
-${GREEN}10.${PLAIN} 添加 固定 Argo 节点
-${GREEN}11.${PLAIN} 添加 临时 Argo 节点
-
-------------- Batch Generator -------------
-${GREEN}12.${PLAIN} 全协议一键生成（自动端口，统一校验，仅 reload 一次）
-
-${GREEN}0.${PLAIN} 返回主菜单
-----------------------"
-
-    read -r -p "请输入选项 [0-12]: " nchoice || return
-
-    case "${nchoice}" in
         0) return ;;
 
         1)
@@ -483,12 +615,14 @@ ${GREEN}0.${PLAIN} 返回主菜单
             xray_run conf/batch.sh
             ;;
 
+        13) xray_run conf/mknode.sh ;;
+        14) xray_run tools/preset_batch.sh --help ;;
         *)
-            echo -e "${RED}无效的选项${PLAIN}"
+            ui_invalid "$nchoice"
             ;;
-    esac
-
-    return
+        esac
+        ui_pause
+    done
 }
 
 # 主程序循环。show_menu 内部在 EOF 时 exit, 所以不会无限刷屏。

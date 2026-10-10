@@ -2452,6 +2452,100 @@ if [[ -f "$CL_ACT" ]]; then
     fi
 fi
 
+# ---------------------------------------------------------------- 客户端新增能力
+# 简易出站（把别的内核当上游）+ 浏览器运行时 + 面板自管理。
+# 三件都是"功能存在但用户点不到/装不上"的那一类，所以要真的验到路径上。
+group "简易出站 / 浏览器运行时"
+CL_NODE="$ROOT/Client/lib/node.py"
+CL_GEN="$ROOT/Client/lib/genconfig.py"
+CL_CMP="$ROOT/Client/lib/compat.py"
+if [[ -f "$CL_NODE" ]]; then
+    # 1) 三种防护：监听地址、非法端口、类型 —— 都给拦住（M/SB 都是这些坑）
+    GUARD=$(python3 - "$ROOT" <<'PY'
+import importlib.util, sys, os
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+import node as N
+out = []
+for args in (("ftp", "h", 1), ("socks", "0.0.0.0", 1), ("socks", "h", 0),
+             ("socks", "h", 70000), ("socks", "", 1080)):
+    try:
+        N.simple_node(*args); out.append("MISS:" + str(args))
+    except ValueError:
+        pass
+n = N.simple_node("socks", "127.0.0.1", 1080)
+print("OK" if not out else "BAD " + " ".join(out))
+print(n["name"], n["protocol"], n["security"], n["transport"])
+PY
+)
+    assert_eq "$(printf '%s' "$GUARD" | head -1)" "OK" "简易出站拦住非法输入（类型/监听地址/端口）"
+    assert_eq "$(printf '%s' "$GUARD" | tail -1)" "SOCKS5-127.0.0.1-1080 socks none tcp" \
+        "简易出站默认名与字段（对齐 M/SB 的 SOCKS5-地址-端口）"
+
+    # 2) 生成配置里真的是 socks/http 出站，且**不带** streamSettings
+    GEN=$(python3 - "$ROOT" <<'PY'
+import json, os, subprocess, sys, tempfile
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+import node as N
+out = []
+for proto, port, u, p in (("socks", 1080, "", ""), ("http", 7890, "u", "p")):
+    n = N.simple_node(proto, "127.0.0.1", port, u, p)
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(n, f); f.close()
+    o = tempfile.mktemp(suffix=".json")
+    r = subprocess.run(["python3", os.path.join(root, "Client", "lib", "genconfig.py"),
+                        "--node", f.name, "--output", o, "--mode", "normal",
+                        "--listen", "127.0.0.1", "--port-normal", "1080", "--dns",
+                        "standard", "--family", "auto", "--logs", "/tmp"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        out.append(proto + ":FAIL"); continue
+    ob = [x for x in json.load(open(o))["outbounds"] if x.get("tag") == "proxy"][0]
+    ok = (ob["protocol"] == proto and "servers" in ob["settings"]
+          and "streamSettings" not in ob)
+    out.append(proto + (":OK" if ok else ":BAD"))
+    os.unlink(o); os.unlink(f.name)
+print(" ".join(out))
+PY
+)
+    assert_eq "$GEN" "socks:OK http:OK" "简易出站生成的是 socks/http 出站（无 streamSettings）"
+
+    # 3) 能力判定：认它可用，且浏览器拨号的说明是"不适用"而不是通用那句
+    CAP=$(python3 - "$ROOT" <<'PY'
+import os, sys
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+import compat
+r = compat.check_all({"protocol": "socks", "address": "127.0.0.1", "port": 1080})
+items = {c["item"]: c["verdict"] for c in r["xray"]["checks"]}
+dialer = [c["detail"] for c in r["dialer"]["checks"] if c["item"] == "浏览器拨号"]
+print(r.get("can_use_xray"), items.get("传输"), items.get("安全"),
+      "不适用" if dialer and "不适用" in dialer[0] else "通用原因")
+PY
+)
+    assert_eq "$CAP" "True SUPPORTED SUPPORTED 不适用" "能力判定：简易出站可用、拨号原因专门说明"
+fi
+
+if [[ -f "$ROOT/Client/lib/actions.sh" ]]; then
+    for pair in "CLI 有 node simple|cmd_node_simple" \
+                "分发接线 node simple|simple|local)" \
+                "自环检查认本机 LAN IP|就是本客户端自己的入口" \
+                "监听地址被拦|是**监听**地址" \
+                "浏览器状态命令|xbd_browser_status" \
+                "浏览器安装命令|xbd_browser_install" \
+                "面板子命令（重启/停）|xbd_panel_service" \
+                "落盘路径与导入共用|_xbd_node_save_json"; do
+        panel_has "$ROOT/Client/lib/actions.sh" "${pair#*|}" "${pair%%|*}"
+    done
+    # 面板里也要有入口（点得到才算有）
+    panel_has "$ROOT/Client/lib/web/panel.py" 'id="add-simple"' "面板弹窗有简易出站表单"
+    panel_has "$ROOT/Client/lib/web/panel.py" '"node_simple"' "面板有 node_simple 动作"
+    panel_has "$ROOT/Client/lib/web/panel.py" '"browser_install"' "面板有安装浏览器动作"
+    panel_has "$ROOT/Client/lib/web/panel.py" '"panel_restart"' "面板能重启自己"
+    panel_has "$ROOT/Client/lib/web/panel.py" 'id="p-url"' "配置页有网页面板卡片"
+fi
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

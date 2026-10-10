@@ -33,7 +33,9 @@ UNKNOWN = "UNKNOWN"
 #   http socks freedom dns blackhole loopback
 #   （dokodemo-door / tun 是入站专用，不能做出站）
 # 我们这里只关心"能当节点用的代理协议"，所以只列代理类。
-XRAY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2"}
+XRAY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks", "hysteria2",
+                  # 简易出站：把本机/局域网里别的内核当上游（见 xbd node simple）
+                  "socks", "http"}
 
 # 传输方式：官方 transport.md 的 method 取值 —— raw|xhttp|mkcp|grpc|websocket|httpupgrade|hysteria
 # 实测（v26.3.27）method 还接受这些别名与遗留值：
@@ -200,7 +202,8 @@ def check_xray(node: dict) -> dict:
         return _pack(checks, notes)
 
     if proto in XRAY_PROTOCOLS:
-        label = {"shadowsocks": "Shadowsocks", "hysteria2": "Hysteria2"}.get(proto, proto.upper())
+        label = {"shadowsocks": "Shadowsocks", "hysteria2": "Hysteria2",
+                 "socks": "SOCKS5（简易出站）", "http": "HTTP（简易出站）"}.get(proto, proto.upper())
         add("协议", OK, label)
     else:
         add("协议", NO, f"{proto} 不在本 Xray 版本的出站协议里")
@@ -226,7 +229,19 @@ def check_xray(node: dict) -> dict:
                          f'多出站时一个节点就能让整份配置起不来。'
                          f'可用：{FP_HINT}')
 
-    if proto in ("vless", "vmess") and not node.get("uuid"):
+    if proto in ("socks", "http"):
+        # 上游代理可以不开认证。写了用户名就必须有密码（反之亦然）——
+        # 只填一个的话内核会拿空密码去认证，报错还很难懂。
+        _u = (node.get("username") or "").strip()
+        _p = (node.get("password") or "").strip()
+        if _u and not _p:
+            add("凭据", WARN, "填了用户名但没填密码")
+            notes.append("很多本地代理是「用户名+密码」一起校验；只填一个通常会认证失败。")
+        elif _u:
+            add("凭据", OK, f"用户名 {_u}")
+        else:
+            add("凭据", OK, "无需认证")
+    elif proto in ("vless", "vmess") and not node.get("uuid"):
         add("凭据", NO, "缺少 UUID")
     elif proto in ("trojan", "hysteria2") and not node.get("password"):
         add("凭据", NO, "缺少密码")
@@ -239,7 +254,11 @@ def check_xray(node: dict) -> dict:
     # 不归一化的话**每个普通 TCP 节点**都会被误报"未在本版本确认"（实测过），
     # 而且同一个节点在 check_xray 与 check_dialer 里会得到互相矛盾的结论。
     transport = canon_transport(node.get("transport") or "")
-    if proto == "hysteria2":
+    if proto in ("socks", "http"):
+        # 简易出站没有传输层（不支持 TLS/WS/XHTTP —— 上游是什么就是什么）。
+        # 按传输白名单去判它会得到"传输不支持"这种莫名其妙的结论。
+        add("传输", OK, "无（本地代理跳，传输由上游决定）")
+    elif proto == "hysteria2":
         add("传输", OK, "hysteria（原生 QUIC 传输）")
     elif transport in XRAY_TRANSPORTS:
         add("传输", OK, transport)
@@ -247,6 +266,12 @@ def check_xray(node: dict) -> dict:
         add("传输", NO, f"{transport or '未知'} 不在本 Xray 版本支持的传输里")
         notes.append("本版本支持的传输：raw / xhttp / mkcp / grpc / websocket / httpupgrade / hysteria。"
                      "h2、h3、http、quic、gun 等已被 26.x 移除，写了会让整个实例起不来。")
+        return _pack(checks, notes)
+
+    if proto in ("socks", "http"):
+        add("安全", OK, "无（明文本地跳；要加密请在上游那端开）")
+        if node.get("flow"):
+            add("flow", WARN, "简易出站没有 flow")
         return _pack(checks, notes)
 
     security = (node.get("security") or "none").lower()
@@ -305,6 +330,16 @@ def check_dialer(node: dict) -> dict:
     addr = (node.get("address") or "").strip()
     sni = (node.get("sni") or "").strip()
     host = (node.get("host") or "").strip()
+
+    if proto in ("socks", "http"):
+        # 简易出站没有传输层，浏览器拨号对它**不适用**（也不需要）——
+        # 不能沿用"要求传输是 ws/xhttp"那句通用原因，那会让人以为配错了。
+        add("类型", OK, "本地代理跳（socks/http 出站）")
+        add("浏览器拨号", WARN, "不适用：它没有传输层，本来就是直连上游口")
+        notes.append("浏览器拨号是给「代理协议 + ws/xhttp 传输」用的；"
+                     "简易出站走的是本机/局域网的代理口，用不用它都一样。"
+                     "该节点仍可正常使用。")
+        return _pack(checks, notes)
 
     # 实测优先：配置层面"合法"不等于"能通"。实测过两种判定覆盖不到的情况：
     #   * 同一套 ws 配置，8nm3ai 这台服务器浏览器路径可用、cswdcsdcw 不行 —— 配置一模一样；

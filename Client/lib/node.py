@@ -833,6 +833,56 @@ def auto_name(proto: str, security: str = "", existing=(), transport: str = "") 
     return tag
 
 
+# ---------------------------------------------------------------- 简易出站
+#
+# 把本机 / 局域网里别的内核当上游：socks5 或 http 代理。
+# 与订阅导入的节点**同构**（同一份状态模型），所以配置生成、能力检查、
+# 面板列表全都不需要为新类型写分支。
+SIMPLE_PROTOCOLS = {"socks": "SOCKS5", "http": "HTTP"}
+
+
+def simple_node(proto: str, host: str, port: int, username: str = "",
+                password: str = "", name: str = "") -> dict:
+    """构造一个简易出站节点。
+
+    默认名对齐另外两个内核：`SOCKS5-127.0.0.1-1080` / `HTTP-127.0.0.1-7890`
+    —— 名字里带类型和地址端口，列表里一眼知道它指向哪。
+    """
+    p = (proto or "").strip().lower()
+    p = {"socks5": "socks", "socks5h": "socks", "https": "http"}.get(p, p)
+    if p not in SIMPLE_PROTOCOLS:
+        raise ValueError("类型只能是 socks 或 http（得到 %r）" % proto)
+    host = (host or "").strip()
+    if not host:
+        raise ValueError("目标地址不能为空")
+    if host in ("0.0.0.0", "::"):
+        # 监听地址不是连接目标；这里挡住，别让它变成"连不上又看不出原因"
+        raise ValueError("%s 是监听地址，不能当连接目标（本机请填 127.0.0.1）" % host)
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise ValueError("端口必须是数字")
+    if not (1 <= port <= 65535):
+        raise ValueError("端口必须在 1-65535")
+
+    n = new_node()
+    n.update({
+        "name": (name or "").strip() or "%s-%s-%d" % (SIMPLE_PROTOCOLS[p], host, port),
+        "protocol": p,
+        "address": host,
+        "port": port,
+        "username": (username or "").strip(),
+        "password": (password or "").strip() if (username or "").strip() else "",
+        # 简易出站没有传输层与安全层（明文本地跳），显式写死，免得后面
+        # 被 build_stream 当成普通节点去拼 streamSettings。
+        "transport": "tcp",
+        "transport_raw": "tcp",
+        "security": "none",
+        "source": "local-proxy",
+    })
+    return n
+
+
 def build_link(node: dict) -> str:
     """把统一模型节点拼成分享链接。
 

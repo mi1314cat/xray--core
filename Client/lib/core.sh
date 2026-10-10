@@ -163,7 +163,10 @@ conn_count() { ss -tnH 2>/dev/null | grep -c "$1" || true; }
 
 unit_active()  { systemctl is-active  --quiet "$1" 2>/dev/null; }
 unit_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
-unit_state()   { systemctl is-active "$1" 2>/dev/null || echo unknown; }
+# ★ 不能写 `|| echo unknown`: `systemctl is-active` 对未运行的单元**先打印
+#   "inactive" 再返回非 0**, 于是 `||` 又补一个 "unknown" —— 变量变成两行,
+#   后面 case 匹配全落到兜底分支, 显示成"Chromium 运行时: inactive\nunknown"。
+unit_state()   { local s; s=$(systemctl is-active "$1" 2>/dev/null) || true; printf '%s' "${s:-unknown}"; }
 
 # ------------------------------------------------------------ 配置读取 ----
 cfg_get() {  # cfg_get <file> <key> [default]

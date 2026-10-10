@@ -252,6 +252,17 @@ setTimeout(async () => {
   ck(($('#f-transport').value || '') !== '', '预设填好了传输 (' + $('#f-transport').value + ')');
   ck(!!$('#f-fingerprint') && !!$('#f-ech'),
      '表单有指纹与 ECH 字段（预设要用到的参数）');
+  // 简易出站（把别的内核当上游）—— 与 M/SB 同一功能，必须在面板里点得到
+  const simpleBtn = $$('#add-menu .mitem').find(b => /SOCKS5/.test(b.textContent));
+  ck(!!simpleBtn, '弹窗里有「简易出站 SOCKS5」入口');
+  if (simpleBtn) {
+    simpleBtn.dispatchEvent(new w.MouseEvent('click', {bubbles: true}));
+    ck(w.getComputedStyle($('#add-simple')).display !== 'none', '点它进入简易出站表单');
+    ck(($('#s-proto').textContent || '').includes('SOCKS'), '表单显示类型');
+    ck(($('#s-note').textContent || '').includes('0.0.0.0'),
+       '表单提示写清了"0.0.0.0 不能当目标"');
+    ck((($('#s-host') || {}).value || '') === '127.0.0.1', '地址默认本机回环');
+  }
   w.closeAdd();
 
   // ---- 局域网分享页 ----

@@ -48,6 +48,18 @@ _cr_source() {
     source "$f"
 }
 
+# 菜单排版用 conf/lib/print.sh 的 ui_*（与面板同一套）；取不到就用朴素版。
+_cr_source print.sh 2>/dev/null || true
+if ! declare -F ui_menu >/dev/null 2>&1; then
+    ui_rule() { printf '%s\n' "----------------------------------------"; }
+    ui_title() { ui_rule; printf ' %s\n' "$1"; ui_rule; }
+    ui_sec()  { printf '\n %s\n' "$1"; }
+    ui_menu() { printf '  %2s) %s\n' "$1" "$2"; }
+    ui_hint() { printf '  %s\n' "$1"; }
+    ui_kv()   { printf '   %s: %s\n' "$1" "$2"; }
+    ui_invalid() { printf '  无效选项: %s\n' "$1"; }
+fi
+
 _cr_cleanup() { [[ ${#_CERTMENU_TMP[@]} -gt 0 ]] && rm -f "${_CERTMENU_TMP[@]}"; }
 trap _cr_cleanup EXIT
 
@@ -231,7 +243,14 @@ _cr_do_where() {
 _cr_menu() {
     while :; do
         echo
-        _cr "════════ 证书管理 ════════"
+        ui_title "证书管理"
+        ui_menu 1 "校验一对证书   路径 / 有效性 / crt-key 配对 / 域名"
+        ui_menu 2 "列出全部证书   标注"使用中"还是"未引用""
+        ui_menu 3 "谁在用这张     引用它的片段与 nginx 配置"
+        ui_menu 4 "回收未引用     只删没有任何引用的（需确认）"
+        ui_menu 5 "容器里的证书   主机 GC 看不到的那部分"
+        ui_menu 6 "搜索范围       证书会从哪些目录被发现"
+        ui_menu 0 "返回"
         _gr "  1) 校验一对证书   路径/有效性/crt-key 配对/域名"
         _gr "  2) 列出全部证书   标注使用中还是未引用"
         _gr "  3) 谁在用这张     引用它的片段与 nginx 配置"

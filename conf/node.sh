@@ -408,10 +408,15 @@ share_meta.purge(os.environ['SHARE_DIR'], os.environ['TAG'])
 # ---------------------------------------------------------------- 菜单
 node_menu() {
     while :; do
-        printf "\n${_CYN}===== 节点管理 =====${_RST}\n" >&2
+        printf '\n' >&2
+        ui_title "节点管理"
         node_list >&2
-        printf "\n  1) 查看节点详情\n  2) 改名\n  3) 删除\n  4) 检查 nginx 孤儿片段 (残留的已删节点 location)\n  0) 返回\n" >&2
-        printf "  选择: " >&2
+        ui_menu 1 "查看节点详情"
+        ui_menu 2 "改名           片段 / 文件名 / 分享元数据 / 令牌引用四处同步"
+        ui_menu 3 "删除           先校验再吊销分享，失败则回滚"
+        ui_menu 4 "检查 nginx 孤儿片段（已删节点残留的 location）"
+        ui_menu 0 "返回"
+        printf '\n  请选择: ' >&2
         read -r c || return 0
         case "$c" in
             1)

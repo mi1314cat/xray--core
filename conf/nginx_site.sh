@@ -48,6 +48,18 @@ _ng_source() {
     source "$(_ng_resolve "$1")"
 }
 
+# 菜单排版用 conf/lib/print.sh 的 ui_*（与面板同一套）。取不到就退回本脚本
+# 自己的 _ng/_gn —— 排版失败不该让菜单打不开。
+_ng_source print.sh 2>/dev/null || true
+if ! declare -F ui_menu >/dev/null 2>&1; then
+    ui_rule() { printf '%s\n' "----------------------------------------"; }
+    ui_title() { ui_rule; printf ' %s\n' "$1"; ui_rule; }
+    ui_sec()  { printf '\n %s\n' "$1"; }
+    ui_menu() { printf '  %2s) %s\n' "$1" "$2"; }
+    ui_hint() { printf '  %s\n' "$1"; }
+    ui_invalid() { printf '  无效选项: %s\n' "$1"; }
+fi
+
 _ng_cleanup() { [[ ${#_NGMENU_TMP[@]} -gt 0 ]] && rm -f "${_NGMENU_TMP[@]}"; }
 trap _ng_cleanup EXIT
 
@@ -225,14 +237,15 @@ _ng_do_preview() {
 _ng_menu() {
     while :; do
         echo
-        _ng "════════ Nginx 站点管理 ════════"
-        _gn "  1) 列出所有站点     server_name 与所在文件"
-        _gn "  2) 查看某个站点     含本工具插入的内容"
-        _gn "  3) 校验配置         nginx -t (主机与容器)"
-        _gn "  4) 摘除反代         只删标记块, 不动自写的 server"
-        _gn "  5) 预览插入         --dry-run 看会插什么"
-        _gn "  0) 返回"
-        printf "\n  选择: "
+        ui_title "Nginx 站点管理"
+        ui_menu 1 "列出所有站点     server_name 与所在文件"
+        ui_menu 2 "查看某个站点     含本工具插入的内容"
+        ui_menu 3 "校验配置         nginx -t（主机与容器）"
+        ui_menu 4 "摘除反代         只删标记块，不动自写的 server"
+        ui_menu 5 "预览插入         --dry-run 看会插什么"
+        ui_menu 0 "返回"
+        echo
+        printf '  %s请选择%s: ' "${_CYN:-}" "${_RST:-}"
         read -r c
         case "$c" in
             1) _ng_do_list ;;
@@ -241,7 +254,7 @@ _ng_menu() {
             4) _ng_do_remove ;;
             5) _ng_do_preview ;;
             0|"") return 0 ;;
-            *) _rd "  无效选项: $c" ;;
+            *) ui_invalid "$c" ;;
         esac
     done
 }

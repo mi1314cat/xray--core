@@ -18,6 +18,29 @@ _i()  { printf '\033[36m%s\033[0m\n' "$*"; }
 
 # 优先用同目录的 dns_edit.py; 面板经 curl 执行时本脚本是临时文件,
 # 同目录不存在, 这时从仓库取。与项目其它入口一致: 远程取, 不 vendor。
+# 菜单排版用 conf/lib/print.sh 的 ui_*；取不到就用朴素版（排版失败不该让菜单打不开）
+_x_ui_lib() {
+    local self f
+    self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    for f in "$self/lib/print.sh" "${XRAY_BASE:-/root/catmi/xray}/conf/lib/print.sh"; do
+        [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    f=$(mktemp -t print.XXXXXX) && curl -fsSL \
+        "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/print.sh" \
+        -o "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
+    rm -f "$f"; return 1
+}
+f=$(_x_ui_lib) && source "$f" 2>/dev/null || true
+if ! declare -F ui_menu >/dev/null 2>&1; then
+    ui_rule() { printf '%s\n' "----------------------------------------"; }
+    ui_title() { ui_rule; printf ' %s\n' "$1"; ui_rule; }
+    ui_sec()  { printf '\n %s\n' "$1"; }
+    ui_menu() { printf '  %2s) %s\n' "$1" "$2"; }
+    ui_hint() { printf '  %s\n' "$1"; }
+    ui_kv()   { printf '   %s: %s\n' "$1" "$2"; }
+    ui_invalid() { printf '  无效选项: %s\n' "$1"; }
+fi
+
 dns_run() {
     local script="$_DNS_DIR/lib/dns_edit.py"
     if [[ ! -r "$script" ]]; then
@@ -113,7 +136,15 @@ dns_reset() {
 dns_menu() {
     while :; do
         echo
-        _i "════════ DNS 管理 ════════"
+        ui_title "DNS 管理"
+        ui_menu 1 "查看当前配置"
+        ui_menu 2 "添加/更新 DNS 服务器"
+        ui_menu 3 "删除 DNS 服务器"
+        ui_menu 4 "设置解析策略 (queryStrategy)"
+        ui_menu 5 "添加静态解析 (hosts)"
+        ui_menu 6 "禁用 fallback"
+        ui_menu 7 "清空整个 dns 段"
+        ui_menu 0 "返回"
         echo "  1) 查看当前配置"
         echo "  2) 添加/更新 DNS 服务器"
         echo "  3) 删除 DNS 服务器"

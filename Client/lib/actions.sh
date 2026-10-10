@@ -296,6 +296,7 @@ cmd_node() {
   local sub="${1:-list}"; shift || true
   case "$sub" in
     add|import)  cmd_node_add "$@" ;;
+    simple|local) cmd_node_simple "$@" ;;
     latency|ping|delay) cmd_node_latency "$@" ;;
     list|ls)     cmd_node_list "$@" ;;
     use|select)  cmd_node_use "$@" ;;
@@ -416,6 +417,180 @@ if dup:
   [ "$total" -gt 1 ] && { info ""; ok "共导入 $count/$total 个节点"; }
   # 必须显式 return 0：上面那条 `[ ... ] && { ...; }` 在"只导入 1 个节点"时为假，
   # 函数于是以退出码 1 结束 —— 面板把它当失败（红字），而节点其实好好地加上了。
+  return 0
+}
+
+# ---------------------------------------------------------------- 简易出站
+#
+# 把本机 / 局域网里**别的内核**当上游用：本客户端多一个节点，选它就走那个
+# socks5/http 端口出去（方向是 outbound，不是在本机再开一个 socks 端口给
+# 别人连 —— 那是 PORT_NORMAL 的事）。
+#
+# 对齐另外两个内核的同一功能，三条防护一个都不能少（它们都是踩出来的）：
+#   · 0.0.0.0 / :: 是**监听**地址，不是能连的目标 —— 用户最常填错的一项
+#   · 127.0.0.1 且端口等于本机自己的入口 = 自己代理自己，必然死循环
+#   · 端口上没有东西在听时先探测再问一句，并列出在听的常见端口
+cmd_node_simple() {
+  local proto="" host="" port="" user="" pass="" name="" batch=0
+  # 非交互：xbd node simple socks 127.0.0.1 1080 [用户] [密码] [名字]
+  if [ $# -ge 3 ]; then
+    proto="$1"; host="$2"; port="$3"; user="${4:-}"; pass="${5:-}"; name="${6:-}"
+    batch=1
+  fi
+
+  if [ -z "$proto" ]; then
+    echo
+    ui_title "添加简易 SOCKS / HTTP 出站"
+    ui_hint "把本机或局域网里别的内核当上游（本客户端主动连出去）"
+    echo
+    ui_menu 1 "socks5   多数内核都有，支持 UDP"
+    ui_menu 2 "http     上游只提供 HTTP 代理时用"
+    ui_menu 0 "取消"
+    printf '\n  请选择 [1-2，回车=1]: '
+    local c; read -r c || return 0
+    case "$(printf '%s' "${c:-1}" | tr -d '[:space:]')" in
+      2) proto="http" ;;
+      0) return 0 ;;
+      *) proto="socks" ;;
+    esac
+  fi
+  case "$proto" in
+    socks|socks5|socks5h) proto="socks" ;;
+    http|https)           proto="http" ;;
+    *) die "类型只能是 socks 或 http（得到 $proto）" ;;
+  esac
+  local defport=1080
+  [ "$proto" = "http" ] && defport=8080
+
+  # 默认 127.0.0.1：面板就跑在客户端机器上，最常见的用法是链本机另一个内核
+  while :; do
+    if [ -z "$host" ]; then
+      printf '  目标地址 (默认 127.0.0.1): '
+      read -r host || return 0
+      host=$(printf '%s' "$host" | tr -d '[:space:]')
+      [ -n "$host" ] || host="127.0.0.1"
+    fi
+    if [ "$host" = "0.0.0.0" ] || [ "$host" = "::" ]; then
+      # 监听地址不是连接目标 —— 放过去的话，连的是"所有网卡"这个不存在的目标
+      warn "$host 是**监听**地址，不能当连接目标"
+      info "本机填 127.0.0.1；局域网里别的设备填它自己的 IP"
+      [ "$batch" -eq 1 ] && return 1
+      host=""
+      continue
+    fi
+    break
+  done
+
+  if [ -z "$port" ]; then
+    printf '  目标端口 (默认 %s): ' "$defport"
+    read -r port || return 0
+    port=$(printf '%s' "$port" | tr -d '[:space:]')
+    [ -n "$port" ] || port="$defport"
+  fi
+  case "$port" in ''|*[!0-9]*) die "端口必须是数字（得到 $port）" ;; esac
+  { [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; } || die "端口必须在 1-65535（得到 $port）"
+
+  # 自己代理自己：本机入口端口就是自己，链上去必然死循环。
+  # ★ 本机地址要认全：回环（127.0.0.1/localhost/::1）**以及本机自己的
+  #   LAN IP** —— 实测最容易踩的就是后者：面板给了"局域网设备填 192.168.x.x"，
+  #   用户在本机上照着填，指向的还是自己。
+  xbd_load_ports
+  local _self_ip _is_self=0
+  case "$host" in
+    127.0.0.1|localhost|::1) _is_self=1 ;;
+    *)
+      _self_ip=$(detect_lan_ip 2>/dev/null || true)
+      [ -n "$_self_ip" ] && [ "$host" = "$_self_ip" ] && _is_self=1
+      for _self_ip in $(hostname -I 2>/dev/null || true); do
+        [ "$host" = "$_self_ip" ] && _is_self=1
+      done ;;
+  esac
+  if [ "$_is_self" -eq 1 ]; then
+    local p
+    for p in $XBD_PORT_NORMAL $XBD_PORT_HTTP $XBD_PORT_LAN_HTTP; do
+      [ "$port" = "$p" ] && die "$host:$port 就是本客户端自己的入口 —— 自己代理自己会死循环"
+    done
+  fi
+
+  # 探测：通不通先看一眼，不通就问一句（另外两个内核也是这么做的）
+  if ! _xbd_port_open "$host" "$port"; then
+    warn "$host:$port 上没有东西在监听"
+    local common="" p2
+    for p2 in 1080 1081 7890 7891 8080 8888 10808 10809; do
+      [ "$p2" = "$port" ] && continue
+      _xbd_port_open "$host" "$p2" && common="$common $p2"
+    done
+    [ -n "$common" ] && info "这台机器上在听的口:$common"
+    if [ "$batch" -eq 0 ]; then
+      printf '  仍要继续? [y/N] '
+      local a; read -r a || return 0
+      case "$a" in y|Y) ;; *) return 0 ;; esac
+    fi
+  else
+    ok "$host:$port 有东西在监听"
+  fi
+
+  if [ "$batch" -eq 0 ]; then
+    printf '  用户名 (留空=不认证): '; read -r user || return 0
+    user=$(printf '%s' "$user" | tr -d '[:space:]')
+    printf '  密码 (留空=不认证): '; read -r pass || return 0
+    pass=$(printf '%s' "$pass" | tr -d '[:space:]')
+    if [ -n "$pass" ] && [ -z "$user" ]; then
+      warn "只填了密码没填用户名，按不认证处理"
+      pass=""
+    fi
+    printf '  节点名 (留空自动生成): '; read -r name || return 0
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  if ! SIMPLE_PROTO="$proto" SIMPLE_HOST="$host" SIMPLE_PORT="$port" \
+       SIMPLE_USER="$user" SIMPLE_PASS="$pass" SIMPLE_NAME="$name" \
+       XBD_LIBDIR="$XBD_LIBDIR" python3 - "$tmp" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ.get("XBD_LIBDIR", ""))
+import node as N
+n = N.simple_node(os.environ["SIMPLE_PROTO"], os.environ["SIMPLE_HOST"],
+                  int(os.environ["SIMPLE_PORT"]), os.environ.get("SIMPLE_USER", ""),
+                  os.environ.get("SIMPLE_PASS", ""), os.environ.get("SIMPLE_NAME", ""))
+json.dump(n, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+PY
+  then
+    bad "生成节点失败"; rm -f "$tmp"; return 1
+  fi
+  _xbd_node_save_json "$tmp" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  info ""
+  info "切换: xbd node use <编号> ｜ 列表: xbd node list"
+  return 0
+}
+
+# 端口上有没有东西在听（TCP）。用 bash 的 /dev/tcp，不依赖 nc/ss 的版本差异。
+_xbd_port_open() { # <host> <port>
+  timeout 3 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null
+}
+
+# 把一份节点 JSON 落盘。与导入路径共用同一套：编号、slug、导入即固定证书、
+# 首个节点自动选中。抽出来是为了"简易节点"和"粘贴链接"两条路不会漂。
+_xbd_node_save_json() { # <json 文件>
+  local tmp="$1" slug dest idx=1
+  slug=$(python3 -c '
+import json,sys,re
+d=json.load(open(sys.argv[1]))
+s=re.sub(r"[^A-Za-z0-9._-]+","-",(d.get("name") or d.get("address") or "node")).strip("-").lower()
+print(s[:40] or "node")' "$tmp")
+  while :; do
+    dest="$XBD_NODES/$(printf 'node-%03d' "$idx")-$slug.json"
+    [ -e "$dest" ] && { idx=$((idx+1)); continue; }
+    break
+  done
+  _xbd_autopin_cert "$tmp"
+  install -m 0644 "$tmp" "$dest"
+  print_node_card "$dest"
+  if [ ! -e "$XBD_NODES/current" ]; then
+    ln -sfn "$(basename "$dest")" "$XBD_NODES/current"
+    ok "已设为当前节点: $(basename "$dest")"
+  fi
   return 0
 }
 
@@ -1472,7 +1647,120 @@ cmd_status() {
   XBD_PREFIX="$XBD_PREFIX" python3 "$XBD_LIBDIR/state.py" $quick
 }
 
+# ---------------------------------------------------------------- 浏览器运行时
+#
+# Browser Dialer 需要 Chromium。这里回答三个问题：**装没装 / 装了哪个版本 /
+# 一个命令怎么装**。
+#
+# 为什么不自动装: 浏览器是几百 MB 的包, 而且在 Debian/Ubuntu 上 `chromium`
+# 可能是 snap 壳（装上了也起不来）。默认只检测 + 给命令, 用户明确说了才装 ——
+# "装个客户端顺手给我拖半个浏览器下来"不是所有人都想要的。
+xbd_browser_installed() {
+  local b; b=$(detect_browser 2>/dev/null) || return 1
+  printf '%s' "$b"
+}
+
+xbd_browser_status() {
+  local b ver
+  if b=$(xbd_browser_installed); then
+    ver=$(browser_version 2>/dev/null)
+    ok "浏览器: $b"
+    [ -n "$ver" ] && dim "         $ver"
+  else
+    warn "系统里没有 Chromium / Chrome —— 依赖浏览器拨号的节点会不可用"
+    info "  其余节点不受影响（是否走浏览器由节点自身决定）"
+    info "  安装: xbd browser install"
+  fi
+  local st; st=$(unit_state "$XBD_U_CHROMIUM")
+  case "$st" in
+    active)   ok "Chromium 运行时: 运行中" ;;
+    inactive) info "Chromium 运行时: 未运行（按需启动即可，省内存）" ;;
+    *)        warn "Chromium 运行时: $st" ;;
+  esac
+  # 当前节点到底需不需要它 —— 用户最容易被"Chromium 没跑"误导
+  local curf need
+  curf=$(current_node_file 2>/dev/null || true)
+  if [ -n "$curf" ]; then
+    need=$(python3 "$XBD_LIBDIR/compat.py" json "$curf" 2>/dev/null \
+           | python3 -c 'import json,sys;print("yes" if json.load(sys.stdin).get("can_use_dialer") else "no")' 2>/dev/null || echo '?')
+    case "$need" in
+      yes) info "当前节点: 需要浏览器拨号（先 xbd dialer on）" ;;
+      no)  info "当前节点: 不需要浏览器（走 Xray 自带 TLS）" ;;
+      *)   info "当前节点: 判定不出来（xbd node check）" ;;
+    esac
+  fi
+}
+
+xbd_browser_install() {
+  need_root
+  local yes=0; [ "${1:-}" = "--yes" ] && yes=1
+  if xbd_browser_installed >/dev/null; then
+    ok "已经装了: $(xbd_browser_installed)"
+    return 0
+  fi
+  local pm="" pkg=""
+  if command -v apt-get >/dev/null 2>&1; then
+    pm="apt-get"; pkg="chromium"
+    # Debian 系的 chromium 在新版里是 snap 壳, 装上也可能起不来 —— 明确说清
+    if grep -qi debian /etc/os-release 2>/dev/null; then
+      warn "Debian 的 chromium 包可能是 snap 壳（装完也起不来）"
+      info "  更稳的做法: 用 xtradeb 源（Ubuntu）或装 google-chrome-stable"
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    pm="dnf"; pkg="chromium"
+  elif command -v apk >/dev/null 2>&1; then
+    pm="apk"; pkg="chromium"
+  else
+    bad "认不出包管理器，请手动安装 Chromium / Google Chrome"
+    return 1
+  fi
+  info "将执行: $pm install $pkg"
+  if [ "$yes" -eq 0 ]; then
+    printf '  浏览器是几百 MB 的包，继续吗? [y/N] '
+    local a; read -r a || return 0
+    case "$a" in y|Y) ;; *) info "已取消"; return 0 ;; esac
+  fi
+  case "$pm" in
+    apt-get) apt-get update -qq && apt-get install -y "$pkg" ;;
+    dnf)     dnf install -y "$pkg" ;;
+    apk)     apk add --no-cache "$pkg" ;;
+  esac || { bad "安装失败 —— 也可以自己装 google-chrome-stable"; return 1; }
+  if xbd_browser_installed >/dev/null; then
+    ok "装好了: $(xbd_browser_installed)"
+    info "下一步: xbd dialer on（或 xbd restart）"
+  else
+    bad "装完还是找不到浏览器可执行文件 —— 可能是 snap 壳，换 google-chrome-stable 试试"
+    return 1
+  fi
+}
+
+# 网页面板服务（自研面板）：看地址 / 重启 / 停掉
+xbd_panel_service() {
+  local op="${1:-status}"
+  case "$op" in
+    status) cmd_panel ;;
+    restart)
+      need_root
+      systemctl restart "$XBD_U_PANEL" && ok "面板已重启" || bad "面板重启失败"
+      sleep 1; cmd_panel ;;
+    stop)
+      need_root
+      systemctl stop "$XBD_U_PANEL" && ok "面板已停止（xbd panel restart 可再起来）" \
+        || bad "停止失败" ;;
+    *) info "用法: xbd panel [status|restart|stop]" ;;
+  esac
+}
+
 cmd_panel() {
+  # 更名说明: `xbd panel` 原来是"只打印地址"。现在多一个管理入口
+  # （status/restart/stop），但**不带参数时必须还是打印地址** —— 脚本里
+  # 到处都在 `xbd panel | grep` 取地址，改了行为等于把它们全弄坏。
+  case "${1:-}" in
+    restart|stop) xbd_panel_service "$1"; return $? ;;
+    status) ;;
+    "") ;;
+    *) info "用法: xbd panel [status|restart|stop]"; return 1 ;;
+  esac
   xbd_load_ports
   info "面板地址: http://$XBD_PANEL_HOST:$XBD_PANEL_PORT/"
   [ -n "$XBD_PANEL_TOKEN" ] && { info "访问令牌: $XBD_PANEL_TOKEN"; info "完整链接: http://$XBD_PANEL_HOST:$XBD_PANEL_PORT/?token=$XBD_PANEL_TOKEN"; }
@@ -2220,6 +2508,8 @@ Xray Client Web Manager v$XBD_VERSION
 
   节点（共享资产；是否需要浏览器拨号由服务器按节点自动决定）
     node add "<uri|json|yaml>"             导入节点（支持多行 / 多协议）
+    node simple [socks|http] [地址] [端口]  简易出站：把本机/局域网里别的内核当上游
+                                           例: xbd node simple socks 127.0.0.1 1080
     node sub <订阅URL>                     导入订阅
     node list                              节点列表（含 Xray / Browser Dialer 两种能力）
     node use <编号>                        切换当前节点
@@ -2232,6 +2522,8 @@ Xray Client Web Manager v$XBD_VERSION
     stop [--all]                           停止 Xray（--all 连面板一起停）
     restart                                重启 Xray（会自动同步重启 Chromium）
     dialer on|off|toggle|status            启动/停掉 Chromium（Browser Dialer 的运行时依赖）
+    browser [install]                      浏览器运行时：装没装 / 版本 / 一键安装
+                                           （默认不自动装：几百 MB，且 Debian 上可能是 snap 壳）
     apply                                  重新生成配置
     port [类型] [值]                       查看/修改端口（normal/http/lan-http/channel/panel/api/addr）
     ports check|fix|verify                 端口冲突检查 / 自动重新分配 / 校验浏览器两端接上
@@ -2257,7 +2549,7 @@ Xray Client Web Manager v$XBD_VERSION
   状态与诊断
     status [--quick]                       状态（含当前节点实际走哪条 TLS 路径）
     diagnose [--quick]                     全面诊断
-    panel                                  面板地址与令牌
+    panel [status|restart|stop]            网页面板：地址与令牌 / 重启 / 停掉
     export                                 导出连接配置到 generated/（方便复制）
     cert <编号|--missing>                  取服务端证书指纹并固定（自签证书节点用；--missing 批量补齐）
     ech                                    验证 Chromium 原生 ECH
@@ -2287,6 +2579,10 @@ xbd_main() {
     status)     cmd_status "$@" ;;
     diagnose)   cmd_diagnose "$@" ;;
     panel)      cmd_panel "$@" ;;
+    browser)    case "${1:-status}" in
+                  install) shift; xbd_browser_install "$@" ;;
+                  *) xbd_browser_status ;;
+                esac ;;
     ech)        cmd_ech "$@" ;;
     proxy)      cmd_proxy "$@" ;;
     xray)       cmd_xray "$@" ;;

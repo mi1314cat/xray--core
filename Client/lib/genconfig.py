@@ -248,17 +248,26 @@ def build_outbound(node: dict, mode: str, mux: bool, tag: str = "proxy") -> dict
             "method": node.get("method", ""),
             "password": node.get("password", ""),
         }]}
+    elif proto in ("socks", "http"):
+        # 简易出站：把本机或局域网里**别的内核**当上游用（socks5 / http 代理）。
+        # 官方 Xray 的 socks/http 出站形状都是 servers 数组；认证是可选的，
+        # 留空就完全不写 users 字段 —— 写了空 users 反而会被内核当成"要认证"。
+        srv = {"address": node.get("address", ""),
+               "port": int(node.get("port") or (1080 if proto == "socks" else 8080))}
+        user = (node.get("username") or "").strip()
+        if user:
+            srv["users"] = [{"user": user, "pass": node.get("password") or ""}]
+        settings = {"servers": [srv]}
     else:
         fail(f"不支持的协议: {proto}")
 
     # Xray 侧协议名是 hysteria（version 2 即 hysteria2）
     proto_out = "hysteria" if proto == "hysteria2" else proto
-    ob: dict = {
-        "tag": tag,
-        "protocol": proto_out,
-        "settings": settings,
-        "streamSettings": build_stream(node, mode),
-    }
+    ob: dict = {"tag": tag, "protocol": proto_out, "settings": settings}
+    # socks / http 是**明文本地跳**，没有传输层可配。给它们塞一个
+    # streamSettings 会被内核忽略，但会让人以为"这里能配 TLS" —— 不写。
+    if proto not in ("socks", "http"):
+        ob["streamSettings"] = build_stream(node, mode)
     if node.get("flow") and mode == NORMAL and proto == "vless":
         pass  # flow 已在 users 里
     if mux:

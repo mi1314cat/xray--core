@@ -24,6 +24,29 @@ else
 fi
 
 _lg()  { printf '\033[36m%s\033[0m\n' "$*"; }
+# 菜单排版用 conf/lib/print.sh 的 ui_*；取不到就用朴素版（排版失败不该让菜单打不开）
+_x_ui_lib() {
+    local self f
+    self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    for f in "$self/lib/print.sh" "${XRAY_BASE:-/root/catmi/xray}/conf/lib/print.sh"; do
+        [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    f=$(mktemp -t print.XXXXXX) && curl -fsSL \
+        "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/print.sh" \
+        -o "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
+    rm -f "$f"; return 1
+}
+f=$(_x_ui_lib) && source "$f" 2>/dev/null || true
+if ! declare -F ui_menu >/dev/null 2>&1; then
+    ui_rule() { printf '%s\n' "----------------------------------------"; }
+    ui_title() { ui_rule; printf ' %s\n' "$1"; ui_rule; }
+    ui_sec()  { printf '\n %s\n' "$1"; }
+    ui_menu() { printf '  %2s) %s\n' "$1" "$2"; }
+    ui_hint() { printf '  %s\n' "$1"; }
+    ui_kv()   { printf '   %s: %s\n' "$1" "$2"; }
+    ui_invalid() { printf '  无效选项: %s\n' "$1"; }
+fi
+
 _lgy() { printf '\033[33m%s\033[0m\n' "$*"; }
 
 log_lines() {
@@ -61,7 +84,14 @@ log_status() {
 log_menu() {
     while :; do
         echo
-        _lg "════════ 日志 ════════"
+        ui_title "日志"
+        ui_menu 1 "最近 100 行"
+        ui_menu 2 "最近 300 行"
+        ui_menu 3 "自定义行数"
+        ui_menu 4 "报错解释       把内核报错翻成人话"
+        ui_menu 5 "跟随输出"
+        ui_menu 6 "服务状态与端口占用"
+        ui_menu 0 "返回"
         echo "  1) 最近 100 行"
         echo "  2) 最近 300 行"
         echo "  3) 自定义行数"

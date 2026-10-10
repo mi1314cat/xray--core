@@ -698,17 +698,16 @@ print(json.dumps({"name": sys.argv[1], "tags": json.loads(sys.argv[2])}, ensure_
 # ---------------------------------------------------------------- 菜单
 share_menu() {
     while :; do
-        printf "\n${_CYN}===== 分享管理 =====${_RST}\n" >&2
-        cat >&2 <<EOF
-  1) 生成分享链接
-  2) 分享列表
-  3) 启停 / 撤销
-  4) 改次数上限
-  5) 改有效期
-  6) 分享服务管理
-  0) 返回
-EOF
-        printf "  选择: " >&2
+        printf '\n' >&2
+        ui_title "分享管理"
+        ui_menu 1 "生成分享链接    选节点 → 生成一条带令牌的订阅地址"
+        ui_menu 2 "分享列表        已发出的链接：次数 / 有效期 / 状态"
+        ui_menu 3 "启停 / 撤销     立刻失效，节点本身不受影响"
+        ui_menu 4 "改次数上限"
+        ui_menu 5 "改有效期"
+        ui_menu 6 "分享服务管理    公共基础服务（安装 / 状态）"
+        ui_menu 0 "返回"
+        printf '\n  请选择: ' >&2
         read -r c || return 0
         case "$c" in
             1) share_create ;;
