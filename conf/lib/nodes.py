@@ -21,8 +21,12 @@
 
 import base64
 import glob
+import ipaddress
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 
 # 显示名（旗帜 + 服务器前缀）实现在 naming.py —— 只有一份，
@@ -48,6 +52,103 @@ def _client_field(inbound, field):
                     or c.get("id"))
     # Shadowsocks / Socks / HTTP 是单用户形态
     return settings.get("password") or settings.get("auth")
+
+
+def _strip_port(host):
+    """去掉 host:port 里的端口。IPv6 必须带方括号才算有端口, 否则冒号是地址的一部分。"""
+    h = str(host or "").strip()
+    if h.startswith("["):
+        return h[1:h.index("]")] if "]" in h else h
+    if h.count(":") == 1 and h.rsplit(":", 1)[1].isdigit():
+        return h.rsplit(":", 1)[0]
+    return h
+
+
+def is_ip_literal(host) -> bool:
+    """这个值是不是 IP 字面量。
+
+    ★ 为什么分享层必须能判这个: SNI 是**域名**。写成 IP 时客户端拿 IP 去
+      校验证书, 而证书的 SAN 里不会有这个 IP (自签证书即使补了 IP SAN, 也只
+      补 127.0.0.1/0.0.0.0 这类本机地址) —— 实测报错就是
+          x509: cannot validate certificate for 107.173.154.178
+              because it doesn't contain any IP SANs
+      即"链接生成成功, 客户端导入成功, 就是连不上"。宁可省略 sni 让客户端
+      按默认行为走, 也不要写一个必然校验失败的 IP。
+    """
+    h = _strip_port(host)
+    if not h:
+        return False
+    if h.endswith("."):            # FQDN 写法的尾巴, 1.2.3.4. 也是 IPv4
+        h = h[:-1]
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return False
+
+
+# 同一个证书文件在一次进程生命周期里只读一次 (key 里带 mtime, 换证书会失效)。
+# collect() 每次列表/分享都要遍历全部片段, 不加缓存就是每个 TLS 节点两次
+# openssl 子进程 —— 面板每刷一次都付这个代价。
+_CERT_DOMAIN_CACHE = {}
+
+
+def cert_domain(cert_file):
+    """从证书文件读它签给谁: SAN 里第一个 DNS: → CN。读不到返回 None。
+
+    这是**客户端实际会看到的那张证书**上的名字, 比任何元数据都可靠 ——
+    分享元数据里的 host 是"连到哪"(可以是 IP), 证书里的是"该用哪个 SNI"。
+    与 sing-box / mihomo 面板侧的做法一致 (extract_cert_domain / cert_is_trusted):
+    先 SAN 再 CN, 拿不到就返回空, 不猜文件名当域名用。
+    """
+    if not cert_file:
+        return None
+    try:
+        key = (cert_file, os.path.getmtime(cert_file))
+    except OSError:
+        return None                      # 证书不在本机 (别的机器上生成的片段)
+    if key in _CERT_DOMAIN_CACHE:
+        return _CERT_DOMAIN_CACHE[key]
+    dom = None
+    if shutil.which("openssl"):
+        for args, rx in ((["-ext", "subjectAltName"], r"DNS:([^,\s]+)"),
+                         (["-subject"], r"CN\s*=\s*([^,\n]+)")):
+            try:
+                r = subprocess.run(
+                    ["openssl", "x509", "-in", cert_file, "-noout"] + args,
+                    capture_output=True, text=True, timeout=10)
+            except Exception:            # noqa: BLE001 — openssl 缺失/超时都不该炸分享
+                break
+            m = re.search(rx, r.stdout or "") if r.returncode == 0 else None
+            if m:
+                dom = m.group(1).strip().strip('"').lower()
+                break
+    _CERT_DOMAIN_CACHE[key] = dom
+    return dom
+
+
+def tls_domains(tls):
+    """TLS 节点上"该用哪个域名做 SNI"的候选, 按可靠程度排。
+
+    1. tlsSettings.serverName —— 节点自己的显式声明, 最直接
+    2. 证书文件里的 SAN/CN  —— 客户端真的要校验的那个名字
+    3. certificates[].domain —— 生成脚本写在证书项里的域名 (hy2 脚本会写)
+
+    刻意**不**把"连接地址"算进来: 它就是 IP, 写进 sni 必然校验失败。
+    """
+    out = []
+    sn = tls.get("serverName")
+    if isinstance(sn, str) and sn.strip():
+        out.append(sn.strip())
+    for c in (tls.get("certificates") or []):
+        if not isinstance(c, dict):
+            continue
+        d = cert_domain(c.get("certificateFile"))
+        if d:
+            out.append(d)
+        if isinstance(c.get("domain"), str) and c["domain"].strip():
+            out.append(c["domain"].strip())
+    return out
 
 
 def extract(inbound, source_file):
@@ -84,6 +185,13 @@ def extract(inbound, source_file):
         "server_names": reality.get("serverNames") or [],
         "path": ws.get("path") or xhttp.get("path") or "",
         "sni": None,
+        # TLS 节点的 SNI 候选 (serverName / 证书 SAN·CN / 证书项 domain)。
+        # 旧版本只从 realitySettings.serverNames 取 sni, 于是**所有 tls 节点
+        # 的分享链接都没有 sni=** —— 实测 (RN 真实节点 vless-xhttp07/08):
+        # 链接里 security=tls 却没有 sni, 客户端拿连接地址(公网 IP)当 SNI,
+        # 报 "cannot validate certificate for <IP> ... no IP SANs", 经分享
+        # 链接根本连不上, 而服务端一切正常。
+        "tls_domains": tls_domains(tls),
         # ---- 证书 ----
         "cert_files": [
             c.get("certificateFile")
@@ -245,6 +353,34 @@ def share_target(n, meta=None):
     return host, front, note, None
 
 
+def reality_sni(n):
+    """REALITY 节点的 SNI —— 仍然只来自 serverNames (握手伪装的目标站点),
+    取法一字未改; 只拦"serverNames 被填成 IP"这种病态配置。"""
+    sni = (n.get("server_names") or [""])[0]
+    return sni if sni and not is_ip_literal(sni) else ""
+
+
+def link_sni(n, meta=None):
+    """TLS 类节点该写进分享链接的 sni。取不到返回 "" (整个参数不写)。
+
+    **绝不返回 IP 字面量** —— 见 is_ip_literal 的说明, 那是"链接看起来正常
+    但客户端必然握手失败"。宁可省略: 省略时各家客户端的行为是"用连接地址
+    作 SNI", 至少不会比我们写死一个错的更差, 而且不会让订阅解析器当成
+    "节点自己声明了 SNI=<IP>"。
+
+    优先级 (与 SB/M 面板侧一致: 证书/节点声明优先, 元数据只是兜底):
+      1. 节点自身的 serverName / 证书 SAN·CN / 证书项 domain
+      2. 分享元数据里的域名 (CDN 节点就是这种: 元数据 host 是域名)
+    """
+    for cand in (n.get("tls_domains") or []):
+        if cand and not is_ip_literal(cand):
+            return str(cand)
+    host = str((meta or {}).get("host") or "").strip()
+    if host and not is_ip_literal(host):
+        return host
+    return ""
+
+
 def build_share_link(n, meta=None, notes=None):
     """从节点视图生成 Xray 分享链接。
 
@@ -305,8 +441,12 @@ def build_share_link(n, meta=None, notes=None):
         if n.get("flow"):
             q["flow"] = n["flow"]
         if n.get("security") == "reality":
-            if n.get("server_names"):
-                q["sni"] = n["server_names"][0]
+            # REALITY 的 SNI 仍然只来自 serverNames (握手伪装的目标站点) ——
+            # 这一条不动。只拦"serverNames 里被填成 IP"这种病态配置:
+            # 那不是域名, 客户端拿它做 SNI 必然对不上。
+            sni = reality_sni(n)
+            if sni:
+                q["sni"] = sni
             q["fp"] = meta.get("fingerprint", "chrome")
             if meta.get("short_id"):
                 q["sid"] = meta["short_id"]
@@ -314,8 +454,11 @@ def build_share_link(n, meta=None, notes=None):
                 q["pbk"] = meta["public_key"]
             q["spx"] = meta.get("spx", "")
         elif n.get("security") == "tls":
-            if n.get("sni"):
-                q["sni"] = n["sni"]
+            # ★ 这里以前是 `if n.get("sni")`, 而 n["sni"] 只从 REALITY 的
+            #   serverNames 取 —— 于是 TLS 节点的链接**永远没有 sni=**。
+            sni = link_sni(n, meta)
+            if sni:
+                q["sni"] = sni
             if n.get("path"):
                 q["path"] = n["path"]
             if n.get("network") == "ws":
@@ -330,16 +473,18 @@ def build_share_link(n, meta=None, notes=None):
             return None
         q = {"security": n.get("security") or "none", "type": n.get("network") or "tcp"}
         if n.get("security") == "reality":
-            if n.get("server_names"):
-                q["sni"] = n["server_names"][0]
+            sni = reality_sni(n)
+            if sni:
+                q["sni"] = sni
             q["fp"] = meta.get("fingerprint", "chrome")
             if meta.get("short_id"):
                 q["sid"] = meta["short_id"]
             if meta.get("public_key"):
                 q["pbk"] = meta["public_key"]
         elif n.get("security") == "tls":
-            if n.get("sni"):
-                q["sni"] = n["sni"]
+            sni = link_sni(n, meta)
+            if sni:
+                q["sni"] = sni
             if n.get("network") == "ws" and n.get("path"):
                 # 原样放进 q, 转义交给下面的 _qval 统一做 ——
                 # 这里再 _q 一次会变成 %252F, 路径里出现字面量 "%252F"。
@@ -359,7 +504,15 @@ def build_share_link(n, meta=None, notes=None):
         # 而分享链接的 scheme 必须写 hysteria2://。所以匹配时要把
         # "hysteria" 也算进来 —— 漏了它, 内核实机跑出来的 hysteria2 节点
         # 一个都生成分享链接。
-        q = {"sni": meta.get("host") or "", "insecure": "0"}
+        #
+        # ★ sni 以前取的是 meta["host"], 生产上那是**连接地址** —— 实测生成过
+        #   `sni=107.173.154.178`, 客户端拿 IP 校验证书必然失败。现在取证书/
+        #   节点声明的域名, 拿不到就整个参数不写。
+        q = {}
+        sni = link_sni(n, meta)
+        if sni:
+            q["sni"] = sni
+        q["insecure"] = "0"
         if meta.get("alpn"):
             q["alpn"] = meta["alpn"]
         qs = "&".join(f"{k}={_qval(v)}" for k, v in q.items() if v)
@@ -387,7 +540,8 @@ def build_share_link(n, meta=None, notes=None):
             "net": n.get("network") or "tcp",
             "type": "none", "host": "", "path": n.get("path") or "",
             "tls": "tls" if n.get("security") in ("tls", "reality") else "",
-            "sni": n.get("sni") or "",
+            "sni": reality_sni(n) if n.get("security") == "reality"
+            else link_sni(n, meta),
         }
         b = base64.b64encode(json.dumps(obj, ensure_ascii=False).encode()).decode()
         return f"vmess://{b}"
