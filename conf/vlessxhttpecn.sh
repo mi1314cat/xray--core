@@ -1113,16 +1113,27 @@ EOF
     #      给 base64 会报 "encoding/hex: invalid byte", 给数组会报
     #      "cannot unmarshal array into Go struct field TLSConfig"。
     #
-    # 用公网 CA 签的证书走正常校验, 不需要 pin —— 那时 pin 反而多余,
-    # 证书换了就得重算指纹。
+    # ★ pin 不是"有证书文件就写" —— 判据与实测都收口在
+    #   conf/lib/cert.sh 的 x_cert_client_pin 里 (那里有完整的失败实录:
+    #   CDN-ECH 节点的边缘证书是公网 CA 签的, 源站证书算出来的 pin 必然
+    #   对不上 → "peer cert is unrecognized (against pinnedPeerCertSha256)")。
+    #
+    #   这里只回答一个问题: **TLS 是不是终止在本节点**。
+    #     direct-ECH  = 客户端直连 Xray 端口, 看到的就是 CERT_FILE → 是
+    #     CDN-ECH     = 连 CDN:443, 边缘出示自己的证书        → 不是
+    #     nginx 档    = 连 nginx:NPORT, 站点证书不一定是这张 → 不是
+    #   不是"本节点终结"时一律不写 pin; 用户明确要求用 XRAY_PIN_CERT=1 覆盖。
     local CLIENT_PIN_FIELD=""
+    local _pin_here=0
+    [[ "${ACCESS_MODE:-}" != "nginx" && "${ECH_MODE:-}" != "cdn" ]] && _pin_here=1
     local _pin_hex
-    if [ -f "$CERT_FILE" ] && _pin_hex=$(openssl x509 -in "$CERT_FILE" -outform DER 2>/dev/null \
-        | openssl dgst -sha256 -hex 2>/dev/null | awk '{print $NF}') \
-        && [ -n "$_pin_hex" ]; then
+    _pin_hex=$(x_cert_client_pin "$CERT_FILE" "$_pin_here" "${XRAY_PIN_CERT:-0}")
+    if [[ -n "$_pin_hex" ]]; then
         CLIENT_PIN_FIELD=",
           \"pinnedPeerCertSha256\": \"$_pin_hex\""
-        print_info "客户端 pin 自签证书 SHA256: ${_pin_hex:0:16}..."
+        print_info "客户端 pin 证书 SHA256: ${_pin_hex:0:16}..."
+    elif [[ -n "$CERT_FILE" ]]; then
+        print_info "客户端不写 pin: 证书由公网 CA 签发, 或 TLS 不由本节点终结 (正常校验即可)"
     fi
 
     if [[ "$VLESS_TRANSPORT" = "xhttp" ]]; then

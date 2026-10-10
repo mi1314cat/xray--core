@@ -132,6 +132,39 @@ x_cert_trusted() {
 }
 
 
+# x_cert_client_pin <crt> <TLS 是否终止于本节点: 0|1> [强制: 0|1]
+#
+# 输出该写进客户端配置的 pinnedPeerCertSha256 (证书 DER 的 hex sha256);
+# **不该写时输出空**, 返回 0。
+#
+# ★ 钉扎的指纹必须与"客户端真的会看到的那张证书"一致, 否则连接必然失败:
+#     tls: failed to verify certificate:
+#         peer cert is unrecognized (against pinnedPeerCertSha256)
+#   实测 (RN 生产 vless-xhttp07, 2026-10): 源站证书是 Let's Encrypt 签的
+#   moontv.6896698.xyz (DER sha256 48165d74...), 而客户端经 CDN-ECH 连的是
+#   Cloudflare 边缘, 边缘出示的是 Google Trust Services 签的另一张证书
+#   (DER sha256 601927a1...) —— 两个指纹天然不同, 挂了 pin 就永远连不上,
+#   而节点本身完全正常。
+#
+# 所以判据是三条, 不是"证书文件存在":
+#   1. TLS 由本节点终结 —— 走 nginx 或 CDN 时边缘出示的是别的证书
+#   2. 证书不是公网 CA 签的 (x_cert_trusted 为假) —— 真证书走正常校验,
+#      钉扎只会"证书一续期就连不上"
+#   3. 算得出指纹
+# 与 SB 的 CERT_TRUSTED / M 的 cert_is_trusted 是同一套判据 (自签才 pin,
+# 真证书不 pin)。用户显式要求 (强制=1) 时跳过 1、2 两条。
+x_cert_client_pin() {
+    local crt="${1:-}" here="${2:-0}" force="${3:-0}"
+    if [[ "$force" != "1" ]]; then
+        [[ "$here" = "1" ]] || return 0
+        x_cert_trusted "$crt" && return 0
+    fi
+    [[ -f "$crt" ]] || return 0
+    openssl x509 -in "$crt" -outform DER 2>/dev/null \
+        | openssl dgst -sha256 -hex 2>/dev/null | awk '{print $NF}'
+}
+
+
 # 输出用的颜色。cert.sh 是独立库, 不假设宿主脚本定义了 print_ok 之类。
 _CERT_GRN=""; _CERT_YEL=""; _CERT_RED=""; _CERT_RST=""
 if [[ -t 2 ]]; then
