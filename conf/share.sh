@@ -184,16 +184,24 @@ os.environ["XRAY_CONF_DIR"] = conf_dir
 os.environ["XRAY_SHARE_DIR"] = share_dir
 sys.path.insert(0, lib_dir)
 import share_payload
-payload, missing, nometa, bad = share_payload.build_payload(tags)
+payload, missing, nometa, bad, refused, notes = share_payload.build_payload(tags, full=True)
 if payload is None:
-    print("无可分发内容 (片段没了? 缺对外地址?)", file=sys.stderr)
+    print("无可分发内容 (片段没了? 缺对外地址? 只绑了回环?)", file=sys.stderr)
     raise SystemExit(1)
 with open(out, "w", encoding="utf-8") as fh:
     fh.write(payload)
-# 三类"没发出去"分开报 —— 合并成一条就查不出是哪一种
+# 四类"没发出去"分开报 —— 合并成一条就查不出是哪一种
 for label, items in (("节点已删", missing), ("缺分享元数据", nometa)):
     if items:
         print("%s: %s" % (label, ",".join(items)), file=sys.stderr)
+# ★ 「不该发布」是**新分开的一类**, 最要命的一类:
+#   节点在、元数据也在, 但按它的监听地址外部根本连不上 (只绑回环又没有 nginx)。
+#   以前它会照样生成一条链接, 用户拿到手里才发觉连不通 —— 生产
+#   vless-xhttp-01/02/03 三条死链就是这么发出去的。
+for t, why in refused:
+    print("不该对外发布: %s —— %s" % (t, why), file=sys.stderr)
+for n in notes:
+    print("提示: %s" % n, file=sys.stderr)
 if bad:
     print("片段解析失败: %d 个" % len(bad), file=sys.stderr)
 PY

@@ -43,11 +43,16 @@ print_title() {
 # ================================
 PROTO="vless-xhttp"                     # 用于文件名/tag
 PROTO_NAME="VLESS-XHTTP/WS-ECH-MLKEM"
-CONF_DIR="/root/catmi/xray/conf"
-OUT_DIR="/root/catmi/xray/out"
+# 目录与内核路径: 生产默认 /root/catmi/xray; 可用 XRAY_BASE_DIR / XRAY_INSTALL_DIR
+# 指到别处 —— 与 conf/ 下其余协议脚本同一套约定。没有这条, 这个脚本只能写生产
+# 目录, 于是"生成一次看看产物对不对"这件事在沙箱里做不了 (而它正是产出分享
+# 链接/客户端配置的那条路径, 恰恰最需要能单独验)。
+XRAY_BASE="${XRAY_BASE_DIR:-/root/catmi/xray}"
+CONF_DIR="$XRAY_BASE/conf"
+OUT_DIR="$XRAY_BASE/out"
 XRAY_CLIENT_SOCKS_PORT=10831   # Xray 客户端 JSON 的 socks inbound 起始端口 (每次递增)
-MAIN_CONF="/root/catmi/xray/config.json"
-XRAYLS_BIN="/root/catmi/xray/xrayls"
+MAIN_CONF="$XRAY_BASE/config.json"
+XRAYLS_BIN="${XRAY_INSTALL_DIR:-$XRAY_BASE}/xrayls"
 
 mkdir -p "$CONF_DIR" "$OUT_DIR"
 
@@ -967,11 +972,34 @@ render_client() {
     OUT_FILE="$OUT_DIR/${PROTO}_client-$num2.yaml"
     SHARE_FILE="$OUT_DIR/${PROTO}_share-$num2.txt"
 
-    # 客户端连接目标:
-    #   CDN-ECH 模式 (ECH_MODE=cdn):   连 CDN:443 (域名), TLS 终止于 Cloudflare, 自动发现 CF 的 ECH
-    #   direct-ECH 模式 (ECH_MODE=direct): 连 xray 服务器自身端口 (直连, TLS 终止于 xray, echServerKeys 生效)
+    # 客户端连接目标。**必须同时看接入方式与 ECH 模式** —— 只看 ECH 模式
+    # 曾经产出过三条死链 (生产 vless-xhttp-01/02/03):
+    #
+    #   当时是"cdn 直连 + direct-ECH", 链接写成 `公网IP:节点端口` (25333);
+    #   后来节点改成 nginx 档 (只绑 127.0.0.1, 端口也换了 45630), 而这里
+    #   重算出来的仍然是 `公网IP:节点端口` —— 那个地址外部没人听。
+    #   nginx 档的对外入口是 **nginx 的域名:443**, 不是 Xray 自己的端口。
+    #
+    #   direct-ECH 还有个前提: 它要求客户端"直连 Xray 端口"才能验 pin 的
+    #   ECHConfig。绑了回环就不可能直连 —— 这时 direct-ECH 与 nginx 档互斥,
+    #   必须显式说出来, 而不是生成一条必然连不上的链接。
     CLIENT_SNI="$CERT_DOMAIN"
-    if [[ "$ECH_MODE" = "direct" ]]; then
+    if [[ "$ACCESS_MODE" = "nginx" ]]; then
+        LINK_HOST="$CERT_DOMAIN"
+        # nginx 前端的端口: 环境变量 NPORT > install_info.env 里的 NPORT > 443。
+        # 不能写死 443 —— nginx 换了端口就又会生成一条连不上的链接,
+        # 而这次修的就是同一类问题 (链接里的端口与真实入口不符)。
+        LINK_PORT="${NPORT:-}"
+        if [[ -z "$LINK_PORT" && -r "$XRAY_BASE/install_info.env" ]]; then
+            LINK_PORT=$(sed -n 's/^NPORT=["'"'"']*\([0-9]\{1,5\}\)["'"'"']*.*/\1/p' \
+                        "$XRAY_BASE/install_info.env" | tail -1)
+        fi
+        LINK_PORT="${LINK_PORT:-443}"
+        if [[ "$ECH_MODE" = "direct" ]]; then
+            print_warn "接入=nginx(只绑 127.0.0.1) 与 direct-ECH 互斥: direct-ECH 要求客户端直连 Xray 端口,"
+            print_warn "  而回环端口外部不可达。链接按 nginx 入口生成(域名:${LINK_PORT}), ECH 请改用 cdn 模式。"
+        fi
+    elif [[ "$ECH_MODE" = "direct" ]]; then
         # direct ECH = 必须直连 xray 端口 (TLS 终止于 xray), 否则 pin 的 ECHConfig 会被 CF 拒绝
         # 优先 IPv4, 无则 IPv6 (IPv6 加方括号)
         if [[ -n "$PUBLIC_IP_V4" ]]; then
@@ -1228,6 +1256,18 @@ rebuild_one() {
 
     ECH_MODE="cdn"
     [[ -n "$ECH_SERVER_KEYS" ]] && ECH_MODE="direct"
+
+    # 接入方式**从片段本身的监听地址推**，不靠"上次生成时选的是什么"。
+    #
+    # ★ 这条是 vless-xhttp-01/02/03 三条死链的直接教训: 片段是绑 127.0.0.1 的
+    #   (nginx 档), 而 out/ 下的客户端文件是"上一次以 cdn 档生成"留下的 ——
+    #   链接里写着 `公网IP:25333`, 片段却只在 127.0.0.1:45630 上听。
+    #   重建时若还按旧状态猜, 就会再造一条同样连不上的链接。
+    #   listen 是片段里的**事实**, 只有它能决定对外入口该写什么。
+    case "$(jq -r '.inbounds[0].listen // ""' "$file")" in
+        127.0.0.1|::1|localhost) ACCESS_MODE="nginx" ;;
+        *)                       ACCESS_MODE="cdn" ;;
+    esac
 
     ECH_CONFIG_LIST=""
     if [[ "$ECH_MODE" = "direct" ]]; then

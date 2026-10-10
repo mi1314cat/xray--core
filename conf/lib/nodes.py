@@ -176,16 +176,92 @@ def _qval(v):
     return _q(v)
 
 
-def build_share_link(n, meta=None):
+# ================================================================ 对外目标
+#
+# 分享链接里的 host:port 是"客户端去哪里连", 与"内核听在哪里"是**两件事**。
+# 生产上出过一次典型事故 (vless-xhttp-01/02/03): 三个入站只绑 127.0.0.1,
+# 分享链接却写 107.173.154.178:25333 —— 那个地址端口外部根本没人听,
+# 三条链接必然是死链。根因就是这里**从来没看过 listen**。
+LOOPBACK_LISTEN = {"127.0.0.1", "::1", "localhost", "[::1]", "127.0.0.2"}
+DEFAULT_FRONT_PORT = 443        # nginx 前端默认端口 (与 deploy.py 的 public_port 同义)
+
+
+def is_loopback_bound(n) -> bool:
+    """节点是否**只**监听回环。
+
+    listen 为空表示"没写这个字段" —— 内核默认监听 0.0.0.0, 也就是对外可达,
+    所以空不算回环。只有明确写成回环地址才算。
+    """
+    listen = str(n.get("listen") or "").strip().lower()
+    return listen in LOOPBACK_LISTEN
+
+
+def share_target(n, meta=None):
+    """决定分享链接里的 host:port, 返回 (host, port, note, refuse)。
+
+    refuse 非空 = **不该发布**: 调用方必须把原因报出来, 而不是静默少一个节点。
+
+    规则:
+      · 只绑回环 + tier=nginx  → 用域名 + nginx 前端端口 (默认 443), 正确形态
+      · 只绑回环 + 没有 nginx  → 拒绝发布 (外部访问不到; 要么去配 nginx, 要么改绑定)
+      · 绑公网                 → 用分享元数据里的 host:port
+    另外报 two 类"元数据陈旧"的疑点 (note), 它们不会让链接必然失效, 但值得说:
+      · tier=nginx 却把节点自己的回环端口当对外端口 (生产 VLESS-WS_01 就是这种)
+      · 元数据端口与片段端口不一致 (换了端口没重建分享元数据)
+    """
+    meta = meta or {}
+    host = str(meta.get("host") or n.get("sni") or "").strip()
+    tier = str(meta.get("tier") or "").strip().lower()
+    node_port = n.get("port")
+    meta_port = meta.get("port")
+
+    if not is_loopback_bound(n):
+        if not host or not (meta_port or node_port):
+            return "", 0, None, "缺对外地址/端口"
+        if tier == "nginx" and str(meta_port) == str(node_port):
+            # 绑了公网却说自己走 nginx —— 端口语义有歧义, 按元数据发布但要说出来
+            return host, meta_port, ("tier=nginx 但元数据端口与片段端口相同 "
+                                     f"({meta_port}); 若确实经 nginx 转发, 对外端口应是前端端口",
+                                     ), None
+        if meta_port and node_port and str(meta_port) != str(node_port):
+            return host, meta_port, (f"元数据端口 {meta_port} 与片段端口 {node_port} 不一致 —— "
+                                     "多半是换了端口没重建分享元数据 (客户端按元数据连)", ), None
+        return host, meta_port or node_port, None, None
+
+    # ---- 只绑回环 ----
+    if tier != "nginx":
+        return "", 0, None, (
+            f"节点只监听 {n.get('listen')}, 外部访问不到, 分享元数据里也没有 "
+            "tier=nginx · 先给它配 nginx 反代 (conf/lib/nginx_apply.py) 或改绑 0.0.0.0")
+    if not host:
+        return "", 0, None, "nginx 档但分享元数据没有域名(host), 生成不出可连的链接"
+    front = meta.get("public_port") or DEFAULT_FRONT_PORT
+    note = None
+    if str(meta_port) == str(node_port) or meta_port in (None, ""):
+        note = (f"元数据里的端口 {meta_port or '(缺)'} 是节点自己的回环端口, 不是对外端口 —— "
+                f"已按 nginx 前端的 {front} 发布")
+    elif str(front) != str(meta_port):
+        note = f"按 nginx 前端端口 {front} 发布 (元数据记的是 {meta_port})"
+    return host, front, note, None
+
+
+def build_share_link(n, meta=None, notes=None):
     """从节点视图生成 Xray 分享链接。
 
     meta 是 conf/lib/share_meta.py 的记录, 提供片段里没有的字段
     (REALITY 公钥、VLESS encryption、对外地址、显示名)。
+    notes 非空时, 把"元数据陈旧"这类提示 append 进去 —— 生成链接的路径有好几条
+    (创建 / 刷新 / 面板), 提示必须跟着返回值走, 否则总有一条路径不吭声。
     """
     meta = meta or {}
     proto = n.get("protocol")
-    host = meta.get("host") or n.get("sni") or ""
-    port = meta.get("port") or n.get("port")
+    host, port, note, refuse = share_target(n, meta)
+    if notes is not None and note:
+        notes.append(f"{n.get('tag') or '?'}: {note}")
+    if refuse:
+        if notes is not None:
+            notes.append(f"{n.get('tag') or '?'}: 未发布 —— {refuse}")
+        return None
     name = meta.get("name") or n.get("tag") or ""
 
     # 显示名不能为空。Client 的解析器是 `name = fragment or hostname`
@@ -206,8 +282,9 @@ def build_share_link(n, meta=None):
         name = naming.display_name(name)
 
     if not host or not port:
-        # 没有对外地址就没法生成分享链接 —— 但不静默返回 None 让上层
-        # 以为"节点不存在", 这里显式区分。
+        # 兜底: share_target 已经保证到这里 host/port 都非空, 这一条是防止
+        # 以后有人改 share_target 时把它破坏掉 (宁可少一条链接, 不要发一条
+        # host="" 的链接 —— 客户端会把它当成地址解析失败)。
         return None
 
     if proto == "vless":
@@ -216,6 +293,9 @@ def build_share_link(n, meta=None):
         # 表现是"分享了 4 个节点客户端只收到 3 个"且没有任何报错。
         # 生成一条连不上的链接比不生成更糟 —— 用户会以为已经分享成功了。
         if n.get("security") == "reality" and not meta.get("public_key"):
+            if notes is not None:
+                notes.append(f"{n.get('tag') or '?'}: 未发布 —— REALITY 缺公钥(pbk), "
+                             "客户端会静默丢弃这条链接")
             return None
         q = {
             "encryption": meta.get("encryption", "none"),
@@ -245,6 +325,8 @@ def build_share_link(n, meta=None):
 
     if proto == "trojan":
         if n.get("security") == "reality" and not meta.get("public_key"):
+            if notes is not None:
+                notes.append(f"{n.get('tag') or '?'}: 未发布 —— REALITY 缺公钥(pbk)")
             return None
         q = {"security": n.get("security") or "none", "type": n.get("network") or "tcp"}
         if n.get("security") == "reality":
