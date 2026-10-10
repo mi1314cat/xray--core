@@ -2183,6 +2183,29 @@ else
     printf '  (跳过: Client/lib/web/panel.py 不存在)\n'
 fi
 
+# 镜像顺序：实时回源的必须在 CDN 前面。
+# 理由不是"谁快"，而是 raw.githubusercontent.com 有 max-age=300 —— 刚发布时
+# 它会把**上一版的包和上一版的 .sha256 一起**给你，两个文件自洽、校验通过，
+# 于是"更新成功但版本没变"。实测踩到过（2.5.0 → 2.5.1 更新完还是 2.5.0）。
+group "镜像顺序 (实时源优先于 CDN)"
+for f in "$ROOT/Client/l.sh"; do
+    [[ -f "$f" ]] || continue
+    first=$(sed -n '/^MIRROR_DIRS=(/,/^)/p' "$f" | grep -oE '"[^"]+"' | head -1)
+    assert_has_mirror() { # <说明> <期望子串>
+        if printf '%s' "$first" | grep -q "$2"; then ok "$1"; else bad "$1（首个镜像: $first）"; fi
+    }
+    assert_has_mirror "第一个镜像走实时回源的代理" "ghproxy"
+    # 只数"裸的" raw 入口（代理形式里也含 raw.githubusercontent.com，
+    # 第一版按子串数，数出 3 个，差点把自己写成假失败）
+    both=$(sed -n '/^MIRROR_DIRS=(/,/^)/p' "$f" | grep -cE '^\s*"https://raw\.githubusercontent\.com/\$REPO')
+    assert_eq "$both" "1" "原始 CDN 仍在链里（只是不再排第一）"
+    if grep -q 'XBD_ARCHIVE=' "$f"; then ok "支持 XBD_ARCHIVE 指定实时源"; else bad "支持 XBD_ARCHIVE 指定实时源"; fi
+    if grep -q '发布包版本' "$f"; then ok "安装时打印包内版本（更新成功但没变版本看得出来）"; else bad "安装时打印包内版本"; fi
+    # --ref 分支必须用**同一套**顺序，否则换分支时又踩回旧的坑
+    n=$(sed -n '/--ref)/,/shift 2/p' "$f" | grep -c 'ghproxy')
+    assert_eq "$n" "1" "--ref 分支用同一套镜像顺序"
+done
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

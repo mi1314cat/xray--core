@@ -43,10 +43,15 @@ LOG="/tmp/xbd-deploy-$(date +%H%M%S).log"
 #     这种**混合状态** —— 校验必然对不上, 白跑一轮 → 只能垫底
 #   · 不同网络封的不一样: 有人的机器直连 github.com 是"卡死", CC 上则是
 #     raw.githubusercontent.com 被 reset 而 ghproxy 正常 —— 链要够长才都覆盖
+# ★ 顺序按"能不能立刻拿到刚推的版本"排，不按"谁快"排。
+#   raw.githubusercontent.com 是 CDN，max-age=300：刚发布时它会把
+#   **上一版的包和上一版的 .sha256** 一起给你 —— 两个文件自洽，校验通过，
+#   于是"更新成功"但版本没变。实测踩到过（2.5.0 → 2.5.1 更新完还是 2.5.0）。
+#   实时回源的代理排前面，CDN 垫底。
 MIRROR_DIRS=(
-  "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
   "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
   "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
+  "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
   "https://github.com/$REPO/raw/refs/heads/$REF/$SUBDIR"
   "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
 )
@@ -82,10 +87,11 @@ while [ $# -gt 0 ]; do
     --ref)
       REF="${2:-}"
       # --ref 换分支时重建同一套镜像链（顺序理由见文件上方 MIRROR_DIRS 的注释）
+      # 同一套顺序（理由见文件上方 MIRROR_DIRS 的注释）
       MIRROR_DIRS=(
-        "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
         "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
         "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
+        "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
         "https://github.com/$REPO/raw/refs/heads/$REF/$SUBDIR"
         "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
       )
@@ -231,6 +237,16 @@ tar x${TAR_FLAG#-}f "$TARBALL" -C "$WORKDIR/src" \
   || die "解压失败（压缩包可能损坏，或缺少 ${ARCHIVE_NAME##*.} 解压工具）"
 [ -f "$WORKDIR/src/RUN.sh" ] || die "压缩包结构异常：缺少 RUN.sh"
 ok "已解压"
+# 把包内版本报出来。以前只看"校验通过"就以为更新成了 ——
+# 而 CDN 给的可能是**上一版**的包（和它自己的 .sha256 自洽），版本号没变
+# 这件事只有打出来才看得见。
+PKG_VER=$(cat "$WORKDIR/src/VERSION" 2>/dev/null || echo "?")
+CUR_VER=$(cat "$PREFIX/VERSION" 2>/dev/null || echo "无")
+info "  发布包版本: ${PKG_VER}（本机现有: ${CUR_VER}）"
+if [ -n "$CUR_VER" ] && [ "$PKG_VER" = "$CUR_VER" ]; then
+  warn "  包内版本与本机相同 —— 若你刚推送了新版本，说明取到的是 CDN 缓存；"
+  warn "  可以用 XBD_ARCHIVE=<ghproxy 地址> 指定实时源重试"
+fi
 
 step "开始安装"
 XBD_PREFIX="$PREFIX" bash "$WORKDIR/src/RUN.sh" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
