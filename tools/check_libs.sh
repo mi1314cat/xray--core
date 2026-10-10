@@ -1755,6 +1755,254 @@ grep -q 'up=50&down=200&upmbps=50&downmbps=200' "$ROOT/conf/hysteria2.sh" \
     && ok "hysteria2.sh 的分享链接两种带宽名字都写 (mihomo 只认 up/down)" \
     || bad "hysteria2.sh 的分享链接少了 up=/down= (mihomo 会整条丢掉 upmbps=)"
 
+# ---- Xray JSON 导入这一跳: 我们自己生成的产物必须能被自己读回 ----
+#
+# 现场: 把 RN 上真实的 /root/catmi/xray/out/hy2_client-04.xray.json 喂给
+# `node.py parse` → "Xray 配置里没有可识别的出站"。原因是白名单里写的是
+# "hysteria2", 而**内核与 conf/hysteria2.sh 写的都是 "hysteria"**(version 2)。
+# 而且 hysteria 出站的 settings 是**扁平**的(address/port), 不是 servers[] ——
+# 只加白名单会"解析成功"但 address 空、port=443。
+#
+# 下面两份 JSON 是从真机产物逐字抄下来的两个世代:
+#   旧世代(本轮修复前, RN 上 hy2_client-02/03/04 全是这个形态):
+#       带宽只在已废弃的 hysteriaSettings.up/down 里
+#   新世代(conf/hysteria2.sh 现在写的): finalmask.quicParams + pin + udpHop
+# 两份都必须能解析, 且带宽/跳跃/pin 一个不丢。
+group "Xray JSON 导入: 自己生成的 hy2 客户端产物能被自己读回"
+CLH2=$(python3 - "$ROOT" <<'PY'
+import json, os, subprocess, sys, tempfile
+root = sys.argv[1]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+import node as N
+
+GEN = os.path.join(root, "Client", "lib", "genconfig.py")
+res = {}
+
+# ---- 真机产物①: RN /root/catmi/xray/out/hy2_client-04.xray.json (逐字) ----
+ART_OLD = """
+{
+  "outbounds": [
+    {
+      "tag": "hy2-04",
+      "protocol": "hysteria",
+      "settings": { "version": 2, "address": "107.173.154.178", "port": 29604 },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": { "serverName": "moontv.6896698.xyz", "alpn": ["h3"] },
+        "hysteriaSettings": { "version": 2, "auth": "05615ce2-4bf4-4f4e-908e-c99a16a803e8",
+                              "up": "50mbps", "down": "200mbps" }
+      }
+    }
+  ]
+}
+"""
+n = N.parse_xray_json(ART_OLD)
+res["old_proto"] = n.get("protocol")
+res["old_addr"] = n.get("address")
+res["old_port"] = n.get("port")
+res["old_auth"] = n.get("password")
+res["old_sni"] = n.get("sni")
+res["old_alpn"] = n.get("alpn")
+res["old_transport"] = n.get("transport")
+res["old_transport_raw"] = n.get("transport_raw")
+res["old_up"] = n.get("up")
+res["old_down"] = n.get("down")
+res["old_src"] = n.get("bandwidth_source")
+
+
+def qp(ss):
+    return ((ss or {}).get("finalmask") or {}).get("quicParams") or {}
+
+
+def gen(node, extra=()):
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(node, f); f.close()
+    o = tempfile.mktemp(suffix=".json")
+    r = subprocess.run(["python3", GEN, "--node", f.name, "--output", o,
+                        "--mode", "normal", "--listen", "127.0.0.1",
+                        "--port-normal", "1080", "--dns", "standard",
+                        "--family", "auto", "--logs", tempfile.gettempdir()] + list(extra),
+                       capture_output=True, text=True)
+    os.unlink(f.name)
+    if r.returncode != 0:
+        return None
+    ss = [x for x in json.load(open(o))["outbounds"] if x.get("tag") == "proxy"][0]["streamSettings"]
+    os.unlink(o)
+    return ss
+
+
+# 旧世代的带宽**不能丢**: 内核不读那个位置, 但那是我们自己产物里唯一的数据源;
+# 生成时必须把它搬到 finalmask。而"已废弃的位置"本身一个字段都不许再写。
+ss_old = gen(n)
+res["old_gen_up"] = qp(ss_old).get("brutalUp")
+res["old_gen_down"] = qp(ss_old).get("brutalDown")
+res["old_gen_deprecated"] = any(k in (ss_old.get("hysteriaSettings") or {}) for k in ("up", "down"))
+
+# ---- 真机产物②: conf/hysteria2.sh 现在的自签档 (+ 端口跳跃) ----
+ART_NEW = """
+{
+  "outbounds": [
+    {
+      "tag": "hy2-05",
+      "protocol": "hysteria",
+      "settings": { "version": 2, "address": "107.173.154.178", "port": 29605 },
+      "streamSettings": {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "moontv.6896698.xyz",
+          "alpn": ["h3"],
+          "pinnedPeerCertSha256": "694E89C0350E1C9C8C71C24CF0521C6147DEE182A18BA0979B8E6BDA67114E69"
+        },
+        "hysteriaSettings": { "version": 2, "auth": "05615ce2-4bf4-4f4e-908e-c99a16a803e8" },
+        "finalmask": { "quicParams": { "brutalUp": "50 mbps", "brutalDown": "200 mbps",
+                                       "udpHop": { "ports": "30000-31000" } } }
+      }
+    }
+  ]
+}
+"""
+m = N.parse_xray_json(ART_NEW)
+res["new_up"] = m.get("up")
+res["new_down"] = m.get("down")
+res["new_src"] = m.get("bandwidth_source")
+res["new_mport"] = m.get("mport")
+res["new_pin"] = m.get("pinned_cert_sha256")
+ss_new = gen(m)
+res["new_gen_up"] = qp(ss_new).get("brutalUp")
+res["new_gen_hop"] = (qp(ss_new).get("udpHop") or {}).get("ports")
+res["new_gen_pin"] = ((ss_new.get("tlsSettings") or {}).get("pinnedPeerCertSha256") or "")[:8]
+
+# ---- 权威性: 两个位置都有且冲突时, 以 finalmask 为准(旧位置只是回退) ----
+both = json.loads(ART_OLD)
+both["outbounds"][0]["streamSettings"]["finalmask"] = {"quicParams": {"brutalUp": "10 mbps"}}
+nb = N.parse_xray_json(json.dumps(both))
+res["prec_up"] = nb.get("up")            # finalmask 的 10 mbps, 不是旧位置的 50
+res["prec_down"] = nb.get("down")        # 旧位置回退
+res["prec_src"] = nb.get("bandwidth_source")
+
+# ---- 单位语法: 内核的数量级(bps = bit/s)也要能原样搬运 ----
+bits = json.loads(ART_NEW)
+bits["outbounds"][0]["streamSettings"]["finalmask"]["quicParams"]["brutalUp"] = "800000"
+res["bits_up"] = N.parse_xray_json(json.dumps(bits)).get("up")
+res["bits_gen_up"] = qp(gen(N.parse_xray_json(json.dumps(bits)))).get("brutalUp")
+
+# ---- 低于内核下限的源值: 丢弃, 不能搬进配置(搬进去内核拒收整份) ----
+low = json.loads(ART_NEW)
+low["outbounds"][0]["streamSettings"]["finalmask"]["quicParams"]["brutalUp"] = "40000"
+res["low_up"] = N.parse_xray_json(json.dumps(low)).get("up") or "SKIPPED"
+res["low_gen_hop"] = "udpHop" in qp(gen(N.parse_xray_json(json.dumps(low))))
+
+# ---- 认不出的单位: 不猜 ----
+junk = json.loads(ART_NEW)
+junk["outbounds"][0]["streamSettings"]["finalmask"]["quicParams"]["brutalUp"] = "50 xyz"
+res["junk_up"] = N.parse_xray_json(json.dumps(junk)).get("up") or "SKIPPED"
+
+# ---- 没写带宽: 不许编默认值 ----
+nobw = json.loads(ART_OLD)
+del nobw["outbounds"][0]["streamSettings"]["hysteriaSettings"]["up"]
+del nobw["outbounds"][0]["streamSettings"]["hysteriaSettings"]["down"]
+res["nobw_up"] = N.parse_xray_json(json.dumps(nobw)).get("up") or "SKIPPED"
+res["nobw_src"] = N.parse_xray_json(json.dumps(nobw)).get("bandwidth_source") or "SKIPPED"
+
+# ---- 白名单没有变成"什么都收": 不认识的协议仍然要响着失败 ----
+try:
+    N.parse_xray_json(json.dumps({"outbounds": [{"protocol": "wireguard", "tag": "w"}]}))
+    res["unknown_proto"] = "NO-RAISE"
+except ValueError as e:
+    res["unknown_proto"] = "raised"
+
+# ---- 同一处共享改动: TLS 里的 pin 对非 hysteria 协议也得读 ----
+ART_TROJAN = json.dumps({"outbounds": [{"tag": "t3", "protocol": "trojan",
+    "settings": {"servers": [{"address": "1.2.3.4", "port": 29602, "password": "pw"}]},
+    "streamSettings": {"network": "tcp", "security": "tls",
+        "tlsSettings": {"serverName": "a.example", "pinnedPeerCertSha256": "ABCDEF01"}}}]})
+res["trojan_pin"] = N.parse_xray_json(ART_TROJAN).get("pinned_cert_sha256")
+print(json.dumps(res, ensure_ascii=False))
+PY
+)
+CH2() { python3 -c "
+import json,sys
+print(json.loads(sys.argv[1]).get(sys.argv[2], '<无>'))" "$CLH2" "$1"; }
+
+assert_eq "$(CH2 old_proto)" "hysteria2" "真机产物① protocol:\"hysteria\" 被认出来(内核与脚本都写这个名字)"
+assert_eq "$(CH2 old_addr)" "107.173.154.178" "扁平 settings.address 被读到(走 servers[] 分支会是空串)"
+assert_eq "$(CH2 old_port)" "29604" "扁平 settings.port 被读到(走 servers[] 分支会是 443)"
+assert_eq "$(CH2 old_auth)" "05615ce2-4bf4-4f4e-908e-c99a16a803e8" "认证从 hysteriaSettings.auth 读到"
+assert_eq "$(CH2 old_sni)" "moontv.6896698.xyz" "sni 不丢"
+assert_eq "$(CH2 old_alpn)" "h3" "alpn 不丢"
+assert_eq "$(CH2 old_transport)" "quic" "hysteria 传输归一成 quic(与 parse_hysteria2 同一个模型)"
+assert_eq "$(CH2 old_transport_raw)" "hysteria" "原始 network 写法留在 transport_raw 备查"
+assert_eq "$(CH2 old_up)" "50 mbps" "旧位置(hysteriaSettings.up)的带宽按回退值收下, 不丢"
+assert_eq "$(CH2 old_down)" "200 mbps" "旧位置的 down 同样收下"
+assert_eq "$(CH2 old_src)" "hysteriaSettings" "并标明来源是已废弃位置(不是权威来源)"
+assert_eq "$(CH2 old_gen_up)" "50 mbps" "旧世代产物 → 生成的配置把带宽搬进 finalmask.brutalUp"
+assert_eq "$(CH2 old_gen_down)" "200 mbps" "旧世代产物 → brutalDown 同样搬过去"
+assert_eq "$(CH2 old_gen_deprecated)" "False" "生成的配置不再写已废弃的 hysteriaSettings.up/down"
+assert_eq "$(CH2 new_up)" "50 mbps" "新世代产物 finalmask.brutalUp 被读到"
+assert_eq "$(CH2 new_src)" "finalmask" "来源标成 finalmask(权威位置)"
+assert_eq "$(CH2 new_mport)" "30000-31000" "finalmask.quicParams.udpHop.ports 被读到"
+assert_eq "$(CH2 new_pin)" "694e89c0350e1c9c8c71c24cf0521c6147dee182a18ba0979b8e6bda67114e69" "tlsSettings.pinnedPeerCertSha256 被读到(自签节点唯一的信任来源)"
+assert_eq "$(CH2 new_gen_up)" "50 mbps" "新世代产物 → 生成回来带宽不丢"
+assert_eq "$(CH2 new_gen_hop)" "30000-31000" "新世代产物 → 端口跳跃不丢"
+assert_eq "$(CH2 new_gen_pin)" "694e89c0" "新世代产物 → 生成的配置带上 pin"
+assert_eq "$(CH2 prec_up)" "10 mbps" "finalmask 与旧位置冲突时以 finalmask 为准(权威性)"
+assert_eq "$(CH2 prec_down)" "200 mbps" "另一字段仍可回退到旧位置"
+assert_eq "$(CH2 prec_src)" "mixed" "混合来源被如实标成 mixed"
+assert_eq "$(CH2 bits_up)" "800000 bps" "内核的 bit/s 无数量级写法被原样保留(800000/8=100000 B/s)"
+assert_eq "$(CH2 bits_gen_up)" "800000 bps" "这种写法也能下发回内核, 不被当成噪音丢掉"
+assert_eq "$(CH2 low_up)" "SKIPPED" "低于内核下限 65536 B/s 的源值被丢弃(搬进去内核拒收整份配置)"
+assert_eq "$(CH2 low_gen_hop)" "True" "丢弃低于下限的带宽不影响同节点的其它字段(udpHop 照常下发)"
+assert_eq "$(CH2 junk_up)" "SKIPPED" "认不出的单位不猜(内核 Bps() 会直接报 unsupported unit)"
+assert_eq "$(CH2 nobw_up)" "SKIPPED" "没写带宽时不编默认值"
+assert_eq "$(CH2 nobw_src)" "SKIPPED" "没读到带宽时来源为空, 不冒充"
+assert_eq "$(CH2 unknown_proto)" "raised" "没把白名单放宽成\"什么都收\": 不认识的协议仍然报错"
+assert_eq "$(CH2 trojan_pin)" "abcdef01" "同一处共享改动: 非 hysteria 产物的 pin 也读到了(小写归一)"
+
+# 内核在就用真内核把"旧世代产物 → 配置"这一条验穿: 带宽搬到了 finalmask, 配置起得来
+XK2="${XRAY_BIN:-}"
+[[ -z "$XK2" && -x /root/catmi/xray/xrayls ]] && XK2=/root/catmi/xray/xrayls
+if [[ -n "$XK2" && -x "$XK2" ]]; then
+    H2V="$TMP/hyv"; mkdir -p "$H2V"
+    python3 - "$ROOT" "$H2V" <<'PY'
+import os, subprocess, sys, json
+root, work = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+import node as N
+art = json.dumps({"outbounds": [{"tag": "hy2-04", "protocol": "hysteria",
+    "settings": {"version": 2, "address": "107.173.154.178", "port": 29604},
+    "streamSettings": {"network": "hysteria", "security": "tls",
+        "tlsSettings": {"serverName": "moontv.6896698.xyz", "alpn": ["h3"]},
+        "hysteriaSettings": {"version": 2, "auth": "a", "up": "50mbps", "down": "200mbps"}}}]})
+json.dump(N.parse_xray_json(art), open(os.path.join(work, "n.json"), "w"))
+PY
+    python3 "$ROOT/Client/lib/genconfig.py" --node "$H2V/n.json" --output "$H2V/out.json" \
+        --mode normal --listen 127.0.0.1 --port-normal 1080 --dns standard \
+        --family auto --logs "$H2V" >/dev/null 2>&1
+    if "$XK2" run -test -c "$H2V/out.json" >"$H2V/test.log" 2>&1; then
+        ok "真内核 xray run -test: 真机产物 → 生成的配置 Configuration OK"
+    else
+        bad "真机产物生成的配置过不了内核: $(tail -1 "$H2V/test.log")"
+    fi
+    # 反向: 低于下限的带宽不许写进去 —— 写了内核会拒收整份配置
+    python3 -c "
+import json,sys
+n=json.load(open('$H2V/n.json')); n['up']='1 kbps'; n['down']='0.5 kbps'
+json.dump(n, open('$H2V/n_low.json','w'))"
+    python3 "$ROOT/Client/lib/genconfig.py" --node "$H2V/n_low.json" --output "$H2V/out_low.json" \
+        --mode normal --listen 127.0.0.1 --port-normal 1080 --dns standard \
+        --family auto --logs "$H2V" >/dev/null 2>&1
+    if "$XK2" run -test -c "$H2V/out_low.json" >"$H2V/test_low.log" 2>&1; then
+        ok "真内核: 低于下限的带宽被跳过, 配置照样起得来(写进去就是 rc=23 整份拒收)"
+    else
+        bad "低于下限的带宽还是写进去了: $(tail -1 "$H2V/test_low.log")"
+    fi
+else
+    ok "（跳过内核校验用例：本机没有 xray 二进制）"
+    ok "（跳过内核校验用例：本机没有 xray 二进制）"
+fi
+
 
 # ---- 证书 pin: 公网 CA 不写, 自签才写 ----
 PIN_SELF=$(bash -c "source '$LIB/cert.sh'; x_cert_client_pin '$SC/certs/self.crt' 1 0")

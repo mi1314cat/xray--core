@@ -204,35 +204,67 @@ def _alpn_list(v) -> list:
 # 与 Client/lib/node.py 的 bandwidth_hint() 是同一套语法：那边负责把来源
 # （裸数字 = Mbps / "45 Mbps" / "50mbps"）归一化，这边只做校验 + 兜底
 # —— 节点 JSON 也可能是手写或旧版本落盘的。
-_BW_CANON_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgt])bps$", re.I)
+#
+# 数量级允许缺省：解析 Xray JSON 时（node.py 的 bandwidth_xray()）源里可能写着
+# 内核的 bit/s 形态（"400000" = 50000 B/s），转成规范写法就是 "400000 bps"。
+# 这种值必须能原样下发，否则"从 Xray 产物导入"这条路径会静默丢带宽。
+_BW_CANON_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?)bps$", re.I)
 _BW_BARE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)$")
+# Xray 的 Bandwidth 数量级是 1024 进制（infra/conf/transport_internet.go 的 Bps()）。
+_BW_MUL = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+# brutalUp/brutalDown 的内核下限：`BrutalUp must be at least 65536 bytes per second`
+# （v26.3.27 实测报错原文）。低于它的值写进去 = 内核拒收**整份**配置。
+_BW_FLOOR_BPS = 65536
+
+
+def _bandwidth_bps(s: str) -> float:
+    """规范写法 → 字节/秒（复刻内核 Bps()：数量级 1024 进制，最后 /8）。"""
+    m = _BW_CANON_RE.match(s.strip().replace(" ", ""))
+    if not m:
+        return 0.0
+    return float(m.group(1)) * _BW_MUL[m.group(2).lower()] / 8
 
 
 def _bandwidth_value(v) -> str:
-    """节点里的带宽提示 → Xray 的 Bandwidth 语法；认不出返回 "" 并说明。
+    """节点里的带宽提示 → Xray 的 Bandwidth 语法；认不出/不可用返回 "" 并说明。
 
-    ★ 为什么必须**带单位**，以及为什么不能原样透传节点里的字符串：
-      Xray 的 `Bandwidth.Bps()` 把裸数字当**字节/秒**（""/"b"/"bps" 都是字节），
-      而 brutalUp/brutalDown 有 `>= 65536 B/s` 的下限。实测把 "50" 写进
-      brutalUp 的后果不是"带宽提示没生效"，而是内核**拒收整份配置**：
+    ★ 为什么必须**带数量级**，以及为什么不能原样透传节点里的字符串：
+      Xray 的 `Bandwidth.Bps()` 把缺数量级的写法当 **bit/s**（""/"b"/"bps"
+      都是 mul=1，返回值再 /8），而 brutalUp/brutalDown 有 `>= 65536 B/s` 的
+      下限。实测把 "50" 写进 brutalUp 的后果不是"带宽提示没生效"，而是内核
+      **拒收整份配置**：
           infra/conf: BrutalUp must be at least 65536 bytes per second
       链接侧的裸数字却是 Mbps（mihomo 的 up/down、sing-box 的 upmbps/downmbps）。
       两边语义相反，所以这里认不出就**不写**，绝不把来源字符串直接塞进内核。
+
+    ★ 下限检查（本轮补）：**任何**写法算出来的 B/s < 65536 都不写。
+      以前只查了"有没有数量级"，`"1 kbps"`（=128 B/s）、`"400000 bps"`（=50000 B/s）
+      这类值能过格式校验，却被内核连整份配置一起拒收 —— 那是比"不写"严重得多的后果。
     """
     if v is None or v == "" or isinstance(v, bool):
         return ""
     if isinstance(v, (int, float)):
-        return f"{v:g} mbps" if v > 0 else ""
+        v = f"{v:g} mbps"          # 裸数字按链接侧约定 = Mbps
     s = str(v).strip()
     m = _BW_CANON_RE.match(s)
     if m:
-        return f"{float(m.group(1)):g} {m.group(2).lower()}bps"
-    if _BW_BARE_RE.match(s):
-        # 旧节点文件里可能只有裸数字 —— 按链接侧的约定当 Mbps（不是字节/秒）。
-        return f"{float(s):g} mbps" if float(s) > 0 else ""
-    print(f"genconfig: 带宽提示 {s!r} 不是可识别的写法（要 \"50 mbps\" 这种带单位的"
-          "形式；裸数字会被内核当成字节/秒并拒绝整份配置）—— 已跳过", file=sys.stderr)
-    return ""
+        out = f"{float(m.group(1)):g} {m.group(2).lower()}bps"
+    elif _BW_BARE_RE.match(s):
+        # 旧节点文件里可能只有裸数字 —— 按链接侧的约定当 Mbps（不是 bit/s）。
+        out = f"{float(s):g} mbps"
+    else:
+        print(f"genconfig: 带宽提示 {s!r} 不是可识别的写法（要 \"50 mbps\" 这种带单位的"
+              "形式；裸数字会被内核当成 bit/s 并拒绝整份配置）—— 已跳过", file=sys.stderr)
+        return ""
+    bps = _bandwidth_bps(out)
+    if bps < _BW_FLOOR_BPS:
+        # 内核原文: BrutalUp must be at least 65536 bytes per second。
+        # 写进去不是"限速没生效"，是**整份配置起不来** —— 宁可不写。
+        print(f"genconfig: 带宽提示 {s!r} 换算成 {bps:g} B/s，低于内核下限 "
+              f"{_BW_FLOOR_BPS} B/s（写进去内核会拒收整份配置）—— 已跳过",
+              file=sys.stderr)
+        return ""
+    return out
 
 
 def _port_hop(v) -> str:

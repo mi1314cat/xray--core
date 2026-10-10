@@ -67,14 +67,29 @@ DEFAULT_NODE = {
     #
     # ★ 存的是**带单位的规范写法**（"50 mbps" / "1.5 gbps"），不是来源原文。
     #   因为 Xray 的 Bandwidth 解析器
-    #   （infra/conf/transport_internet.go 的 `func (b Bandwidth) Bps()`）把
-    #   **裸数字当成字节/秒**，而链接侧（mihomo 的 up/down、sing-box 与本项目
-    #   conf/hysteria2.sh 的 upmbps/downmbps）的裸数字是 **Mbps** —— 两边语义
-    #   正好相反。实测把 "50" 直接写进 brutalUp 时真内核拒收**整份**配置：
+    #   （infra/conf/transport_internet.go 的 `func (b Bandwidth) Bps()`）与链接侧
+    #   是**两套相反的约定**（v26.3.27 源码逐字读过）：
+    #     内核: 数字 + 可选数量级 + 可选 b/bps，缺数量级 = bit/s，返回值再 /8 成字节/秒
+    #           ⇒ "50" = 6 B/s，而 "50 mbps" = 6553600 B/s
+    #     链接: 裸数字 = Mbps（mihomo 的 up/down、sing-box 与本项目
+    #           conf/hysteria2.sh 的 upmbps/downmbps）
+    #   实测把 "50" 直接写进 brutalUp 时真内核拒收**整份**配置：
     #       infra/conf: BrutalUp must be at least 65536 bytes per second
     #   所以归一化只能在解析这一处做，下游原样下发，绝不透传来源字符串。
     "up": "",                  # 上行提示，规范写法；未声明 = ""
     "down": "",                # 下行提示，规范写法；未声明 = ""
+    # 带宽是从哪个位置读到的（排查/审计用）。Xray 的 hysteria 出站里有两个位置：
+    #   "finalmask"        —— streamSettings.finalmask.quicParams.brutalUp/brutalDown，
+    #                          **内核唯一真正读的键**（权威）
+    #   "hysteriaSettings" —— 旧位置，26.3.27 的 Build() 只打一行 Warning 就丢掉，
+    #                          `xray run -test` 还返回 rc=0 "Configuration OK"
+    #   "mixed"            —— 一个字段来自 finalmask、另一个只能退回旧位置
+    #   ""                 —— 没读到（未声明）
+    # 之所以还读旧位置：本项目 conf/hysteria2.sh 在上一轮修复前产出的
+    # hy2_client-*.xray.json 里**只有**这个位置有带宽，不读它就等于"我们自己的
+    # 客户端读不懂我们自己生成的产物"。但它是回退，不是权威：finalmask 有值时
+    # 一律以 finalmask 为准。
+    "bandwidth_source": "",
     # 端口跳跃范围，**原样**保留（Xray 的 PortList 收 "a-b" / "a,b" / 单端口）。
     "mport": "",
     # mux：**只表示 Xray 自己的 mux.cool**。见 parse_mihomo_yaml 里对 smux 的说明 ——
@@ -168,6 +183,59 @@ def bandwidth_hint(v) -> str:
         return ""
     # mag 是数量级字母（k/m/g/t）。数量级没写时按链接侧约定补上 "m"（= Mbps）。
     return f"{num:g} {mag}bps" if mag else f"{num:g} mbps"
+
+
+# Xray 的 `Bandwidth` 语法（infra/conf/transport_internet.go 的 `Bps()`）：
+# 数字 + 可选数量级(k/m/g/t，1024 进制) + 可选 b/bps/bit/bits；缺数量级 = bit/s。
+_BW_XRAY_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?)\s*(?:b|bps|bit|bits)?$", re.I)
+_BW_XRAY_MUL = {"": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+
+# brutalUp/brutalDown 的内核下限（B/s）。低于它的值写进配置会让内核**拒收整份**
+# 配置：`infra/conf: BrutalUp must be at least 65536 bytes per second`（v26.3.27 实测）。
+BANDWIDTH_FLOOR_BPS = 65536
+
+
+def bandwidth_xray(v) -> str:
+    """Xray JSON 里的带宽写法 → 本项目的规范写法；认不出/低于内核下限返回 ""。
+
+    与 `bandwidth_hint()` 是**两套相反的约定**，绝不能互相调用：
+
+        内核 (Bps()):  "50"      → 50/8 = 6 B/s        ← 缺数量级 = bit/s
+                       "50 mbps" → 50*1048576/8 B/s
+        链接侧:        "50"      → 50 Mbps（mihomo up/down、sing-box upmbps）
+
+    本函数只用于**读 Xray JSON**（hysteria 出站的 finalmask / 旧 hysteriaSettings），
+    按内核语义解释，再转成规范写法 `"<数字> <数量级>bps"`。
+
+    ★ 为什么低于 65536 B/s 要整个丢掉而不是照抄：`brutalUp` 有硬下限，把源里
+      一个更小的值搬进节点模型、再生成回配置，结果不是"限速没生效"而是**内核
+      拒收整份配置**（连代理都起不来）。丢掉它反而是唯一不制造故障的做法；
+      这个值本来也不可能作为 brutal 值生效。
+    """
+    if v is None or isinstance(v, bool):
+        return ""
+    if isinstance(v, (int, float)):
+        s = f"{v:g}"
+    else:
+        s = str(v).strip()
+    if not s:
+        return ""
+    m = _BW_XRAY_RE.match(s)
+    if not m:
+        return ""
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return ""
+    if not num > 0:
+        # 0 是"没写"，不是"限速到 0"。
+        return ""
+    mag = m.group(2).lower()
+    if int(num * _BW_XRAY_MUL[mag]) // 8 < BANDWIDTH_FLOOR_BPS:
+        print(f"node: 带宽值 {s!r} 低于内核下限 65536 B/s —— 已丢弃"
+              "（写进 brutalUp 会让内核拒收整份配置）", file=sys.stderr)
+        return ""
+    return f"{num:g} {mag}bps" if mag else f"{num:g} bps"
 
 
 def bandwidth_mbps(v) -> str:
@@ -436,22 +504,38 @@ def parse_xray_json(text: str) -> dict:
     outbounds = cfg.get("outbounds") or []
     ob = None
     for cand in outbounds:
-        if cand.get("protocol") in ("vless", "vmess", "trojan", "shadowsocks", "hysteria2"):
+        # ★ `"hysteria"` 必须在白名单里：Xray 自己的协议名就是 hysteria
+        #   （version 2 即 hysteria2），本项目 conf/hysteria2.sh 生成的
+        #   hy2_client-*.xray.json 里写的也是 `"protocol": "hysteria"`。
+        #   名单里只写 "hysteria2" 的后果实测过：把我们**自己生成的**客户端产物
+        #   喂回 `xbd` 会报"Xray 配置里没有可识别的出站" —— 自己读不懂自己的产物。
+        #   两家的命名坑在 conf/lib/nodes.py 那边已经踩过一次，客户端这份漏了。
+        if cand.get("protocol") in ("vless", "vmess", "trojan", "shadowsocks",
+                                    "hysteria", "hysteria2"):
             ob = cand
             break
     if ob is None:
         raise ValueError("Xray 配置里没有可识别的出站")
 
     proto = ob["protocol"]
+    is_hysteria = proto.lower() in ("hysteria", "hysteria2")
     ss = ob.get("streamSettings") or {}
     settings = ob.get("settings") or {}
     n = new_node()
-    n["protocol"] = proto
+    # 统一模型里 hysteria 一律记成 "hysteria2"（version 2）—— genconfig 的
+    # hysteria 分支按这个名字判协议；内核侧的 `hysteria` 写法由它自己写回，
+    # 与 parse_hysteria2() 的产物保持同一种模型。
+    n["protocol"] = "hysteria2" if is_hysteria else proto
     n["name"] = ob.get("tag") or proto
     n["source"] = "xray-json"
     n["raw"] = text[:4000]
     n["transport_raw"] = (ss.get("network") or "tcp").lower()
-    n["transport"] = _norm_transport(n["transport_raw"])
+    if is_hysteria:
+        # hysteria 出站的传输就是 QUIC（network 写的是 "hysteria"），与
+        # parse_hysteria2() 的模型对齐；原始写法留在 transport_raw 里备查。
+        n["transport"] = "quic"
+    else:
+        n["transport"] = _norm_transport(n["transport_raw"])
     n["security"] = (ss.get("security") or "none").lower()
 
     if proto in ("vless", "vmess"):
@@ -462,6 +546,16 @@ def parse_xray_json(text: str) -> dict:
         n["uuid"] = users.get("id", "")
         n["flow"] = users.get("flow") or ""
         n["encryption"] = users.get("encryption") or ("auto" if proto == "vmess" else "none")
+    elif is_hysteria:
+        # ★ hysteria 出站的 settings 是**扁平**的，不是 servers[]/vnext[]：
+        #     "settings": { "version": 2, "address": "1.2.3.4", "port": 29604 }
+        #   走下面那个 servers[] 分支的话 address 会是空串、port 会是 443 ——
+        #   解析"成功"但连到一个不存在的节点。
+        n["address"] = settings.get("address", "")
+        n["port"] = int(settings.get("port") or 443)
+        # 认证在 streamSettings.hysteriaSettings.auth（官方文档与本项目产物一致）。
+        hs = ss.get("hysteriaSettings") or {}
+        n["password"] = str(hs.get("auth") or settings.get("password") or "")
     else:
         servers = (settings.get("servers") or [{}])[0]
         n["address"] = servers.get("address", "")
@@ -479,6 +573,9 @@ def parse_xray_json(text: str) -> dict:
     n["alpn"] = ",".join(tls.get("alpn") or [])
     n["fingerprint"] = tls.get("fingerprint") or reality.get("fingerprint") or ""
     n["allow_insecure"] = bool(tls.get("allowInsecure"))
+    # 证书钉扎：自签节点唯一的信任来源，同一份产物里 tlsSettings 有它、
+    # 节点模型以前没有这个键 —— 从 Xray JSON 导入的自签节点必然校验失败。
+    n["pinned_cert_sha256"] = str(tls.get("pinnedPeerCertSha256") or "").strip().lower()
     n["host"] = ws.get("host") or xh.get("host") or ""
     n["path"] = ws.get("path") or xh.get("path") or ""
     n["mode"] = xh.get("mode") or ""
@@ -494,6 +591,45 @@ def parse_xray_json(text: str) -> dict:
     # ECH 节点，配置一直是空的。
     n["ech"] = str(tls.get("echConfigList") or "").strip()
     n["ech_declared"] = bool(n["ech"] or tls.get("echServerKeys") or tls.get("echSettings"))
+
+    if is_hysteria:
+        # ---- 带宽与端口跳跃：权威位置只有一个 ----
+        #
+        #   streamSettings.finalmask.quicParams.{brutalUp,brutalDown,udpHop.ports}
+        #       ← 26.3.27 的 Build() 真正读的键（见 _BW_XRAY_RE 上方说明）
+        #   streamSettings.hysteriaSettings.{up,down,udphop}
+        #       ← 旧位置：能过 `-test` 但内核只打一行 Warning 就丢
+        #
+        # 只读 finalmask 的话，本项目 conf/hysteria2.sh 上一轮修复**之前**产出的
+        # hy2_client-*.xray.json（RN 上 hy2_client-02/03/04 三份都在这个形态）
+        # 带宽全丢；只读 hysteriaSettings 的话，就是在拿内核不认的键当权威。
+        # 所以：finalmask 优先，逐字段回退到旧位置，并把来源记进 bandwidth_source。
+        hs = ss.get("hysteriaSettings") or {}
+        qp = ((ss.get("finalmask") or {}).get("quicParams") or {})
+        src = set()
+        for field, key in (("up", "brutalUp"), ("down", "brutalDown")):
+            raw = qp.get(key)
+            if raw not in (None, ""):
+                n[field] = bandwidth_xray(raw)
+                if n[field]:
+                    src.add("finalmask")
+                continue
+            raw = hs.get(field)
+            if raw not in (None, ""):
+                n[field] = bandwidth_xray(raw)
+                if n[field]:
+                    src.add("hysteriaSettings")
+                    print(f"node: {ob.get('tag') or proto} 的 {field} 只存在于已废弃的 "
+                          f"hysteriaSettings.{field}（内核 26.3.27 会静默丢弃）"
+                          "—— 已按回退值收下，生成时会写进 finalmask.quicParams",
+                          file=sys.stderr)
+        n["bandwidth_source"] = ("mixed" if len(src) > 1
+                                 else (src.pop() if src else ""))
+        hop = (qp.get("udpHop") or {}).get("ports")
+        if hop in (None, ""):
+            # 同一对坑的另一半：旧位置是 hysteriaSettings.udphop。
+            hop = (hs.get("udphop") or {}).get("ports")
+        n["mport"] = port_hop_range(hop)
     return n
 
 
