@@ -373,7 +373,15 @@ require('fs').writeFileSync(process.argv[3], out.join('\n'));
                  ("分组计数徽标", "--dim", "--ov2", "--card"),
                  ("分组行·选中名", "--fg", "--acc-bg2", "--card"),
                  ("批量条文字", "--fg", "--acc-bg", "--card"),
-                 ("分组菜单·危险", "--bad-text", "--modal-bg", "--modal-bg")]
+                 ("分组菜单·危险", "--bad-text", "--modal-bg", "--modal-bg"),
+                 # 应用外壳（版式重构新增）
+                 ("顶栏 chip 文字", "--dim", "--ov0", "--bg"),
+                 # 侧栏底 = --ov0 叠在页面 --bg 上。上一版把 base 也写成
+                 # --ov0，等于叠了两层，合成出一个浅底 —— 于是"选中态"算出
+                 # 1.04:1 这种不可能的数字。基准链错一层，结论就完全反了。
+                 ("侧栏导航·未选中", "--dim", "--ov0", "--bg"),
+                 ("侧栏导航·选中", "--fg", "--acc-bg2", "--bg"),
+                 ("品牌方块文字", "--on-acc", "--acc-btn", "--acc-btn")]
         bad_pairs = []
         for label, fgv, bgv, basev in PAIRS:
             for tname, T in (("深色", TD), ("浅色", TL)):
@@ -391,7 +399,40 @@ require('fs').writeFileSync(process.argv[3], out.join('\n'));
     else:
         ck(False, "能取出两套主题变量")
 
-    print("\n[9] 内联 JS 语法")
+    print("\n[9] 版式：应用式而不是文章式")
+    # 这一组是版式重构的**硬约束**。用户的原话是"不要设置一个很小的 max-width
+    # 把整个应用限制成文章宽度" —— 所以这里直接断言"不存在居中的窄容器"，
+    # 而不是靠人记得别加回去。
+    ck(re.search(r"\.app\s*\{[^}]*display:\s*grid", bare) is not None,
+       "应用外壳用 grid 布局")
+    ck(re.search(r"\.app\s*\{[^}]*grid-template-columns:\s*212px", bare) is not None,
+       "左栏固定宽度 + 主区自适应")
+    ck(".wrap" not in re.sub(r"/\*.*?\*/", "", bare, flags=re.S).split("@media")[0]
+       or re.search(r"\.wrap\s*\{[^}]*max-width", bare) is None,
+       "没有 .wrap 居中窄容器")
+    # 主区不得再设 max-width（只允许 pre/hint 这类文字块限宽）
+    m = re.search(r"\.main\s*\{([^}]*)\}", bare)
+    ck(m is not None and "max-width" not in m.group(1),
+       "主工作区不设宽度上限（桌面端吃满屏宽）")
+    ck(re.search(r"\.card pre[^{]*\{[^}]*max-width", bare) is not None,
+       "改由文字块自己限宽（可读性不靠缩小整个应用）")
+    ck(re.search(r"\.view\s*\{[^}]*display:\s*none", bare) is not None
+       and re.search(r"\.view\.on\s*\{[^}]*display:\s*block", bare) is not None,
+       "视图切换：同一时刻只显示一个")
+    ck(re.search(r"\.nav button\.on\s*\{", bare) is not None,
+       "侧栏导航有选中态")
+    ck(re.search(r"\.chip\s*\{", bare) is not None, "顶栏状态 chip 有样式")
+    ck('id="view-nodes"' in page and 'id="view-status"' in page
+       and 'id="view-config"' in page and 'id="view-core"' in page,
+       "四个视图都在")
+    ck('class="app"' in page and 'class="side"' in page and 'class="main"' in page,
+       "应用外壳三件套齐（app / side / main）")
+    # 桌面优先：窄屏才塌成顶部导航
+    ck(re.search(r"@media\(max-width:900px\)\{[^}]*\.app\s*\{[^}]*grid-template-columns:1fr",
+                 bare, re.S) is not None,
+       "窄屏（≤900px）才把侧栏收成顶部条")
+
+    print("\n[10] 内联 JS 语法")
     # ★ 这一条是补一个真实盲区：页面的 JS 全拼在字符串里，此前**没有任何东西
     #   检查它的语法** —— CSS 有括号配对检查，JS 没有。一次重复的 const 声明
     #   就能让整个面板的脚本静默失效（页面照常渲染，只是所有按钮都没反应）。
@@ -412,7 +453,7 @@ require('fs').writeFileSync(process.argv[3], out.join('\n'));
     else:
         print("  ⏭  没有 node，跳过 JS 语法检查")
 
-    print("\n[10] 页面骨架")
+    print("\n[11] 页面骨架")
     ck(page.lstrip().startswith("<!DOCTYPE html>"), "以 DOCTYPE 开头")
     ck(page.count("<style>") == 1 and page.count("</style>") == 1,
        "只有一段 <style>")

@@ -1014,7 +1014,81 @@ PAGE = r"""<!DOCTYPE html>
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:14px/1.55 -apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif}
-.wrap{max-width:1100px;margin:0 auto;padding:22px 18px 60px}
+/* =============================================================
+   应用外壳（Dashboard 版式）
+   -------------------------------------------------------------
+   原来是 `.wrap{max-width:1100px;margin:0 auto}` + 9 个 card 纵向堆叠 ——
+   那是文章/文档的版式，不是管理面板。这里换成标准应用外壳：
+   左侧常驻导航 + 顶部状态栏 + 占满宽度的主工作区。
+
+   ★ 刻意**不设窄 max-width**。桌面端（1440/1920/2560）上要占满屏幕，
+     只在超宽屏给一个很大的上限，否则表格行会被拉成一条细线。
+   ============================================================= */
+.app{display:grid;grid-template-columns:212px minmax(0,1fr);
+ min-height:100vh;align-items:start}
+
+/* ---- 左侧导航 ---- */
+.side{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;
+ gap:3px;padding:14px 10px 12px;border-right:1px solid var(--line);
+ background:var(--ov0);overflow:auto}
+.brand{display:flex;align-items:center;gap:9px;padding:4px 8px 14px;
+ font-size:13.5px;font-weight:600;letter-spacing:.01em}
+.brand .logo{width:24px;height:24px;border-radius:7px;flex:0 0 auto;
+ background:var(--acc-btn);color:var(--on-acc);display:grid;place-items:center;
+ font-size:13px;font-weight:700}
+.nav{display:flex;flex-direction:column;gap:2px}
+.nav button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;
+ border:0;background:transparent;color:var(--dim);border-radius:8px;
+ padding:8px 10px;font-size:13px;font-family:inherit;cursor:pointer;line-height:1.4}
+.nav button:hover{background:var(--ov2);color:var(--fg)}
+.nav button.on{background:var(--acc-bg2);color:var(--fg);font-weight:600}
+.nav button.on .ico{color:var(--acc)}
+.nav .ico{width:15px;text-align:center;font-size:12px;flex:0 0 auto;opacity:.9}
+.nav .n{color:var(--dim);font-size:11px;font-weight:400}
+.side .grp{padding:12px 10px 4px;font-size:10.5px;color:var(--dim);
+ text-transform:uppercase;letter-spacing:.06em}
+.side-foot{margin-top:auto;display:flex;flex-direction:column;gap:6px;
+ padding-top:12px;border-top:1px solid var(--line)}
+.side-foot .ver{font-size:11px;color:var(--dim);padding:0 10px;
+ font-variant-numeric:tabular-nums}
+
+/* ---- 主工作区 ---- */
+.main{display:flex;flex-direction:column;min-width:0;padding:0 22px 26px}
+/* 只有成段的文字限宽 —— 拿整个应用去迁就 <pre> 是可读性倒挂。
+   2560 宽屏上配置块拉成一行 200 字符，谁也不会去读它。 */
+.card pre,.card .hint{max-width:1100px}
+.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;
+ gap:10px;flex-wrap:wrap;padding:12px 0;margin-bottom:14px;
+ background:var(--bg);border-bottom:1px solid var(--line)}
+.topbar h1{font-size:15.5px;margin:0;font-weight:600;white-space:nowrap}
+.topbar .sp{flex:1 1 auto}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;
+ border-radius:20px;border:1px solid var(--line);background:var(--ov0);
+ font-size:11.5px;color:var(--dim);white-space:nowrap;line-height:1.6}
+.chip b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+.chip .dot{margin:0;width:6px;height:6px}
+
+/* 视图切换：同一时刻只显示一个，替代原来的长滚动 */
+.view{display:none}
+.view.on{display:block}
+/* 节点视图是主角：让它至少占满一屏，避免底下露出大片空白 */
+#view-nodes.on{display:flex;flex-direction:column;gap:12px;
+ min-height:calc(100vh - 110px)}
+/* 其余视图的卡片之间也要有间距（原来靠卡片自带的 margin-top 堆叠） */
+.view.on > .card + .card{margin-top:12px}
+
+/* ---- 消息条（原来是紧跟 header 的一段，现在贴在顶栏下） ---- */
+#msg{margin:0 0 12px}
+
+/* ---- 卡片变"面板"：紧凑一档，去掉文章式的大留白 ---- */
+.card{padding:12px 14px}
+.card h2{font-size:11.5px;margin:0 0 9px;letter-spacing:.04em}
+.nodes-card{padding:0}
+/* 面板标题行：标题 + 右侧操作，横向排开而不是各占一行 */
+.phead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.phead h2{margin:0}
+.phead .sp{flex:1 1 auto}
 header{display:flex;align-items:baseline;gap:12px;margin-bottom:18px;flex-wrap:wrap}
 h1{font-size:19px;margin:0;font-weight:600}
 .sub{color:var(--dim);font-size:12px}
@@ -1050,7 +1124,7 @@ input:focus,select:focus{outline:none;border-color:var(--acc)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--dim);font-weight:600;padding:7px 8px;
 border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase}
-td{padding:9px 8px;border-bottom:1px solid var(--ov1);vertical-align:middle}
+td{padding:7px 8px;border-bottom:1px solid var(--ov1);vertical-align:middle}
 tr.cur{background:var(--acc-bg)}
 tr.cur td:first-child{box-shadow:inset 3px 0 0 var(--acc)}
 .tag{display:inline-block;padding:2px 7px;border-radius:5px;font-size:11px;
@@ -1147,7 +1221,8 @@ display:none;font-size:13px;white-space:pre-wrap}
 #msg.on{display:block}
 #msg.good{border-color:var(--ok-line)}
 #msg.err{border-color:var(--bad-line)}
-.hint{color:var(--dim);font-size:12px;margin-top:8px;line-height:1.5}
+.hint{color:var(--dim);font-size:11.5px;margin-top:6px;line-height:1.45;
+ max-width:1100px}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
 .mode-pick{display:flex;gap:8px;margin-top:6px}
 .mode-pick button{flex:1}
@@ -1173,7 +1248,7 @@ display:none;font-size:13px;white-space:pre-wrap}
         像原来那样整张表到处 nowrap。
    断点从 1 个加到 4 个, 因为节点表在 640-900px 之间就已经开始难看了。 */
 .nowrap{white-space:nowrap}
-.wrap, .card{min-width:0}
+.card{min-width:0}
 .grid>*{min-width:0}
 .grow{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 td, th{overflow-wrap:anywhere}
@@ -1181,12 +1256,23 @@ table{table-layout:auto;max-width:100%}
 .listwrap, .gridwrap{min-width:0;max-width:100%}
 
 @media(max-width:900px){
+  /* 侧栏收成顶部横向条：窄屏上左侧导航会把内容挤没 */
+  .app{grid-template-columns:1fr}
+  .side{position:static;height:auto;flex-direction:row;align-items:center;
+   gap:4px;padding:8px 10px;border-right:0;border-bottom:1px solid var(--line);
+   overflow-x:auto}
+  .brand{padding:0 10px 0 2px;flex:0 0 auto}
+  .nav{flex-direction:row;gap:2px}
+  .nav button{width:auto;padding:6px 10px;white-space:nowrap}
+  .side .grp,.side-foot{display:none}
+  .main{max-width:none}
+  #view-nodes.on{min-height:0}
   .subs-rail{width:auto;flex:0 0 auto;border-right:none;
     border-bottom:1px solid var(--line)}
   .nodes-body{flex-direction:column}
 }
 @media(max-width:760px){
-  .wrap{padding:14px 12px 48px}
+  .main{padding:0 12px 20px}
   .card{padding:13px}
   header{gap:8px}
   h1{font-size:17px}
@@ -1345,19 +1431,99 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   /* 首次 apply 时按钮还没解析出来，DOM 就绪后再刷一次图标。 */
   document.addEventListener('DOMContentLoaded',function(){apply(saved())});
 })();
-</script></head><body><div class="wrap">
+</script></head><body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><span class="logo">X</span><span>Xray Client</span></div>
+    <nav class="nav" id="nav">
+      <button data-view="nodes" class="on" onclick="go('nodes')">
+        <span class="ico">▤</span>节点<span style="flex:1"></span><span class="n" id="nav-nodes">0</span></button>
+      <button data-view="status" onclick="go('status')">
+        <span class="ico">◉</span>状态</button>
+      <button data-view="config" onclick="go('config')">
+        <span class="ico">⚙</span>配置</button>
+      <button data-view="core" onclick="go('core')">
+        <span class="ico">◆</span>内核</button>
+    </nav>
+    <div class="side-foot"><span class="ver" id="side-ver">—</span></div>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <h1 id="view-title">节点</h1>
+      <div class="chips" id="top-chips"></div>
+      <span class="sp"></span>
+      <span class="sub" id="stamp">加载中…</span>
+      <button id="btn-theme" class="sm" onclick="themeCycle()" title="主题">◐</button>
+      <button class="sm" onclick="load()">刷新</button>
+    </div>
+    <div id="msg"></div>
 
-<header>
-  <h1>Xray Client</h1>
-  <span class="sub" id="stamp">加载中…</span>
-  <span style="flex:1"></span>
-  <button id="btn-theme" class="sm" onclick="themeCycle()" title="主题">◐</button>
-  <button onclick="load()">刷新</button>
-</header>
 
-<div id="msg"></div>
+    <section class="view on" id="view-nodes">
+<div class="card nodes-card">
+  <div class="nodes-head">
+    <div class="nh-l">
+      <button class="pri sm" onclick="openAdd()" title="手动添加 / 粘贴链接 / 订阅 / 扫码 / Server Pull">＋ 添加节点</button>
+      <b>节点</b><span class="badge" id="side-count">0</span>
+      <span class="chipbar">
+        <label class="chk"><input type="checkbox" id="onlyavail" onchange="renderNodes()">仅可用</label>
+      </span>
+    </div>
+    <div class="nlt">
+      <input id="nq" class="nli wide" placeholder="搜索名称 / 地址 / 协议…" oninput="renderNodes()">
+      <select id="ns" class="nli" onchange="renderNodes()">
+        <option value="default">默认排序</option>
+        <option value="name">按名称</option><option value="lat">按延迟</option>
+        <option value="traffic">按流量</option><option value="proto">按协议</option>
+      </select>
+      <select id="nd" class="nli" onchange="setDensity(this.value)">
+        <option value="table">表格</option><option value="grid">卡片</option>
+        <option value="list">紧凑</option>
+      </select>
+      <button class="sm" onclick="batchAll(this)">全选</button>
+      <button class="sm" onclick="batchTest()">测速</button>
+      <button class="sm" onclick="batchDelete()">删除</button>
+    </div>
+  </div>
+    <div class="bulkbar" id="bulkbar">
+    <span>已选 <b id="bulk-n">0</b> 个节点</span>
+    <select id="bulk-move" class="nli" style="flex:0 0 auto" onchange="pickMoveTarget(this)">
+      <option value="">移动到分组…</option>
+    </select>
+    <button class="sm" onclick="batchTest()">批量测速</button>
+    <button class="sm" onclick="batchDelete()">批量删除</button>
+    <button class="sm" onclick="batchClear()">取消选择</button>
+  </div>
+  <div class="nodes-body">
+    <aside class="subs-rail">
+      <input id="gq" class="nli" placeholder="筛选分组…" oninput="renderSubs()">
+      <div id="subs-list"></div>
+      <button class="sm wide" onclick="newGroup()">＋ 新建分组</button>
+    </aside>
+    <div class="nodes-main">
+      <div id="node-list"></div>
+      <div class="hint" id="node-count"></div>
+    </div>
+  </div>
+  <div class="hint">「普通连接」与「Browser Dialer」只是同一节点的两种用法，切换不会修改节点本身。</div>
+</div>
+<div class="card"><h2>Browser Dialer（按节点自动生效）</h2>
+    <div class="row"><span class="k">当前节点走哪条路</span><span class="v" id="s-dialer">—</span></div>
+    <div class="row"><span class="k">Chromium 运行时</span><span class="v" id="s-chromium">—</span></div>
+    <div class="row"><span class="k">浏览器连接数</span><span class="v" id="s-ws">—</span></div>
+    <div class="row"><span class="k">Chromium 进程</span><span class="v" id="s-chromium-procs">—</span></div>
+    <div class="mode-pick">
+      <button id="m-dialer" onclick="setMode('browser_dialer')">启动 Chromium</button>
+      <button id="m-normal" onclick="setMode('normal')"
+              title="会把当前节点切到普通连接（Xray 自带 TLS）并停掉 Chromium，释放约 890MB">停掉 Chromium</button>
+    </div>
+    <div class="hint" id="hint-dialer"></div>
+  </div>
+<div class="card" id="out-card" style="display:none"><h2>输出</h2><pre id="out">—</pre></div>
+    </section>
 
-  <div class="card"><h2>运行状态</h2>
+    <section class="view" id="view-status">
+<div class="card"><h2>运行状态</h2>
     <div class="row"><span class="k">Xray（常驻）</span><span class="v" id="s-xray">—</span></div>
     <div class="row"><span class="k">连接模式</span><span class="v" id="s-mode">—</span></div>
     <div class="row"><span class="k">当前节点</span><span class="v" id="s-node">—</span></div>
@@ -1368,13 +1534,96 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
     </div>
     <div class="hint" id="hint-main">Xray 常驻运行；Browser Dialer 按需启用，两者互不影响。</div>
   </div>
-
-<div class="card"><h2>添加节点</h2>
-  <div class="bar">
-    <textarea id="in-node" rows="6" style="width:100%;font-family:monospace" placeholder="粘贴节点（可多个）：vless:// vmess:// trojan:// ss:// hysteria2:// / Xray JSON / Mihomo YAML（支持整段多行粘贴）/ 订阅URL"></textarea>
-    <button class="pri" onclick="openAdd()">添加节点</button>
+<div class="card"><h2>运行概况</h2>
+    <div class="row"><span class="k">SOCKS5 入口</span><span class="v mono" id="s-nport">—</span></div>
+    <div class="row"><span class="k">HTTP 入口</span><span class="v mono" id="s-hport">—</span></div>
+    <div class="row"><span class="k">代理连通</span><span class="v" id="s-proxy">—</span></div>
+    <div class="row"><span class="k">DNS</span><span class="v">
+        <select id="dns-mode" onchange="setDns(this.value)" style="background:rgba(255,255,255,.05);
+          border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8px;font-size:12px">
+          <option value="off">不接管（系统 DNS）</option>
+          <option value="standard">标准：加密 DNS</option>
+          <option value="strict">严格防泄漏</option>
+        </select></span></div>
+    <div class="row"><span class="k">多出站</span><span class="v">
+        <select id="family-mode" onchange="setFamily(this.value)"
+                style="background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--fg);
+                       border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit">
+          <option value="auto">auto：直连走 IPv4，DNS 按连通性选</option>
+          <option value="v4">强制 IPv4</option>
+          <option value="v6">强制 IPv6</option>
+        </select>
+        <select id="multi-mode" onchange="setMulti(this.value)" style="background:rgba(255,
+          border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8p
+          <option value="off">关：单节点（切换需重启）</option>
+          <option value="on">开：全部常驻（切换不断线）</option>
+        </select></span></div>
+    <div class="row"><span class="k">出口 IP</span><span class="v mono" id="s-ip2">—</span></div>
+    <div class="hint" id="hint-multi"></div>
+    <div class="hint">端口统一在下面的「端口设置」里改，这里只做显示 ——
+      之前两处都能改，容易改重。</div>
   </div>
-  <div class="hint">导入后自动做能力检查：Xray 普通模式与 Browser Dialer 分别判定。也支持 Xray JSON 与 Mihomo YAML。</div>
+</div>
+<div class="card"><h2>代理入口</h2>
+  <div class="hint" style="margin:0 0 10px">本客户端<strong>不修改系统代理配置</strong>。
+    下面这些入口照常提供，需要时在客户端或 shell 里指定即可。</div>
+  <div class="row"><span class="k">代理入口</span>
+    <span class="v mono" id="entries">—</span></div>
+  <div class="hint" id="hint-takeover"></div>
+  <div class="row" style="margin-top:6px"><span class="k">旧版接管残留</span>
+    <span class="v"><button id="tk-clean" onclick="cleanTakeover()">清理系统代理配置</button>
+    <span class="hint" id="clean-note"></span></span></div>
+</div>
+    </section>
+
+    <section class="view" id="view-config">
+<div class="card"><h2>端口设置</h2>
+  <div class="hint" style="margin:0 0 10px">所有端口都可以改。改完会自动重新生成配置并重启对应服务。
+    第一次安装时会自动挑没被占用的端口。</div>
+  <table><tbody id="tb-ports"></tbody></table>
+  <div class="bar" style="margin-top:10px">
+    <input id="in-addr" placeholder="绑定地址（当前值见下表）" style="flex:1 1 160px">
+    <button onclick="setAddr(this)">改绑定地址</button>
+  </div>
+  <div class="bar">
+    <button onclick="portsCheck(this)">检查冲突</button>
+    <button class="pri" onclick="portsFix(this)">自动重新分配</button>
+  </div>
+  <div class="hint">「自动重新分配」只改被别的服务占用的那些端口，不会动正常的。</div>
+</div>
+<div class="card"><h2>连接配置（可直接复制）</h2>
+  <div class="hint" style="margin:0 0 10px">在需要代理的设备上使用。所有内容按当前端口实时生成，改端口后点「刷新配置」即可。</div>
+  <div class="bar">
+    <button onclick="loadConn(this)">刷新配置</button>
+    <button onclick="copyText(document.getElementById('conn-yaml').textContent, this)">复制 YAML</button>
+    <button onclick="copyText(document.getElementById('conn-env').textContent, this)">复制环境变量</button>
+  </div>
+
+  <div style="margin-top:12px"><div class="k" style="margin-bottom:5px">Mihomo / Clash 配置</div>
+    <pre id="conn-yaml">点「刷新配置」生成…</pre></div>
+
+  <div style="margin-top:12px"><div class="k" style="margin-bottom:5px">代理链接（点右侧按钮复制）</div>
+    <table><tbody id="tb-links"></tbody></table></div>
+
+  <div style="margin-top:12px"><div class="k" style="margin-bottom:5px">环境变量（Linux / macOS）</div>
+    <pre id="conn-env">—</pre></div>
+
+  <div class="hint" id="conn-note"></div>
+</div>
+    </section>
+
+    <section class="view" id="view-core">
+<div class="card"><h2>Xray 内核</h2>
+  <div class="row"><span class="k">已安装版本</span><span class="v mono" id="xver">—</span></div>
+  <div class="bar">
+    <button onclick="xrayCheck(this)">检查更新</button>
+    <button class="pri" onclick="xrayUpgrade(this)">更新内核</button>
+  </div>
+  <div class="hint">只更新本项目自己的副本（$PREFIX/bin/xray），不碰系统 Xray。下载后会校验官方 SHA256。</div>
+</div>
+    </section>
+  </main>
+
 
 <div id="add-modal" class="modal">
  <div class="mbox">
@@ -1440,162 +1689,6 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   </div>
  </div>
 </div>
-
-<div class="card nodes-card">
-  <div class="nodes-head">
-    <div class="nh-l">
-      <b>节点</b><span class="badge" id="side-count">0</span>
-      <span class="chipbar">
-        <label class="chk"><input type="checkbox" id="onlyavail" onchange="renderNodes()">仅可用</label>
-      </span>
-    </div>
-    <div class="nlt">
-      <input id="nq" class="nli wide" placeholder="搜索名称 / 地址 / 协议…" oninput="renderNodes()">
-      <select id="ns" class="nli" onchange="renderNodes()">
-        <option value="default">默认排序</option>
-        <option value="name">按名称</option><option value="lat">按延迟</option>
-        <option value="traffic">按流量</option><option value="proto">按协议</option>
-      </select>
-      <select id="nd" class="nli" onchange="setDensity(this.value)">
-        <option value="table">表格</option><option value="grid">卡片</option>
-        <option value="list">紧凑</option>
-      </select>
-      <button class="sm" onclick="batchAll(this)">全选</button>
-      <button class="sm" onclick="batchTest()">测速</button>
-      <button class="sm" onclick="batchDelete()">删除</button>
-    </div>
-  </div>
-    <div class="bulkbar" id="bulkbar">
-    <span>已选 <b id="bulk-n">0</b> 个节点</span>
-    <select id="bulk-move" class="nli" style="flex:0 0 auto" onchange="pickMoveTarget(this)">
-      <option value="">移动到分组…</option>
-    </select>
-    <button class="sm" onclick="batchTest()">批量测速</button>
-    <button class="sm" onclick="batchDelete()">批量删除</button>
-    <button class="sm" onclick="batchClear()">取消选择</button>
-  </div>
-  <div class="nodes-body">
-    <aside class="subs-rail">
-      <input id="gq" class="nli" placeholder="筛选分组…" oninput="renderSubs()">
-      <div id="subs-list"></div>
-      <button class="sm wide" onclick="newGroup()">＋ 新建分组</button>
-    </aside>
-    <div class="nodes-main">
-      <div id="node-list"></div>
-      <div class="hint" id="node-count"></div>
-    </div>
-  </div>
-  <div class="hint">「普通连接」与「Browser Dialer」只是同一节点的两种用法，切换不会修改节点本身。</div>
-</div>
-
-  <div class="card"><h2>Browser Dialer（按节点自动生效）</h2>
-    <div class="row"><span class="k">当前节点走哪条路</span><span class="v" id="s-dialer">—</span></div>
-    <div class="row"><span class="k">Chromium 运行时</span><span class="v" id="s-chromium">—</span></div>
-    <div class="row"><span class="k">浏览器连接数</span><span class="v" id="s-ws">—</span></div>
-    <div class="row"><span class="k">Chromium 进程</span><span class="v" id="s-chromium-procs">—</span></div>
-    <div class="mode-pick">
-      <button id="m-dialer" onclick="setMode('browser_dialer')">启动 Chromium</button>
-      <button id="m-normal" onclick="setMode('normal')"
-              title="会把当前节点切到普通连接（Xray 自带 TLS）并停掉 Chromium，释放约 890MB">停掉 Chromium</button>
-    </div>
-    <div class="hint" id="hint-dialer"></div>
-  </div>
-
-  <div class="card"><h2>运行概况</h2>
-    <div class="row"><span class="k">SOCKS5 入口</span><span class="v mono" id="s-nport">—</span></div>
-    <div class="row"><span class="k">HTTP 入口</span><span class="v mono" id="s-hport">—</span></div>
-    <div class="row"><span class="k">代理连通</span><span class="v" id="s-proxy">—</span></div>
-    <div class="row"><span class="k">DNS</span><span class="v">
-        <select id="dns-mode" onchange="setDns(this.value)" style="background:rgba(255,255,255,.05);
-          border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8px;font-size:12px">
-          <option value="off">不接管（系统 DNS）</option>
-          <option value="standard">标准：加密 DNS</option>
-          <option value="strict">严格防泄漏</option>
-        </select></span></div>
-    <div class="row"><span class="k">多出站</span><span class="v">
-        <select id="family-mode" onchange="setFamily(this.value)"
-                style="background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--fg);
-                       border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit">
-          <option value="auto">auto：直连走 IPv4，DNS 按连通性选</option>
-          <option value="v4">强制 IPv4</option>
-          <option value="v6">强制 IPv6</option>
-        </select>
-        <select id="multi-mode" onchange="setMulti(this.value)" style="background:rgba(255,
-          border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8p
-          <option value="off">关：单节点（切换需重启）</option>
-          <option value="on">开：全部常驻（切换不断线）</option>
-        </select></span></div>
-    <div class="row"><span class="k">出口 IP</span><span class="v mono" id="s-ip2">—</span></div>
-    <div class="hint" id="hint-multi"></div>
-    <div class="hint">端口统一在下面的「端口设置」里改，这里只做显示 ——
-      之前两处都能改，容易改重。</div>
-  </div>
-</div>
-
-<div class="card" style="margin-top:14px"><h2>代理入口</h2>
-  <div class="hint" style="margin:0 0 10px">本客户端<strong>不修改系统代理配置</strong>。
-    下面这些入口照常提供，需要时在客户端或 shell 里指定即可。</div>
-  <div class="row"><span class="k">代理入口</span>
-    <span class="v mono" id="entries">—</span></div>
-  <div class="hint" id="hint-takeover"></div>
-  <div class="row" style="margin-top:6px"><span class="k">旧版接管残留</span>
-    <span class="v"><button id="tk-clean" onclick="cleanTakeover()">清理系统代理配置</button>
-    <span class="hint" id="clean-note"></span></span></div>
-</div>
-
-<div class="card" style="margin-top:14px"><h2>连接配置（可直接复制）</h2>
-  <div class="hint" style="margin:0 0 10px">在需要代理的设备上使用。所有内容按当前端口实时生成，改端口后点「刷新配置」即可。</div>
-  <div class="bar">
-    <button onclick="loadConn(this)">刷新配置</button>
-    <button onclick="copyText(document.getElementById('conn-yaml').textContent, this)">复制 YAML</button>
-    <button onclick="copyText(document.getElementById('conn-env').textContent, this)">复制环境变量</button>
-  </div>
-
-  <div style="margin-top:12px"><div class="k" style="margin-bottom:5px">Mihomo / Clash 配置</div>
-    <pre id="conn-yaml">点「刷新配置」生成…</pre></div>
-
-  <div style="margin-top:12px"><div class="k" style="margin-bottom:5px">代理链接（点右侧按钮复制）</div>
-    <table><tbody id="tb-links"></tbody></table></div>
-
-  <div style="margin-top:12px"><div class="k" style="margin-bottom:5px">环境变量（Linux / macOS）</div>
-    <pre id="conn-env">—</pre></div>
-
-  <div class="hint" id="conn-note"></div>
-</div>
-
-<div class="card" style="margin-top:14px"><h2>端口设置</h2>
-  <div class="hint" style="margin:0 0 10px">所有端口都可以改。改完会自动重新生成配置并重启对应服务。
-    第一次安装时会自动挑没被占用的端口。</div>
-  <table><tbody id="tb-ports"></tbody></table>
-  <div class="bar" style="margin-top:10px">
-    <input id="in-addr" placeholder="绑定地址（当前值见下表）" style="flex:1 1 160px">
-    <button onclick="setAddr(this)">改绑定地址</button>
-  </div>
-  <div class="bar">
-    <button onclick="portsCheck(this)">检查冲突</button>
-    <button class="pri" onclick="portsFix(this)">自动重新分配</button>
-  </div>
-  <div class="hint">「自动重新分配」只改被别的服务占用的那些端口，不会动正常的。</div>
-</div>
-
-<div class="card" style="margin-top:14px"><h2>Xray 内核</h2>
-  <div class="row"><span class="k">已安装版本</span><span class="v mono" id="xver">—</span></div>
-  <div class="bar">
-    <button onclick="xrayCheck(this)">检查更新</button>
-    <button class="pri" onclick="xrayUpgrade(this)">更新内核</button>
-  </div>
-  <div class="hint">只更新本项目自己的副本（$PREFIX/bin/xray），不碰系统 Xray。下载后会校验官方 SHA256。</div>
-</div>
-
-
-</div>
-
-
-</div>
-
-<div class="card" id="out-card" style="margin-top:14px;display:none"><h2>输出</h2><pre id="out">—</pre></div>
-
-
 
 <script>
 const $ = id => document.getElementById(id);
@@ -1785,6 +1878,55 @@ function say(t, cls){ const m=$('msg'); m.textContent=t; m.className='on '+(cls|
 function clearMsg(){ $('msg').className=''; }
 function out(t){ $('out-card').style.display='block'; $('out').textContent=t; }
 
+// ================================================================
+// 应用外壳：视图切换 / 顶栏状态
+//
+// 原来 9 个 card 从上往下堆成一条长滚动 —— 那是文章的结构，用户既看不出
+// "这个应用有哪几块"，也找不到"当前在哪"。现在收成 4 个视图，侧栏常驻。
+// 视图状态存 localStorage：刷新后停在原来那一屏，而不是每次都弹回节点页。
+// ================================================================
+const VIEWS = {nodes:'节点', status:'状态', config:'配置', core:'内核'};
+const VIEW_KEY = 'xray-panel-view';
+
+function go(v){
+  if(!VIEWS[v]) v = 'nodes';
+  document.querySelectorAll('.view').forEach(el =>
+    el.classList.toggle('on', el.id === 'view-' + v));
+  document.querySelectorAll('#nav button').forEach(b =>
+    b.classList.toggle('on', b.dataset.view === v));
+  const t = $('view-title'); if(t) t.textContent = VIEWS[v];
+  try { localStorage.setItem(VIEW_KEY, v); } catch(e){}
+  renderTop();
+}
+
+// 顶栏状态条：Xray / 当前节点 / 出口 IP。
+// 这些值本来在「运行状态」card 里占了一整屏第一位置 —— 但它们是**状态**，
+// 属于应用级信息，应该常驻在顶栏；节点列表才是这一屏的主角。
+function renderTop(){
+  const box = $('top-chips'); if(!box) return;
+  const svc = (ST.services||{}).xray || {};
+  const on = !!svc.active;
+  const chromOn = ((ST.services||{}).chromium || {}).active;
+  const bdInUse = !!ST.can_use_dialer && ST.use_browser !== false;
+  const cur = ST.node || (ST.nodes||[]).find(n => n.current);
+  const c = [];
+  c.push(`<span class="chip"><span class="dot ${on?'ok':'bad'}"></span>Xray <b>${on?'运行中':'已停止'}</b></span>`);
+  if(on){
+    c.push(`<span class="chip">链路 <b>${ESC(ST.mode_detail || (bdInUse ? '浏览器 TLS' : 'Xray 自带 TLS'))}</b>`
+         + (bdInUse ? `<span class="dot ${chromOn?'ok':'bad'}"></span>` : '') + `</span>`);
+  }
+  c.push(`<span class="chip">当前 <b>${cur ? ESC(cur.name) : '未选择'}</b></span>`);
+  if(ST.exit_ip) c.push(`<span class="chip">出口 <b class="mono">${ESC(ST.exit_ip)}</b></span>`);
+  box.innerHTML = c.join('');
+
+  const nn = $('nav-nodes');
+  if(nn) nn.textContent = (ST.nodes||[]).length;
+  const sv = $('side-ver');
+  if(sv) sv.textContent = ST.xray_ver ? ('Xray ' + ST.xray_ver) : '';
+  const sc = $('side-count');
+  if(sc && !sc.textContent) sc.textContent = (ST.nodes||[]).length;
+}
+
 async function load(){
   try{
     const ctl=new AbortController(); const tm=setTimeout(()=>ctl.abort(),20000);
@@ -1900,6 +2042,7 @@ async function load(){
   if (fm && ST.addr_family) fm.value = ST.addr_family;
   renderSubs();
   renderNodes();
+  renderTop();
 }
 
 async function setFamily(v){
@@ -2584,11 +2727,9 @@ function submitPull(){
        '正在从 Server 拉取…');
 }
 
-const addNode = () => {
-  const v = $('in-node').value.trim();
-  if(!v) return say('请粘贴节点链接、Xray JSON 或 Mihomo YAML','err');
-  post('import', {uri:v}, '正在导入并做能力检查…');
-};
+// 原来这里有个 addNode()，从「添加节点」card 的 textarea 取内容。
+// 那张 card 已并入工具栏的「＋ 添加节点」按钮（弹窗里本来就有粘贴入口），
+// 元素不存在了，函数留着只会在将来某次调用时炸成 null.value。
 async function testLatency(file, btn){
   LAT[file] = {loading:true};
   const paint = () => {
@@ -2614,10 +2755,12 @@ async function checkNode(f, btn){
   else say((j.message||'检查失败'), 'err');
 }
 
+// 恢复上次停留的视图（默认节点），再拉数据
+try { go(localStorage.getItem(VIEW_KEY) || 'nodes'); } catch(e){ go('nodes'); }
 load();
 loadConn();
 setInterval(load, 5000);
-</script></div></body></html>
+</script></body></html>
 """
 
 

@@ -90,6 +90,48 @@ setTimeout(() => {
   const rows = $$(ROWS);
   ck(rows.length >= 8, '节点行渲染出来了 (' + rows.length + ')');
 
+  // ---- 应用外壳：文章式 → Dashboard 式 ----
+  // 这一组是版式重构的验收点。最要紧的一条：**不再有窄居中容器** ——
+  // 原来是 `.wrap{max-width:1100px;margin:0 auto}`，那是博客的版式。
+  ck(!d.querySelector('.wrap'), '没有 .wrap 窄居中容器了');
+  ck(!!$('.app') && !!$('.app > .side') && !!$('.app > .main'),
+     '应用外壳 = 左侧导航 + 主工作区');
+  const views = $$('.view');
+  ck(views.length === 4, '4 个视图 (' + views.length + ')');
+  ck(views.filter(v => v.classList.contains('on')).length === 1,
+     '同一时刻只显示一个视图');
+  const navBtns = $$('#nav button');
+  ck(navBtns.length === 4, '侧栏 4 个导航项');
+  ck(navBtns.filter(b => b.classList.contains('on')).length === 1,
+     '侧栏只有一项处于选中态');
+  ck(navBtns.filter(b => b.classList.contains('on'))[0]
+     .getAttribute('data-view') === 'nodes', '默认停在节点视图');
+  ck(!!$('#view-title') && $('#view-title').textContent === '节点',
+     '顶栏标题跟着视图 (' + ($('#view-title') || {}).textContent + ')');
+
+  // 切换视图：视图与导航必须同步（不同步就会出现"标题写着状态、内容是节点"）
+  w.go('status');
+  const onNow = $$('.view').filter(v => v.classList.contains('on'));
+  ck(onNow.length === 1 && onNow[0].id === 'view-status', 'go(status) 切到状态视图');
+  ck($('#view-title').textContent === '状态', '标题同步');
+  ck(navBtns.filter(b => b.classList.contains('on'))[0]
+     .getAttribute('data-view') === 'status', '导航高亮同步');
+  w.go('nodes');
+  ck($$('.view').filter(v => v.classList.contains('on'))[0].id === 'view-nodes',
+     'go(nodes) 切回来');
+
+  // 顶栏状态 chips + 侧栏计数
+  const chips = $$('#top-chips .chip');
+  ck(chips.length >= 2, '顶栏有状态 chips (' + chips.length + ')');
+  ck(chips.some(c => c.textContent.includes('Xray')), 'chips 含 Xray 状态');
+  ck(($('#nav-nodes') || {}).textContent === String(rows.length),
+     '侧栏节点计数与列表一致 (' + ($('#nav-nodes') || {}).textContent + ')');
+
+  // 节点区必须落在节点视图里（它是主角），且带「添加节点」入口
+  ck(!!$('#view-nodes .nodes-card'), '节点区在节点视图内');
+  ck(!!$('#view-nodes .nodes-card button[onclick*="openAdd"]'), '节点区有「添加节点」入口');
+  ck(!d.querySelector('.wrap'), '（复查）仍无窄居中容器');
+
   // 分段控件：每个节点行一个，两侧齐全，当前节点有一侧高亮
   const segs = $$('#node-list .seg');
   ck(segs.length === rows.length,
