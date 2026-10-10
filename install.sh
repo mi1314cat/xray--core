@@ -29,6 +29,8 @@ DIM=$'\033[2m'; RST=$'\033[0m'
 [[ -t 1 ]] || { RED=""; GRN=""; YEL=""; CYN=""; DIM=""; RST=""; }
 
 say()  { printf "  ${CYN}[--]${RST} %s\n" "$*"; }
+tty_dim() { printf '%s' "$DIM"; }
+tty_off() { printf '%s' "$RST"; }
 ok()   { printf "  ${GRN}[OK]${RST} %s\n" "$*"; }
 warn() { printf "  ${YEL}[!]${RST} %s\n" "$*"; }
 err()  { printf "  ${RED}[X]${RST} %s\n" "$*"; }
@@ -96,7 +98,10 @@ show_status() {
 
 # ---------------------------------------------------------------- 服务端
 run_server() {
-    if ! srv_installed; then
+    if srv_installed; then
+        # 服务端面板本身就是管理界面 —— 进来直接进, 不重装。
+        say "已安装: $SRV_ROOT (xrayls: $(srv_service)) —— 直接进面板"
+    else
         say "服务端未安装 —— 进入面板后选第 1 项「安装/更新 xray」"
     fi
     TMP="${TMP:-$(mktemp -d)}"
@@ -106,11 +111,57 @@ run_server() {
 }
 
 # ---------------------------------------------------------------- 客户端
+#
+# ★ 已经装过的机器上, `client` **直接进面板**, 不再重装。
+#
+#   原来的行为是"每次进来都跑一遍安装器": 用户想看一眼客户端, 却看到
+#   "检测到已安装 → 将执行更新 → 下载发布包 → 校验 → 安装" 一整套 ——
+#   既慢又吓人（看起来像要覆盖掉他的配置）。M / SB 那边进来就是面板,
+#   这里对齐。
+#
+#   要更新得**明说**: `install.sh client update`（或 --update / -u）。
+#   面板里也有「更新脚本」入口。
 run_client() {
+    local args=("$@") force=0 a
+    for a in "$@"; do
+        case "$a" in update|--update|-u|upgrade) force=1 ;; esac
+    done
+    if [[ "$force" -eq 0 ]] && cli_installed && [[ -x "$CLI_PREFIX/bin/xbd" ]]; then
+        # 已经是客户端了 —— 直接进面板
+        exec "$CLI_PREFIX/bin/xbd" menu
+    fi
+    if [[ "$force" -eq 0 ]] && cli_installed; then
+        say "检测到客户端目录 $CLI_PREFIX, 但没有可用的 xbd —— 走安装器修复"
+    fi
+    [[ "$force" -eq 1 ]] && say "按要求执行更新（不进入面板）"
+    # 面板不认 update 这个参数, 传下去会被 l.sh 当成未知参数
+    local pass=()
+    for a in "$@"; do
+        case "$a" in update|--update|-u|upgrade) ;; *) pass+=("$a") ;; esac
+    done
     TMP="${TMP:-$(mktemp -d)}"
     local l="$TMP/l.sh"
     _fetch "Client/l.sh" "$l" || die "取不到客户端安装器 (镜像链全不通?)"
-    exec bash "$l" "$@"
+    exec bash "$l" ${pass[@]+"${pass[@]}"}
+}
+
+# ---------------------------------------------------------------- 更新
+#
+# 「更新」= 走安装器把脚本与内核同步到最新（等价于在客户端面板里选更新）。
+# 单独拎出来是因为它和"进入面板"现在是两件事: 进面板不重装, 更新才下载。
+run_update() {
+    printf '\n  更新哪一个?\n'
+    printf '    1) 服务端 (xray-panel.sh + conf/ + 内核不动)\n'
+    printf '    2) 客户端 (xbd 全套 + 面板 + Web UI)\n'
+    printf '    0) 返回\n'
+    printf '  选择: '
+    local c; read -r c || return 0
+    case "$c" in
+        1) run_server ;;
+        2) run_client update ;;
+        0|"") return 0 ;;
+        *) warn "无效选择" ;;
+    esac
 }
 
 # ---------------------------------------------------------------- 卸载
@@ -163,16 +214,28 @@ main_menu() {
     while :; do
         banner
         show_status
-        printf '\n  1) 服务端面板 (节点 / 分享 / 证书 / Nginx / 诊断)\n'
-        printf '  2) 客户端 (装内核 + 面板 + Web UI)\n'
-        printf '  3) 卸载\n'
+        # 菜单本身先说清"进去是面板还是安装" —— 这一行差别就是用户
+        # 上一次的困惑:"我明明装过了, 为什么又装一遍"。
+        if srv_installed; then
+            printf '\n  1) 服务端面板   %s(已安装 · 直接进入)%s\n' "$(tty_dim)" "$(tty_off)"
+        else
+            printf '\n  1) 服务端面板   %s(安装 + 进面板)%s\n' "$(tty_dim)" "$(tty_off)"
+        fi
+        if cli_installed; then
+            printf '  2) 客户端面板   %s(已安装 · 直接进入)%s\n' "$(tty_dim)" "$(tty_off)"
+        else
+            printf '  2) 客户端       %s(装内核 + 面板 + Web UI)%s\n' "$(tty_dim)" "$(tty_off)"
+        fi
+        printf '  3) 更新到最新版本\n'
+        printf '  4) 卸载\n'
         printf '  0) 退出\n'
         printf '  选择: '
         local c; read -r c || return 0
         case "$c" in
             1) run_server ;;
             2) run_client ;;
-            3) run_uninstall ;;
+            3) run_update ;;
+            4) run_uninstall ;;
             0|"") return 0 ;;
             *) warn "无效选择" ;;
         esac

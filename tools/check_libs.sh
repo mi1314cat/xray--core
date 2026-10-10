@@ -2405,6 +2405,53 @@ else
     bad "conf/lib/naming.py 不存在"
 fi
 
+# ---------------------------------------------------------------- 客户端排版
+# 客户端菜单的排版统一到 core.sh 的 ui_* 上。
+#
+# 为什么值得一条闸门: 原来是每个菜单各写各的 printf + 各带一套颜色转义,
+# 于是同一个客户端里分隔线两种、字号三种、颜色漏了非 TTY 判断（管道里全是
+# 转义乱码）。改成统一出口之后, 只要有人再手写 printf 就会红。
+group "客户端排版 (ui_* 统一出口)"
+CL_ACT="$ROOT/Client/lib/actions.sh"
+CL_CORE="$ROOT/Client/lib/core.sh"
+if [[ -f "$CL_CORE" ]]; then
+    for pair in "排版函数齐|ui_rule" \
+                "菜单行统一|ui_menu()" \
+                "分组标题统一|ui_sec()" \
+                "键值对齐（中文按显示宽度）|ui_pad()" \
+                "说明行统一|ui_hint()" \
+                "无效输入回显|ui_invalid()" \
+                "暂停行统一|ui_pause()"; do
+        panel_has "$CL_CORE" "${pair#*|}" "${pair%%|*}"
+    done
+    # 颜色必须受 TTY 判断保护（否则日志里全是 \033[36m）
+    if grep -q "if \[ -t 1 \]" "$CL_CORE"; then ok "颜色受 TTY 判断保护"; else bad "颜色受 TTY 判断保护"; fi
+fi
+if [[ -f "$CL_ACT" ]]; then
+    # 硬编码的菜单样式（自己写 printf 带颜色）不许再出现
+    # ★ 不能写 `|| echo 0`: grep -c 无匹配时**先打印 0 再返回 1**, 于是
+    #   `||` 又补一个 0, 值变成 "0\n0" —— 永远不等于 "0"。
+    #   （这个 || echo 的坑本项目踩过好几次, 记在这里省得下次再踩。）
+    hard=$(grep -c 'printf .*\\033\[36m' "$CL_ACT" 2>/dev/null || true)
+    hard=${hard:-0}
+    assert_eq "$hard" "0" "菜单里没有手写的颜色转义（全走 ui_*）"
+    # 主菜单必须给出状态块的三项 + 面板地址
+    for pair in "主菜单显示服务状态|ui_kv \"服务状态\"" \
+                "主菜单显示内核版本|ui_kv \"内核版本\"" \
+                "主菜单显示节点数量|ui_kv \"节点数量\"" \
+                "主菜单显示当前节点|ui_kv \"当前节点\"" \
+                "主菜单显示网页面板|ui_kv \"网页面板\"" \
+                "菜单项带说明|列出 / 添加 / 切换 / 测速"; do
+        panel_has "$CL_ACT" "${pair#*|}" "${pair%%|*}"
+    done
+    # 直接敲 xbd 在终端里应当进面板（脚本/管道里仍给用法）
+    if grep -q 'if \[ -t 0 \] && \[ -t 1 \]; then cmd_menu' "$CL_ACT"; then
+        ok "xbd 无参数在终端里进面板"
+    else
+        bad "xbd 无参数在终端里进面板"
+    fi
+fi
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

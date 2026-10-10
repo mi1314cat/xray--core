@@ -90,6 +90,48 @@ step()  { printf '\n%s==>%s %s\n' "$C_B" "$C_0" "$*"; }
 die()   { printf '%s✗%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 ask()   { local p="$1" d="${2:-}"; local a; read -r -p "$p" a; printf '%s' "${a:-$d}"; }
 
+# ------------------------------------------------------------ 面板排版 ----
+# 菜单/状态块的公共样式。原来每个菜单各写各的 printf、各带一套颜色转义，
+# 于是同一个客户端里三种字号、两种分隔线、颜色还漏了非 TTY 的判断 ——
+# 管道里跑出来的日志全是乱码转义。
+#
+# 这里的几个函数是**唯一**的排版出口，新菜单一律用它们。
+ui_w() {   # 终端宽度（拿不到就 44）
+  local w; w=$(tput cols 2>/dev/null || true)
+  case "$w" in ''|*[!0-9]*) w=44 ;; esac
+  [ "$w" -gt 100 ] && w=100
+  printf '%s' "$w"
+}
+ui_rule() {  # 一条横线，宽度跟随终端
+  local n i line=""
+  n=$(ui_w)
+  for (( i = 0; i < n; i++ )); do line+="─"; done
+  printf '%s%s%s\n' "$C_B" "$line" "$C_0"
+}
+ui_title() {  # 标题（上下各一条横线）
+  ui_rule
+  printf ' %s%s%s\n' "$C_B" "$1" "$C_0"
+  ui_rule
+}
+ui_sec()  { printf ' %s%s%s\n' "$C_D" "$1" "$C_0"; }
+ui_menu() { printf '  %s%2s%s) %s\n' "$C_B" "$1" "$C_0" "$2"; }
+ui_hint() { printf '  %s%s%s\n' "$C_D" "$1" "$C_0"; }              # 灰色补充说明
+ui_tip()  { printf '  %s提示%s: %s\n' "$C_B" "$C_0" "$1"; }        # 青色操作提示
+ui_invalid() { printf '  %s无效选项: %s%s\n' "$C_R" "$1" "$C_0"; } # 回显用户敲的内容
+ui_pause() { printf '\n'; read -r -p "  按回车返回..." _ || true; }
+
+# 键值行：键按**显示宽度**补齐（中文算两列）。
+# printf 的 %-Ns 按字节补，中文标签会错位 —— 所以自己算。
+ui_pad() {
+  local t="$1" w=0 i ch
+  for (( i = 0; i < ${#t}; i++ )); do
+    ch="${t:i:1}"
+    if [[ "$ch" == [$'\u4e00'-$'\u9fff'] ]]; then w=$((w + 2)); else w=$((w + 1)); fi
+  done
+  printf '%s%*s' "$t" $(( $2 - w )) ""
+}
+ui_kv() { printf '   %s : %s\n' "$(ui_pad "$1" 10)" "$2"; }
+
 need_root() { [ "$(id -u)" -eq 0 ] || die "需要 root 权限（当前 uid=$(id -u)）"; }
 
 # -------------------------------------------------------------- 环境探测 ----

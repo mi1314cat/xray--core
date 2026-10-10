@@ -2297,7 +2297,13 @@ xbd_main() {
     menu)       cmd_menu "$@" ;;
     multi)      cmd_multi "$@" ;;
     family)     cmd_family "$@" ;;
-    ""|-h|--help|help) xbd_usage ;;
+    "")
+      # 直接敲 xbd 时: 在终端里进面板, 管道/脚本里给用法。
+      # 理由: 站在服务器上打开客户端, 九成是想看状态或切节点; 而脚本里
+      # `xbd`（比如 CI 里跑一下）必须拿到可解析的文本, 不能被菜单卡住。
+      if [ -t 0 ] && [ -t 1 ]; then cmd_menu
+      else xbd_usage; fi ;;
+    -h|--help|help) xbd_usage ;;
     *) xbd_usage; die "未知命令: $cmd" ;;
   esac
 }
@@ -2317,36 +2323,83 @@ _mmenu() {
   local c
   while :; do
     clear 2>/dev/null || true
-    printf '\033[36mXray Client\033[0m\n'
-    printf -- '----------------------\n'
-    _mmenu_status
-    printf -- '----------------------\n'
-    printf "  \033[36m1)\033[0m 节点管理      添加/删除/切换/测速\n"
-    printf "  \033[36m2)\033[0m 服务控制      启动/停止/重启/状态\n"
-    printf "  \033[36m3)\033[0m 端口设置      HTTP/SOCKS 入口\n"
-  printf "  \033[36m7)\033[0m 多出站        所有节点常驻, 切换不断线\n"
-    printf "  \033[36m4)\033[0m 配置分发      局域网设备用 URL 拉配置\n"
-    printf "  \033[36m5)\033[0m Web 面板      地址/令牌/开关\n"
-    printf "  \033[36m6)\033[0m 诊断          连接排查\n"
-    printf "  \033[36m0)\033[0m 退出\n"
-    printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-7]: " c || return 0
+    _mmenu_header
+    echo
+    ui_sec "节点"
+    ui_menu 1 "节点管理      列出 / 添加 / 切换 / 测速 / 删除"
+    ui_menu 2 "分组管理      订阅归组 / 改名 / 整组删除"
+    ui_menu 3 "浏览器拨号    逐节点开关（省内存，默认关）"
+    echo
+    ui_sec "服务"
+    ui_menu 4 "服务控制      启动 / 停止 / 重启 / 状态"
+    ui_menu 5 "端口设置      SOCKS / HTTP / 面板端口"
+    ui_menu 6 "多出站        所有节点常驻，切换不断线"
+    echo
+    ui_sec "接入与分发"
+    ui_menu 7 "配置分发      局域网设备用 URL 拉配置"
+    ui_menu 8 "Web 面板      地址 / 令牌 / 开关"
+    echo
+    ui_sec "其它"
+    ui_menu 9 "诊断          连不上时先看这个"
+    ui_menu 0 "退出"
+    echo
+    ui_hint "直接回车 = 退出；命令行等价写法: xbd --help"
+    printf "  %s请选择%s: " "$C_B" "$C_0"
+    read -r c || return 0
     case "$c" in
       1) _mmenu_node ;;
-      2) _mmenu_service ;;
-      3) _mmenu_port ;;
-      4) _mmenu_share ;;
-      5) _mmenu_panel ;;
-      6) xbd diagnose ;;
-      7) _mmenu_multi ;;
-      0) return 0 ;;
-      *) printf '  无效选项 %s\n' "$c" ;;
+      2) _mmenu_group ;;
+      3) _mmenu_browser ;;
+      4) _mmenu_service ;;
+      5) _mmenu_port ;;
+      6) _mmenu_multi ;;
+      7) _mmenu_share ;;
+      8) _mmenu_panel ;;
+      9) xbd diagnose ;;
+      0|"") return 0 ;;
+      *) ui_invalid "$c" ;;
     esac
     _mmenu_pause
   done
 }
 
-_mmenu_pause() { printf '\n'; read -r -p "按回车返回主菜单..." _ || true; }
+# 面板顶部：一条标题 + 四行状态。
+#
+# 为什么不做成 cmd_status_text 那 12 行: 菜单每操作一步都会重画一次, 12 行状态
+# 会把菜单顶到屏幕外。这里只留"打开就知道现在什么情况"的四项, 详细状态
+# 用 xbd status。
+_mmenu_header() {
+  ui_title "Xray Client  v${XBD_VERSION:-?}"
+  local st ver n cur panel_host panel_port
+  st=$(systemctl is-active "$XBD_U_XRAY" 2>/dev/null || echo inactive)
+  ver=$("$XBD_XRAY" version 2>/dev/null | head -1 | awk '{print $2}')
+  n=$(ls "$XBD_NODES"/node-*.json 2>/dev/null | wc -l | tr -d ' ')
+  # ★ 显示节点**真名**（JSON 里的 name），不是文件名。
+  #   文件名形如 node-001-ccsmhysteria2-01.json，直接剥前缀显示出来是
+  #   "001-ccsmhysteria2-01" —— 而用户在自己客户端里看到的是
+  #   "🇺🇸 CCSmHysteria2-01"，两个名字对不上，切节点时会怀疑切错了。
+  local curf; curf=$(current_node_file 2>/dev/null || true)
+  if [ -n "$curf" ]; then
+    cur=$(node_field "$curf" name 2>/dev/null || true)
+    [ -n "$cur" ] || cur=$(basename "$curf" | sed 's/^node-//; s/\.json$//')
+  else
+    cur=""
+  fi
+  panel_host=$(cfg_get "$XBD_CONF/panel.env" PANEL_HOST 127.0.0.1)
+  panel_port=$(cfg_get "$XBD_CONF/panel.env" PANEL_PORT 18090)
+
+  if [ "$st" = "active" ]; then
+    ui_kv "服务状态" "$(printf '%s● 运行中%s' "$C_G" "$C_0")"
+  else
+    ui_kv "服务状态" "$(printf '%s○ %s%s' "$C_Y" "$st" "$C_0")"
+  fi
+  ui_kv "内核版本" "${ver:-未知}"
+  ui_kv "节点数量" "$n"
+  ui_kv "当前节点" "${cur:-（未选择）}"
+  ui_kv "网页面板" "http://$panel_host:$panel_port/"
+}
+
+_mmenu_pause() { ui_pause; }
 
 # 顶部一行状态：不用进子菜单就知道现在是什么情况
 _mmenu_status() {
@@ -2364,18 +2417,20 @@ _mmenu_status() {
 _mmenu_node() {
   local c
   while :; do
-    printf '\n\033[36m节点管理\033[0m\n'; printf -- '----------------------\n'
-    printf "  \033[36m1)\033[0m 列出全部节点\n"
-    printf "  \033[36m2)\033[0m 添加节点 (链接/文件/配置)\n"
-    printf "  \033[36m3)\033[0m 导入订阅并命名成组\n"
-    printf "  \033[36m4)\033[0m 切换当前节点\n"
-    printf "  \033[36m5)\033[0m 测速 (全部)\n"
-    printf "  \033[36m6)\033[0m 删除节点\n"
-    printf "  \033[36m7)\033[0m 分组管理      新建/整组删除\n"
-    printf "  \033[36m8)\033[0m 浏览器拨号    逐节点开关（省内存）\n"
-    printf "  \033[36m0)\033[0m 返回\n"
-    printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-8]: " c || return 0
+    echo
+    ui_title "节点管理"
+    ui_menu 1 "列出全部节点        名字 / 地址 / 延迟 / 能力标签"
+    ui_menu 2 "添加节点            分享链接 / 订阅 / Xray JSON / Mihomo YAML"
+    ui_menu 3 "导入订阅并命名成组"
+    ui_menu 4 "切换当前节点"
+    ui_menu 5 "测速（全部节点）"
+    ui_menu 6 "删除节点"
+    ui_menu 7 "分组管理            新建 / 改名 / 整组删除"
+    ui_menu 8 "浏览器拨号          逐节点开关（省内存）"
+    ui_menu 0 "返回"
+    echo
+    printf "  %s请选择%s: " "$C_B" "$C_0"
+    read -r c || return 0
     case "$c" in
       1) xbd node list ;;
       2) xbd node add ;;
@@ -2386,7 +2441,7 @@ _mmenu_node() {
       7) _mmenu_group ;;
       8) _mmenu_browser ;;
       0) return ;;
-      *) printf '  无效选项 %s\n' "$c" ;;
+      *) ui_invalid "$c" ;;
     esac
     _mmenu_pause
   done
@@ -2439,19 +2494,21 @@ _mmenu_del() {
 _mmenu_browser() {
   local c
   while :; do
-    printf '\n\033[36m浏览器拨号 (Browser Dialer)\033[0m\n'
+    echo
+    ui_title "浏览器拨号 (Browser Dialer)"
     printf '  只有 xhttp/websocket 且非 REALITY 的节点能走浏览器转发。\n'
     printf '  选「原生」可省下 Chromium 的内存，节点仍然完全可用。\n'
     printf -- '----------------------\n'
     _xbd_browser_table
     printf -- '----------------------\n'
-    printf "  \033[36m1)\033[0m 逐个切换开关\n"
-    printf "  \033[36m2)\033[0m 当前节点：切到「浏览器 / 原生 / 默认」\n"
-    printf "  \033[36m3)\033[0m 把所有支持浏览器的节点设为「浏览器」\n"
-    printf "  \033[36m4)\033[0m 把所有节点设为「原生」（最省内存）\n"
-    printf "  \033[36m0)\033[0m 返回\n"
+    ui_menu 1 "逐个切换开关"
+    ui_menu 2 "当前节点：切到「浏览器 / 原生 / 默认」"
+    ui_menu 3 "把所有支持浏览器的节点设为「浏览器」"
+    ui_menu 4 "把所有节点设为「原生」（最省内存）"
+    ui_menu 0 "返回"
     printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-4]: " c || return 0
+    printf "  %s请选择%s: " "$C_B" "$C_0"
+    read -r c || return 0
     case "$c" in
       1) _xbd_browser_pick ;;
       2)
@@ -2631,14 +2688,16 @@ except Exception:
 _mmenu_group() {
   local c
   while :; do
-    printf '\n\033[36m分组管理\033[0m\n'; printf -- '----------------------\n'
+    echo
+    ui_title "分组管理"
     python3 "$XBD_LIBDIR/subs.py" list "$XBD_PREFIX" 2>/dev/null | sed 's/^/  /' || printf '  (暂无分组)\n'
     printf -- '----------------------\n'
-    printf "  \033[36m1)\033[0m 新建分组\n"
-    printf "  \033[36m2)\033[0m 整组删除 (连节点一起删)\n"
-    printf "  \033[36m0)\033[0m 返回\n"
+    ui_menu 1 "新建分组"
+    ui_menu 2 "整组删除 (连节点一起删)"
+    ui_menu 0 "返回"
     printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-2]: " c || return 0
+    printf "  %s请选择%s: " "$C_B" "$C_0"
+    read -r c || return 0
     case "$c" in
       1)
         local n
@@ -2667,7 +2726,7 @@ print("  已删除分组「%s」及其节点" % name)
 PY
         ;;
       0) return ;;
-      *) printf '  无效选项 %s\n' "$c" ;;
+      *) ui_invalid "$c" ;;
     esac
     _mmenu_pause
   done
@@ -2676,19 +2735,21 @@ PY
 _mmenu_service() {
   local c
   while :; do
-    printf '\n\033[36m服务控制\033[0m\n'; printf -- '----------------------\n'
+    echo
+    ui_title "服务控制"
     printf '  当前: %s\n' "$(systemctl is-active "$XBD_U_XRAY" 2>/dev/null)"
     printf -- '----------------------\n'
-    printf "  \033[36m1)\033[0m 启动\n"
-    printf "  \033[36m2)\033[0m 停止\n"
-    printf "  \033[36m3)\033[0m 重启\n"
-    printf "  \033[36m4)\033[0m 应用配置并重启\n"
-    printf "  \033[36m0)\033[0m 返回\n"
+    ui_menu 1 "启动"
+    ui_menu 2 "停止"
+    ui_menu 3 "重启"
+    ui_menu 4 "应用配置并重启"
+    ui_menu 0 "返回"
     printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-4]: " c || return 0
+    printf "  %s请选择%s: " "$C_B" "$C_0"
+    read -r c || return 0
     case "$c" in
       1) xbd start ;; 2) xbd stop ;; 3) xbd restart ;; 4) xbd apply ;; 0) return ;;
-      *) printf '  无效选项 %s\n' "$c" ;;
+      *) ui_invalid "$c" ;;
     esac
     _mmenu_pause
   done
@@ -2702,7 +2763,8 @@ _mmenu_port() {
 _mmenu_multi() {
   local c
   while :; do
-    printf '\n\033[36m多出站\033[0m\n'; printf -- '----------------------\n'
+    echo
+    ui_title "多出站"
     xbd multi status
     printf -- '----------------------\n'
     printf '  关: 只有当前节点进配置, 切换节点需要重启 (连接断 1-2 秒)\n'
@@ -2710,16 +2772,17 @@ _mmenu_multi() {
     printf '  开: 所有节点常驻一份配置, 切换不断线。\n'
     printf '      但共享一份配置 —— 一个节点构建失败, 整份都过不了校验。\n'
     printf -- '----------------------\n'
-    printf "  \033[36m1)\033[0m 开启\n"
-    printf "  \033[36m2)\033[0m 关闭\n"
-    printf "  \033[36m0)\033[0m 返回\n"
+    ui_menu 1 "开启"
+    ui_menu 2 "关闭"
+    ui_menu 0 "返回"
     printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-2]: " c || return 0
+    printf "  %s请选择%s: " "$C_B" "$C_0"
+    read -r c || return 0
     case "$c" in
       1) xbd multi on ;;
       2) xbd multi off ;;
       0) return ;;
-      *) printf '  无效选项 %s\n' "$c" ;;
+      *) ui_invalid "$c" ;;
     esac
     _mmenu_pause
   done
@@ -2728,15 +2791,17 @@ _mmenu_multi() {
 _mmenu_share() {
   local c
   while :; do
-    printf '\n\033[36m配置分发\033[0m\n'; printf -- '----------------------\n'
+    echo
+    ui_title "配置分发"
     printf '  让局域网其他设备用一个 URL 拉走全部节点。\n'
     printf -- '----------------------\n'
-    printf "  \033[36m1)\033[0m 开启 (生成链接)\n"
-    printf "  \033[36m2)\033[0m 列出所有链接\n"
-    printf "  \033[36m3)\033[0m 停用某条\n"
-    printf "  \033[36m0)\033[0m 返回\n"
+    ui_menu 1 "开启 (生成链接)"
+    ui_menu 2 "列出所有链接"
+    ui_menu 3 "停用某条"
+    ui_menu 0 "返回"
     printf -- '----------------------\n'
-    read -r -p "请输入选项 [0-3]: " c || return 0
+    printf "  %s请选择%s: " "$C_B" "$C_0"
+    read -r c || return 0
     case "$c" in
       1) xbd share new ;;
       2) xbd share list ;;
@@ -2748,7 +2813,7 @@ _mmenu_share() {
         xbd share off "$t"
         ;;
       0) return ;;
-      *) printf '  无效选项 %s\n' "$c" ;;
+      *) ui_invalid "$c" ;;
     esac
     _mmenu_pause
   done
@@ -3055,12 +3120,12 @@ _xbd_multi_status() {
   m=$(_xbd_multi_mode)
   actual=$(cat "$XBD_RUNTIME/multi.actual" 2>/dev/null || echo "")
   if [ "$m" = "on" ]; then
-    printf '  \033[32m多出站已开启\033[0m  所有节点常驻一份配置，切换节点不用重启\n'
+    ok "多出站已开启  所有节点常驻一份配置，切换节点不用重启"
     # 同样要 || true: 单节点模式下匹配数不为 0, 但文件不存在时 grep 会返回 1,
     # 在 pipefail 下配合 set -e 会让整个 status 命令失败。
     printf '  出站数: %s\n' "$(grep -c '"tag":' "$XBD_RUNTIME/xray-client.json" 2>/dev/null | head -1 || true)"
   else
-    printf '  \033[36m单节点模式\033[0m  当前配置只有当前节点，切换节点需要重启\n'
+    printf '  %s单节点模式%s  当前配置只有当前节点，切换节点需要重启\n' "$C_B" "$C_0"
   fi
   # 开关说开、实际却是单节点（或反过来），是会出现的不一致状态。必须报出来：
   # 用户看到"已开启"却发现切换仍然要重启，第一反应是"面板坏了"。

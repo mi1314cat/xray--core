@@ -178,6 +178,16 @@ def build_state(deep: bool = True) -> dict:
     panel_host = cfg_get(panel_env, "PANEL_HOST", "127.0.0.1")
     panel_port = cfg_get(panel_env, "PANEL_PORT", "18090")
 
+    # 内核版本：面板里有这一行, 命令行也得有 —— 用户排查时最常问的就是
+    # "我这是哪个版本"。本地二进制, 调用开销可忽略（已实测 <20ms）。
+    xray_ver = ""
+    try:
+        rc, out, _ = sh([os.path.join(PREFIX, "bin", "xray"), "version"], timeout=10)
+        if rc == 0 and len(out.split()) > 1:
+            xray_ver = out.split()[1]
+    except Exception:                                            # noqa: BLE001
+        pass
+
     ux = unit_info(U_XRAY)
     uc = unit_info(U_CHROMIUM)
     up = unit_info(U_PANEL)
@@ -213,6 +223,7 @@ def build_state(deep: bool = True) -> dict:
 
     result = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "xray_ver": xray_ver,
         "mode": mode,
         "mode_label": MODE_LABEL[mode],
         # 一句话说清当前到底在跑什么、当前节点走哪条路 —— 不写死"Xray + Chromium"，
@@ -288,37 +299,102 @@ def build_state(deep: bool = True) -> dict:
     return result
 
 
+def _disp_w(t: str) -> int:
+    """显示宽度：中文/全角算两列。
+
+    printf 与 python 的 %-Ns 都按**字节或字符数**补齐，中文标签会参差不齐 ——
+    竖着看对不齐的键值块，比不带冒号还难读。
+    """
+    import unicodedata
+    w = 0
+    for ch in t:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _is_tty() -> bool:
+    import os as _os
+    if _os.environ.get("XBD_PLAIN"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+# ANSI 只在终端里给。管道/日志里带转义序列 = 一片乱码（实测过）。
+_C = {"g": "\033[32m", "y": "\033[33m", "r": "\033[31m", "b": "\033[36m",
+      "d": "\033[2m", "0": "\033[0m"}
+
+
+def _c(key: str, text: str) -> str:
+    if not _is_tty():
+        return text
+    return f"{_C[key]}{text}{_C['0']}"
+
+
 def cmd_status_text(state: dict) -> str:
+    """给人看的状态块。
+
+    与网页面板同一套信息、同一套中文标签 —— 命令行和面板各叫一个名字
+    （"Connection Mode" / "连接模式"）是最容易让人怀疑"这俩是不是两个东西"
+    的地方。
+    """
     svc = state["services"]
+
     def dot(on):
-        return "●" if on else "○"
-    lines = []
-    lines.append("=" * 44)
-    lines.append(f'Xray Client:        {dot(svc["xray"]["active"])} {svc["xray"]["state"]}')
-    lines.append(f'Connection Mode:    {state["mode_label"]}')
-    if state.get("mode_detail"):
-        lines.append(f'                    {state["mode_detail"]}')
+        return _c("g", "●") if on else _c("y", "○")
+
+    def state_cn(on, yes="运行中", no="未运行"):
+        return _c("g", yes) if on else _c("y", no)
+
+    rows = []
+    x = svc["xray"]
+    rows.append(("服务状态", f'{dot(x["active"])} '
+                 + (state_cn(True) if x["active"] else state_cn(False, no=x["state"]))))
+
+    mode = state["mode_label"] + (" —— " + state["mode_detail"] if state.get("mode_detail") else "")
+    rows.append(("连接方式", mode))
+
     node = state.get("node")
-    lines.append(f'Current Node:       {node["name"] if node else "（未选择）"}')
-    lines.append(f'Chromium:           {dot(svc["chromium"]["active"])} {"Running" if svc["chromium"]["active"] else "Stopped"}'
-                 + (f' ({state["chromium_procs"]} 进程)' if state["chromium_procs"] else ''))
+    rows.append(("当前节点", (node["name"] if node else _c("d", "（未选择）"))))
+    if state.get("xray_ver"):
+        rows.append(("内核版本", f'Xray {state["xray_ver"]}'))
+
     ports = state["ports"]
-    lines.append(f'SOCKS5 入口:        {ports["listen"]}:{ports["normal"]}'
-                 + ("  LISTENING" if ports["normal_up"] else "  未监听"))
-    lines.append(f'HTTP  入口(LAN):    {ports["listen"]}:{ports["lan_http"]}'
-                 + ("  LISTENING" if ports["lan_http_up"] else "  未监听"))
-    lines.append(f'HTTP  入口(本机):   127.0.0.1:{ports["http"]}'
-                 + ("  LISTENING" if ports["http_up"] else "  未监听"))
-    lines.append(f'浏览器↔Dialer:      {state["ws_connections"]} 条连接')
-    lines.append(f'出口 IP:            {state["exit_ip"] or "（未探测）"}')
-    lines.append(f'Panel:              {dot(svc["panel"]["active"])} http://{cfg_get(os.path.join(PREFIX, "config", "panel.env"), "PANEL_HOST", "127.0.0.1")}:'
-                 f'{cfg_get(os.path.join(PREFIX, "config", "panel.env"), "PANEL_PORT", "18090")}/')
+
+    def ep(label, host, port, up):
+        return f'{label} {host}:{port} ' + (_c("g", "✓") if up else _c("y", "（未监听）"))
+
+    rows.append(("代理入口", ep("SOCKS5", ports["listen"], ports["normal"], ports["normal_up"])))
+    rows.append(("", ep("HTTP  ", ports["listen"], ports["lan_http"], ports["lan_http_up"])))
+    rows.append(("", ep("本机  ", "127.0.0.1", ports["http"], ports["http_up"])))
+
+    ch = svc["chromium"]
+    ch_txt = state_cn(True) if ch["active"] else state_cn(False, no="未运行")
+    if ch["active"] and state.get("chromium_procs"):
+        ch_txt += f'（{state["chromium_procs"]} 进程）'
     if node and not state.get("can_use_dialer"):
-        lines.append(f'Browser Dialer 可用: 否（该节点走 Xray 自带 TLS）— {state.get("dialer_reason", "")}')
-    elif node:
-        lines.append(f'Browser Dialer 可用: 是（本节点走浏览器 TLS）')
-    lines.append("=" * 44)
-    return "\n".join(lines)
+        # 明确说清"不需要它"而不是让人以为坏了 —— 这是最容易误解的一行
+        ch_txt += _c("d", "（当前节点不需要：走 Xray 自带 TLS）")
+    rows.append(("浏览器拨号", ch_txt))
+
+    rows.append(("出口 IP", state["exit_ip"] or _c("d", "（未探测）")))
+    panel_host = cfg_get(os.path.join(PREFIX, "config", "panel.env"), "PANEL_HOST", "127.0.0.1")
+    panel_port = cfg_get(os.path.join(PREFIX, "config", "panel.env"), "PANEL_PORT", "18090")
+    rows.append(("网页面板", f'{dot(svc["panel"]["active"])} http://{panel_host}:{panel_port}/'))
+
+    width = 44
+    out = [_c("b", "─" * width)]
+    for k, v in rows:
+        # 冒号必须落在同一列: 1(前导空格) + 键宽 + 补白 = 12
+        out.append(f' {k}{" " * max(1, 12 - _disp_w(k))}: {v}' if k
+                   else f' {" " * 11}: {v}')
+    out.append(_c("b", "─" * width))
+    if node and state.get("dialer_reason") and not state.get("can_use_dialer"):
+        out.append(_c("d", " 说明: " + str(state["dialer_reason"])[:160]))
+    out.append(_c("d", " 详情: xbd diagnose ｜ 网页面板里能点着改"))
+    return "\n".join(out)
 
 
 def main(argv) -> int:
