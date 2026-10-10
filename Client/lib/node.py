@@ -63,6 +63,20 @@ DEFAULT_NODE = {
     "ech": "",
     "ech_declared": False,     # 来源声明了 ECH 但没给出可用配置（只有 mihomo 的 enable 会这样）
     "pinned_cert_sha256": "",  # 自签证书节点的证书哈希（Xray 26.x 的 allowInsecure 替代）
+    # ---- hysteria2 的带宽提示与端口跳跃 ----
+    #
+    # ★ 存的是**带单位的规范写法**（"50 mbps" / "1.5 gbps"），不是来源原文。
+    #   因为 Xray 的 Bandwidth 解析器
+    #   （infra/conf/transport_internet.go 的 `func (b Bandwidth) Bps()`）把
+    #   **裸数字当成字节/秒**，而链接侧（mihomo 的 up/down、sing-box 与本项目
+    #   conf/hysteria2.sh 的 upmbps/downmbps）的裸数字是 **Mbps** —— 两边语义
+    #   正好相反。实测把 "50" 直接写进 brutalUp 时真内核拒收**整份**配置：
+    #       infra/conf: BrutalUp must be at least 65536 bytes per second
+    #   所以归一化只能在解析这一处做，下游原样下发，绝不透传来源字符串。
+    "up": "",                  # 上行提示，规范写法；未声明 = ""
+    "down": "",                # 下行提示，规范写法；未声明 = ""
+    # 端口跳跃范围，**原样**保留（Xray 的 PortList 收 "a-b" / "a,b" / 单端口）。
+    "mport": "",
     # mux：**只表示 Xray 自己的 mux.cool**。见 parse_mihomo_yaml 里对 smux 的说明 ——
     # 那是 sing-box/mihomo 的另一套多路复用协议，不能混为一谈。
     "mux": False,
@@ -108,6 +122,88 @@ def _b64decode(s: str) -> str:
 
 def _norm_transport(raw: str) -> str:
     return _TRANSPORT_ALIASES.get((raw or "").lower(), (raw or "").lower())
+
+
+# 带宽写法：数字 + 可选数量级 + 可选 bps 后缀。数量级缺省时**不带后缀**才算数
+# （见 bandwidth_hint 的说明：带后缀却没数量级的写法有歧义，不猜）。
+_BW_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgt]?)(bps|b|bit|bits)?$", re.I)
+
+
+def bandwidth_hint(v) -> str:
+    """把来源里的带宽写法归一成 Xray 的 Bandwidth 语法（"50 mbps" / "1.5 gbps"）。
+
+    ★ 为什么必须补单位（这条是实测出来的，不是照抄文档）：
+      Xray 的 `Bandwidth.Bps()` 认 ""/"b"/"bps" 为**字节**，认 "k/m/g/t" 为
+      1024 进制；也就是说 `"50"` = 50 字节/秒。而 brutalUp/brutalDown 有
+      `>= 65536 B/s` 的下限，实测把 "50" 写进去的后果是内核**拒绝整份配置**：
+          infra/conf: BrutalUp must be at least 65536 bytes per second
+      链接侧的裸数字却是 Mbps（mihomo 的 up/down、sing-box 的 upmbps/downmbps
+      都是这个约定）。两边语义相反 → 归一化只能做一次，做在解析阶段。
+
+    认得的输入：50 / "50" / "50mbps" / "50 Mbps" / "1.5g" / "2 gbps"
+    认不出的（含 "50bps" 这种没写数量级的）返回 ""：不猜、不硬塞。
+    """
+    if v is None or isinstance(v, bool):
+        return ""
+    if isinstance(v, (int, float)):
+        s = f"{v:g}"
+    else:
+        s = str(v).strip()
+    if not s:
+        return ""
+    m = _BW_RE.match(s)
+    if not m:
+        return ""
+    mag, suffix = m.group(2).lower(), (m.group(3) or "").lower()
+    if not mag and suffix:
+        # "50bps" / "50b"：数量级没写，是 50 bit/s 还是 50 Mbps？来源没表态，
+        # 猜错就是把带宽提示变成反效果，所以整个丢弃。
+        return ""
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return ""
+    if num <= 0:
+        # 0 表示"没有提示"，不是"限速到 0"。
+        return ""
+    # mag 是数量级字母（k/m/g/t）。数量级没写时按链接侧约定补上 "m"（= Mbps）。
+    return f"{num:g} {mag}bps" if mag else f"{num:g} mbps"
+
+
+def bandwidth_mbps(v) -> str:
+    """bandwidth_hint 的逆：把规范写法还原成链接里要的裸数字（Mbps）。
+
+    只用于"生成链接"方向。认不出返回 ""（宁可不写，也不写一个错的值）。
+    """
+    s = bandwidth_hint(v)
+    if not s:
+        return ""
+    num, _, unit = s.partition(" ")
+    mul = {"": 1, "k": 1 / 1024, "m": 1, "g": 1024, "t": 1024 * 1024}[unit[:1]]
+    try:
+        n = float(num) * mul
+    except ValueError:
+        return ""
+    return f"{n:g}"
+
+
+def port_hop_range(v) -> str:
+    """hysteria2 的端口跳跃范围，收原样字符串（Xray 的 PortList 语法）。
+
+    只做**合法性**校验，不做格式转换：内核认 "20000-30000"、"20000,30000"、
+    "20000" 三种写法，我们照收。范围里有非法端口就整个丢弃 —— 写进去会让
+    内核 build 失败（整份配置起不来），比不写严重得多。
+    """
+    if v is None or v == "":
+        return ""
+    s = str(v).strip().replace(" ", "")
+    if not re.fullmatch(r"[0-9]+(?:[-.,][0-9]+)*", s):
+        return ""
+    for part in re.split(r"[.,]", s):
+        for end in part.split("-"):
+            if not (0 < int(end) <= 65535):
+                return ""
+    return s
 
 
 def _flag(v) -> bool:
@@ -306,6 +402,23 @@ def parse_hysteria2(uri: str) -> dict:
         "sni": q.get("sni") or q.get("peer") or "",
         "alpn": q.get("alpn") or "",
         "allow_insecure": str(q.get("insecure", "")).lower() in ("1", "true"),
+        # ---- 带宽提示 ----
+        # 链接里同时可能有两个名字，各自的解析器认各家的（实测）：
+        #   up/down           —— mihomo 认（裸数字 = Mbps）
+        #   upmbps/downmbps   —— sing-box 面板与本项目 conf/hysteria2.sh 认
+        # 两个名字同时出现时以 upmbps/downmbps 为准（本项目自己的约定），
+        # 只有一个就用手上那个，一个都没有就留空 —— **不编默认值**：
+        # 编了会让"链接没写带宽"和"链接写了 50/200"变成同一件事。
+        "up": bandwidth_hint(q.get("upmbps") or q.get("up")),
+        "down": bandwidth_hint(q.get("downmbps") or q.get("down")),
+        # 端口跳跃。mihomo 的链接参数名是 mport。
+        "mport": port_hop_range(q.get("mport")),
+        # ★ pin= 是**自签 hy2 节点唯一的信任来源**（本项目 conf/hysteria2.sh
+        #   自签分支写的就是 `pin=<证书 DER 的 hex sha256>`，与 Xray 的
+        #   pinnedPeerCertSha256 同一个值）。以前这里没读它 —— 链接里有、
+        #   节点 JSON 里没有、生成的配置里也就没有 → 自签节点必然校验失败。
+        #   与 parse_trojan 的同一字段取名一致（那边也是 pin=）。
+        "pinned_cert_sha256": (q.get("pin") or "").strip().lower(),
         "source": "hysteria2-uri",
         "raw_params": q,
         "raw": uri,
@@ -547,6 +660,18 @@ def _yaml_entry_to_node(entry: dict) -> dict:
     if "alpn" in entry:
         alpn = entry["alpn"]
         n["alpn"] = ",".join(alpn) if isinstance(alpn, list) else str(alpn)
+    if proto == "hysteria2":
+        # mihomo 的 hysteria2 节点把带宽写在 up/down（"45 Mbps" 这种**带单位**
+        # 的字符串，或裸数字 = Mbps），端口跳跃写在 ports（mihomo 在 hysteria2
+        # 上要求**必须**给 hop-interval，我们这边内核自己按 30s 默认跳，
+        # hop-interval 目前不下发 —— 见 docs 里的遗留说明）。
+        #
+        # ★ 实机现场：CC 上正在跑的那个 hy2 节点，mihomo YAML 里明明有
+        #   `up: "45 Mbps"` / `down: "150 Mbps"`，解析出来的 node JSON 里
+        #   这两个键**一个都没有** —— 链接/订阅侧补齐了参数，客户端这一跳又丢。
+        n["up"] = bandwidth_hint(entry.get("up"))
+        n["down"] = bandwidth_hint(entry.get("down"))
+        n["mport"] = port_hop_range(entry.get("ports") or entry.get("mport"))
     return n
 
 
@@ -1026,6 +1151,22 @@ def build_link(node: dict) -> str:
             q.append(("sid", node["reality_short_id"]))
         if node.get("reality_spider_x"):
             q.append(("spx", node["reality_spider_x"]))
+    # hysteria2 专属参数。同样按"解析器认识哪些键，生成就得写哪些键"：
+    # 手动添加表单里填了带宽/端口跳跃/证书 pin，拼链接时不写 = 导入回来少一半，
+    # 而界面上什么提示都没有（与 P1-4 的 sni、trojan 的 pbk 是同一类）。
+    #   up/down 写**裸数字**（链接两侧的通用约定 = Mbps），upmbps/downmbps
+    #   再写一遍 —— 与本项目 conf/lib/nodes.py 发出去的链接逐字同形。
+    if proto == "hysteria2":
+        for key, val in (("up", bandwidth_mbps(node.get("up"))),
+                         ("down", bandwidth_mbps(node.get("down")))):
+            if val:
+                q.append((key, val))
+                q.append((key + "mbps", val))
+        if node.get("mport"):
+            q.append(("mport", node["mport"]))
+        # pin 用的是 hex DER sha256，与 Xray 的 pinnedPeerCertSha256 同值。
+        if node.get("pinned_cert_sha256"):
+            q.append(("pin", node["pinned_cert_sha256"]))
     qs = urllib.parse.urlencode(q)
     tail = ("?" + qs) if qs else ""
 

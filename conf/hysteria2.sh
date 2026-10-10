@@ -734,10 +734,13 @@ EOF
     [[ -n "$HOP_RANGE" ]] && mport="mport=$HOP_RANGE&"
     if [[ "$CERT_TRUSTED" == "true" ]]; then
         # 真 CA 证书 → 正常校验，无 insecure
-        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&insecure=0&alpn=h3&upmbps=50&downmbps=200#hysteria-$index"
+        # up/down 与 upmbps/downmbps 两种名字都写 —— mihomo 只认 `up/down`
+        # （裸数字 = Mbps），sing-box 面板与本项目脚本只认 `upmbps/downmbps`。
+        # 只写一种就是实测过的坑: 旧链接里的 upmbps=50 被 mihomo 整条丢掉。
+        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&insecure=0&alpn=h3&up=50&down=200&upmbps=50&downmbps=200#hysteria-$index"
     else
         # 自签 → 用 pin (hex, URI规范)，不再使用 insecure= 参数（兼容新Xray内核）
-        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&alpn=h3&pin=$cert_hex_pin&upmbps=50&downmbps=200#hysteria-$index"
+        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&alpn=h3&pin=$cert_hex_pin&up=50&down=200&upmbps=50&downmbps=200#hysteria-$index"
     fi
 
     # ---- Xray 客户端 JSON 片段 (pinnedPeerCertSha256 用 hex, v26.3.27 实测) ----
@@ -754,7 +757,8 @@ EOF
         "network": "hysteria",
         "security": "tls",
         "tlsSettings": { "serverName": "$domain", "alpn": ["h3"] },
-        "hysteriaSettings": { "version": 2, "auth": "$uuid", "up": "50mbps", "down": "200mbps" }
+        "finalmask": { "quicParams": { "brutalUp": "50 mbps", "brutalDown": "200 mbps" } },
+        "hysteriaSettings": { "version": 2, "auth": "$uuid" }
       }
     }
   ]
@@ -776,7 +780,8 @@ EOF
           "alpn": ["h3"],
           "pinnedPeerCertSha256": "$cert_hex_pin"
         },
-        "hysteriaSettings": { "version": 2, "auth": "$uuid", "up": "50mbps", "down": "200mbps" }
+        "hysteriaSettings": { "version": 2, "auth": "$uuid" },
+        "finalmask": { "quicParams": { "brutalUp": "50 mbps", "brutalDown": "200 mbps" } }
       }
     }
   ]

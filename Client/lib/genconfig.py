@@ -200,6 +200,52 @@ def _alpn_list(v) -> list:
     return [a for a in str(v).split(",") if a]
 
 
+# 带宽提示的**规范**写法："50 mbps" / "1.5 gbps"。
+# 与 Client/lib/node.py 的 bandwidth_hint() 是同一套语法：那边负责把来源
+# （裸数字 = Mbps / "45 Mbps" / "50mbps"）归一化，这边只做校验 + 兜底
+# —— 节点 JSON 也可能是手写或旧版本落盘的。
+_BW_CANON_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgt])bps$", re.I)
+_BW_BARE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)$")
+
+
+def _bandwidth_value(v) -> str:
+    """节点里的带宽提示 → Xray 的 Bandwidth 语法；认不出返回 "" 并说明。
+
+    ★ 为什么必须**带单位**，以及为什么不能原样透传节点里的字符串：
+      Xray 的 `Bandwidth.Bps()` 把裸数字当**字节/秒**（""/"b"/"bps" 都是字节），
+      而 brutalUp/brutalDown 有 `>= 65536 B/s` 的下限。实测把 "50" 写进
+      brutalUp 的后果不是"带宽提示没生效"，而是内核**拒收整份配置**：
+          infra/conf: BrutalUp must be at least 65536 bytes per second
+      链接侧的裸数字却是 Mbps（mihomo 的 up/down、sing-box 的 upmbps/downmbps）。
+      两边语义相反，所以这里认不出就**不写**，绝不把来源字符串直接塞进内核。
+    """
+    if v is None or v == "" or isinstance(v, bool):
+        return ""
+    if isinstance(v, (int, float)):
+        return f"{v:g} mbps" if v > 0 else ""
+    s = str(v).strip()
+    m = _BW_CANON_RE.match(s)
+    if m:
+        return f"{float(m.group(1)):g} {m.group(2).lower()}bps"
+    if _BW_BARE_RE.match(s):
+        # 旧节点文件里可能只有裸数字 —— 按链接侧的约定当 Mbps（不是字节/秒）。
+        return f"{float(s):g} mbps" if float(s) > 0 else ""
+    print(f"genconfig: 带宽提示 {s!r} 不是可识别的写法（要 \"50 mbps\" 这种带单位的"
+          "形式；裸数字会被内核当成字节/秒并拒绝整份配置）—— 已跳过", file=sys.stderr)
+    return ""
+
+
+def _port_hop(v) -> str:
+    """端口跳跃范围 → Xray PortList 语法（"a-b" / "a,b" / 单端口）；非法就跳过。"""
+    s = str(v).strip().replace(" ", "")
+    if re.fullmatch(r"[0-9]+(?:[-.,][0-9]+)*", s) and all(
+            0 < int(e) <= 65535 for p in re.split(r"[.,]", s) for e in p.split("-")):
+        return s
+    print(f"genconfig: mport={v!r} 不是合法的端口范围 —— 已跳过"
+          "（写进去内核会拒绝整份配置，比不写严重得多）", file=sys.stderr)
+    return ""
+
+
 def _node_port(node: dict, default: int) -> int:
     """端口取值：数字/数字字符串都认。类型不对返回 default（类型问题由
     node_type_problems 提前报错，这里只负责不抛异常）。"""
@@ -239,6 +285,15 @@ def node_type_problems(node: dict) -> tuple:
     alpn = node.get("alpn")
     if alpn not in (None, "") and not isinstance(alpn, (str, list)):
         problems.append(f"alpn={alpn!r}（{type(alpn).__name__}，内核要字符串或数组）")
+    # hysteria2 的带宽/端口跳跃：**不放进 _NODE_STR_FIELDS**。那边是"不是
+    # string 就毙掉整个节点"，而这三个字段数字写法完全合理（裸数字 = Mbps，
+    # genconfig 自己会补单位）—— 因为一个能救的写法把节点毙掉，比照着旧的
+    # 静默丢弃还糟。这里只拦内核绝对收不下的类型（对象/数组/布尔）。
+    for k in ("up", "down", "mport"):
+        v = node.get(k)
+        if v in (None, "") or (isinstance(v, (str, int, float)) and not isinstance(v, bool)):
+            continue
+        problems.append(f"{k}={v!r}（{type(v).__name__}，要字符串或数字）")
     # ech 是**已知的历史格式**，见上面注释：跳过 + 告知，不阻断。
     ech = node.get("ech")
     if ech not in (None, "") and not isinstance(ech, str):
@@ -272,6 +327,43 @@ def build_stream(node: dict, mode: str) -> dict:
         if node.get("password"):
             hs["auth"] = node["password"]
         stream["hysteriaSettings"] = hs
+        # ---- 带宽提示 / 端口跳跃：**只有这才是指挥内核的字段名** ----
+        #
+        # ★ 这里的字段名是拿真内核试出来的，不是照抄文档：
+        #   `hysteriaSettings.up/down` 确实还存在，但 26.3.27 的 Build() 只对它
+        #   打一行警告就丢掉：
+        #       [Warning] infra/conf: congestion & up & down & udphop
+        #                 move to finalmask/quicParams
+        #   而 `xray run -test` 对它返回 **rc=0 / Configuration OK** ——
+        #   于是"配置能过 -test"完全不能证明带宽被采纳（本仓库吃过这个亏）。
+        #   真正生效的是 streamSettings.finalmask.quicParams.brutalUp/brutalDown，
+        #   实测反证：把 brutalUp 写成裸数字 "50" → 内核**拒收整份配置**
+        #       infra/conf: BrutalUp must be at least 65536 bytes per second
+        #   写成 "bogus" → `strconv.ParseFloat: parsing "": invalid syntax`。
+        #   会报错就说明这个键真的被读了（对照：随便写个 brutalUpXX → OK）。
+        #
+        # 值必须是**带单位**的字符串：Bandwidth.Bps() 认 ""/"b"/"bps" 为字节/秒
+        # （所以裸数字 50 = 50 B/s < 65536 会让配置起不来）。节点里的 up/down
+        # 已在 node.py 归一成 "50 mbps" 这种形态，这里原样下发。
+        #
+        # 不写 congestion：缺省("")在 dialer 里的分支就是 brutal 家族，与服务端
+        # 是否广播带宽有关（服务端 BrutalDown=0 时自动退回 BBR）。写死会把
+        # "跟随服务端"变成"单方面强制"，那是另一个语义。
+        qp: dict = {}
+        for src, dst in (("up", "brutalUp"), ("down", "brutalDown")):
+            val = _bandwidth_value(node.get(src))
+            if val:
+                qp[dst] = val
+        # 端口跳跃：内核的字段是 finalmask.quicParams.udpHop.ports，
+        # 收 "20000-30000" / "20000,30000" / 单端口。不写 interval ——
+        # udphop 的默认就是 30s（intervalMin/Max 为 0 时取 defaultHopInterval），
+        # 写 0 反而没有意义。
+        if node.get("mport"):
+            mport = _port_hop(node["mport"])
+            if mport:
+                qp["udpHop"] = {"ports": mport}
+        if qp:
+            stream["finalmask"] = {"quicParams": qp}
         if security in ("tls", "none"):
             # hysteria2 默认就是 TLS（QUIC 自带），按官方示例给 tlsSettings
             tls_h: dict = {"serverName": node.get("sni") or node.get("address", "")}

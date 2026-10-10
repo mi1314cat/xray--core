@@ -1629,6 +1629,133 @@ assert_eq "$(S_GET hy2 alpn)" "h3" "hy2 链接带 alpn=h3"
 assert_eq "$(S_GET hy2 up)" "50" "hy2 链接带 up= (mihomo 认的名字)"
 assert_eq "$(S_GET hy2 upmbps)" "50" "hy2 链接带 upmbps= (sing-box 面板认的名字)"
 
+# ------------------------------------------------- 客户端链路: 链接参数不许丢
+# 分享层补齐了参数, 客户端这一跳又丢 —— 实机现场: CC 上正在跑的 hysteria2
+# 节点, mihomo YAML 里明明有 `up: "45 Mbps"` / `down: "150 Mbps"`, 解析出来的
+# node JSON 里这两个键**一个都没有**。链路是
+#     链接 → node.py → 节点 JSON → genconfig.py → 内核配置
+# 任何一跳静默丢弃, 端到端就还是缺这一截, 而界面上什么提示都没有。
+#
+# ★ 字段名以**真内核**为准 (Xray 26.3.27 / CC 实测), 这条不能照抄文档:
+#   `hysteriaSettings.up/down` 确实还在, 但 Build() 只对它打一行 Warning
+#   就丢掉("congestion & up & down & udphop move to finalmask/quicParams"),
+#   而 `xray run -test` 对它返回 **rc=0 / Configuration OK** ——
+#   也就是说"配置能过 -test"完全不能证明带宽被采纳(本仓库吃过这个亏)。
+#   真正生效的是 streamSettings.finalmask.quicParams.brutalUp/brutalDown。
+#   反证(会报错才说明键真的被读了, 对照: 随便写 brutalUpXX → OK):
+#     brutalUp:"50"    → rc=23 BrutalUp must be at least 65536 bytes per second
+#     brutalUp:"bogus" → rc=23 strconv.ParseFloat: parsing "": invalid syntax
+#   所以裸数字**绝不能**透传(内核当字节/秒, 且 50 < 65536 会让整份配置起不来),
+#   必须补单位。
+group "hy2 客户端链路: 链接参数不静默消失 (解析 → 生成)"
+CL_HY2_LINK='hysteria2://AUTH@107.173.154.178:29604?sni=moontv.6896698.xyz&insecure=0&alpn=h3&up=50&down=200&upmbps=50&downmbps=200&mport=30000-31000&pin=694e89c0350e1c9c8c71c24cf0521c6147dee182a18ba0979b8e6bda67114e69#hysteria-04'
+CL_HY2_NOBW='hysteria2://AUTH@107.173.154.178:29604?sni=moontv.6896698.xyz&insecure=0&alpn=h3#hysteria-04'
+CLH=$(python3 - "$ROOT" "$CL_HY2_LINK" "$CL_HY2_NOBW" <<'PY'
+import json, os, re, subprocess, sys, tempfile
+root, link, nobw = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, os.path.join(root, "Client", "lib"))
+import node as N
+
+GEN = os.path.join(root, "Client", "lib", "genconfig.py")
+res = {}
+
+n = N.parse_node(link)
+# 1) 解析这一跳: 字段必须在**顶层**, 只躺在 raw_params 里等于没保留
+res["up"] = n.get("up")
+res["down"] = n.get("down")
+res["mport"] = n.get("mport")
+res["alpn"] = n.get("alpn")
+res["pin8"] = (n.get("pinned_cert_sha256") or "")[:8]
+
+
+def gen(node):
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(node, f); f.close()
+    o = tempfile.mktemp(suffix=".json")
+    r = subprocess.run(["python3", GEN, "--node", f.name, "--output", o,
+                        "--mode", "normal", "--listen", "127.0.0.1",
+                        "--port-normal", "1080", "--dns", "standard",
+                        "--family", "auto", "--logs", "/tmp"],
+                       capture_output=True, text=True)
+    os.unlink(f.name)
+    if r.returncode != 0:
+        return None
+    ob = [x for x in json.load(open(o))["outbounds"] if x.get("tag") == "proxy"][0]
+    os.unlink(o)
+    return ob["streamSettings"]
+
+
+def qp(ss):
+    return ((ss or {}).get("finalmask") or {}).get("quicParams") or {}
+
+
+ss = gen(n)
+res["brutalUp"] = qp(ss).get("brutalUp")
+res["brutalDown"] = qp(ss).get("brutalDown")
+res["udphop"] = (qp(ss).get("udpHop") or {}).get("ports")
+# 2) 已废弃的那条路一个字段都不许写: 它**能过 -test 但内核不采纳**,
+#    写了等于拿"配置 OK"骗自己。
+res["deprecated"] = any(k in (ss.get("hysteriaSettings") or {}) for k in ("up", "down"))
+# 3) 内核语法: 必须带单位(裸数字会被当成字节/秒 → 整份配置起不来)
+res["unit_ok"] = all(re.fullmatch(r"[0-9.]+ [kmgt]bps", qp(ss).get(k, ""))
+                     for k in ("brutalUp", "brutalDown"))
+# 4) 裸数字/带单位混写(旧节点文件、手写 JSON) 要补单位, 不能原样透传
+ss2 = gen(dict(n, up=50, down="150 Mbps"))
+res["bare_up"] = qp(ss2).get("brutalUp")
+res["bare_down"] = qp(ss2).get("brutalDown")
+# 5) 非法端口范围: 丢掉, 且不许把坏值写进内核(写进去 build 直接失败)
+ss3 = gen(dict(n, mport="70000"))
+res["bad_mport_hop"] = "udpHop" in qp(ss3)
+res["bad_mport_keeps_bw"] = qp(ss3).get("brutalUp")
+# 6) 认不出的带宽写法: 不猜、不硬塞
+res["junk_up"] = qp(gen(dict(n, up="fast"))).get("brutalUp") or "SKIPPED"
+# 7) 缺省: 链接没写带宽 → 配置里**不写** finalmask(不编默认值,
+#    编了会让"没写"和"写了 50/200"变成同一件事)
+res["nobw_has_finalmask"] = "finalmask" in (gen(N.parse_node(nobw)) or {})
+# 8) 反向: 节点 → 链接 → 节点, up/down 也不能丢
+back = N.parse_node(N.build_link(n))
+res["rt_up"] = back.get("up")
+res["rt_down"] = back.get("down")
+print(json.dumps(res, ensure_ascii=False))
+PY
+)
+CH_GET() { python3 -c "
+import json,sys
+print(json.loads(sys.argv[1]).get(sys.argv[2], '<无>'))" "$CLH" "$1"; }
+
+assert_eq "$(CH_GET up)" "50 mbps" "解析: 链接的 up=50 落到节点 JSON 顶层 (不是只进 raw_params)"
+assert_eq "$(CH_GET down)" "200 mbps" "解析: 链接的 down=200 落到节点 JSON 顶层"
+assert_eq "$(CH_GET mport)" "30000-31000" "解析: 链接的 mport 落到节点 JSON 顶层"
+assert_eq "$(CH_GET alpn)" "h3" "解析: 链接的 alpn 落到节点 JSON 顶层"
+assert_eq "$(CH_GET pin8)" "694e89c0" "解析: 链接的 pin= 落到 pinned_cert_sha256 (自签节点唯一的信任来源)"
+assert_eq "$(CH_GET brutalUp)" "50 mbps" "生成: 带宽写进 finalmask.quicParams.brutalUp (内核真正读的键)"
+assert_eq "$(CH_GET brutalDown)" "200 mbps" "生成: 带宽写进 finalmask.quicParams.brutalDown"
+assert_eq "$(CH_GET udphop)" "30000-31000" "生成: mport 写进 finalmask.quicParams.udpHop.ports"
+assert_eq "$(CH_GET deprecated)" "False" "生成: 一个字段都不写已废弃的 hysteriaSettings.up/down (能过 -test 但内核丢掉)"
+assert_eq "$(CH_GET unit_ok)" "True" "生成: 带宽值一律带单位 (裸数字会被内核当成字节/秒 → 整份配置起不来)"
+assert_eq "$(CH_GET bare_up)" "50 mbps" "生成: 裸数字 50 (旧节点文件) 被补成 50 mbps, 不是原样透传"
+assert_eq "$(CH_GET bare_down)" "150 mbps" "生成: \"150 Mbps\" 归一成内核语法"
+assert_eq "$(CH_GET bad_mport_hop)" "False" "生成: 非法端口范围不写进内核 (写进去 build 直接失败)"
+assert_eq "$(CH_GET bad_mport_keeps_bw)" "50 mbps" "生成: 端口范围非法不影响带宽照常下发"
+assert_eq "$(CH_GET junk_up)" "SKIPPED" "生成: 认不出的带宽写法跳过 (不猜、不硬塞)"
+assert_eq "$(CH_GET nobw_has_finalmask)" "False" "链接没写带宽时不编默认值 (不写 finalmask)"
+assert_eq "$(CH_GET rt_up)" "50 mbps" "反向: 节点 → 链接 → 节点 的 up 不丢"
+assert_eq "$(CH_GET rt_down)" "200 mbps" "反向: 节点 → 链接 → 节点 的 down 不丢"
+
+# 服务端同一个节点自己的客户端产物也必须描述同一件事:
+#   conf/hysteria2.sh 的 Xray 客户端 JSON 以前写 hysteriaSettings.up/down
+#   (26.3.27 只警告就丢), 现在必须是 finalmask.quicParams。
+grep -q '"finalmask": { "quicParams": { "brutalUp"' "$ROOT/conf/hysteria2.sh" \
+    && ok "hysteria2.sh 的客户端 JSON 改用 finalmask.quicParams (内核真正读的键)" \
+    || bad "hysteria2.sh 的客户端 JSON 还在写被丢弃的 hysteriaSettings.up/down"
+grep -q '"up": "50mbps"' "$ROOT/conf/hysteria2.sh" \
+    && bad "hysteria2.sh 仍在写已废弃的 hysteriaSettings.up/down" \
+    || ok "hysteria2.sh 不再写已废弃的 hysteriaSettings.up/down"
+grep -q 'up=50&down=200&upmbps=50&downmbps=200' "$ROOT/conf/hysteria2.sh" \
+    && ok "hysteria2.sh 的分享链接两种带宽名字都写 (mihomo 只认 up/down)" \
+    || bad "hysteria2.sh 的分享链接少了 up=/down= (mihomo 会整条丢掉 upmbps=)"
+
+
 # ---- 证书 pin: 公网 CA 不写, 自签才写 ----
 PIN_SELF=$(bash -c "source '$LIB/cert.sh'; x_cert_client_pin '$SC/certs/self.crt' 1 0")
 PIN_CA=$(bash -c "source '$LIB/cert.sh'; x_cert_client_pin '$SC/certs/leaf.crt' 1 0")
