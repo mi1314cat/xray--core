@@ -1926,6 +1926,14 @@ CH2() { python3 -c "
 import json,sys
 print(json.loads(sys.argv[1]).get(sys.argv[2], '<无>'))" "$CLH2" "$1"; }
 
+# 生成器崩了(比如解析直接抛异常) → 后面的断言会全部拿到 '<无>', 但那样只说明"值不对",
+# 说不清是"生成器根本没跑完"。单独一条把这件事点出来(不静默跳过)。
+if printf '%s' "$CLH2" | python3 -c 'import json,sys;json.load(sys.stdin)' 2>/dev/null; then
+    ok "hy2 断言生成器跑完并产出合法 JSON（没有静默跳过）"
+else
+    bad "hy2 断言生成器没有产出合法 JSON（崩溃/被跳过）: $(printf '%s' "$CLH2" | tail -1)"
+fi
+
 assert_eq "$(CH2 old_proto)" "hysteria2" "真机产物① protocol:\"hysteria\" 被认出来(内核与脚本都写这个名字)"
 assert_eq "$(CH2 old_addr)" "107.173.154.178" "扁平 settings.address 被读到(走 servers[] 分支会是空串)"
 assert_eq "$(CH2 old_port)" "29604" "扁平 settings.port 被读到(走 servers[] 分支会是 443)"
@@ -1979,11 +1987,14 @@ from proxy_node_compat import check_node, Target, Registry, default_registry_pat
 LINK = ("trojan://LV7CpzX9Jc8vWuhP0YV0@107.173.154.178:29602?security=reality&type=tcp"
         "&sni=audio-ssl.itunes.apple.com&fp=chrome&sid=b860a9f0"
         "&pbk=GiR4k0uVRhKEWlfD9oRjjv-C0STrp5M0uP3kRIT2pgU#TROJAN-03")
-out = []
-
-
 def ok(cond, desc):
-    out.append(("OK " if cond else "NO ") + desc)
+    # 逐条**即时**打印: 生成器后半段崩了, 前面已经判定的证据也不会丢
+    # (旧写法是攒到末尾一次性 print —— 中途异常 = 这组检查一条都不算, 静默全绿)
+    print(("OK " if cond else "NO ") + desc, flush=True)
+
+
+def note(desc):
+    print("NO " + desc, flush=True)
 
 
 reg = Registry.load(default_registry_path())
@@ -2024,8 +2035,6 @@ ok(kernels <= {"xray", "mihomo", "singbox"}, "所有 target_kernel 取值都是�
 legacy = [u for u in reg.uri_rules if not u.get("target_kernel")]
 ok(all(reg.uri_rule(u["scheme"], u["feature"]) is not None for u in legacy),
    "旧调用形式对所有全局行仍然取得到(向后兼容)")
-for line in out:
-    print(line)
 PYEOF
 )
 while IFS= read -r ln; do
@@ -2034,6 +2043,9 @@ while IFS= read -r ln; do
         "NO "*) bad "${ln#NO }" ;;
     esac
 done <<< "$CH3"
+# 生成器崩了/没输出 = 这组检查被静默跳过。本项目吃过"检查根本没跑却全绿"的亏,
+# 所以这里必须当场红, 不许当成"没有失败"。
+[[ "$CH3" == *"OK "* || "$CH3" == *"NO "* ]]     && ok "compat 断言生成器有输出（没有静默跳过）"     || bad "compat 断言生成器没有输出（崩溃/被跳过）: $(printf '%s' "$CH3" | tail -1)"
 
 # 内核在就用真内核把"旧世代产物 → 配置"这一条验穿: 带宽搬到了 finalmask, 配置起得来
 XK2="${XRAY_BIN:-}"
