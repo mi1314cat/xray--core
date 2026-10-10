@@ -1575,8 +1575,17 @@ test_outbound() {
 
     # 3. TLS 握手（tls/reality/hy2/trojan）
     if [[ -n "$sni" && -x "$(command -v openssl)" ]]; then
-        if echo | timeout 8 openssl s_client -connect "$addr:$port" -servername "$sni" 2>/dev/null | grep -q "CONNECTION ESTABLISHED"; then
+        # 判据用 "BEGIN CERTIFICATE"（1.1.1 和 3.x 都会打）:
+        #   * OpenSSL 3.x 起**不再打印** "CONNECTION ESTABLISHED"（只有 1.1.1 打）,
+        #     原来按它判断 —— 在 3.x 上握手成功也一律报"握手失败"（实测命中 0 次）。
+        #   * 也不再走管道: `... | grep -q` 会让 s_client 吃 SIGPIPE(141),
+        #     本脚本开着 pipefail, 明明成功也会判成失败。
+        local tls_out="" tls_rc=0
+        tls_out=$(echo | timeout 8 openssl s_client -connect "$addr:$port" -servername "$sni" 2>/dev/null) || tls_rc=$?
+        if [[ "$tls_out" == *"BEGIN CERTIFICATE"* || "$tls_out" == *"CONNECTION ESTABLISHED"* ]]; then
             say "TLS" "握手成功 (sni=$sni)"
+        elif [[ "$tls_rc" -eq 0 && -n "$tls_out" ]]; then
+            say "TLS" "握手成功 (sni=$sni, 未取到证书)"
         else
             say "TLS" "握手失败（Reality 或证书校验属正常，以实际流量为准）"
         fi

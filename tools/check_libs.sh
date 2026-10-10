@@ -2609,6 +2609,24 @@ else
     ok "pipefail 脚本里没有早退管道（不会猝死、不会判断反）"
 fi
 
+# ---------------------------------------------------------------- TLS 握手判据
+# OpenSSL 3.x 起 s_client **不再打印** "CONNECTION ESTABLISHED"（只有 1.1.1 打）。
+# 按它判断的话, 3.x 上握手成功也一律报"握手失败" —— 实测 cloudflare:443 命中 0 次,
+# 而同一台机器 "BEGIN CERTIFICATE" / "Verify return code" 都在。
+#
+# 这类"判据依赖某个版本的输出文案"的坑值得钉住: 代码看起来完全正常,
+# 失败时也只打印一句含糊的"握手失败", 没人会怀疑判据本身。
+group "TLS 握手判据 (不能只认 1.1.1 的输出文案)"
+_tlsbad=$(grep -rn 'CONNECTION ESTABLISHED' "$ROOT/conf" "$ROOT/xray-panel.sh" \
+          "$ROOT/tools" 2>/dev/null | grep -v 'BEGIN CERTIFICATE' \
+          | grep -v '^\S*:\s*#' | grep -v 'check_libs.sh' || true)
+if [[ -n "$_tlsbad" ]]; then
+    bad "TLS 判据没有只认 CONNECTION ESTABLISHED" \
+        "$(printf '%s' "$_tlsbad" | awk 'NR<=3' | tr '\n' ' ') —— OpenSSL 3.x 不打印它, 会一律报握手失败"
+else
+    ok "TLS 判据没有只认 CONNECTION ESTABLISHED（3.x 上也能判对）"
+fi
+
 # ---------------------------------------------------------------- 面板覆盖面
 # 用户的要求: "客户端面板（TUI/CLI）的功能，最好都能接进我们自研的这个 UI"。
 #
