@@ -369,6 +369,30 @@ DOM 文本从无障碍快照读回：
 github → jsdelivr，并且解压后打印「发布包版本 vs 本机现有」，
 两者相同时明确提示这可能是 CDN 缓存。
 
+#### 7. 入口与文档：SB/M 有的东西，X 有但用户看不见（2.5.3）
+
+用户两条反馈，都不是代码 bug，但都是"用户拿到的是错的东西"：
+
+| 用户说 | 实情 |
+|---|---|
+| "SB 和 M 都是一个脚本进服务端或客户端，我们这脚本上写着只有一个能进服务端" | `install.sh` **早就有**角色菜单（1 服务端 / 2 客户端 / 3 卸载），但 README 一个字没提：标题是"xray-core 一键脚本"、描述是"Xray 服务端节点管理面板"、唯一给的命令是 `xray-panel.sh` |
+| "客户端这边的链接还指向我的老项目" | `Client/README.md`（6 处）与 `Client/RUN.md`（3 处）的**安装链接全指向** `mi1314cat/xary-core`；更隐蔽的是 `conf/Reality.sh` / `Shadowsocks.sh` / `Trojan.sh` 生成 Reality 密钥时真的会去老仓库 `curl` 那个 `conf/XRevise.sh` |
+
+处理：README 头改成与 SB/M 一致的"服务端 / 客户端面板"+"一键安装"，
+列出 `server` / `client` / `uninstall` / `--status` 四种显式用法；
+9 处老链接换成当前仓库；3 处 `conf/*.sh` 的取文件改成
+`${XRAY_RAW:-<当前仓库>}`，与另外 33 处统一（面板的镜像链因此也能管到它）。
+`docs/audit/*` 里的 `xary-core` **不改** —— 那是当时的审计记录。
+
+入口本身也实测过，不是照着 README 写完就算：
+RN `install.sh --status` → 服务端已安装 + `xrayls` active，`server` 分支进面板；
+CC `install.sh client --yes` → 走 ghproxy 拉包、2.5.2 → 2.5.3、三个单元 active。
+
+门禁：`check_libs` 新增「入口与文档一致性」（13 项）—— 安装/下发路径里不许出现
+指向老仓库的链接、README 必须同时出现两种角色与两个显式参数、
+`install.sh` 的 server/client 分支必须真的分别取 `xray-panel.sh` / `Client/l.sh`。
+负向验证：把老链接放回去 + 删掉 README 的 client 用法，两条都会红。
+
 ## 五、缺口清单（按优先级）
 
 ### 🟡 P1：Web UI 仍缺「功能清单 + HTTP 冒烟」
