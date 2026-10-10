@@ -1540,6 +1540,141 @@ ESC=$(L escape)
 [[ "$ESC" == *"pbk=A%2BB%2FC%3D"* ]] && ok "公钥特殊字符已转义" || bad "公钥特殊字符已转义 (得到 $ESC)"
 [[ "$(L ss)" == ss://* ]] && ok "Shadowsocks 生成 SIP002 链接" || bad "Shadowsocks 生成 SIP002 链接"
 
+# ---------------------------------------------------------------- SNI / pin / hy2 参数
+# 三条都是实机实证 (RN 真实节点 + CC 真客户端):
+#   1. TLS 节点的分享链接里没有 sni= (旧代码只从 REALITY 的 serverNames 取),
+#      客户端就拿连接地址(公网 IP)当 SNI →
+#         x509: cannot validate certificate for <IP> because it doesn't
+#         contain any IP SANs
+#      实测: 同一条链接, sni=域名 HTTP 204 / sni=IP HTTP 000。
+#   2. 只要证书文件存在就写 pinnedPeerCertSha256, 公网 CA 证书也写; 而 CDN
+#      节点的边缘证书是另一张 (实测 RN 源站 Let's Encrypt 48165d74... / 边缘
+#      Google Trust Services 601927a1...) →
+#         peer cert is unrecognized (against pinnedPeerCertSha256)
+#   3. hy2 链接丢 alpn/带宽: mihomo 认 up/down + alpn, sing-box 面板认
+#      upmbps/downmbps + alpn。两种写法都要有 (名字写错是静默忽略)。
+group "分享链接 SNI / 证书 pin / hy2 参数 (实机三证)"
+if ! command -v openssl >/dev/null 2>&1; then
+    printf '  - 本组需要 openssl 造证书 (本机没有, 已在实机跑过)\n'
+else
+SC="$TMP/sni"; mkdir -p "$SC/conf" "$SC/share" "$SC/certs"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SC/certs/self.key" -out "$SC/certs/self.crt" \
+    -days 3650 -subj "/CN=tls.example.com" \
+    -addext "subjectAltName=DNS:tls.example.com" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SC/certs/ca.key" -out "$SC/certs/ca.crt" \
+    -days 3650 -subj "/CN=Test Root CA" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout "$SC/certs/leaf.key" -out "$SC/certs/leaf.csr" \
+    -subj "/CN=leaf.example.com" >/dev/null 2>&1
+openssl x509 -req -in "$SC/certs/leaf.csr" -CA "$SC/certs/ca.crt" -CAkey "$SC/certs/ca.key" \
+    -CAcreateserial -out "$SC/certs/leaf.crt" -days 3650 \
+    -extfile <(printf 'subjectAltName=DNS:leaf.example.com') >/dev/null 2>&1
+# a) TLS 节点: 片段里没有 serverName, 只有证书 → 必须从证书 CN 取到 sni
+cat > "$SC/conf/tls1.json" <<J
+{"inbounds":[{"tag":"tls1","port":30001,"protocol":"vless","listen":"0.0.0.0",
+ "settings":{"clients":[{"id":"u1"}],"decryption":"none"},
+ "streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{
+   "certificates":[{"certificateFile":"$SC/certs/self.crt","keyFile":"$SC/certs/self.key"}]},
+   "xhttpSettings":{"path":"/p","mode":"auto"}}}]}
+J
+# b) 没有证书、没有域名 —— sni 只能"不写", 绝不允许写成 IP
+cat > "$SC/conf/tls2.json" <<'J'
+{"inbounds":[{"tag":"tls2","port":30002,"protocol":"vless","listen":"0.0.0.0",
+ "settings":{"clients":[{"id":"u2"}],"decryption":"none"},
+ "streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":""}}}]}
+J
+# c) hysteria2: 有证书 (CN=域名), 连接地址是 IP —— 旧代码把 IP 当 sni 写
+cat > "$SC/conf/hy2.json" <<J
+{"inbounds":[{"tag":"hy2","port":30003,"protocol":"hysteria","listen":"0.0.0.0",
+ "settings":{"version":2,"clients":[{"auth":"AUTH"}]},
+ "streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{
+   "alpn":["h3"],
+   "certificates":[{"certificateFile":"$SC/certs/self.crt","keyFile":"$SC/certs/self.key"}]}}}]}
+J
+# d) REALITY 必须保持原逻辑 (sni 取 serverNames[0])
+printf '{"inbounds":[{"tag":"re1","port":30004,"protocol":"vless","listen":"0.0.0.0","settings":{"clients":[{"id":"u3"}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["re.example.com"]}}}]}\n' > "$SC/conf/re1.json"
+python3 - "$LIB" "$SC" <<'PY' > "$SC/out.txt"
+import json, sys, urllib.parse
+sys.path.insert(0, sys.argv[1])
+import nodes as N
+SC = sys.argv[2]
+nl, _ = N.collect(SC + "/conf")
+by = {n["tag"]: n for n in nl}
+res = {}
+for tag, meta in (("tls1", {"host": "107.173.154.178", "port": 30001, "name": "t1"}),
+                  ("tls2", {"host": "107.173.154.178", "port": 30002, "name": "t2"}),
+                  ("hy2",  {"host": "107.173.154.178", "port": 30003, "name": "h2"}),
+                  ("re1",  {"host": "107.173.154.178", "port": 30004, "name": "r1",
+                            "public_key": "PK", "short_id": "ab"})):
+    link = N.build_share_link(by[tag], dict(meta)) or ""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+    res[tag] = {"link": link, "sni": (q.get("sni") or [""])[0],
+                "up": (q.get("up") or [""])[0], "upmbps": (q.get("upmbps") or [""])[0],
+                "alpn": (q.get("alpn") or [""])[0]}
+print(json.dumps(res, ensure_ascii=False))
+PY
+S_GET() { python3 -c "
+import json
+d = json.load(open('$SC/out.txt'))
+print(d['$1']['$2'])"; }
+IPRE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+assert_eq "$(S_GET tls1 sni)" "tls.example.com" "TLS 节点的 sni 取自证书 (不是空)"
+assert_eq "$(S_GET hy2 sni)"  "tls.example.com" "hysteria2 的 sni 取自证书 (不是连接地址)"
+for t in tls1 tls2 hy2 re1; do
+    v=$(S_GET "$t" sni)
+    if [[ -n "$v" && "$v" =~ $IPRE ]]; then bad "$t 的 sni 是 IP ($v)"; else ok "$t 的链接没有把 IP 写成 sni"; fi
+done
+assert_eq "$(S_GET tls2 sni)" "" "拿不到域名时不写 sni (宁可省略也不写 IP)"
+assert_eq "$(S_GET re1 sni)" "re.example.com" "REALITY 的 sni 仍取 serverNames"
+assert_eq "$(S_GET hy2 alpn)" "h3" "hy2 链接带 alpn=h3"
+assert_eq "$(S_GET hy2 up)" "50" "hy2 链接带 up= (mihomo 认的名字)"
+assert_eq "$(S_GET hy2 upmbps)" "50" "hy2 链接带 upmbps= (sing-box 面板认的名字)"
+
+# ---- 证书 pin: 公网 CA 不写, 自签才写 ----
+PIN_SELF=$(bash -c "source '$LIB/cert.sh'; x_cert_client_pin '$SC/certs/self.crt' 1 0")
+PIN_CA=$(bash -c "source '$LIB/cert.sh'; x_cert_client_pin '$SC/certs/leaf.crt' 1 0")
+PIN_EDGE=$(bash -c "source '$LIB/cert.sh'; x_cert_client_pin '$SC/certs/self.crt' 0 0")
+PIN_FORCE=$(bash -c "source '$LIB/cert.sh'; x_cert_client_pin '$SC/certs/leaf.crt' 0 1")
+[[ -n "$PIN_SELF" ]] && ok "自签证书 + TLS 终止于本节点 → 写 pin" || bad "自签证书没写 pin"
+assert_eq "$PIN_CA" "" "公网 CA 证书不写 pin"
+assert_eq "$PIN_EDGE" "" "TLS 不在本节点终结 (CDN/nginx) 不写 pin"
+[[ -n "$PIN_FORCE" ]] && ok "显式要求 (force=1) 时公网 CA 也写 pin" || bad "显式要求时没写 pin"
+
+# 产物级: 真跑 render_client 的"生产形态" —— CDN-ECH + 公网 CA 证书。
+# 单测函数还不够: 出问题的是"函数返回值有没有被写进 JSON"。
+RC="$TMP/rc"; mkdir -p "$RC"
+awk '/^render_client\(\) \{/{f=1;print;next} f && /^[A-Za-z_][A-Za-z0-9_]*\(\) \{/{exit} f{print}' \
+    "$ROOT/conf/vlessxhttpecn.sh" > "$RC/fn.sh"
+if [[ -s "$RC/fn.sh" ]]; then
+    cat > "$RC/run.sh" <<RSH
+set -uo pipefail
+source '$LIB/cert.sh'
+print_info(){ :; }; print_ok(){ :; }; print_warn(){ :; }; print_error(){ :; }; print_title(){ :; }
+urlencode(){ python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "\$1"; }
+source '$RC/fn.sh'
+OUT_DIR='$RC'; PROTO=vless-xhttp; PROTO_NAME=N; index=9; num2=9
+VLESS_TRANSPORT=xhttp; XHTTP_MODE=auto; XHTTP_PATH=/p; WS_PATH=/p
+UUID=u1; CLIENT_ENC=none; CERT_DOMAIN=cdn.example.com; XRAY_BASE='$RC'
+XRAY_CLIENT_SOCKS_PORT=10899; VLESS_PORT=8443; NPORT=443; PUBLIC_IP_V4=1.2.3.4; PUBLIC_IP_V6=''
+ECH_CONFIG_LIST=x; CLIENT_SNI=''
+ACCESS_MODE=\$1; ECH_MODE=\$2; CERT_FILE=\$3
+LINK_HOST=cdn.example.com; LINK_PORT=443
+render_client >/dev/null 2>&1
+python3 -c "
+import json
+d = json.load(open('$RC/vless-xhttp_client-9.json'))
+t = d['outbounds'][0]['streamSettings']['tlsSettings']
+print(t.get('pinnedPeerCertSha256', ''))"
+RSH
+    RCJ=$(bash "$RC/run.sh" cdn cdn "$SC/certs/leaf.crt" 2>/dev/null)
+    assert_eq "$RCJ" "" "CDN-ECH + 公网 CA 证书 → 客户端 JSON 里没有 pin"
+    RCJ2=$(bash "$RC/run.sh" cdn direct "$SC/certs/self.crt" 2>/dev/null)
+    [[ -n "$RCJ2" ]] && ok "direct-ECH + 自签证书 → 客户端 JSON 里仍写 pin" \
+        || bad "direct-ECH + 自签证书时 pin 丢了"
+else
+    bad "render_client 抽取失败 (无法做产物级断言)"
+fi
+fi
+
 # ---------------------------------------------------------------- 令牌存储
 group "令牌存储 (token_store.py)"
 SH="$TMP/share"; mkdir -p "$SH/tokens"
