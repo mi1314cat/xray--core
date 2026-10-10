@@ -12,6 +12,20 @@
     transport/internet/splithttp/dialer.go:50   只有 realityConfig == nil 才启用 browser dialer
     transport/internet/websocket/dialer.go:114  同样的 host 规则
     docs/config/features/browser_dialer.md      只支持 XHTTP/WebSocket；不能自定义 SNI/Host
+
+────────────────────────────────────────────────────────────────────────────
+接入 proxy-node-compat 之后本文件的分工
+────────────────────────────────────────────────────────────────────────────
+* **内核能力维度**（协议/传输/安全/组合/版本）→ 交给 `compat2.py`
+  → `proxy_node_compat`（判定只在那里发生一次）。入口 `check_all()` 默认走它。
+* **Browser Dialer 维度** → 仍然只在本文件判定。它是**客户端自己的功能路径**
+  （浏览器拨号的实测探测、SNI==host==address、xhttp mode、Chromium 无跳过证书校验），
+  不是内核能力，proxy-node-compat 里没有也不该有对应规则 —— 所以它保留在这里，
+  且**只有一个实现**，compat2 只转发不重写。
+* **旧判定基线** → 全部原逻辑原样保留在 `check_all_legacy()` / `check_xray()` 里，
+  用途有二：(1) compat 因为"没有规则"而 UNKNOWN 时回退；(2) `tools/dualkernel-compare.py`
+  的双跑对比基准。
+* 回滚开关：`XBD_COMPAT_ENGINE=legacy` 一键退回旧判定（不改代码）。
 """
 from __future__ import annotations
 
@@ -555,7 +569,14 @@ def want_browser_dialer(node: dict) -> bool:
     return node.get("use_browser", None) is not False
 
 
-def check_all(node: dict) -> dict:
+def check_all_legacy(node: dict) -> dict:
+    """旧判定（v1）—— **原逻辑原样保留**，不再作为默认入口。
+
+    保留原因：
+      1. compat 的注册表没有覆盖某个组合时会返回 UNKNOWN_CAPABILITY，
+         那表示"我们没有数据"，不是"节点不行" —— 此时回退到这里（见 compat2.merge）；
+      2. tools/dualkernel-compare.py 用它做双跑对比的基准。
+    """
     xray = check_xray(node)
     dialer = check_dialer(node)
 
@@ -580,6 +601,51 @@ def check_all(node: dict) -> dict:
         "can_use_dialer": dialer["overall"] in (OK, WARN),
         "protocol_may_dialer": may,
     }
+
+
+_COMPAT2_CACHE: list = []
+
+
+def _compat2():
+    """惰性载入 compat2（内核维度判定）。取不到就返回 None → 用旧判定。
+
+    默认走 v2；`XBD_COMPAT_ENGINE=legacy` 一键回滚（不改代码）。
+    **必须缓存**：节点列表会对每个节点调一次 check_all，不缓存就是每个节点
+    重新 exec 一遍适配层（还要重载一次注册表），节点一多就明显卡。
+    """
+    import importlib.util
+    if os.environ.get("XBD_COMPAT_ENGINE", "v2").strip().lower() in (
+            "legacy", "v1", "off", "0", "no"):
+        return None
+    if _COMPAT2_CACHE:
+        return _COMPAT2_CACHE[0]
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "compat2.py")
+    if not os.path.exists(path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_xbd_compat2", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _COMPAT2_CACHE.append(mod)
+        return mod
+    except Exception:
+        return None          # 适配层坏了也绝不让节点列表崩掉 —— 退回旧判定
+
+
+def check_all(node: dict) -> dict:
+    """**唯一对外入口**。默认 = compat2（内核维度交给 proxy_node_compat）。
+
+    compat2 只做映射与合并，判定本身发生在 proxy_node_compat 里；
+    Browser Dialer 维度仍由本文件的 check_dialer 判定（同一个实现，不重写）。
+    """
+    v2 = _compat2()
+    if v2 is not None:
+        try:
+            return v2.check_all(node)
+        except Exception:
+            pass
+    return check_all_legacy(node)
 
 
 def render(result: dict) -> str:

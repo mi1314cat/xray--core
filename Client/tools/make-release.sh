@@ -16,9 +16,32 @@ OUT_XZ="$HERE/xbd-client.tar.xz"
 
 # 校验必需文件，防止打出残缺包
 for f in RUN.sh bin/xbd l.sh uninstall-xray-client.sh lib/actions.sh lib/node.py lib/genconfig.py \
-         service/xray-client.service scripts/run-xray.sh tools/selftest-arch.sh; do
+         service/xray-client.service scripts/run-xray.sh tools/selftest-arch.sh \
+         lib/compat.py lib/compat2.py tools/dualkernel-compare.py tools/compat-corpus.json \
+         lib/proxy_node_compat/__init__.py lib/proxy_node_compat/engine.py \
+         lib/proxy_node_compat/data/rules.json; do
   [ -e "$HERE/$f" ] || { echo "缺少必需文件: $f" >&2; exit 1; }
 done
+
+# vendored 依赖的完整性：少一个 .py 或 rules.json 空了，客户端不会报错，
+# 只会**静默**退回旧判定（compat.py 的 _compat2() 取不到就 return None）——
+# 那正是最难发现的一类退化，所以在打包这一关就挡住。
+python3 - "$HERE/lib" <<'PY' || exit 1
+import json, os, sys
+lib = sys.argv[1]
+sys.path.insert(0, lib)
+try:
+    import proxy_node_compat as p
+except Exception as exc:
+    sys.exit(f"vendored proxy_node_compat 导入失败: {exc}")
+d = json.load(open(os.path.join(lib, "proxy_node_compat", "data", "rules.json"),
+                   encoding="utf-8"))
+if not d.get("rules") or not d.get("evidence"):
+    sys.exit("proxy_node_compat/data/rules.json 为空或残缺")
+if not os.path.exists(os.path.join(lib, "compat2.py")):
+    sys.exit("缺少 lib/compat2.py")
+print(f"vendored {p.__version__}: {len(d['rules'])} 规则 / {len(d['evidence'])} 证据")
+PY
 
 # 已废弃的 dialer 实例单元绝不能被重新打进包 —— 它会把架构退回双实例
 for f in service/xray-dialer.service lib/state.py; do

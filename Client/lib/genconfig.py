@@ -141,8 +141,22 @@ def build_stream(node: dict, mode: str) -> dict:
         #   —— 意思是"用 cloudflare-ech.com 的 DNS 记录里的 ECHConfig，
         #   并且指定从这个 DoH 查"。丢掉这个值 = 服务端配了 ECH 而客户端
         #   什么都没做，SNI 照样明文出去。
-        if node.get("ech") and mode == NORMAL:
-            tls["echConfigList"] = node["ech"]
+        #
+        # ★ 只能写**非空字符串**。旧节点文件里 ech 可能是 bool：mihomo 的
+        #   `ech-opts: {enable: true}`（没有静态 config，指望靠 DNS 取）在早期
+        #   node.py 里落成了 `"ech": true`。把 true 写进 echConfigList 的后果不是
+        #   "ECH 不生效"，而是**整份配置构建失败**（实测 26.3.27 原文：
+        #   cannot unmarshal bool into Go struct field TLSConfig.outbounds.
+        #   streamSettings.tlsSettings.echConfigList of type string），
+        #   而单节点模式不跑 --validate-with → 写进去 → 内核起不来 → 客户端全挂。
+        #   没有静态 config 的 ECH 本来就该由 pinnedPeerCertSha256 兜底（见下）。
+        _ech = node.get("ech")
+        if mode == NORMAL and isinstance(_ech, str) and _ech.strip():
+            tls["echConfigList"] = _ech.strip()
+        elif mode == NORMAL and _ech:
+            print("genconfig: 节点声明的 ech 不是可用配置（需要 echConfigList 字符串，"
+                  f"实际 {type(_ech).__name__}={_ech!r}）—— 已跳过 ECH，"
+                  "证书校验请用 pinnedPeerCertSha256", file=sys.stderr)
         # 自签证书节点的正确解法：固定服务端证书哈希。
         # Xray 26.x 移除了 allowInsecure，官方替代就是 pinnedPeerCertSha256。
         if node.get("pinned_cert_sha256"):
