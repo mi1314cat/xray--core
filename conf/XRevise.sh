@@ -14,6 +14,10 @@ print_error() {
     echo -e "${RED}[Error]${PLAIN} $1"
 }
 
+print_warn() {
+    echo -e "${YELLOW}[Warn]${PLAIN} $1"
+}
+
 INSTALL_DIR="/root/catmi/xray"
 ENV_FILE="$INSTALL_DIR/install_info.env"
 xrayls_DTR="$INSTALL_DIR/xrayls"
@@ -81,6 +85,40 @@ generate_uuid() {
     cat /proc/sys/kernel/random/uuid
 }
 
+# ---------------------------------------------------------------- 地址库
+# 对外地址探测: 单一实现, 见 conf/lib/addr.sh 顶部 (为什么不问外部"我的 IP")。
+# 本脚本常以 `bash <(curl ...)` 直接跑, 旁边没有 lib/ —— 三级查找:
+# 脚本旁边 -> 安装目录 -> 从仓库现取。都取不到就退化成"只读网卡"的内置实现,
+# 不让一个库取不到就打断整条安装流程。
+_x_addr_loaded=0
+for _addr_cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/addr.sh" \
+                  "$INSTALL_DIR/lib/addr.sh"; do
+    if [ -r "$_addr_cand" ]; then
+        # shellcheck source=/dev/null
+        if source "$_addr_cand" 2>/dev/null; then _x_addr_loaded=1; break; fi
+    fi
+done
+if [ "$_x_addr_loaded" -eq 0 ]; then
+    _addr_tmp=$(mktemp)
+    if curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh" \
+            -o "$_addr_tmp" 2>/dev/null; then
+        # shellcheck source=/dev/null
+        source "$_addr_tmp" 2>/dev/null && _x_addr_loaded=1
+    fi
+    rm -f "$_addr_tmp"
+fi
+if [ "$_x_addr_loaded" -eq 0 ]; then
+    # 退化实现 (不问外部服务, 但也不排除隧道网卡 —— 只保证流程能走完)
+    x_addr4_real() {
+        ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+            grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | head -1
+    }
+    x_addr6_real() {
+        ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+    }
+    print_warn "地址库 conf/lib/addr.sh 取不到, 用内置退化实现（不排除 warp/tun 网卡）"
+fi
+
 usid() {
     # 生成短 id
     short_id=$(openssl rand -hex 4)
@@ -99,26 +137,59 @@ usid() {
     print_info "WS_PATH2: $WS_PATH2"
     print_info "short_id: $short_id"
 
-    # 获取公网 IP 地址（容错）
-    PUBLIC_IP_V4=$(curl -s4 https://api.ipify.org || true)
-    PUBLIC_IP_V6=$(curl -s6 https://api64.ipify.org || true)
+    # ---- 对外地址 ----
+    #
+    # ★ 这里原来是 `curl -s4 https://api.ipify.org`: 问的是"世界看到的我",
+    #   也就是**出站出口**。套了 WARP 时答案是 WARP 的地址 (RN 实测
+    #   104.28.201.80), 而客户端只连得上真实网卡地址 (107.173.154.178)。
+    #   这个值写进 install_info.env 之后, 所有分享链接 (Reality / Trojan /
+    #   转换脚本 / CDN 脚本) 全部跟着错 —— 链接看起来完全正常, 连上去必失败。
+    #
+    #   现在一律先读网卡 (conf/lib/addr.sh: 排除 warp/tun/docker/私网,
+    #   默认路由所在网卡优先); 网卡上确实没有才退回外部探测, 且外部答案
+    #   必须落在本机网卡上才采信 —— 与 SB 的 default_server_ip_real 同源。
+    if [ -n "${XRAY_PUBLIC_IP:-}" ]; then
+        PUBLIC_IP="$XRAY_PUBLIC_IP"
+        print_info "使用 XRAY_PUBLIC_IP 指定的对外地址: $PUBLIC_IP"
+    else
+        PUBLIC_IP_V4=$(x_addr4_real 2>/dev/null || true)
+        PUBLIC_IP_V6=$(x_addr6_real 2>/dev/null || true)
 
-    if [ -z "$PUBLIC_IP_V4" ] && [ -z "$PUBLIC_IP_V6" ]; then
-        print_error "无法检测公网 IP（IPv4/IPv6），请检查网络或手动填写"
-        exit 1
+        if [ -z "$PUBLIC_IP_V4" ] && [ -z "$PUBLIC_IP_V6" ]; then
+            # 网卡上没有可直连地址 (NAT / 全走隧道): 退回外部服务, 但要说清
+            # 这是"世界看到的我", 需要用户自己核对。
+            PUBLIC_IP_V4=$(curl -s4 --max-time 8 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+            PUBLIC_IP_V6=$(curl -s6 --max-time 8 https://api64.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+            if [ -z "$PUBLIC_IP_V4" ] && [ -z "$PUBLIC_IP_V6" ]; then
+                print_error "无法检测公网 IP（网卡与外部服务都没给出地址），请检查网络或用 XRAY_PUBLIC_IP 指定"
+                exit 1
+            fi
+            print_warn "网卡上没有找到可直连的地址（NAT/隧道?），暂用外部服务返回的: ${PUBLIC_IP_V4:-$PUBLIC_IP_V6}"
+        fi
+
+        if [ -n "$PUBLIC_IP_V4" ] && [ -n "$PUBLIC_IP_V6" ]; then
+            echo "请选择要使用的公网 IP 地址:"
+            echo "1. IPv4: $PUBLIC_IP_V4"
+            echo "2. IPv6: $PUBLIC_IP_V6"
+            read -p "请输入对应的数字选择 [默认1，若不可用则选择可用项]: " IP_CHOICE
+            IP_CHOICE=${IP_CHOICE:-1}
+        else
+            # 只有一族可用就不问了 —— 问了也只有那一个答案
+            [ -n "$PUBLIC_IP_V4" ] && IP_CHOICE=1 || IP_CHOICE=2
+        fi
+
+        # 选择公网 IP 地址
+        if [ "$IP_CHOICE" -eq 2 ] && [ -n "$PUBLIC_IP_V6" ]; then
+            PUBLIC_IP="$PUBLIC_IP_V6"
+        else
+            PUBLIC_IP="${PUBLIC_IP_V4:-$PUBLIC_IP_V6}"
+        fi
     fi
 
-    echo "请选择要使用的公网 IP 地址:"
-    [ -n "$PUBLIC_IP_V4" ] && echo "1. IPv4: $PUBLIC_IP_V4"
-    [ -n "$PUBLIC_IP_V6" ] && echo "2. IPv6: $PUBLIC_IP_V6"
-    read -p "请输入对应的数字选择 [默认1，若不可用则选择可用项]: " IP_CHOICE
-    IP_CHOICE=${IP_CHOICE:-1}
-
-    # 选择公网 IP 地址
-    if [ "$IP_CHOICE" -eq 2 ] && [ -n "$PUBLIC_IP_V6" ]; then
-        PUBLIC_IP="$PUBLIC_IP_V6"
-    else
-        PUBLIC_IP="${PUBLIC_IP_V4:-$PUBLIC_IP_V6}"
+    # 自检: 选中的地址客户端连不连得上 (WARP/隧道/私网地址 → 只警告, 不拦)
+    if declare -F x_addr_is_reachable >/dev/null 2>&1; then
+        x_addr_is_reachable "$PUBLIC_IP" || \
+            print_warn "选中的地址 $PUBLIC_IP 不在本机可直连的网卡上（WARP/隧道/私网?）—— 客户端可能连不上"
     fi
 
     # IPv6 需要中括号，IPv4 不需要

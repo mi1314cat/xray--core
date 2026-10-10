@@ -62,6 +62,15 @@ else
     source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/ports.sh") \
         || { print_error "端口库加载失败"; exit 1; }
 fi
+
+# 对外地址探测库 (单一实现) —— 分享链接里的地址一律从这里取。
+# 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
@@ -187,8 +196,15 @@ list_configs() {
 # ================================
 get_public_ip() {
     local ipv4 ipv6 choice manual_ip
-    ipv4=$(curl -s4 --connect-timeout 3 https://api.ipify.org 2>/dev/null || true)
-    ipv6=$(curl -s6 --connect-timeout 3 https://api64.ipify.org 2>/dev/null || true)
+    # ★ 先读网卡 (排除 warp/tun/docker, 默认路由网卡优先), 网卡上没有才问外部服务。
+    #   原来一上来就问 api.ipify.org —— 那答的是**出站出口**: 套了 WARP 的机器
+    #   上拿到的是 WARP 地址, 客户端照着连必然不通。见 conf/lib/addr.sh 顶部。
+    ipv4=$(x_addr4_real 2>/dev/null || true)
+    ipv6=$(x_addr6_real 2>/dev/null || true)
+    if [ -z "$ipv4" ] && [ -z "$ipv6" ]; then
+        ipv4=$(curl -s4 --connect-timeout 3 https://api.ipify.org 2>/dev/null || true)
+        ipv6=$(curl -s6 --connect-timeout 3 https://api64.ipify.org 2>/dev/null || true)
+    fi
 
     if [ -z "$ipv4" ] && [ -z "$ipv6" ]; then
         print_error "无法自动检测公网 IP，请手动输入"

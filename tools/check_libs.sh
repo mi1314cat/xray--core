@@ -481,26 +481,83 @@ server {
     # <<< xray-core END orphan.example.com <<<
 }
 NGE
-NO=$(SHARE_DIR="$TMP/ngshare" XRAY_BASE="$NG_T" bash -c "
+NO=$(SHARE_DIR="$TMP/ngshare" XRAY_BASE="$NG_T" NGINX_CONF_ROOTS="$NG_T/conf.d" bash -c "
   LIB_DIR='$ROOT/conf/lib'
   mkdir -p \"$TMP/ngshare\"
-  # 只取函数体, 换掉扫描目录
-  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh' | sed 's|/etc/nginx/conf.d /etc/nginx/sites-enabled /usr/local/nginx/conf/conf.d|$NG_T/conf.d|')
+  # 只取函数体。扫描范围由 NGINX_CONF_ROOTS 指定 —— 函数内部走 nginx_apply.py
+  # 的探测 (与插入/摘除同一口径), 不再靠 sed 替换目录字符串。
+  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh')
   py() { python3 \"\$@\"; }
   info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
   check_orphan_nginx" 2>&1)
 echo "$NO" | grep 'orphan.example.com' >/dev/null && ok "查出孤儿片段 (会报出域名)" || bad "没查出孤儿片段"
 echo "$NO" | grep '502' >/dev/null && ok "告警里说明了后果 (CDN 回源 502)" || bad "告警没说清后果"
 echo "$NO" | grep '没有发现' >/dev/null && bad "明明有孤儿却报'没有发现'" || ok "没有误报"
+# ★ nginx **不会加载**的文件里留着标记, 不能算孤儿。
+#   现场: 站点文件旁边躺着 *.xray-core-bak / *.mihomo-core-cdn-bak 等备份,
+#   里面同样带着标记; `grep -r` 扫目录会把它们算进来 —— 报出一堆并不存在的
+#   孤儿 (站点里其实干干净净), 用户按提示去删只会更糊涂。
+NG_BAK="$TMP/ngbak"; mkdir -p "$NG_BAK/conf.d"
+printf 'server {\n    server_name bak.example.com;\n    # >>> xray-core BEGIN bak.example.com >>>\n}\n' \
+    > "$NG_BAK/conf.d/bak.example.com.conf.xray-core-bak"
+printf 'server {\n    server_name bak.example.com;\n    # >>> xray-core BEGIN bak.example.com >>>\n}\n' \
+    > "$NG_BAK/conf.d/notes.yaml"
+NB=$(NGINX_CONF_ROOTS="$NG_BAK/conf.d" bash -c "
+  LIB_DIR='$ROOT/conf/lib'
+  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh')
+  py() { python3 \"\$@\"; }
+  info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
+  check_orphan_nginx" 2>&1)
+echo "$NB" | grep '没有发现' >/dev/null && ok "备份/非 .conf 文件里的标记不算孤儿" \
+    || bad "把 nginx 不加载的备份文件当成了孤儿: $NB"
 # 空目录 -> 必须报"没有发现", 不能凭空造出孤儿
 mkdir -p "$NG_T/empty"
-NE=$(XRAY_BASE="$NG_T" bash -c "
+NE=$(XRAY_BASE="$NG_T" NGINX_CONF_ROOTS="$NG_T/empty" bash -c "
   LIB_DIR='$ROOT/conf/lib'
-  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh' | sed 's|/etc/nginx/conf.d /etc/nginx/sites-enabled /usr/local/nginx/conf/conf.d|$NG_T/empty|')
+  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh')
   py() { python3 \"\$@\"; }
   info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
   check_orphan_nginx" 2>&1)
 echo "$NE" | grep '没有发现' >/dev/null && ok "无片段时如实报告 (不凭空造孤儿)" || bad "无片段时报告不正确"
+# ★ nginx 真跑在容器里时, 生效的站点只在**容器里**。旧的实现 grep 宿主机目录,
+#   宿主 conf.d 恰好是空的时候会报"没有发现"—— 假绿, 而站点里一堆孤儿。
+#   这里给一个假 docker + 假容器目录, 断言容器里的标记查得到。
+NG_DK="$TMP/ngdk"; mkdir -p "$NG_DK/bin" "$NG_DK/ctr/conf.d"
+cat > "$NG_DK/ctr/conf.d/docker.example.com.conf" <<'NGE'
+server {
+    server_name docker.example.com;
+    # >>> xray-core BEGIN docker.example.com >>>
+    location /d { proxy_pass http://127.0.0.1:19998; }
+    # <<< xray-core END docker.example.com <<<
+}
+NGE
+cat > "$NG_DK/bin/docker" <<NGE
+#!/bin/bash
+# 假 docker: 与"容器共处"那一组同一个套路 —— 把容器内 /etc/nginx 映射到
+# 夹具目录, 这样 site_files / cat 都能走通。
+#   · exec -i 必须先摘掉, 否则后面的参数全部错位
+#   · sh -c 后面的 \$@ 要一起传下去
+if [[ "\$1" == "ps" ]]; then printf 'nginx\tnginx:alpine\n'; exit 0; fi
+[[ "\$1" == "exec" ]] || exit 1
+shift
+while [[ "\${1:-}" == "-i" ]]; do shift; done
+shift  # 容器名
+if [[ "\${1:-}" == "sh" && "\${2:-}" == "-c" ]]; then
+    script="\$3"; shift 3
+    exec sh -c "\$(printf '%s' "\$script" | sed 's#/etc/nginx#$NG_DK/ctr#g')" "\$@"
+fi
+if [[ "\${1:-}" == "cat" ]]; then exec cat "\${2//\\/etc\\/nginx/$NG_DK/ctr}"; fi
+exit 1
+NGE
+chmod +x "$NG_DK/bin/docker"
+ND=$(PATH="$NG_DK/bin:$PATH" bash -c "
+  LIB_DIR='$ROOT/conf/lib'
+  source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh')
+  py() { python3 \"\$@\"; }
+  info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
+  check_orphan_nginx" 2>&1)
+echo "$ND" | grep 'docker.example.com' >/dev/null && ok "容器里的站点也扫得到 (不再只 grep 宿主目录)" \
+    || bad "容器里的孤儿片段漏掉了 (宿主目录为空就报'没有发现'): $ND"
 
 # ---------------------------------------------------------------- 地址族判定
 # 守的是"向导告诉用户有没有 IPv6"这件事。旧写法两处不对称:
@@ -511,23 +568,173 @@ echo "$NE" | grep '没有发现' >/dev/null && ok "无片段时如实报告 (不
 # 去建 IPv6 节点 —— 建出来的节点谁也连不上。
 group "地址族判定 (addr.sh)"
 AD="$ROOT/conf/lib/addr.sh"
-# 两个函数必须都引用隧道正则 —— 防止有人只改一个
+# 判据必须收在一处: x_has_v4 / x_has_v6 都走 _x_addr_pick, 而隧道过滤
+# (X_TUNNEL_IFACE_RE) 与逐接口判定都在 _x_addr_pick 里。
+# 旧写法这两个函数各写一份循环, 于是同一个坑要修两遍, 还修得不一致。
+_pick_body=$(sed -n "/^_x_addr_pick()/,/^}/p" "$AD")
+echo "$_pick_body" | grep 'X_TUNNEL_IFACE_RE' >/dev/null \
+    && ok "_x_addr_pick 排除隧道接口 (地址族判定与取地址共用同一判据)" \
+    || bad "_x_addr_pick 没有排除隧道接口 —— 只有 WARP 的机器会被误判成'有'"
+echo "$_pick_body" | grep -E 'read -r dev cidr' >/dev/null \
+    && ok "_x_addr_pick 逐接口判定 (不是整表 grep 一下就算)" \
+    || bad "_x_addr_pick 没有逐接口判定"
 for fn in x_has_v4 x_has_v6; do
     body=$(sed -n "/^${fn}()/,/^}/p" "$AD")
-    echo "$body" | grep 'X_TUNNEL_IFACE_RE' >/dev/null \
-        && ok "$fn 排除隧道接口 (与另一个对称)" \
-        || bad "$fn 没有排除隧道接口 —— 只有 WARP 的机器会被误判成'有'"
-done
-# 也不能只看接口就下结论: 必须逐条按 dev 过滤
-for fn in x_has_v4 x_has_v6; do
-    body=$(sed -n "/^${fn}()/,/^}/p" "$AD")
-    echo "$body" | grep -E 'read -r dev cidr' >/dev/null \
-        && ok "$fn 逐接口判定 (不是整表 grep 一下就算)" \
-        || bad "$fn 没有逐接口判定"
+    echo "$body" | grep '_x_addr_pick' >/dev/null \
+        && ok "$fn 走统一判定 (_x_addr_pick)" \
+        || bad "$fn 没有走统一判定 —— 又出现了第二份实现"
 done
 # 空/异常输入下不能崩
 got=$(bash -c "source '$AD'; x_has_v4 >/dev/null 2>&1; echo rc=\$?")
 [[ "$got" =~ ^rc=[01]$ ]] && ok "x_has_v4 返回 0/1 而不是崩掉" || bad "x_has_v4 异常: $got"
+
+# ---------------------------------------------------------------- 对外地址取值
+# 守的是"分享链接里的地址客户端连不连得上"。三个实测现场:
+#   · RN 上 WARP 开着, 取到的是 WARP 出口 104.28.201.80 (客户端连不上),
+#     真实入口是 eth0 上的 107.173.154.178;
+#   · 多网卡机器上"枚举里第一个"不一定是默认路由那张网卡;
+#   · 存量的 WARP 地址如果只判"在不在本机接口上", 会被一直沿用 (warp 网卡
+#     上的地址**确实**在本机)。
+# 用一个假 `ip` 把这些场景钉死 —— 真机上跑门禁时结果取决于本机网卡, 测不了。
+group "对外地址取值 (addr.sh)"
+FB="$TMP/fakeip"; mkdir -p "$FB"
+cat > "$FB/ip" <<'FIPE'
+#!/usr/bin/env bash
+# 场景: 枚举顺序里 eth0(私网) 在前, 真实出口在 eth1; warp/docker 都在;
+#       默认路由走 eth1 / he-ipv6 —— 与 RN 的形状一致 (warp 上挂着公网 v6)。
+case "$*" in
+  "-4 route show default") echo "default via 203.0.113.1 dev eth1 proto static";;
+  "-6 route show default") echo "default via 2001:db8::1 dev he-ipv6 proto static";;
+  *"-4 addr show scope global"*)
+      echo "2: eth0    inet 10.0.0.5/24 scope global eth0"
+      echo "3: eth1    inet 8.8.8.8/32 scope global eth1"
+      echo "4: warp    inet 172.16.0.2/32 scope global warp"
+      echo "5: docker0 inet 172.17.0.1/16 scope global docker0";;
+  *"-6 addr show scope global"*)
+      echo "3: eth1    inet6 2a01:4f8:c17::1/64 scope global"
+      echo "4: warp    inet6 2606:4700:110::1/128 scope global";;
+  *"addr show scope global"*)
+      echo "2: eth0    inet 10.0.0.5/24 scope global eth0"
+      echo "3: eth1    inet 8.8.8.8/32 scope global eth1"
+      echo "4: warp    inet 172.16.0.2/32 scope global warp"
+      echo "3: eth1    inet6 2a01:4f8:c17::1/64 scope global"
+      echo "4: warp    inet6 2606:4700:110::1/128 scope global";;
+  *"addr show"*)
+      echo "1: lo    inet 127.0.0.1/8 scope host lo"
+      echo "3: eth1  inet 8.8.8.8/32 scope global eth1"
+      echo "4: warp  inet 172.16.0.2/32 scope global warp"
+      echo "4: warp  inet6 2606:4700:110::1/128 scope global";;
+  *) echo "FAKE-IP-UNHANDLED: $*" >&2; exit 1;;
+esac
+FIPE
+chmod +x "$FB/ip"
+fip() { PATH="$FB:$PATH" bash -c "source '$AD'; $1"; }
+got=$(fip 'x_default_route_iface')
+assert_eq "$got" "eth1" "默认路由网卡优先 (不是枚举里第一个 eth0)"
+got=$(fip 'x_addr4_real')
+assert_eq "$got" "8.8.8.8" "真实 IPv4 = 默认路由网卡上的地址 (不是私网 eth0)"
+got=$(fip 'x_addr6_real')
+assert_eq "$got" "2a01:4f8:c17::1" "真实 IPv6 排除 warp 上的公网 v6"
+got=$(fip 'x_iface_public_addr')
+assert_eq "$got" "8.8.8.8" "对外地址 v4 优先"
+got=$(fip 'x_has_v4 && echo Y || echo N')
+assert_eq "$got" "Y" "有 IPv4"
+got=$(fip 'x_has_v6 && echo Y || echo N')
+assert_eq "$got" "Y" "有 IPv6"
+# warp 上的地址【在本机接口上】, 但客户端连不上 —— 两档判定必须分开
+got=$(fip 'x_addr_is_local 172.16.0.2 && echo Y || echo N')
+assert_eq "$got" "Y" "warp 地址确实在本机接口上 (x_addr_is_local)"
+got=$(fip 'x_addr_is_reachable 172.16.0.2 && echo Y || echo N')
+assert_eq "$got" "N" "同一地址判定为客户端连不上 (x_addr_is_reachable)"
+# ★ 关键回归: 存量 WARP 地址 (env 里存的那个) 不能被沿用
+got=$(fip 'x_public_addr "" 172.16.0.2')
+assert_eq "$got" "8.8.8.8" "存量的 WARP v4 地址不被沿用, 换回网卡地址"
+got=$(fip 'x_public_addr "" 2606:4700:110::1')
+assert_eq "$got" "8.8.8.8" "存量的 WARP v6 地址不被沿用 (只判'在本机'会漏掉这个)"
+got=$(fip 'x_link_addr 172.16.0.2')
+assert_eq "$got" "8.8.8.8" "分享链接入口 x_link_addr 同样不沿用 WARP 地址"
+got=$(fip 'x_public_addr 9.9.9.9')
+assert_eq "$got" "9.9.9.9" "显式传参仍然最优先"
+got=$(fip 'XRAY_PUBLIC_IP=1.2.3.4 x_link_addr 172.16.0.2')
+assert_eq "$got" "1.2.3.4" "XRAY_PUBLIC_IP 覆盖一切"
+
+# ★ install_info.env 的写入方: 链接地址的来源必须是网卡, 不是"我的 IP"服务。
+#   旧实现是 `curl api.ipify.org` —— 套了 WARP 时那是**出站出口**地址,
+#   写进去之后所有分享链接跟着错。这里让假 curl 返回一个 WARP 地址,
+#   断言最终落到 env 里的是网卡地址。
+group "对外地址写入 (XRevise.sh → install_info.env)"
+XA="$TMP/xrev"; mkdir -p "$XA/xray" "$XA/lib"
+cp "$AD" "$XA/lib/addr.sh"
+# 假 curl: 外部服务只会答 WARP 出口地址 (真实场景就是这样)
+mkdir -p "$XA/bin"
+cat > "$XA/bin/curl" <<'CURLX'
+#!/usr/bin/env bash
+echo "104.28.201.80"
+CURLX
+chmod +x "$XA/bin/curl"
+# 只取"地址库加载 + usid()"两块拼成夹具: 整脚本会生成密钥并写生产路径,
+# 不能在测试里执行。INSTALL_DIR/ENV_FILE 换成夹具目录, 其余逻辑逐字保留。
+# 用 { } > file 逐段拼, 不走 heredoc 展开 —— 被抽出来的代码里也有 $(...),
+# 放进未加引号的 heredoc 会在生成阶段就被外层 shell 展开掉。
+{
+    echo 'set -u'
+    printf 'INSTALL_DIR=%q\n' "$XA/xray"
+    echo 'ENV_FILE="$INSTALL_DIR/install_info.env"'
+    echo 'xrayls_DTR=/dev/null'
+    sed -n '/^# -* 地址库$/,/^fi$/p' "$ROOT/conf/XRevise.sh"
+    echo 'update_env() { printf "%s=\"%s\"\n" "$1" "$2" >> "$ENV_FILE"; }'
+    echo 'print_info() { echo "[Info] $*"; }'
+    echo 'print_warn() { echo "[Warn] $*"; }'
+    echo 'print_error() { echo "[Error] $*"; }'
+    sed -n '/^usid()/,/^}/p' "$ROOT/conf/XRevise.sh"
+    echo 'mkdir -p "$INSTALL_DIR"'
+    echo 'usid >/dev/null 2>&1'
+} > "$XA/run.sh"
+PATH="$FB:$XA/bin:$PATH" bash "$XA/run.sh" </dev/null >/dev/null 2>&1
+got=$(grep -E '^(PUBLIC_IP|link_ip)=' "$XA/xray/install_info.env" 2>/dev/null | awk 'NR<=2' | tr '\n' ' ')
+case "$got" in
+  *'8.8.8.8'*) ok "env 里写的是网卡地址 (外部的 WARP 地址没被采信): $got" ;;
+  *) bad "env 里的地址来源不对: $got" ;;
+esac
+case "$got" in
+  *104.28.201.80*) bad "env 里写进了外部服务的 WARP 出口地址: $got" ;;
+  *) ok "env 里没有 WARP 出口地址" ;;
+esac
+# 只有私网地址 (NAT 机器) 时: 网卡上确实没有可直连地址, 这时才允许退回外部
+# 探测 —— 但必须**明确告警**, 不能静默用"世界看到的我"。
+XN="$TMP/xrevnat"; mkdir -p "$XN/xray" "$XN/lib" "$XN/bin"
+cp "$AD" "$XN/lib/addr.sh"
+cat > "$XN/bin/ip" <<'IPNAT'
+#!/usr/bin/env bash
+case "$*" in
+  *"route show default"*) exit 1;;
+  *"-4 addr show scope global"*) echo "2: eth0 inet 10.0.0.5/24 scope global eth0";;
+  *"addr show"*) echo "2: eth0 inet 10.0.0.5/24 scope global eth0";;
+  *) exit 1;;
+esac
+IPNAT
+cat > "$XN/bin/curl" <<'CURLN'
+#!/usr/bin/env bash
+echo "104.28.201.80"
+CURLN
+chmod +x "$XN/bin/ip" "$XN/bin/curl"
+{
+    echo 'set -u'
+    printf 'INSTALL_DIR=%q\n' "$XN/xray"
+    echo 'ENV_FILE="$INSTALL_DIR/install_info.env"'
+    echo 'xrayls_DTR=/dev/null'
+    sed -n '/^# -* 地址库$/,/^fi$/p' "$ROOT/conf/XRevise.sh"
+    echo 'update_env() { printf "%s=\"%s\"\n" "$1" "$2" >> "$ENV_FILE"; }'
+    echo 'print_info() { echo "[Info] $*"; }'
+    echo 'print_warn() { echo "[Warn] $*"; }'
+    echo 'print_error() { echo "[Error] $*"; }'
+    sed -n '/^usid()/,/^}/p' "$ROOT/conf/XRevise.sh"
+    echo 'mkdir -p "$INSTALL_DIR"'
+    echo 'usid'
+} > "$XN/run.sh"
+NATOUT=$(PATH="$XN/bin:$PATH" bash "$XN/run.sh" </dev/null 2>&1)
+echo "$NATOUT" | grep 'Warn.*104.28.201.80' >/dev/null && ok "只有私网地址时退回外部探测并明确告警" \
+    || bad "退回外部探测时没有告警: $NATOUT"
 
 # ---------------------------------------------------------------- 内核回退
 # 守的是"更新内核失败后能不能退回去"。更新是不可逆操作里最容易出事的一个:
@@ -1540,6 +1747,45 @@ EOF
 chmod +x "$TMP/bin/nginx"
 PATH="$TMP/bin:$PATH" python3 "$LIB/nginx_apply.py" --file "$SITE" --domain d.example.com --port 8443 >/dev/null 2>&1
 if diff -q "$SITE.orig" "$SITE" >/dev/null 2>&1; then ok "nginx -t 失败已回滚"; else bad "nginx -t 失败已回滚"; fi
+
+# ★ 写入前的前置校验: 站点**本来就是坏的**时, 一个字都不该改。
+#   没有这一关, 我们会去动一个坏文件, 然后回滚, 把"配置坏了"这件事记在
+#   这次操作头上 —— 用户看到"插入失败", 真正的原因 (本来就坏) 被掩盖。
+cp "$SITE.orig" "$SITE"
+rm -f "$SITE.xray-core-bak"
+RC=0
+PATH="$TMP/bin:$PATH" python3 "$LIB/nginx_apply.py" --file "$SITE" --domain d.example.com --port 8443 >/dev/null 2>&1 || RC=$?
+assert_eq "$RC" "3" "现有配置不通过 nginx -t 时拒绝操作 (rc=3)"
+if diff -q "$SITE.orig" "$SITE" >/dev/null 2>&1; then ok "拒绝时文件未被改动"; else bad "拒绝时文件被改动了"; fi
+[[ -f "$SITE.xray-core-bak" ]] && bad "拒绝时仍留下了备份文件" || ok "拒绝时没有多余产物 (没写备份)"
+# --skip-precheck 是给"就是来修这份坏配置"的场景留的出口: 这时才会走到
+# 写入后的校验与回滚 (文件仍然要能恢复原样)
+cp "$SITE.orig" "$SITE"
+PATH="$TMP/bin:$PATH" python3 "$LIB/nginx_apply.py" --file "$SITE" --domain d.example.com \
+    --port 8443 --skip-precheck >/dev/null 2>&1
+if diff -q "$SITE.orig" "$SITE" >/dev/null 2>&1; then ok "--skip-precheck 走写入路径, 失败后照样回滚"; else bad "--skip-precheck 回滚失败"; fi
+
+# ★ 容器探测: 只认容器名 nginx / nginx-proxy 会漏掉"名字叫 web、镜像却是 nginx"
+#   的部署 —— 那时探测返回 None, 于是又去改宿主机上 nginx 根本不读的文件
+#   (提示写入成功、reload 成功, 站点毫无变化)。
+#   与 SB (cdn_probe_nginx) 同口径: 容器名或镜像名里带 nginx 就算。
+DKP="$TMP/dkprobe"; mkdir -p "$DKP/bin"
+cat > "$DKP/bin/docker" <<'EOF'
+#!/bin/sh
+printf 'web\tnginx:alpine\n'
+EOF
+chmod +x "$DKP/bin/docker"
+PROBE=$(PATH="$DKP/bin:$PATH" python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import nginx_apply as N; print(N.probe_docker() or '')")
+assert_eq "$PROBE" "web" "容器名不含 nginx 但镜像含 nginx 时也认得出来"
+cat > "$DKP/bin/docker" <<'EOF'
+#!/bin/sh
+printf 'myprox\tnginx:alpine\nother\tredis:7\n'
+EOF
+chmod +x "$DKP/bin/docker"
+PROBE=$(PATH="$DKP/bin:$PATH" python3 -c "
+import sys; sys.path.insert(0,'$LIB'); import nginx_apply as N; print(N.probe_docker() or '')")
+assert_eq "$PROBE" "myprox" "镜像名带 nginx 的容器挑得出来 (不选 redis)"
 
 # ---------------------------------------------------------------- 证书
 group "证书 (cert.sh)"

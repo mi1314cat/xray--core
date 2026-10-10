@@ -287,8 +287,14 @@ m = share_meta.load(os.environ["SHARE_DIR"], os.environ["TAG"]) or {}
 print(m.get("host", ""))
 ' 2>/dev/null)
     if [[ -z "$host" ]]; then
-        # 退一步: 本机第一个非回环地址。依然不问外部服务。
-        host=$(hostname -I 2>/dev/null | tr " " "\n" | grep -vE "^(127\.|::1|$)" | awk 'NR==1')
+        # 退一步: 网卡上第一个**客户端连得上**的地址 (排除 warp/tun/docker/私网,
+        # 默认路由网卡优先)。依然不问外部服务 —— 那是出站出口。
+        host=$(x_iface_public_addr 2>/dev/null || true)
+    fi
+    if [[ -z "$host" ]]; then
+        # 最后兜底: 连私网接口地址也比什么都没有强 (NAT 机器需要自己端口转发)
+        host=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+               grep -vE '^127\.' | awk 'NR==1')
     fi
     [[ -n "$host" ]] || host="<服务器IP>"
     local url="http://$host:$port/share/$token"

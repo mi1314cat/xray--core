@@ -713,14 +713,31 @@ EOF
     cert_hex_pin=$(openssl x509 -in "$CERT_FILE" -outform der 2>/dev/null | sha256sum | awk '{print tolower($1)}')
     
     # ---- 生成分享链接（考虑 Xray 2026-06-01 移除 allowInsecure）----
+    #
+    # ★ 这里原来两份链接都硬编码了 `&obfs=none`。看着无害, 实测**会把别的
+    #   客户端整条订阅打挂**:
+    #     mihomo v1.19.32 (RN 上真内核复现) 解析 hysteria2:// 时,
+    #     只要 URI 里出现 obfs 参数就要求同时有 obfs-password ——
+    #     `obfs=none` 直接被判成"设了混淆但没给密码":
+    #         provider xsub error: proxy 0 error: missing obfs password
+    #     于是该订阅里**一个节点都加载不出来** (不是静默忽略这一条, 是整条失败)。
+    #     去掉 obfs 参数后同一份订阅正常加载 (对照实验见
+    #     research/known-issues/x-deployment-investigation.md Q4)。
+    #   SB 自己的解析器也拒收 `obfs=none` (outbound_uri.py: 不支持的 obfs: 'none')。
+    #   Hysteria2 的语义是"没有 obfs 就不写这个参数", 所以这里的正确写法就是
+    #   **不写** —— 本内核也确实不支持 obfs (见下)。
+    #
+    # ★ 本内核的 hysteria 入站**不支持混淆**: settings 里写 obfs 会被静默忽略
+    #   (配置能过 -test, 但开了 salamander 的官方客户端连不上, 不开的能连上;
+    #   实测见同一份文档)。所以这里也从来没有别的 obfs 值可写。
     local link mport=""
     [[ -n "$HOP_RANGE" ]] && mport="mport=$HOP_RANGE&"
     if [[ "$CERT_TRUSTED" == "true" ]]; then
         # 真 CA 证书 → 正常校验，无 insecure
-        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&insecure=0&alpn=h3&obfs=none&upmbps=50&downmbps=200#hysteria-$index"
+        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&insecure=0&alpn=h3&upmbps=50&downmbps=200#hysteria-$index"
     else
         # 自签 → 用 pin (hex, URI规范)，不再使用 insecure= 参数（兼容新Xray内核）
-        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&alpn=h3&obfs=none&pin=$cert_hex_pin&upmbps=50&downmbps=200#hysteria-$index"
+        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&alpn=h3&pin=$cert_hex_pin&upmbps=50&downmbps=200#hysteria-$index"
     fi
 
     # ---- Xray 客户端 JSON 片段 (pinnedPeerCertSha256 用 hex, v26.3.27 实测) ----

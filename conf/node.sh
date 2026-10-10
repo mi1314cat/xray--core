@@ -229,16 +229,30 @@ except Exception: print("tcp")' "$f" 2>/dev/null)
 # 只报告不自动删: 站点文件是用户自己的东西, 自动改动的风险大于收益。
 # 报告里直接给出可复制的摘除命令。
 check_orphan_nginx() {
-    local dirs=() d
-    for d in /etc/nginx/conf.d /etc/nginx/sites-enabled /usr/local/nginx/conf/conf.d; do
-        [[ -d "$d" ]] && dirs+=("$d")
-    done
-    ((${#dirs[@]})) || { info "本机没有常见的 nginx 配置目录, 跳过"; return 0; }
-
-    # 站点里被 xray-core 标记过的域名
+    # 站点里被 xray-core 标记过的域名。
+    #
+    # ★ 这里必须走 nginx_apply.py 的同一套探测, 不能自己 grep 宿主目录:
+    #   1. nginx 跑在容器里时 (生产就是这样) 真正生效的站点在容器的挂载目录
+    #      (如 /home/web/conf.d), 宿主 /etc/nginx/conf.d 是空的 —— 自己扫宿主
+    #      目录会得出"没有发现片段"的**假结论**, 而站点里其实一堆孤儿;
+    #   2. `grep -r` 会把 *.xray-core-bak / *.yaml 这些 nginx **根本不加载**的
+    #      文件也算进来 (备份里留着标记) —— 于是报出一堆不存在的孤儿, 白折腾。
+    #   nginx_apply.site_files() 只列 nginx 真会读的 *.conf, 且容器/宿主自适应,
+    #   与"插入/摘除"用的是同一个口径 (改哪儿就在哪儿查)。
     local marked
-    marked=$(grep -rhoE '>>> xray-core BEGIN [^ >]+' "${dirs[@]}" 2>/dev/null |
-             awk '{print $4}' | sort -u)
+    marked=$(LIB="$LIB_DIR" py -c "
+import os, re, sys
+sys.path.insert(0, os.environ['LIB'])
+import nginx_apply as N
+dk = N.probe_docker()
+for f in N.site_files(dk):
+    try:
+        raw = N.c_read(f, dk).decode('utf-8', 'replace')
+    except Exception:
+        continue
+    for m in re.finditer(r'>>>\s*xray-core\s+BEGIN\s+(\S+)', raw):
+        print(m.group(1))
+" 2>/dev/null | sort -u)
     if [[ -z "$marked" ]]; then
         ok "没有发现 xray-core 插入的 nginx 片段"
         return 0

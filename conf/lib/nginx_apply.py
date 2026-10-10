@@ -43,17 +43,35 @@ def probe_docker():
     mihomo 的生产环境就是这样。直接在宿主机上跑 nginx -t 会报找不到
     配置, 而配置其实好好地在那儿 —— 于是"校验失败"触发回滚, 改动丢失,
     而真正的原因只是命令敲错了地方。
+
+    ★ 判据不能只精确匹配容器名。生产上那个容器恰好叫 nginx, 但用户把容器
+      命名成 web / proxy ("web" + 镜像 nginx:alpine 是很常见的组合) 时,
+      只认 {"nginx", "nginx-proxy"} 就找不到 —— 于是又回到"改了一个 nginx
+      永远不会加载的文件"那个坑: 提示写入成功, reload 也成功, 站点毫无变化。
+      现在与 SB 的 cdn_probe_nginx 同一口径: **容器名或镜像名里带 nginx** 就算,
+      名字正好是 nginx / nginx-proxy 的优先 (保持原有选择不变)。
     """
     if not shutil.which("docker"):
         return None
     try:
-        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}\t{{.Image}}"],
                            capture_output=True, timeout=8, text=True)
         if r.returncode != 0:
             return None
-        for name in r.stdout.split():
-            if name in ("nginx", "nginx-proxy"):
-                return name
+        cands = []
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            name = parts[0].strip() if parts else ""
+            image = parts[1].strip() if len(parts) > 1 else ""
+            if not name:
+                continue
+            if "nginx" not in f"{name} {image}".lower():
+                continue
+            cands.append((0 if name in ("nginx", "nginx-proxy") else 1, name))
+        if not cands:
+            return None
+        cands.sort()
+        return cands[0][1]
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -413,6 +431,32 @@ def detect_indent(lines, server_end):
 
 
 # ---------------------------------------------------------------- 提交
+def nginx_precheck(nginx, docker):
+    """动手之前先验证**当前**这份配置是好的。
+
+    ★ 为什么要前置 (与写入后的校验是两件事):
+      后面的路径是"写入 -> nginx -t -> 失败回滚"。如果站点**本来就是坏的**
+      (用户手改坏了 / 别的工具写坏了), 那条路径会把我们的改动回滚, 同时把
+      "配置坏了"这件事归到这次操作头上 —— 用户看到"插入失败", 真正的原因
+      (本来就坏) 完全被掩盖; 更糟的是我们还在一个坏文件上动了手。
+      前置校验失败就一个字都不改, 直接告诉用户"先修好它"。
+
+    返回 (ok, 说明)。检测不到 nginx (没装 / PATH 里没有) 时视为 ok ——
+    与写入后的处理口径一致: 没得校验就跳过, 不能因为校验不可用而拦住操作。
+    """
+    if nginx == "none" or not nginx:
+        return True, ""
+    argv = nginx_cmd(docker) + [nginx]
+    try:
+        t = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        return True, f"无法执行 {' '.join(argv)} ({e}); 跳过前置校验"
+    if t.returncode != 0:
+        msg = (t.stderr or t.stdout or "").strip()
+        return False, "\n".join("    " + ln for ln in msg.splitlines()[:6])
+    return True, ""
+
+
 def commit(path, lines, nl, had_bom, dry_run, nginx, docker, remove_only):
     payload = nl.join(lines) + nl
     data = payload.encode("utf-8")
@@ -517,6 +561,18 @@ def apply(args):
     text = raw.decode("utf-8-sig" if had_bom else "utf-8", errors="replace")
     lines = text.splitlines()
 
+    # --- 前置校验: 现有配置就已经不通过 nginx -t 时, 什么都不动 ---
+    #     (--skip-precheck 是给"就是来修这份坏配置"的场景留的出口)
+    if not args.dry_run and not args.skip_precheck:
+        pre_ok, pre_why = nginx_precheck(args.nginx, args.docker)
+        if not pre_ok:
+            print("[错误] 站点现有配置就没通过 nginx -t, 未做任何改动。"
+                  "先修好它再来 (或加 --skip-precheck 强行操作):", file=sys.stderr)
+            print(pre_why, file=sys.stderr)
+            return 3
+        if pre_why:
+            print(f"[信息] {pre_why}", file=sys.stderr)
+
     domain = args.domain
 
     # --- 0) 先摘掉上一轮插入的内容, 这是幂等的基础 ---
@@ -594,6 +650,9 @@ def main():
     p.add_argument("--indent", type=int, default=0,
                    help="插入内容的缩进空格数, 0=自动跟随文件风格")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--skip-precheck", action="store_true",
+                   help="跳过【写入前 nginx -t】这道前置校验 (默认不跳; "
+                        "站点本来就是坏的、而你就是来修它的时候用)")
     p.add_argument("--docker", help="nginx 所在容器名")
     args = p.parse_args()
 

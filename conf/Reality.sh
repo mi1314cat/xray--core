@@ -73,6 +73,27 @@ else
     source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/ports.sh") \
         || { print_error "端口库加载失败"; exit 1; }
 fi
+
+# 对外地址探测库 —— 分享链接/客户端产物里的地址一律从这里取。
+# 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
+
+# 该写进分享链接的那个地址。
+#
+# ★ 为什么不能直接用 install_info.env 里的 PUBLIC_IP:
+#   那是**安装时**写进去的。修复前那版脚本问的是 api.ipify.org (出站出口),
+#   套了 WARP 的机器上存的就是 WARP 地址 (RN 实测 104.28.201.80), 而服务器
+#   入站是 107.173.154.178 —— 分享链接发出去即死, 且链接本身看起来完全正常。
+#   所以每次生成都现场算: 存的值只有"落在客户端连得上的网卡上"才沿用。
+#   优先级: XRAY_PUBLIC_IP > 存的值(过自检) > 网卡地址 > 外部探测(仍要自检)。
+resolve_public_ip() {
+    x_link_addr "${1:-}"
+}
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
@@ -182,6 +203,17 @@ prepare_env() {
     for v in UUID PRIVATE_KEY PUBLIC_KEY short_id dest_server SERVER_DEC CLIENT_ENC PUBLIC_IP link_ip; do
         [[ -n "${!v}" ]] || { print_error "缺少必要变量：$v"; return 1; }
     done
+
+    # ★ 现场校正对外地址 (见 resolve_public_ip 注释):
+    #   env 里存的可能是修复前写进去的 WARP 出口地址, 直接用它 = 分享链接死链。
+    local ip_now
+    ip_now=$(resolve_public_ip "$PUBLIC_IP")
+    if [[ -n "$ip_now" && "$ip_now" != "$PUBLIC_IP" ]]; then
+        print_warn "install_info.env 里的地址 $PUBLIC_IP 客户端连不上（WARP/隧道/不在本机?），本次改用 $ip_now"
+        print_warn "  如需长期修正: 重跑安装(面板选项 1) 或用 XRAY_PUBLIC_IP=<真实入口地址> 生成节点"
+        PUBLIC_IP="$ip_now"
+    fi
+    if [[ "$PUBLIC_IP" == *:* ]]; then link_ip="[$PUBLIC_IP]"; else link_ip="$PUBLIC_IP"; fi
     return 0
 }
 

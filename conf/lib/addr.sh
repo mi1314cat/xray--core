@@ -26,6 +26,10 @@
 #   绝大多数 VPS 上第一步就给出正解, **一次网络请求都不需要** —— 也就不会
 #   出现"问了一圈、全是 WARP、全丢掉、再退回本机"那种噪音。
 #
+#   "读网口"还有第二层判据: **默认路由所在的网卡优先** (x_default_route_iface)。
+#   只按 `ip addr` 的枚举顺序取第一个, 是在赌"对外那张网卡排在最前面" ——
+#   多网卡/自定义隧道名的机器上这个假设不成立。内核的路由表才是权威答案。
+#
 #   反过来写 (先问外部服务再自检) 的问题: 套了 WARP 时那条查询本身走隧道,
 #   拿回来的必然是 WARP 地址, 然后自检把它丢掉 —— 每次白跑一趟网络还刷一堆警告。
 # =============================================================
@@ -69,32 +73,75 @@ x_addr_is_local() {
     ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$a"
 }
 
-# 本机真实对外地址 —— 读接口, 排除隧道/虚拟网卡与私网。
-# 输出第一个可用的地址 (优先 IPv4), 没有则返回 1。
-x_iface_public_addr() {
-    local dev cidr first6=""
-    while read -r dev cidr; do
-        [[ -n "$dev" && -n "$cidr" ]] || continue
-        [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && continue
-        x_addr_is_private "$cidr" && continue
-        case "$cidr" in
-            *:*) [[ -z "$first6" ]] && first6="$cidr"; continue ;;   # 记住, 但 v4 优先
-            *)   printf '%s' "$cidr"; return 0 ;;
-        esac
-    done < <(ip -o addr show scope global 2>/dev/null | awk '{print $2, $4}' | sed 's|/[0-9]*$||')
-    [[ -n "$first6" ]] && { printf '%s' "$first6"; return 0; }
+# 这个地址是不是**客户端连得上**的本机地址。
+#
+# ★ 与 x_addr_is_local 的区别很关键: 后者只回答"在本机某张网卡上" ——
+#   WARP / docker / awg 上的地址也满足, 但客户端连不上。
+#   实测: RN 上 warp 网卡挂着 172.16.0.2 和 2606:4700:110:822e:...,
+#   两者都在本机接口上, 拿它们当"服务器地址"下发就是死链。
+#   所以**沿用已保存地址的那道自检必须用这一条**: 光判"在不在本机",
+#   修复前存进去的 WARP 地址 (v4 的 104.28.201.80 / v6 的 2606:4700:...)
+#   照样会被一直沿用下去。
+x_addr_is_reachable() {
+    local a="${1:-}" dev
+    [[ -n "$a" ]] || return 1
+    x_addr_is_local "$a" || return 1
+    x_addr_is_private "$a" && return 1
+    dev=$(ip -o addr show 2>/dev/null | awk -v a="$a" '
+        { split($4, x, "/"); if (x[1] == a) { print $2; exit } }')
+    [[ -n "$dev" ]] || return 1
+    [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && return 1
+    return 0
+}
+
+# 默认路由所在的网卡。
+#
+# ★ 为什么多这一步: 只按 `ip -o addr` 的**枚举顺序**取第一个地址, 是在赌
+#   "对外那张网卡排在最前面"。多网卡机器上这个假设随时不成立 ——
+#   管理口/内网口、漏过正则的自定义隧道网卡都可能排在前面, 于是分享链接里
+#   又出现一个客户端连不上的地址。默认路由是内核按 metric 算出来的
+#   "外面怎么走", 比接口顺序可靠得多。
+x_default_route_iface() {
+    { ip -4 route show default 2>/dev/null; ip -6 route show default 2>/dev/null; } |
+        awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit }}'
+}
+
+# 取地址的通用扫描 (内部实现)。
+#   $1 = 4 | 6          地址族
+#   $2 = strict | any   strict: 再排除私网/保留段; any: 只排除隧道/虚拟网卡
+#
+# 两遍扫描: 先只认**默认路由所在网卡**上的地址, 没有才退回全量扫描。
+# 两遍用的是同一套过滤, 第二遍只是"换张网卡再找", 不会为了凑出一个地址
+# 而放宽过滤 —— 绝不会因此交出 WARP / docker / fake-ip 的地址。
+_x_addr_pick() {
+    local fam="$1" mode="${2:-strict}" pref dev cidr pass
+    pref=$(x_default_route_iface 2>/dev/null || true)
+    for pass in pref all; do
+        [[ "$pass" == "pref" && -z "$pref" ]] && continue
+        while read -r dev cidr; do
+            [[ -n "$dev" && -n "$cidr" ]] || continue
+            [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && continue
+            [[ "$pass" == "pref" && "$dev" != "$pref" ]] && continue
+            [[ "$mode" == "strict" ]] && x_addr_is_private "$cidr" && continue
+            case "$fam" in
+                4) case "$cidr" in *:*) continue ;; esac ;;
+                6) case "$cidr" in *:*) ;; *) continue ;; esac ;;
+            esac
+            printf '%s' "$cidr"; return 0
+        done < <(ip -o -"$fam" addr show scope global 2>/dev/null |
+                 awk '{print $2, $4}' | sed 's|/[0-9]*$||')
+    done
     return 1
 }
 
-# 真实 IPv6 (排除隧道接口)。没有则返回 1。
-x_addr6_real() {
-    local dev cidr
-    while read -r dev cidr; do
-        [[ -n "$dev" && -n "$cidr" ]] || continue
-        [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && continue
-        case "$cidr" in *:*) printf '%s' "$cidr"; return 0 ;; esac
-    done < <(ip -o addr show scope global 2>/dev/null | awk '{print $2, $4}' | sed 's|/[0-9]*$||')
-    return 1
+# 真实 IPv4 / IPv6 (排除隧道接口与私网/保留段)。没有则返回 1。
+x_addr4_real() { _x_addr_pick 4 strict; }
+x_addr6_real() { _x_addr_pick 6 strict; }
+
+# 本机真实对外地址 —— 读接口, 排除隧道/虚拟网卡与私网。
+# 输出第一个可用的地址 (优先 IPv4), 没有则返回 1。
+x_iface_public_addr() {
+    x_addr4_real 2>/dev/null || x_addr6_real 2>/dev/null
 }
 
 # 本机是否有**客户端连得上的** IPv4 / IPv6。
@@ -105,23 +152,12 @@ x_addr6_real() {
 #   而 x_has_v6 早就排除了隧道, 两者判定口径不一致。
 #   实测场景: 机器只有 WARP 的 IPv6 时, 旧写法说"有 IPv6", 于是向导会
 #   引导用户去建 IPv6 节点 —— 建出来的节点谁也连不上。
-x_has_v4() {
-    local dev cidr
-    while read -r dev cidr; do
-        [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && continue
-        case "$cidr" in *:*) continue ;; esac
-        return 0
-    done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2, $4}' | sed 's|/[0-9]*$||')
-    return 1
-}
-x_has_v6() {
-    local dev cidr
-    while read -r dev cidr; do
-        [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && continue
-        case "$cidr" in *:*) return 0 ;; esac
-    done < <(ip -o addr show scope global 2>/dev/null | awk '{print $2, $4}' | sed 's|/[0-9]*$||')
-    return 1
-}
+#
+# 口径: 只排隧道网卡, **不排私网** —— 判定的是"有没有这个地址族"。
+# NAT 后面的机器只有私网地址, 它确实能建节点 (配端口转发), 用 strict
+# 会让它被判成"没有 IPv4", 向导于是推荐 IPv6 监听, 反而更糟。
+x_has_v4() { _x_addr_pick 4 any >/dev/null 2>&1; }
+x_has_v6() { _x_addr_pick 6 any >/dev/null 2>&1; }
 
 # 本机是否正在走 WARP / 隧道 (给"为什么读到的地址不对"提供线索)
 x_tunnel_active() {
@@ -146,10 +182,10 @@ x_public_addr() {
     # 1. 传参
     if [[ -n "$given" ]]; then printf '%s' "$given"; return 0; fi
 
-    # 2. 已保存的 —— 关键是自检。
+    # 2. 已保存的 —— 关键是自检 (而且是"客户端连得上"这一档, 见函数注释)。
     #    ★ 不加这一关, 修复前存进去的 WARP 地址会被**一直沿用**下去,
     #      自检形同虚设 (这是踩过的: 存的是 WARP 出口, 写进配置 13/13 全连不上)。
-    if [[ -n "$saved" ]] && x_addr_is_local "$saved"; then
+    if [[ -n "$saved" ]] && x_addr_is_reachable "$saved"; then
         printf '%s' "$saved"; return 0
     fi
 
@@ -161,7 +197,7 @@ x_public_addr() {
     local url out
     for url in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me/ip"; do
         out=$(curl -4 -s --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]')
-        if [[ "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && x_addr_is_local "$out"; then
+        if [[ "$out" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && x_addr_is_reachable "$out"; then
             printf '%s' "$out"; return 0
         fi
         # 自检不过说明这台机器在 NAT 后面(或者走了隧道), 把外部答案当候选 ——
@@ -192,6 +228,16 @@ x_addr_family_of() {
     local a="${1:-}"
     case "$a" in *:*) printf 'IPv6' ;; *) printf 'IPv4' ;; esac
 }
+# 该写进分享链接/客户端产物的那个地址。
+#
+# ★ 各脚本统一走这一个入口: 优先级 = XRAY_PUBLIC_IP(显式指定) >
+#   保存值(必须过"客户端连得上"自检) > 网卡地址 > 外部探测(仍要自检)。
+#   为什么保存值也要自检: 修复前写进 install_info.env 的可能是 WARP 出口
+#   地址 (RN 实测 104.28.201.80), 而客户端只连得上真实网卡地址 ——
+#   链接发出去即死, 且看起来完全正常。
+x_link_addr() {
+    x_public_addr "${XRAY_PUBLIC_IP:-}" "${1:-}" 2>/dev/null || true
+}
 
 # URL 里的主机: IPv6 必须加方括号, 否则端口会被当成地址的一部分。
 #   错误: http://2001:db8::1:9443/share/xxx
@@ -211,7 +257,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         show)     x_public_addr ;;
         v4)       x_has_v4 && echo yes || echo no ;;
         v6)       x_has_v6 && echo yes || echo no ;;
+        v4addr)   x_addr4_real || true ;;
         v6addr)   x_addr6_real || true ;;
+        route)    x_default_route_iface ;;
         tunnel)   x_tunnel_active && echo "有隧道/WARP 接口" || echo "无" ;;
         ifaces)   ip -o addr show scope global 2>/dev/null |
                       awk '{print $2, $4}' | sed 's|/[0-9]*$||' |
@@ -221,6 +269,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                       done ;;
         check)    # 自检: 给定地址在不在本机接口上
                   if x_addr_is_local "${2:-}"; then echo "本机接口上 ✅"; else echo "不在本机接口上 ❌"; fi ;;
-        *) echo "用法: addr.sh [show|v4|v6|v6addr|tunnel|ifaces|check <地址>]" >&2; exit 1 ;;
+        rcheck)   # 自检: 给定地址客户端连不连得上 (排除隧道/私网)
+                  if x_addr_is_reachable "${2:-}"; then echo "客户端连得上 ✅"; else echo "客户端连不上 ❌ (隧道/私网/不在本机)"; fi ;;
+        *) echo "用法: addr.sh [show|v4|v6|v4addr|v6addr|route|tunnel|ifaces|check <地址>]" >&2; exit 1 ;;
     esac
 fi

@@ -88,6 +88,15 @@ else
     source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/random.sh") \
         || { print_error "随机值库加载失败"; exit 1; }
 fi
+
+# 对外地址探测库 —— 分享链接/客户端产物里的地址一律从这里取。
+# 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
@@ -330,8 +339,12 @@ EOF
     fi
 
     # ---- X 内核客户端出站 ----
-    local server_ip
-    server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    # ★ 地址现场算, 不用 install_info.env 里存的 (可能是修复前写进去的 WARP
+    #   出口地址 —— 链接发出去即死)。判据见 conf/lib/addr.sh 的 x_link_addr。
+    local server_ip link_host
+    server_ip=$(x_link_addr "$PUBLIC_IP")
+    [[ -n "$server_ip" ]] || server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    link_host=$(x_url_host "$server_ip")
     cat > "$OUT_DIR/$PROTO-$next.json" <<EOF
 {
   "protocol": "trojan",
@@ -351,10 +364,10 @@ EOF
 
     # ---- 分享链接 ----
     if [[ "$security" == "reality" ]]; then
-        echo "trojan://${TJPASS}@${server_ip}:${lport}?security=reality&sni=${DEST_R}&type=tcp&fp=chrome&pbk=${R_PK}&sid=${R_SID}#Trojan-${next}" \
+        echo "trojan://${TJPASS}@${link_host}:${lport}?security=reality&sni=${DEST_R}&type=tcp&fp=chrome&pbk=${R_PK}&sid=${R_SID}#Trojan-${next}" \
             > "$OUT_DIR/$PROTO-share-$next.txt"
     else
-        echo "trojan://${TJPASS}@${server_ip}:${lport}#Trojan-${next}" \
+        echo "trojan://${TJPASS}@${link_host}:${lport}#Trojan-${next}" \
             > "$OUT_DIR/$PROTO-share-$next.txt"
     fi
 

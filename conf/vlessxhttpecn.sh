@@ -79,6 +79,15 @@ else
     source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/random.sh") \
         || { print_error "随机值库加载失败"; exit 1; }
 fi
+
+# 对外地址探测库 (单一实现) —— 分享链接里的地址一律从这里取。
+# 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。
+if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
+    source "$_x_lib_dir/lib/addr.sh"
+else
+    source <(curl -fsSL "$_x_lib_base/addr.sh") \
+        || { print_error "地址库加载失败"; exit 1; }
+fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
@@ -178,8 +187,16 @@ detect_listen_ip() {
 # ================================
 detect_public_ip() {
     local ip user_ip
+    # ★ 先读网卡 (排除 warp/tun/docker, 默认路由网卡优先), 网卡上没有才问外部服务。
+    #   原来一上来就问 api.ipify.org —— 那答的是**出站出口**: 套了 WARP 的机器上
+    #   拿到的是 WARP 地址 (实测 RN: 104.28.201.80), 客户端照着连必然不通。
+    #   见 conf/lib/addr.sh 顶部。
+    ip=$(x_iface_public_addr 2>/dev/null || true)
     # Bug4 fix: 保留 IPv6 自动检测 (原版 -s6 api64 兜底)
-    ip=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || curl -s6 https://api64.ipify.org || true)
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s --max-time 8 https://api.ipify.org || curl -s --max-time 8 https://ifconfig.me \
+             || curl -s6 --max-time 8 https://api64.ipify.org || true)
+    fi
     if [[ -z "$ip" ]]; then
         print_error "获取公网 IP 失败"
         read -r -p "请输入公网IP: " ip
