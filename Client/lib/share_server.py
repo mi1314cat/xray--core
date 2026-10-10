@@ -152,7 +152,12 @@ def build_config() -> bytes:
                 link = N.build_link(node)
                 if link:
                     lines.append(link)
-            except Exception:
+            except Exception as exc:                             # noqa: BLE001
+                # ★ 不许静默：少一个节点的症状是"手机导入后就是比别人少一个"，
+                #   而服务端一切正常、日志一片安静 —— 这种错最难查。
+                #   实测踩到过：一个字段空掉的节点文件让 build_link 抛
+                #   "不支持生成链接的协议"，于是分享里少一个节点。
+                sys.stderr.write("share: 跳过 %s（%s）\n" % (name, exc))
                 continue
     except OSError:
         pass

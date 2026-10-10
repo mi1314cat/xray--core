@@ -130,6 +130,10 @@ SHARE = {
     "host": "192.168.1.178", "port": "18190",
     "unit": "xbd-share.service", "active": True, "listening": True, "enabled": True,
     "socks": "192.168.1.178:1080", "http": "192.168.1.178:10809", "clients": 2,
+    # 覆盖：夹具刻意造一个"没进分享"的节点，用来验面板会不会点名
+    "coverage": {"total": 8, "ok": 7,
+                 "skipped": [{"file": "node-x-broken.json", "name": "坏节点",
+                              "why": "不支持生成链接的协议: "}]},
     "tokens": [
         {"token": "852933b3b1dd0dd04ac32f9f", "enabled": True, "used": 3, "max_uses": 0,
          "created_at": 1760000000,

@@ -1028,6 +1028,47 @@ def _share_rows():
     return rows
 
 
+def _share_coverage():
+    """节点目录 ↔ 分享内容：哪个节点没能进订阅、为什么。
+
+    这是用户那句"还有其他节点呢？"的直接答案：面板列 10 个、手机导入 9 个，
+    中间的差就是这里 —— 以前它只发生在分享服务的 `except: continue` 里，
+    面板和日志都不说，用户只能自己数。
+    """
+    try:
+        sys.path.insert(0, os.path.join(DIST, "lib"))
+        import node as _node
+    except Exception as exc:                                     # noqa: BLE001
+        return {"total": 0, "ok": 0, "skipped": [], "error": str(exc)}
+    total = ok = 0
+    skipped = []
+    try:
+        names = sorted(os.listdir(NODES))
+    except OSError:
+        names = []
+    for name in names:
+        if not (name.startswith("node-") and name.endswith(".json")):
+            continue
+        total += 1
+        try:
+            with open(os.path.join(NODES, name), encoding="utf-8") as fh:
+                node = json.load(fh)
+        except (OSError, ValueError) as exc:
+            skipped.append({"file": name, "name": name, "why": "文件读不了：%s" % exc})
+            continue
+        label = (node.get("name") or "").strip() or name
+        try:
+            link = _node.build_link(node)
+        except Exception as exc:                                 # noqa: BLE001
+            skipped.append({"file": name, "name": label, "why": str(exc)})
+            continue
+        if link:
+            ok += 1
+        else:
+            skipped.append({"file": name, "name": label, "why": "生成结果为空"})
+    return {"total": total, "ok": ok, "skipped": skipped}
+
+
 def act_share_status():
     """分享状态 + 链接列表。
 
@@ -1053,6 +1094,8 @@ def act_share_status():
         "socks": socks,
         "http": http_in,
         "clients": len(rows),
+        # 分享覆盖：手机能拿到几个节点、哪个没进去、为什么
+        "coverage": _share_coverage(),
     }
     return True, json.dumps(data, ensure_ascii=False)
 
@@ -1069,12 +1112,21 @@ def act_share_new():
         host = out.strip().splitlines()[-1].strip()
     if not host:
         host = cfg_get(os.path.join(CONF, "ports.env"), "LISTEN_ADDR", "127.0.0.1")
-    # 端口现找一个没被占的：CC 上 10808/10809 都被 Xray 占着，写死一个必然撞。
+    # 端口：**先沿用旧的**。
+    # 每次新建都换端口看着"更稳"，实际是把已经发给别人的链接弄死 —— 手机里
+    # 存的是 http://ip:旧端口/share/<token>，端口一变就打不开了，而面板上一切正常。
+    # 只有当旧端口被别人占了（本机其他 share_server 是常事）才另找一个。
+    old_host, old_port = _share_cfg()
     port = 0
-    for cand in range(18190, 18290):
-        if not _ports.in_use(cand):
-            port = cand
-            break
+    if old_port.isdigit():
+        holder = _ports.in_use(int(old_port))
+        if not holder or "share_server" in holder:
+            port = int(old_port)
+    if not port:
+        for cand in range(18190, 18290):
+            if not _ports.in_use(cand):
+                port = cand
+                break
     if not port:
         return False, "18190-18290 没有可用端口（本机可能起了太多分享服务）"
     os.makedirs(CONF, exist_ok=True)
@@ -1168,7 +1220,9 @@ def act_share_preview(token=""):
     names = []
     for ln in lines:
         if "#" in ln:
-            names.append(ln.rsplit("#", 1)[1][:40])
+            # 订阅里的节点名是**百分号编码**的（emoji 机场名尤其明显）。
+            # 不解码的话，"拉一次看看"给出的是一串 %F0%9F%87%BA，看着像坏了。
+            names.append(urllib.parse.unquote(ln.rsplit("#", 1)[1])[:40])
     note = (f"{len(lines)} 个节点" + ("：" + "、".join(names[:8]) + ("…" if len(names) > 8 else "")
                                       if names else "")) if lines else "内容解不开（可能不是订阅格式）"
     body = plain[:4000] if plain else text[:2000]
@@ -1901,6 +1955,7 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   <div class="row"><span class="k">分享服务</span><span class="v" id="sh-state">—</span></div>
   <div class="row"><span class="k">服务地址</span><span class="v mono" id="sh-addr">—</span></div>
   <div class="row"><span class="k">链接数量</span><span class="v" id="sh-count">—</span></div>
+  <div class="row"><span class="k">分享内容</span><span class="v" id="sh-cover">—</span></div>
   <div class="row"><span class="k">代理入口（也可直接用）</span>
     <span class="v mono" id="sh-proxy">—</span></div>
   <div class="bar">
@@ -2775,9 +2830,29 @@ async function loadShare(btn){
     ? d.host + ':' + d.port : '（还没有配置，点「新建分享链接」）';
   if ($('sh-count')) $('sh-count').textContent = d.clients + ' 条';
   if ($('sh-proxy')) $('sh-proxy').textContent = 'SOCKS5 ' + d.socks + ' · HTTP ' + d.http;
-  if ($('sh-note')) $('sh-note').textContent = d.enabled
-    ? '只监听上面这个局域网地址，没有绑 0.0.0.0 —— 公网访问不到。'
-    : '要给别人用，点「新建分享链接」把服务拉起来。';
+  // 覆盖：面板列几个、分享里进几个。少了就必须点名 —— "还有其他节点呢？"
+  // 这个问题以前只能靠用户自己数。
+  // ★ 这段必须整体算完再写 DOM：上一版先写了告警、后面那行通用的
+  //   `note.textContent = …` 又把它盖掉了 —— 页面上看着一切正常。
+  const cov = d.coverage || {}, miss = cov.skipped || [];
+  if ($('sh-cover')) {
+    $('sh-cover').innerHTML = cov.total
+      ? cov.ok + ' / ' + cov.total + ' 个节点'
+        + (miss.length ? ' <span class="tag bad">少 ' + miss.length + ' 个</span>' : '')
+      : '—';
+  }
+  const note = $('sh-note');
+  if (note) {
+    if (miss.length) {
+      note.innerHTML = '<b>有 ' + miss.length + ' 个节点没能进分享：</b>'
+        + miss.map(m => ESC(m.name) + '（' + ESC(m.why) + '）').join('；')
+        + ' —— 这些节点手机那边拿不到，多出站/订阅里都会少一个。';
+    } else {
+      note.textContent = d.enabled
+        ? '只监听上面这个局域网地址，没有绑 0.0.0.0 —— 公网访问不到。'
+        : '要给别人用，点「新建分享链接」把服务拉起来。';
+    }
+  }
   const tb = $('tb-share');
   if (tb) {
     tb.innerHTML = (d.tokens || []).map(t => `<tr>

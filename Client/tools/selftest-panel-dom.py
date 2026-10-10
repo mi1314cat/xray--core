@@ -271,6 +271,12 @@ setTimeout(async () => {
   ck($$('#tb-share button').length >= 6, '每条链接都有 复制/启用停用/删除 按钮');
   ck(($('#sh-proxy').textContent || '').includes('SOCKS5'),
      '分享页顺带给出局域网代理入口 (' + $('#sh-proxy').textContent + ')');
+  // 覆盖：夹具里有一个节点生成不了链接 —— 面板必须**点名**，
+  // 而不是让用户自己数"为什么手机里少一个"。
+  ck(/7 \/ 8/.test($('#sh-cover').textContent || ''),
+     '分享页显示节点覆盖 (7 / 8)');
+  ck(/坏节点/.test($('#sh-note').textContent || ''),
+     '没进分享的节点被点名（含原因）');
   w.go('nodes');
 
   // 三种密度都要能渲染（同一份标记在三个视图里都要成立）
