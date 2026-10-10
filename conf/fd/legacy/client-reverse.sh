@@ -397,24 +397,28 @@ menu() {
         echo "3) 删除配置" >&2
         echo "0) 退出" >&2
         printf "请选择: " >&2
-        read c
+        # ★ stdin 关闭 (EOF) 时 read 返回非 0 且不修改 $c, case 落到 *) 后回到
+        #   循环顶再读一次 —— 菜单空转刷屏, 永不退出。实测修前:
+        #   timeout 10 bash conf/fd/legacy/client-reverse.sh </dev/null → rc=124。
+        #   EOF 等同"用户退出", 干净 exit 0 (与下面的 0) 分支一致)。
+        read c || { echo "退出" >&2; exit 0; }
         c=$(clean_input "$c")
 
         case $c in
             1)
                 list_configs
                 printf "按回车继续..." >&2
-                read
+                read || { echo "退出" >&2; exit 0; }
                 ;;
             2)
                 add_config
                 printf "按回车继续..." >&2
-                read
+                read || { echo "退出" >&2; exit 0; }
                 ;;
             3)
                 delete_config
                 printf "按回车继续..." >&2
-                read
+                read || { echo "退出" >&2; exit 0; }
                 ;;
             0)
                 echo "退出" >&2
@@ -423,7 +427,7 @@ menu() {
             *)
                 print_error "无效选项"
                 printf "按回车继续..." >&2
-                read
+                read || { echo "退出" >&2; exit 0; }
                 ;;
         esac
     done

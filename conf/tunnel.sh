@@ -265,27 +265,31 @@ config_menu() {
         echo -e "${CYAN}3)${RESET} 删除配置"
         echo -e "${CYAN}0)${RESET} 返回主菜单"
 
-        read -p "$(echo -e ${YELLOW}请选择${RESET}): " c
+        # ★ stdin 关闭 (EOF) 时 read 返回非 0 且不修改 $c, case 落到 *) 后回到
+        #   循环顶再读一次 —— 菜单空转刷屏, 永不退出。实测修前:
+        #   timeout 10 bash conf/tunnel.sh </dev/null → rc=124 (10 秒 1181 行)。
+        #   EOF 等同"用户返回", 直接退出菜单。
+        read -p "$(echo -e ${YELLOW}请选择${RESET}): " c || return 0
 
         case $c in
             1)
                 list_configs
-                read -p "按回车继续..."
+                read -p "按回车继续..." || return 0
             ;;
             2)
                 add_config
-                read -p "按回车继续..."
+                read -p "按回车继续..." || return 0
             ;;
             3)
                 delete_config
-                read -p "按回车继续..."
+                read -p "按回车继续..." || return 0
             ;;
             0)
                 return   # ← 返回主菜单，不暂停
             ;;
             *)
                 print_error "无效选项"
-                read -p "按回车继续..."
+                read -p "按回车继续..." || return 0
             ;;
         esac
     done

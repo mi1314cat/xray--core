@@ -267,24 +267,28 @@ config_menu() {
         echo "0) 返回主菜单" >&2
 
         printf "请选择: " >&2
-        read c
+        # ★ stdin 关闭 (EOF) 时 read 返回非 0 且不修改 $c, case 落到 *) 后回到
+        #   循环顶再读一次 —— 菜单空转刷屏, 永不退出。实测修前:
+        #   timeout 10 bash conf/sock5.sh </dev/null → rc=124 (10 秒 789 行菜单)。
+        #   EOF 等同"用户退出", 直接返回。
+        read c || return 0
         c=$(clean_input "$c")
 
         case $c in
             1)
                 list_configs
                 printf "按回车继续..." >&2
-                read
+                read || return 0
             ;;
             2)
                 add_config
                 printf "按回车继续..." >&2
-                read
+                read || return 0
             ;;
             3)
                 delete_config
                 printf "按回车继续..." >&2
-                read
+                read || return 0
             ;;
             0)
                 return   # ← 返回主菜单，不暂停
@@ -292,7 +296,7 @@ config_menu() {
             *)
                 print_error "无效选项"
                 printf "按回车继续..." >&2
-                read
+                read || return 0
             ;;
         esac
     done

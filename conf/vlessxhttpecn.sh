@@ -1344,7 +1344,17 @@ config_menu() {
         echo "0) 退出" >&2
 
         printf "请选择: " >&2
-        read c
+        # ★ stdin 关闭时必须退出, 否则菜单空转。
+        #
+        #   read 在 EOF 上返回非 0 **且不修改** $c —— 于是 case 落到 *) 打印
+        #   "无效选项", 回到循环顶再读一次, 读到的还是一样, 永远出不去。
+        #   stdin 关闭是常态: `</dev/null`、Ctrl-D、管道/here-doc 喂完、
+        #   cron/CI 里非交互跑。实测修前:
+        #     timeout 10 bash conf/vlessxhttpecn.sh </dev/null → rc=124,
+        #     10 秒内刷了 662 行菜单。
+        #   EOF 等同"用户退出", 干净返回 (本行在 config_menu 函数内, 所以用
+        #   return 0 而不是 exit 0; 返回后脚本自然结束, 不留半截状态)。
+        read c || return 0
         c=$(clean_input "$c")
 
         case $c in
@@ -1383,7 +1393,9 @@ config_menu() {
         esac
 
         printf "按回车继续..." >&2
-        read
+        # 同上: 这一处 EOF 也会空转 —— 回到循环顶后由 read c 兜住, 但直接
+        # 在这里退出语义更清楚: 没人在敲键盘了, 收工。
+        read || return 0
     done
 }
 config_menu

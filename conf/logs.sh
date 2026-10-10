@@ -100,7 +100,11 @@ log_menu() {
         echo "  6) 服务状态与端口占用"
         echo "  0) 返回"
         printf "  请选择: "
-        read -r c
+        # ★ stdin 关闭 (EOF) 时 read 返回非 0 且不修改 $c, case 落到 *) 后回到
+        #   循环顶再读一次 —— 菜单空转刷屏, 永不退出。实测修前:
+        #   timeout 10 bash conf/logs.sh </dev/null → rc=124 (10 秒 390 行菜单)。
+        #   EOF 等同"用户返回", 直接退出菜单。
+        read -r c || return 0
         case "$c" in
             1) log_lines 100 ;;
             2) log_lines 300 ;;
