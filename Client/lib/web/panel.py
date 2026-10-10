@@ -959,7 +959,12 @@ PAGE = r"""<!DOCTYPE html>
 <style>
 :root{
   /* 语义色 */
-  --bg:#0f1115;--card:#171a21;--line:#252a34;--fg:#e7ebf0;--dim:#8b95a5;
+  /* --dim 比"看着够灰"要再亮/暗一档：它会落在**选中的行**上
+     （tr.cur/.nrow.cur/.srow.on 都带 --acc-bg/--acc-bg2 底色），
+     底色一叠上去对比度就掉。远端探针实测深色 3.75:1、浅色 3.85:1，
+     都低于 AA 的 4.5 —— 所以这两个值是算出来的，不是随手挑的。
+     改这两个值等于改可读性门槛，改完必须重跑 selftest-panel-css.py [8]。 */
+  --bg:#0f1115;--card:#171a21;--line:#252a34;--fg:#e7ebf0;--dim:#a0aab8;
   --ok:#3ddc84;--warn:#ffb44d;--bad:#ff5c5c;--acc:#4c9aff;--acc2:#5aa0ff;
   --ov0:rgba(255,255,255,.03);--ov1:rgba(255,255,255,.045);--ov2:rgba(255,255,255,.055);
   --ov3:rgba(255,255,255,.08);--ov-strong:rgba(255,255,255,.85);
@@ -979,7 +984,7 @@ PAGE = r"""<!DOCTYPE html>
    否则用户手动选了深色、系统是浅色时会被系统覆盖回去。 */
 @media (prefers-color-scheme: light){
   :root:not([data-theme]){
-    --bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--fg:#1b1f24;--dim:#666f7b;
+    --bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--fg:#1b1f24;--dim:#59626d;
     --ok:#0f9d58;--warn:#b26a00;--bad:#d93025;--acc:#1a73e8;--acc2:#1a73e8;
     --ov0:rgba(0,0,0,.02);--ov1:rgba(0,0,0,.035);--ov2:rgba(0,0,0,.05);
     --ov3:rgba(0,0,0,.07);--ov-strong:rgba(0,0,0,.8);
@@ -988,15 +993,15 @@ PAGE = r"""<!DOCTYPE html>
     --ok-bg:rgba(15,157,88,.10);--ok-line:rgba(15,157,88,.5);
     --warn-bg:rgba(178,106,0,.10);--warn-line:rgba(178,106,0,.5);
     --bad-bg:rgba(217,48,37,.09);--bad-line:rgba(217,48,37,.5);--bad-glow:rgba(217,48,37,.18);
-    --ok-text:#0b7a44;--warn-text:#8a5200;--bad-text:#b3261e;
+    --ok-text:#096e3c;--warn-text:#8a5200;--bad-text:#b3261e;
     --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 20px rgba(16,24,40,.08);
     --shadow-sm:0 1px 2px rgba(16,24,40,.06);
     --code-bg:#f4f6f9;--modal-bg:#fff;--modal-shadow:0 18px 60px rgba(16,24,40,.18);--acc-tag-text:#0b4fa8;--acc-tag-bg:rgba(26,115,232,.10);
-    --acc-btn:#1a73e8;--bad-btn:#d93025;--acc-fg-dim:rgba(255,255,255,.85);
+    --acc-btn:#1a6fdd;--bad-btn:#d93025;--acc-fg-dim:rgba(255,255,255,.85);
   }
 }
 :root[data-theme="light"]{
---bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--fg:#1b1f24;--dim:#666f7b;
+--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--fg:#1b1f24;--dim:#59626d;
   --ok:#0f9d58;--warn:#b26a00;--bad:#d93025;--acc:#1a73e8;--acc2:#1a73e8;
   --ov0:rgba(0,0,0,.02);--ov1:rgba(0,0,0,.035);--ov2:rgba(0,0,0,.05);
   --ov3:rgba(0,0,0,.07);--ov-strong:rgba(0,0,0,.8);
@@ -1005,11 +1010,11 @@ PAGE = r"""<!DOCTYPE html>
   --ok-bg:rgba(15,157,88,.10);--ok-line:rgba(15,157,88,.5);
   --warn-bg:rgba(178,106,0,.10);--warn-line:rgba(178,106,0,.5);
   --bad-bg:rgba(217,48,37,.09);--bad-line:rgba(217,48,37,.5);--bad-glow:rgba(217,48,37,.18);
-  --ok-text:#0b7a44;--warn-text:#8a5200;--bad-text:#b3261e;
+  --ok-text:#096e3c;--warn-text:#8a5200;--bad-text:#b3261e;
   --shadow:0 1px 2px rgba(16,24,40,.06),0 6px 20px rgba(16,24,40,.08);
   --shadow-sm:0 1px 2px rgba(16,24,40,.06);
   --code-bg:#f4f6f9;--modal-bg:#fff;--modal-shadow:0 18px 60px rgba(16,24,40,.18);--acc-tag-text:#0b4fa8;--acc-tag-bg:rgba(26,115,232,.10);
-  --acc-btn:#1a73e8;--bad-btn:#d93025;--acc-fg-dim:rgba(255,255,255,.85);
+  --acc-btn:#1a6fdd;--bad-btn:#d93025;--acc-fg-dim:rgba(255,255,255,.85);
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);

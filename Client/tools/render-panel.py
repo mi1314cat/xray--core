@@ -209,10 +209,16 @@ PROBE = """
     const bg = backdrop(el);
     return ratio(over(fg, bg), bg);
   }
+  // 报出"量的是哪个元素"。
+  // `q('.tag')` 这种选择器取的是 DOM 里**第一个**匹配 —— 版式一动，
+  // 第一个可能是完全另一个元素，数字跟着变而没人知道量的是谁。
+  // 上一版浅色下突然从 4.82 掉到 4.38，就是因为这个。
   function show(el){
     if (!el) return 'n/a';
     const r = cr(el);
-    return r === null ? 'n/a' : r.toFixed(2) + ':1' + (r < 4.5 ? '⚠' : '');
+    if (r === null) return 'n/a';
+    const who = el.tagName.toLowerCase() + (el.className ? '.' + String(el.className).split(' ')[0] : '');
+    return r.toFixed(2) + ':1' + (r < 4.5 ? '⚠' : '') + '(' + who + ')';
   }
   function vars(){
     const s = getComputedStyle(document.documentElement), out = {};
@@ -265,6 +271,18 @@ PROBE = """
       '表格头=' + show(q('thead th')) + '  单元格=' + show(q('td'))
         + '  代码块=' + show(q('pre')) + '  标签=' + show(q('.tag'))
         + '  分组行=' + show(q('.srow')),
+      // `.tag` 有四种配色（底/ok/warn/bad/acc），`q('.tag')` 只量到**第一个**。
+      // 只报一个数字时，读到 4.38 也说不清是谁不达标 —— 每个都列出来。
+      '标签逐个=' + (function(){
+        const seen = {}, out = [];
+        document.querySelectorAll('.tag').forEach(function(el){
+          const k = el.className;
+          if (seen[k] || out.length >= 6) return;
+          seen[k] = 1;
+          out.push(k + '=' + show(el));
+        });
+        return out.length ? out.join('  ') : '无';
+      })(),
       '页面宽度=' + o.doc + (o.doc.split('/')[0] === o.doc.split('/')[1]
         ? ' 无横向溢出' : ' ⚠ 有横向溢出'),
       '溢出元素=' + (o.els.length ? o.els.join(' | ') : '无'),
@@ -328,6 +346,24 @@ PROBE = """
     rows.push('批量条 勾选前/后=' + before + '/' + after + ' 可移动目标=' + opts);
     if(cb){ cb.checked = false; cb.dispatchEvent(new Event('change')); }
 
+    // ★ 视图可见性必须读**计算样式**：class 对不代表真的只显示一个。
+    //   无障碍快照会把隐藏子树也列出来（看起来像"两个视图同时显示"），
+    //   拿它判断版式会得出完全相反的结论。
+    const vis = [...document.querySelectorAll('.view')]
+      .filter(v => getComputedStyle(v).display !== 'none')
+      .map(v => v.id);
+    rows.push('可见视图=' + (vis.join(',') || '无') + ' 数量=' + vis.length);
+    const app = document.querySelector('.app');
+    rows.push('外壳实际宽度=' + (app ? Math.round(app.getBoundingClientRect().width) : '?')
+      + ' 视口=' + window.innerWidth);
+    const main = document.querySelector('.main');
+    rows.push('主区宽度=' + (main ? Math.round(main.getBoundingClientRect().width) : '?')
+      + ' (占视口 ' + (main ? Math.round(main.getBoundingClientRect().width / window.innerWidth * 100) : '?') + '%)');
+    // 侧栏与主区必须并排，不能各占一行（那说明 grid 没生效）
+    const side = document.querySelector('.side');
+    rows.push('侧栏/主区顶端对齐=' + (side && main
+      ? Math.abs(side.getBoundingClientRect().top - main.getBoundingClientRect().top) < 2 : '?'));
+
     rows.push('分组菜单可弹出=' + (typeof groupMenu === 'function'));
     rows.push('JS 运行时错误=' + (window.__jserr || '无'));
     return rows;
@@ -370,7 +406,18 @@ PROBE = """
         setTimeout(function(){
           report('显式浅色（点一次）');
           b.click();                              // light → dark
-          setTimeout(function(){ report('显式深色（点两次）'); }, 150);
+          setTimeout(function(){
+            report('显式深色（点两次）');
+            // 三次报告都量完了，可以收摊：把应用整体隐藏，只留报告本身。
+            // 远程无障碍快照是按整页生成的，应用树一大，报告就被挤到
+            // "中间省略"里去 —— 探针跑完了却读不到数字，等于没跑。
+            try {
+              const app = document.querySelector('.app');
+              if (app) app.style.display = 'none';
+              document.querySelectorAll(
+                '#add-modal,.toast,#msg').forEach(n => { n.style.display = 'none'; });
+            } catch(e){}
+          }, 150);
         }, 150);
       }); });
     }, 500);

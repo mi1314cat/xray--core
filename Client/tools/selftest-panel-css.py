@@ -396,6 +396,41 @@ require('fs').writeFileSync(process.argv[3], out.join('\n'));
                     bad_pairs.append("%s/%s=%.2f:1" % (tname, label, r))
         ck(not bad_pairs, "节点区新样式的配色对全部 ≥4.5:1（两套主题）",
            "; ".join(bad_pairs[:4]))
+
+        # ---- 叠在**选中行**上的那一层 ----
+        # 上面这一组全部以 --card 为底。但节点列表里最常见的落点不是卡片，
+        # 而是"选中的那一行"：tr.cur / .nrow.cur / .ncard.cur 铺 --acc-bg，
+        # .srow.on 铺 --acc-bg2，再叠 pill 自己的 --ov0/--ok-bg…
+        # 远端探针实测：同两个颜色，在卡片上是 4.87，在选中行上只剩 4.39。
+        # 只测卡片底就是"量了个好看的场景"，真机上最常读的那一行没被覆盖。
+        TINTED = [("次要 tag", "--dim", "--ov0"),
+                  ("计数徽标", "--dim", "--ov2"),
+                  ("ok 标签", "--ok-text", "--ok-bg"),
+                  ("warn 标签", "--warn-text", "--warn-bg"),
+                  ("bad 标签", "--bad-text", "--bad-bg"),
+                  ("acc 标签", "--acc-tag-text", "--acc-tag-bg"),
+                  ("正文", "--fg", None)]
+        bad_tinted = []
+        for tname, T in (("深色", TD), ("浅色", TL)):
+            card = _parse(T.get("--card"))
+            rows = [("选中行", "--acc-bg"), ("选中行2", "--acc-bg2")]
+            for rname, tintv in rows:
+                tint = _parse(T.get(tintv))
+                if not (card and tint):
+                    bad_tinted.append("%s/%s 解析失败" % (tname, rname))
+                    continue
+                base = _over(tint, card)
+                for label, fgv, bgv in TINTED:
+                    fg = _parse(T.get(fgv))
+                    if fg is None:
+                        bad_tinted.append("%s/%s 解析失败" % (tname, label))
+                        continue
+                    b = _over(_parse(T[bgv]), base) if bgv else base
+                    r = _cr(_over(fg, b), b)
+                    if r < 4.5:
+                        bad_tinted.append("%s/%s/%s=%.2f:1" % (tname, rname, label, r))
+        ck(not bad_tinted, "选中行（--acc-bg / --acc-bg2）上的文字仍 ≥4.5:1",
+           "; ".join(bad_tinted[:4]))
     else:
         ck(False, "能取出两套主题变量")
 
