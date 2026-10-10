@@ -227,6 +227,16 @@ def main():
     ck("ondragover=\"groupDragOver" in page and "ondrop=\"groupDrop" in page,
        "分组行是拖放目标")
     ck('draggable="true"' in page and "nodeDragStart" in page, "节点行可拖拽")
+    # 可发现性：只写 draggable 等于"能不能拖只能靠试"。
+    # 抓手 + grab 光标 + 拖动时所有分组行一起亮 —— 三件缺一，用户就得猜。
+    ck(".grip{" in bare.replace(" ", ""), "节点行有常显抓手（一眼看得出能拖）")
+    ck('class="grip"' in page and "GRIP" in page,
+       "抓手在三种密度里共用同一个标记")
+    ck("cursor:grab" in bare.replace(" ", ""), "可拖行/抓手用 grab 光标")
+    ck(re.search(r"body\.dragging\s+\.srow\s*\{", bare) is not None,
+       "拖动中所有分组行一起高亮（不用等鼠标压上去）")
+    ck("classList.add('dragging')" in page and "classList.remove('dragging')" in page,
+       "dragging 态在拖拽开始/结束时正确开关")
     # ⋯ 菜单取代原来的裸 ✕（删除不可撤销，不该只有一个难发现的图标）
     ck("groupMenu(" in page and 'class="sa"' in page, "分组操作收进 ⋯ 菜单")
     ck("renameGroup(" in page and "group_rename" in page, "分组可重命名")

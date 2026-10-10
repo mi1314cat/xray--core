@@ -1342,6 +1342,23 @@ table{table-layout:auto;max-width:100%}
 .srow .sa:hover{opacity:1;background:var(--ov3);color:var(--fg)}
 /* 拖放目标高亮 —— 拖节点到组上时整行亮起，用户才知道能放 */
 .srow.dragover{background:var(--acc-bg2);box-shadow:inset 0 0 0 1px var(--acc-line)}
+/* ---- 拖拽的可发现性 ----
+   只写 draggable="true" 是不够的：鼠标形状不变、行上没有任何标记，
+   用户不可能知道"这一行能拖进左边的分组"。所以三件事一起做：
+     1. 常显抓手（.grip），悬停/按住时变亮 —— 看得见的"这里可以拖"
+     2. 行光标 grab / 按住 grabbing —— 摸得到的反馈
+     3. 一旦开始拖，**所有**分组行同时亮起虚线框 —— "可以放这里"，
+        而不是等鼠标正好压上去才知道。 */
+.grip{flex:0 0 auto;cursor:grab;color:var(--dim);font-size:12px;line-height:1;
+  letter-spacing:-1.5px;padding:0 2px 0 0;user-select:none;opacity:.45}
+.nrow:hover .grip,.ncard:hover .grip,tbody tr:hover .grip{opacity:1;color:var(--fg)}
+.grip:active{cursor:grabbing;opacity:1}
+.listwrap .nrow,.gridwrap .ncard,tbody tr{cursor:grab}
+.listwrap .nrow:active,.gridwrap .ncard:active,tbody tr:active{cursor:grabbing}
+body.dragging{cursor:grabbing}
+body.dragging .srow{background:var(--ov2);box-shadow:inset 0 0 0 1px var(--acc-line)}
+body.dragging .srow .gd{box-shadow:0 0 0 3px var(--acc-bg2)}
+body.dragging .subs-rail{border-right-color:var(--acc-line)}
 .srow.renaming{background:var(--ov2)}
 .srow input.grename{flex:1 1 auto;min-width:0;background:var(--input);color:var(--fg);
  border:1px solid var(--acc);border-radius:5px;padding:3px 6px;font-size:12px;
@@ -2190,11 +2207,13 @@ function renderNodes(){
 function renderBody(ns, sk){
   const sel = n => `<input type="checkbox" class="sel" ${VIEW.sel.has(n.file)?'checked':''}
       onchange="toggleSel('${ESC(n.file)}', this)">`;
-  if (VIEW.density === 'grid'){
+  // 抓手：三种密度共用同一个标记，改一处三处都在。
+  // 少了它，"能不能拖"就只能靠试 —— 而用户明确要求"一眼知道这里可以拖"。
+  const GRIP = `<span class="grip" title="按住拖到左侧分组" aria-hidden="true">⠿</span>`;  if (VIEW.density === 'grid'){
     return `<div class="gridwrap">` + ns.map(n => {
       const c = n.compat || {};
       return `<div class="ncard ${n.current?'cur':''}" draggable="true" ondragstart="nodeDragStart(event,'${ESC(n.file)}')" ondragend="nodeDragEnd()" >
-        <div class="nm">${sel(n)}${n.current?'<span class="cur-dot" title="当前节点"></span>':''}
+        <div class="nm">${GRIP}${sel(n)}${n.current?'<span class="cur-dot" title="当前节点"></span>':''}
           <span>${ESC(n.name)}</span></div>
         <div class="hint mono">${ESC(n.address)}:${ESC(n.port)}</div>
         <div style="margin:6px 0">${(c.tags||[]).map(tagHtml).join('')}</div>
@@ -2215,7 +2234,7 @@ function renderBody(ns, sk){
     // 想看细节的人可以切过去。默认视图服务于"扫一眼、切一个", 不是"查资料"。
     return `<div class="listwrap">` + ns.map(n => {
       return `<div class="nrow ${n.current?'cur':''}" draggable="true" ondragstart="nodeDragStart(event,'${ESC(n.file)}')" ondragend="nodeDragEnd()" >
-        ${sel(n)}
+        ${GRIP}${sel(n)}
         <span class="grow">${ESC(n.name)}
           <span class="dim2 mono">${ESC(n.address)}:${ESC(n.port)}</span></span>
         <span class="tr mono nowrap" id="lat-${ESC(n.file)}">${latText(n.file)}</span>
@@ -2234,7 +2253,7 @@ function renderBody(ns, sk){
     </tr></thead><tbody>` + ns.map(n => {
     const c = n.compat || {};
     return `<tr class="${n.current?'cur':''}" draggable="true" ondragstart="nodeDragStart(event,'${ESC(n.file)}')" ondragend="nodeDragEnd()" >
-      <td class="rowsel">${sel(n)}</td>
+      <td class="rowsel">${GRIP}${sel(n)}</td>
       <td>${n.current?'<span class="tag ok">当前</span> ':''}${ESC(n.name)}
         <div class="hint mono">${ESC(n.address)}:${ESC(n.port)}</div></td>
       <td>${(c.tags||[]).map(tagHtml).join('')}</td>
@@ -2458,20 +2477,21 @@ function renderSubs(){
 
   // 分组行同时是：筛选入口（点击）、操作入口（⋯ 菜单）、**拖放目标**（拖节点进来）。
   // 拖放是"组与组之间"最自然的交互 —— 比"勾选 → 找菜单 → 选目标组"少三步。
-  const row = (key, name, n, origin, acts) =>
+  const row = (key, name, n, origin, acts, dropTip) =>
       `<div class="srow${SUBUI.group===key?' on':''}" data-key="${escAttr(key)}"`
     + ` data-origin="${escAttr(origin)}" onclick="pickGroup('${escAttr(key)}')"`
     + ` ondragover="groupDragOver(event,this)" ondragleave="groupDragLeave(event,this)"`
-    + ` ondrop="groupDrop(event,'${escAttr(key)}')" title="${escAttr(name)}">`
+    + ` ondrop="groupDrop(event,'${escAttr(key)}')" title="${escAttr(dropTip || name)}">`
     + `<span class="gd"></span><span class="sn">${ESC(name)}</span>`
     + `<span class="sc">${n}</span>${acts||''}</div>`;
 
-  let h = row('__all__', '全部', total, 'all', '');
+  let h = row('__all__', '全部', total, 'all', '', '全部节点（不能作为拖放目标）');
   h += gs.map(g => {
     const n = (g.nodes||[]).length;
     const acts = `<button class="sa" title="分组操作" onclick="event.stopPropagation();`
       + `groupMenu(event,'${escAttr(g.key)}','${escAttr(g.name)}',${n})">⋯</button>`;
-    return row(g.key, g.name, n, g.origin, acts);
+    return row(g.key, g.name, n, g.origin, acts,
+               g.name + ' · ' + n + ' 个节点（可把节点拖到这里）');
   }).join('');
   if(!gs.length) h += '<div class="sempty">没有匹配的分组</div>';
   box.innerHTML = h;
@@ -2542,8 +2562,12 @@ function nodeDragStart(ev, file){
   DRAG = VIEW.sel.size && VIEW.sel.has(file) ? [...VIEW.sel] : [file];
   ev.dataTransfer.effectAllowed = 'move';
   ev.dataTransfer.setData('text/plain', DRAG.join(','));
+  // 一开拖就让所有分组行亮起来（CSS 里 body.dragging .srow）：
+  // "能放到哪"要在拖动开始时就说清楚，而不是等鼠标压上去才反馈。
+  document.body.classList.add('dragging');
 }
-function nodeDragEnd(){ DRAG = null; document.querySelectorAll('.srow.dragover')
+function nodeDragEnd(){ DRAG = null; document.body.classList.remove('dragging');
+  document.querySelectorAll('.srow.dragover')
   .forEach(el => el.classList.remove('dragover')); }
 function groupDragOver(ev, el){
   if(!DRAG) return;                    // 不拖节点时不亮，避免误以为能放

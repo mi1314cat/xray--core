@@ -335,6 +335,43 @@ PROBE = """
               ' 带 ondragstart=' + (draggables[0]
                 ? draggables[0].getAttribute('ondragstart').indexOf('nodeDragStart') >= 0
                 : false));
+    // 可发现性要读**计算样式**：JS 里有没有这个 class 是一回事，
+    // 浏览器里到底看不得看得见（opacity / display / 宽度）是另一回事。
+    const grips = document.querySelectorAll('#node-list .grip');
+    const g0 = grips[0];
+    rows.push('拖拽抓手=' + grips.length
+      + ' 可见=' + (g0 ? (getComputedStyle(g0).display !== 'none'
+                          && g0.getBoundingClientRect().width > 0) : false)
+      + ' 光标=' + (g0 ? getComputedStyle(g0).cursor : '?')
+      + ' 行光标=' + (draggables[0] ? getComputedStyle(draggables[0]).cursor : '?'));
+    // 拖动中"所有分组行一起亮" —— 这条只有在真浏览器里加 class 再读
+    // 计算样式才验得到（jsdom 不算样式，本地自检只能验 class 被开关）。
+    const srow = q('.srow');
+    if(srow){
+      // 规则到底在不在样式表里 —— "没生效"可能是选择器写错，也可能是
+      // 规则被前面的语法错误吞了。这两件事的修法完全不同，所以要分开报。
+      let hasRule = false;
+      try {
+        hasRule = [...document.styleSheets].some(ss =>
+          [...ss.cssRules].some(r => String(r.selectorText || '').indexOf('body.dragging') >= 0));
+      } catch(e){}
+      const b4 = getComputedStyle(srow).boxShadow + '|' + getComputedStyle(srow).backgroundColor;
+      // ★ 必须先把过渡关掉再量。`.srow` 带着
+      //   `transition: background-color .12s`，加完 class 立刻读计算样式，
+      //   读到的是**过渡起点**（还是旧值）—— 于是"规则明明在样式表里、
+      //   也匹配得上，量出来却说没变化"。这个坑和换肤闪烁是同一个。
+      const de2 = document.documentElement;
+      de2.classList.add('theme-switching');
+      document.body.classList.add('dragging');
+      void srow.offsetHeight;                       // 强制重排
+      const on = getComputedStyle(srow).boxShadow + '|' + getComputedStyle(srow).backgroundColor;
+      const cls = document.body.className;
+      document.body.classList.remove('dragging');
+      de2.classList.remove('theme-switching');
+      rows.push('拖动中分组行高亮=' + (b4 !== on)
+        + ' 样式表里有规则=' + hasRule + ' body 类=' + (cls || '(空)')
+        + ' 前=' + b4.slice(0, 40) + ' 后=' + on.slice(0, 40));
+    }
 
     // 批量条：没勾选时应隐藏，勾一个后应出现且选项里列出全部组
     const bar = q('#bulkbar');

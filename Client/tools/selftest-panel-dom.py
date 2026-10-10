@@ -156,6 +156,33 @@ setTimeout(() => {
   // 拖拽
   ck($$('#node-list [draggable="true"]').length === rows.length,
      '所有节点行可拖拽');
+  // 可发现性：抓手必须真的渲染出来，而且三种密度都有（在下面的密度循环里再查一遍）。
+  // 只断言 draggable="true" 会让"用户根本不知道能拖"这件事完全溜过去。
+  const grips = $$('#node-list .grip');
+  ck(grips.length === rows.length, '每个节点行都有拖拽抓手 (' + grips.length + ')');
+  ck(grips.every(g => (g.getAttribute('title') || '').length > 0),
+     '抓手带说明（不是只有一个看不懂的符号）');
+  // 拖起来时所有分组行一起亮：这里验的是那个 class 真的被开关。
+  try {
+    // 这个 harness 跑在 Node 里（不是注入页面），页面里的 `let ST` 不挂在
+    // window 上，取不到 —— 从行自己的 ondragstart 里把文件名抠出来，
+    // 顺带也验证了"每行的拖拽确实绑定了它自己的文件"。
+    const attr = rows[0].getAttribute('ondragstart') || '';
+    const m2 = attr.match(/'([^']+)'/);
+    if (!m2) throw new Error('第一行没有可解析的 ondragstart: ' + attr);
+    const ev = new w.Event('dragstart');
+    ev.dataTransfer = {setData(){}, effectAllowed: ''};
+    w.nodeDragStart(ev, m2[1]);
+    ck(d.body.classList.contains('dragging'),
+       '开始拖拽后 body 进入 dragging 态（分组行全部高亮）');
+    w.nodeDragEnd();
+    ck(!d.body.classList.contains('dragging'), '拖拽结束退出 dragging 态');
+    ck($$('.srow.dragover').length === 0, '拖拽结束后没有残留的高亮');
+  } catch (e) {
+    // 错误信息必须拼进断言名里 —— 这个 harness 的 ck 只吃 (条件, 名字)，
+    // 写进第三个参数等于扔掉，排查时只能看到"失败了"三个字。
+    ck(false, '拖拽状态开关: ' + String(e && e.message || e).slice(0, 100));
+  }
 
   // 延迟 pill
   ck($$('#node-list .lat').length === rows.length, '每行都有延迟 pill');
@@ -200,6 +227,10 @@ setTimeout(() => {
       const r2 = $$(ROWS);
       ck(r2.length === rows.length && r2.every(r => r.querySelector('.seg')),
          '切到「' + dens + '」视图后仍是每行都有分段控件 (' + r2.length + ')');
+      // 抓手与拖拽属性必须三种密度都在：表格视图漏一个，那一屏的人就
+      // 完全不知道能拖 —— 而这正是"一眼看得出"要求里最容易漏的一屏。
+      ck(r2.every(r => r.querySelector('.grip') && r.getAttribute('draggable') === 'true'),
+         '「' + dens + '」视图每行都有抓手且可拖');
     } catch (e) {
       ck(false, '切到「' + dens + '」视图', String(e).slice(0, 60));
     }
