@@ -217,6 +217,23 @@ def compat_of(path):
 
 
 # ------------------------------------------------------------------- 动作 ----
+def _existing_node_names():
+    """节点目录里已有的显示名 —— 自动命名时用它避开重名。"""
+    names = []
+    try:
+        for fn in os.listdir(NODES):
+            if not (fn.startswith("node-") and fn.endswith(".json")):
+                continue
+            try:
+                with open(os.path.join(NODES, fn), encoding="utf-8") as fh:
+                    names.append(json.load(fh).get("name") or "")
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return names
+
+
 def act_build_link(p):
     """手动添加表单 → 分享链接。
 
@@ -236,6 +253,18 @@ def act_build_link(p):
         payload["port"] = int(payload.get("port") or 443)
     except (TypeError, ValueError):
         return False, "端口不是数字"
+    # 名字留空 = 自动生成一个（表单上就是这么写的）。
+    # 以前真的留空，fragment 为空 → 客户端用域名当名字，同域名的节点
+    # 在列表里全叫一个名。命名规则与服务端 conf/lib/naming.sh 对齐。
+    if not str(payload.get("name") or "").strip():
+        try:
+            sys.path.insert(0, os.path.join(DIST, "lib"))
+            import node as _node_mod
+            payload["name"] = _node_mod.auto_name(
+                payload.get("protocol", ""), payload.get("security", ""),
+                _existing_node_names())
+        except Exception:                                        # noqa: BLE001
+            payload["name"] = payload.get("protocol") or "node"
     rc, out, err = sh([sys.executable, NODE_PY, "build", "-"], timeout=20,
                       stdin=json.dumps(payload))
     if rc != 0:

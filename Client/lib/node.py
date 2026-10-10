@@ -754,6 +754,18 @@ def selftest() -> int:
     failed += 0 if good else 1
     print(f"  [{'PASS' if good else 'FAIL'}] 生成→解析往返不丢字段（丢: {lost or '无'}）")
 
+    # 自动命名（手动添加留空时用）：不能空、不能与已有重名、规则与服务端一致
+    try:
+        n1 = auto_name("vless", "tls")
+        n2 = auto_name("vless", "tls", ["x-vless01-TLS"])
+        n3 = auto_name("shadowsocks", "none", ["x-ss01-none", "x-ss02-none"])
+        good = (n1 == "x-vless01-TLS" and n2 == "x-vless02-TLS" and n3 == "x-ss03-none")
+        detail = f"{n1} / {n2} / {n3}"
+    except Exception as exc:
+        good, detail = False, f"异常: {exc}"
+    failed += 0 if good else 1
+    print(f"  [{'PASS' if good else 'FAIL'}] 自动命名（{detail}）")
+
     # 订阅解析
     sub = "\n".join([c[0] for c in cases[:3]])
     nodes = parse_subscription(sub)
@@ -777,6 +789,48 @@ def selftest() -> int:
 # 认的是 ws/kcp。发错名的后果很隐蔽：链接能存进订阅，但实际连不上。
 _LINK_TRANSPORT = {"websocket": "ws", "mkcp": "kcp", "http": "h2", "h2": "h2",
                    "gun": "grpc", "raw": "tcp"}
+
+
+# 协议 / 安全层在名字里的写法 —— 与**服务端** conf/lib/naming.sh 的
+# x_proto_slug / x_sec_slug 保持一致。两边不一致的话，同一台服务器推来的
+# 节点和手动加的节点在列表里长得不一样，用户会以为不是一套东西。
+_NAME_PROTO = {"shadowsocks": "ss", "ss2022": "ss2022", "shadowsocks2022": "ss2022",
+               "hy2": "hysteria2", "hysteria": "hysteria2"}
+
+
+def _name_proto(proto: str) -> str:
+    p = re.sub(r"[^a-z0-9]", "", (proto or "node").lower())
+    return _NAME_PROTO.get(p, p) or "node"
+
+
+def _name_sec(sec: str) -> str:
+    s = (sec or "none").lower()
+    return {"tls": "TLS", "reality": "REALITY", "none": "none", "": "none"}.get(s, s.upper())
+
+
+def auto_name(proto: str, security: str = "", existing=(), transport: str = "") -> str:
+    """留空时自动生成的名字：`x-<协议><两位编号>-<安全>`。
+
+    ★ 为什么非要有：手动添加表单写的是"留空自动生成"，但以前**真的留空** ——
+      fragment 是空的，而解析器是 `name = fragment or hostname`，于是同一个
+      域名下的节点在列表里全叫一个名字，用户分不清谁是谁（服务端那边
+      同样的问题在 x_default_name 的注释里记过）。
+
+    编号取已有的同名最大值 +1，所以连加几个不会撞名。
+    """
+    p = _name_proto(proto)
+    sec = _name_sec(security)
+    pat = re.compile(r"^x-" + re.escape(p) + r"(\d+)-", re.I)
+
+    def idx_of(name: str) -> int:
+        m = pat.match((name or "").strip())
+        return int(m.group(1)) if m else 0
+
+    n = max([idx_of(x) for x in existing] + [0]) + 1
+    tag = "x-%s%02d-%s" % (p, n, sec)
+    if transport and transport.lower() == "xhttp" and "cdn" in "".join(existing).lower():
+        pass                       # 位置留给将来；CDN 后缀由调用方决定
+    return tag
 
 
 def build_link(node: dict) -> str:
