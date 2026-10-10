@@ -161,14 +161,57 @@ def xray_target() -> "Target":
 def runtime_options() -> dict:
     """本客户端**运行期会做什么**的事实（不是能力判断，是"我们会怎么写配置"）。
 
-    `mux_cool`：`lib/genconfig.py` 默认给每个出站写 `mux:{enabled:true}`（除非 --no-mux）。
-    实测 CC 上跑的 `runtime/xray-client.json` 里就有它。客户端会开 mux 就得如实告诉
-    compat —— 否则它没法判"XHTTP + mux.cool 同开"这类运行期组合问题。
+    `mux_cool`：`lib/genconfig.py` 现在**默认不开** mux.cool，判据是
+    `mux_decision()` 三层：① 命令行 `--mux/--no-mux` ② 节点 JSON 的 `mux` 字段
+    ③ 默认关。XHTTP/QUIC 传输下即使显式要求也会被拒（官方明确不建议）。
+    这里只能给出"全局默认值"这一个事实；**单个节点**的实际形态由
+    `_augment()` 按 `mux_decision` 的同一套判据算（`effective_mux`）。
+    `XBD_GEN_MUX=1` 留给"这次全都要开"的场景，语义与 `--mux` 一致。
     """
     mux = os.environ.get("XBD_GEN_MUX")
     if mux is None:
-        mux = "1"                       # genconfig.py: --no-mux 默认 False（即默认开 mux）
+        mux = "0"                       # genconfig.py: 不给 --mux 时默认不开
     return {"mux_cool": mux.strip() not in ("", "0", "false", "no")}
+
+
+# 与 lib/genconfig.py 的 MUX_FORBIDDEN_* 同一套判据。
+#
+# ★ 为什么这里要抄一份：compat2 是要能独立跑的适配层（面板、CC 上的
+#   `compat2.py json <节点>` 都不带 genconfig 的依赖），import genconfig 会把
+#   ports/addr 那一串也拖进来。抄一份就必须**锁死**：check_libs.sh 里有一条
+#   门禁逐项比对这两处的键集合，漂移了会红 —— 不然"判据漂移"正是最难查的 bug。
+_MUX_FORBIDDEN_TRANSPORTS = ("xhttp", "quic", "mkcp")
+_MUX_FORBIDDEN_PROTOCOLS = ("hysteria2",)
+
+
+def effective_mux(node: dict, cli_mux=None) -> tuple:
+    """客户端**实际**会不会给这个节点开 mux.cool，返回 (enabled, 原因)。
+
+    与 genconfig.mux_decision 同判据：显式关闭 > 显式开启 > 节点 mux 字段 > 默认关；
+    XHTTP/QUIC 一律拒绝。
+    命令行那层的"显式"在适配层里对应环境变量 `XBD_GEN_MUX`（与 runtime_options 同一个）。
+    """
+    if cli_mux is None:
+        env = os.environ.get("XBD_GEN_MUX")
+        if env is not None:
+            cli_mux = env.strip() not in ("", "0", "false", "no")
+    n_mux = node.get("mux")
+    if isinstance(n_mux, dict):
+        n_mux = n_mux.get("enabled")
+    declared = bool(n_mux)
+    if cli_mux is False:
+        return False, "--no-mux（或 XBD_GEN_MUX=0）显式关闭"
+    if cli_mux is True:
+        want, src = True, "--mux（或 XBD_GEN_MUX=1）"
+    elif declared:
+        want, src = True, "节点 mux 字段"
+    else:
+        return False, "默认不开（没有 --mux，节点也没声明）"
+    transport = str(node.get("transport") or "").lower()
+    proto = str(node.get("protocol") or "").lower()
+    if transport in _MUX_FORBIDDEN_TRANSPORTS or proto in _MUX_FORBIDDEN_PROTOCOLS:
+        return False, f"{transport or proto} 传输下被拒绝（官方不建议 mux.cool 与 XHTTP/QUIC 同开）"
+    return True, f"按 {src} 开启"
 
 
 # ---------------------------------------------------------------------------
@@ -371,25 +414,33 @@ def _profile_from_dict(node: dict) -> "NodeProfile":
 def _augment(prof: "NodeProfile", node: dict, override: bool) -> None:
     """把节点 JSON 里 compat 解析不到、但会影响"实际怎么跑"的事实补进 profile。
 
-    两条，都是**客户端事实**，不是能力判断：
-      · mux.cool —— genconfig 默认写 `mux:{enabled:true}`（实测 CC 生产配置里有）；
-        开着的效果就是 compat 规则 `xray.combo.xhttp_muxcool` 要判的组合。
+    三条，都是**客户端事实**，不是能力判断：
+      · mux.cool —— 现在只有"节点声明了 + 传输允许"才会真的写进配置；
+        声明了但传输不允许（XHTTP/QUIC）时 genconfig 会**拒绝**并在 stderr 说明，
+        这时 compat 必须报告"实际形态里没有 mux"，否则它对 XHTTP 节点给出的
+        运行期结论（`xray.combo.xhttp_muxcool` 判 runtime_fail）比现实更悲观。
       · 未收录的 security 取值（parse_uri 会把 security 当已消费键、静默不建模）。
     """
     # (a) mux
-    mux_declared = bool(node.get("mux"))
-    if mux_declared:
+    on, why = effective_mux(node)
+    if on:
         if prof.get_feature("standard:mux") is None:
-            prof.add_feature(Feature(id="standard:mux", presence=Presence.EXPLICIT,
-                                     provenance=_prov(node), note="节点声明 mux"))
-    elif runtime_options().get("mux_cool") and prof.get_feature("standard:mux") is None:
-        prof.add_feature(Feature(
-            id="standard:mux", presence=Presence.INFERRED, provenance=Provenance.INFERRED,
-            note="客户端运行期会开 mux.cool（节点自己没写）"))
+            prof.add_feature(Feature(
+                id="standard:mux",
+                presence=Presence.EXPLICIT if node.get("mux") else Presence.INFERRED,
+                provenance=_prov(node) if node.get("mux") else Provenance.INFERRED,
+                note=f"客户端会开 mux.cool（{why}）"))
+        if not node.get("mux"):
+            prof.diagnostics.append({
+                "code": "RUNTIME_IMPLIED_MUX",
+                "detail": f"节点自己没写 mux，但客户端运行期会开（{why}）—— "
+                          "它来自客户端，不是链接"})
+    elif node.get("mux"):
+        # 节点要求了、客户端拒绝 —— 必须说话。改动前这里的形态是"节点写了也照开"
+        # （XHTTP 上必坏），改后是"拒绝"，两个结论差别就在运行期成不成。
         prof.diagnostics.append({
-            "code": "RUNTIME_IMPLIED_MUX",
-            "detail": "genconfig.py 默认给每个出站写 mux:{enabled:true}（只有 --no-mux 才关），"
-                      "所以这个节点的实际运行形态里有 mux.cool —— 它来自客户端，不是链接"})
+            "code": "MUX_REQUEST_DECLINED",
+            "detail": f"节点声明了 mux，但客户端不会写进配置：{why}"})
     # (b) 未收录的 security 取值
     sec = _str(node, "security").lower()
     if sec not in _SECURITY_KNOWN and prof.get_feature(f"unknown:security.{sec}") is None:
@@ -450,8 +501,13 @@ def _notes_from_kernel(k: dict) -> list[str]:
     if "RUNTIME_IMPLIED_MUX" in diags and any(
             "mux" in str(ls.get("feature", "")) for ls in (k.get("losses") or [])):
         out.append("⚠ 关于 mux：这个节点的 mux.cool 不是链接里写的 —— "
-                   "lib/genconfig.py 默认给每个出站写 mux:{enabled:true}（只有 --no-mux 关）。"
-                   "下面 compat 对 mux 的结论针对的就是这个默认行为。")
+                   "是客户端按 `--mux`（或 XBD_GEN_MUX=1）显式开出来的。"
+                   "下面 compat 对 mux 的结论针对的就是这个运行期行为。")
+    if "MUX_REQUEST_DECLINED" in diags:
+        out.append("ℹ 关于 mux：链接/节点里声明了 mux.cool，但客户端**不会**写进配置 —— "
+                   "XHTTP/QUIC 传输下官方不建议与 mux.cool 同开（实测开了必连不上），"
+                   "所以按传输类型拒了。"
+                   "下面 compat 判的是「链接声明了什么」，不是你实际跑成什么样。")
     for ls in k.get("losses") or []:
         out.append(f"🟠 会丢能力：{ls.get('feature')} —— {ls.get('what')}"
                    f"（规则 {ls.get('rule')}）")

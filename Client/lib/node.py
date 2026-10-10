@@ -63,7 +63,10 @@ DEFAULT_NODE = {
     "ech": "",
     "ech_declared": False,     # 来源声明了 ECH 但没给出可用配置（只有 mihomo 的 enable 会这样）
     "pinned_cert_sha256": "",  # 自签证书节点的证书哈希（Xray 26.x 的 allowInsecure 替代）
+    # mux：**只表示 Xray 自己的 mux.cool**。见 parse_mihomo_yaml 里对 smux 的说明 ——
+    # 那是 sing-box/mihomo 的另一套多路复用协议，不能混为一谈。
     "mux": False,
+    "smux": False,             # mihomo/sing-box 的 SMUX（来源原生意图，不冒充 mux.cool）
     "udp": True,
     "source": "",              # 来源格式，便于排查
     "raw_params": {},          # 原始 query，一个都不丢
@@ -105,6 +108,19 @@ def _b64decode(s: str) -> str:
 
 def _norm_transport(raw: str) -> str:
     return _TRANSPORT_ALIASES.get((raw or "").lower(), (raw or "").lower())
+
+
+def _flag(v) -> bool:
+    """把各种"开关"写法归一成 bool。
+
+    ★ 字典必须读 `enabled` 而不是直接 bool()：`{"enabled": false}` 是个**非空
+    字典**，`bool()` 恒为真 —— 明确关掉的开关会被读成"要开"。
+    """
+    if isinstance(v, dict):
+        return bool(v.get("enabled", False))
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(v)
 
 
 def _q(params: dict) -> dict:
@@ -342,7 +358,9 @@ def parse_xray_json(text: str) -> dict:
     n["service_name"] = grpc.get("serviceName") or ""
     n["reality_public_key"] = reality.get("publicKey") or ""
     n["reality_short_id"] = reality.get("shortId") or ""
-    n["mux"] = bool(ob.get("mux", {}).get("enabled"))
+    # Xray JSON 里的 `mux:{enabled:…}` 就是 mux.cool 本身 —— 这里读它是**对的**，
+    # 与 mihomo 的 smux 不是一回事。字典要读 enabled（见 _flag）。
+    n["mux"] = _flag(ob.get("mux")) if ob.get("mux") is not None else False
     # 官方字段名：客户端是 echConfigList，服务端是 echServerKeys。
     # 原来读的 "echSettings" 在官方文档里不存在 —— 所以从 Xray JSON 导入的
     # ECH 节点，配置一直是空的。
@@ -451,7 +469,21 @@ def _yaml_entry_to_node(entry: dict) -> dict:
     n["flow"] = str(entry.get("flow", ""))
     n["fingerprint"] = str(entry.get("client-fingerprint", ""))
     n["allow_insecure"] = bool(entry.get("skip-cert-verify"))
-    n["mux"] = bool(entry.get("smux") or entry.get("mux"))
+    # ---- mux 与 smux 必须分开 ----
+    #
+    # mihomo 的 `smux:{enabled,protocol,max-connections,…}` 是 sing-box/mihomo 的
+    # SMUX 协议，**不是** Xray 的 mux.cool（后者的握手是固定域名
+    # v1.mux.cool:9527，只在 Xray 语境里有意义）。原来这里写的是
+    #     n["mux"] = bool(entry.get("smux") or entry.get("mux"))
+    # 两个毛病：
+    #   ① 字典恒为真 —— `smux:{enabled:false}`（明确关掉）也被读成"要开"；
+    #   ② 把另一个协议的字段当成 mux.cool 的意图，于是**导入 mihomo 订阅就等于
+    #      给节点贴上 mux**。同一份订阅里的 XHTTP 节点一旦被开上 mux.cool 就必坏
+    #      （官方明确不建议，实测 mux 开 000 / 关 204）。
+    # 现在：老实读 `enabled`，存进 smux 字段备查；mux（mux.cool）只认同名键。
+    smux = entry.get("smux")
+    n["smux"] = _flag(smux) if smux is not None else False
+    n["mux"] = _flag(entry.get("mux")) if "mux" in entry else False
     n["udp"] = bool(entry.get("udp", True))
     n["source"] = "mihomo-yaml"
     # 原始片段：单条解析时能拿到全文，从列表抽取时只能拿到该条目
@@ -545,12 +577,30 @@ def detect_format(text: str) -> str:
     return "unknown"
 
 
+def _apply_query_flags(n: dict) -> dict:
+    """把 URI 查询串里的开关兑现成节点字段。
+
+    mux 不在 #716 官方分享规范里（属客户端私有扩展），但 v2rayN 一类客户端会写
+    `mux=1`（少数写 `mux-enabled`）。raw_params 一直是一个都不丢地留着，可**留着
+    不等于生效** —— 来源明确要开 mux，节点字段却还是 False，等于意图被吞掉。
+    这里只认 mux.cool 的同义键；`smux=` 是另一套协议，记进 smux 字段备查。
+    """
+    q = {str(k).lower(): v for k, v in (n.get("raw_params") or {}).items()}
+    for key in ("mux", "mux-enabled", "mux_enabled"):
+        if key in q:
+            n["mux"] = _flag(q[key])
+            break
+    if "smux" in q:
+        n["smux"] = _flag(q["smux"])
+    return n
+
+
 def parse_node(text: str) -> dict:
     """把任意支持的输入解析成统一模型。"""
     fmt = detect_format(text)
     if fmt.startswith("uri:"):
         scheme = fmt.split(":", 1)[1]
-        return _URI_SCHEMES[scheme](text.strip())
+        return _apply_query_flags(_URI_SCHEMES[scheme](text.strip()))
     if fmt == "xray-json":
         return parse_xray_json(text)
     if fmt == "node-record":

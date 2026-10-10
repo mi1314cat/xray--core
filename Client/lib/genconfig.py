@@ -61,6 +61,82 @@ DIALER_TRANSPORTS = {"xhttp", "websocket"}
 BALANCER = "xbd-bal"
 OUTBOUND_PREFIX = "node-"
 
+# ---------------------------------------------------------------------------
+# mux.cool —— 什么情况下给出站写 mux
+# ---------------------------------------------------------------------------
+#
+# 背景（改动前）：这里**无条件**写 `mux:{enabled:true,concurrency:8}`，
+# 唯一的开关是 `--no-mux`（默认 False，即默认开）。后果有三层：
+#
+#   1. 节点 JSON 里的 `mux` 字段被完全忽略 —— 导入时明明记着"这个节点不要 mux"
+#      （node.py 的 DEFAULT_NODE 就是 False），运行配置里照样给它开上。
+#      用户的意图被吞掉, 而且没有任何提示。
+#   2. XHTTP 节点被开上 mux.cool, 而官方文档**明确**写着"使用 XHTTP 时不要启用
+#      mux.cool"：XHTTP 自带多路复用（`xhttpSettings.extra.xmux`），再叠一层
+#      mux.cool 只会把所有并发压回一条连接。实测（CC 回环，同机同配置只差 mux）：
+#          mux 关 -> 204，mux 开 -> 000（连不通）
+#   3. 生产证据：RN 的 error.log 里能看到客户端经 mux.cool 建会话后立刻
+#      `common/mux: unexpected EOF > failed to read metadata > timeout`。
+#
+# 现在的策略（三层，优先级从高到低）：
+#
+#   ① 命令行 `--mux` / `--no-mux`（显式，人说的一定算数）
+#   ② 节点 JSON 的 `mux` 字段（来源的意图，现在真的生效了）
+#   ③ 默认 **不开** —— mux.cool 是 2018 年前后为"浏览器同域并发只有 6 条"
+#      设计的补丁；今天的瓶颈在服务端而不是连接数，而它对 UDP(xudp)、
+#      与 XHTTP/QUIC 的组合都有副作用。想开就显式开。
+#
+# XHTTP / QUIC 例外是**硬**的：即使显式要求也不写，并在 stderr 说明原因 ——
+# 这两条不是"风险偏好"问题，而是官方不建议 / 实测必坏。
+MUX_FORBIDDEN_TRANSPORTS = {
+    "xhttp": "官方文档明确「使用 XHTTP 时不要启用 mux.cool」—— XHTTP 自带多路复用"
+             "（xhttpSettings.extra.xmux），叠加 mux.cool 会把并发压回单连接；"
+             "实测 CC 回环: 同机同配置 mux 关 204 / mux 开 000",
+    "quic": "QUIC 传输自带流级多路复用，mux.cool 叠上去没有收益；"
+            "实测 RN 生产日志里 hysteria(QUIC) 上的 mux.cool 会话直接 "
+            "「unexpected EOF > failed to read metadata > timeout」",
+    "mkcp": "mKCP 本身就是为弱网重传设计的传输层，mux.cool 的会话超时"
+            "（默认 30s 无流量即断）比它先到",
+}
+# 协议侧的判据：hysteria2 走 QUIC，transport 字段有时是空的（旧节点文件），
+# 所以协议名也要判一次 —— 只看 transport 会漏掉这一批。
+MUX_FORBIDDEN_PROTOCOLS = {"hysteria2": "hysteria2 走 QUIC，QUIC 自带流级多路复用"}
+
+
+def mux_decision(node: dict, cli_mux=None) -> tuple:
+    """决定这个出站要不要写 mux，返回 (enabled: bool, warn: str)。
+
+    cli_mux: True=`--mux`（显式开），False=`--no-mux`（显式关），None=没给。
+    warn 非空时调用方必须把它打到 stderr —— 被拒绝的请求必须说话,
+    否则用户会以为"我明明开了"（这正是改动前 ech 那个 bool 的老毛病）。
+    """
+    n_mux = node.get("mux")
+    if isinstance(n_mux, dict):                 # 内核配置里是对象, 宽容处理
+        n_mux = n_mux.get("enabled")
+    declared = bool(n_mux)
+
+    if cli_mux is True:
+        want, src = True, "--mux"
+    elif cli_mux is False:
+        want, src = False, "--no-mux"
+    elif declared:
+        want, src = True, "节点 JSON 的 mux 字段"
+    else:
+        want, src = False, ""
+
+    if not want:
+        return False, ""
+
+    transport = (node.get("transport") or "").lower()
+    proto = (node.get("protocol") or "").lower()
+    why = MUX_FORBIDDEN_TRANSPORTS.get(transport) or MUX_FORBIDDEN_PROTOCOLS.get(proto)
+    if why:
+        return False, (f"节点要求开 mux（来自 {src}），但传输 {transport or proto} "
+                       f"不能开 —— 已忽略：{why}")
+    return True, (f"已按 {src} 启用 mux.cool（concurrency=8）。"
+                  "注意：mux.cool 会降低 UDP(443) 与部分协议栈的兼容性，"
+                  "且官方不建议在 XHTTP/QUIC 上使用；只在你确知需要时保留")
+
 
 
 def fail(msg: str) -> None:
@@ -223,7 +299,8 @@ def build_stream(node: dict, mode: str) -> dict:
     return stream
 
 
-def build_outbound(node: dict, mode: str, mux: bool, tag: str = "proxy") -> dict:
+def build_outbound(node: dict, mode: str, mux, tag: str = "proxy") -> dict:
+    """mux: True/False/None —— None 表示调用方没表态，交给节点字段与默认策略。"""
     proto = (node.get("protocol") or "").lower()
     settings: dict
 
@@ -284,8 +361,15 @@ def build_outbound(node: dict, mode: str, mux: bool, tag: str = "proxy") -> dict
         ob["streamSettings"] = build_stream(node, mode)
     if node.get("flow") and mode == NORMAL and proto == "vless":
         pass  # flow 已在 users 里
-    if mux:
-        ob["mux"] = {"enabled": True, "concurrency": 8}
+    # mux 的判据只有一处（mux_decision），单节点与多出站两条路径都走它 ——
+    # 两边各判一次必然会漂移，而症状是"单节点没 mux、切到多出站又有了"。
+    # socks / http 没有传输层，mux.cool 对它们无意义：不写。
+    if proto not in ("socks", "http"):
+        _mux_on, _mux_warn = mux_decision(node, mux)
+        if _mux_warn:
+            print(f"genconfig: {_mux_warn}", file=sys.stderr)
+        if _mux_on:
+            ob["mux"] = {"enabled": True, "concurrency": 8}
     return ob
 
 
@@ -825,7 +909,13 @@ def main() -> int:
                     help="局域网 HTTP 代理端口（0=不启用）。设备在 WiFi 设置里填 IP+端口用")
     ap.add_argument("--logs", default="/opt/xray-browser-dialer/logs")
     ap.add_argument("--loglevel", default="warning")
-    ap.add_argument("--no-mux", dest="mux", action="store_false", default=True)
+    # mux: 三态。默认 None = 没表态 —— 由节点 JSON 的 mux 字段决定，都没有就不开。
+    # ★ 以前是 `--no-mux` + default=True：默认给每个出站开 mux，节点里的
+    #   `mux:false` 被吞掉，XHTTP 节点也被开上（官方明确不建议）。
+    ap.add_argument("--mux", dest="mux", action="store_true", default=None,
+                    help="显式开启 mux.cool（XHTTP/QUIC 传输下会被拒绝并说明原因）")
+    ap.add_argument("--no-mux", dest="mux", action="store_false", default=None,
+                    help="显式关闭 mux.cool（覆盖节点里的 mux:true）")
     args = ap.parse_args()
 
     if args.all_nodes:
@@ -869,6 +959,7 @@ def main() -> int:
     out_dir = os.path.dirname(os.path.abspath(args.output))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+
     with open(args.output, "w") as fh:
         json.dump(cfg, fh, indent=2, ensure_ascii=False)
         fh.write("\n")

@@ -1009,6 +1009,8 @@ render_client() {
       mode: $XHTTP_MODE
       path: $XHTTP_PATH"
         linktype="type=xhttp&mode=$XHTTP_MODE&path=$XHTTP_PATH"
+        mux_comment="# 不要开 smux / mux.cool：XHTTP 自带多路复用，官方明确不建议两者同开
+# （实测同机同配置只差 mux：关 204 / 开 000）。"
     else
         network_block="    network: ws
     ws-opts:
@@ -1016,10 +1018,12 @@ render_client() {
       headers:
         Host: $CERT_DOMAIN"
         linktype="type=ws&path=$WS_PATH&host=$CERT_DOMAIN"
+        mux_comment="# 本节点未声明 mux：Xray 出站默认不开 mux.cool；确有需要再自行开启。"
     fi
 
     cat > "$OUT_FILE" <<EOF
 # $PROTO_NAME #$num2 ($VLESS_TRANSPORT, $ECH_MODE)
+$mux_comment
 $ech_comment
 proxies:
   - name: $PROTO-$num2
@@ -1099,6 +1103,20 @@ EOF
               \"mode\": \"$XHTTP_MODE\"
             }"
         xray_linktype="xhttp"
+        # ★ XHTTP 必须**显式**声明 `mux: false`。
+        #
+        #   官方文档明确"使用 XHTTP 时不要启用 mux.cool"（XHTTP 自带
+        #   xhttpSettings.extra.xmux 多路复用）。而客户端那边曾经**默认**给
+        #   每个出站开 mux.cool —— 于是"服务端生成的这条节点"到了客户端就变成
+        #   "XHTTP + mux.cool 同开"，实测（CC 回环，同机同配置只差 mux）
+        #   mux 关 204 / mux 开 000：链接导入正常，永远连不上。
+        #
+        #   不能靠"客户端自己知道别开"：这个字段是**节点**对客户端的声明，
+        #   服务端生成的节点就得把话说清楚（v2rayN / sing-box / 各家客户端
+        #   对 mux 的默认值并不一致）。Xray 出站的 mux 默认是关，写 false
+        #   与不写在本内核上等价，写出来是为了让别的客户端也照做。
+        xray_mux_conf=",
+      \"mux\": { \"enabled\": false }"
     else
         xray_net_conf="\"wsSettings\": {
               \"path\": \"$WS_PATH\",
@@ -1107,6 +1125,7 @@ EOF
               }
             }"
         xray_linktype="ws"
+        xray_mux_conf=""
     fi
 
     cat > "$xray_out" <<EOF
@@ -1145,7 +1164,7 @@ EOF
           "encryptedClientHelloEnabled": true$CLIENT_PIN_FIELD
         },
         $xray_net_conf
-      }
+      }$xray_mux_conf
     }
   ]
 }
