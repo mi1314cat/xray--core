@@ -2206,6 +2206,66 @@ for f in "$ROOT/Client/l.sh"; do
     assert_eq "$n" "1" "--ref 分支用同一套镜像顺序"
 done
 
+# ---------------------------------------------------------------- 入口与文档
+# "能装"和"用户知道怎么装"是两件事。用户的原话：
+#   "SB 和 M 都是用一个脚本进服务端或客户端，我们项目在 GitHub 上写着只有一个能进服务端"
+#   "客户端这边，它的链接还是指向我的老项目"
+# 两条都是文档/入口层面的，但后果是用户拿到的是**另一个仓库的安装包**。
+group "入口与文档一致性"
+OLD_REPO="mi1314cat/xary-core"
+
+# 1) 指向老仓库的链接：只查"会被执行/被下载"的地方。
+#    docs/audit/ 是当时的审计记录，写的就是那个仓库，属于历史证据，不能改。
+stale=""
+for f in README.md install.sh xray-panel.sh Client/README.md Client/RUN.md Client/l.sh \
+         Client/uninstall-xray-client.sh; do
+    [[ -f "$ROOT/$f" ]] || continue
+    if grep -q "$OLD_REPO" "$ROOT/$f" 2>/dev/null; then
+        stale="$stale $f"
+    fi
+done
+# conf/*.sh 会 curl 仓库里的东西，也一并查
+for f in "$ROOT"/conf/*.sh; do
+    [[ -f "$f" ]] || continue
+    grep -q "$OLD_REPO" "$f" 2>/dev/null && stale="$stale conf/$(basename "$f")"
+done
+if [[ -z "$stale" ]]; then
+    ok "安装/下发路径里没有指向老仓库 ($OLD_REPO) 的链接"
+else
+    bad "还有指向老仓库的链接:$stale"
+fi
+
+# 2) 客户端文档的链接必须指向**本**仓库（换个名字就失效的那种错误）
+if [[ -f "$ROOT/Client/README.md" ]]; then
+    n=$(grep -c 'mi1314cat/xray--core' "$ROOT/Client/README.md" 2>/dev/null || echo 0)
+    [[ "$n" -ge 3 ]] && ok "Client/README.md 的安装链接指向本仓库 ($n 处)" \
+                     || bad "Client/README.md 指本仓库的链接只有 $n 处"
+fi
+
+# 3) README 必须写明"一个入口、两种角色"——SB/M 都是这个形态，
+#    只写服务端会让人以为没有客户端。
+if [[ -f "$ROOT/README.md" ]]; then
+    for pair in "README 里有一键入口|install.sh" \
+                "README 里写了服务端|服务端" \
+                "README 里写了客户端|客户端" \
+                "README 里有 server 参数|install.sh) server" \
+                "README 里有 client 参数|install.sh) client"; do
+        pat="${pair#*|}"
+        if grep -qF -- "$pat" "$ROOT/README.md"; then ok "${pair%%|*}"; else bad "${pair%%|*}（README 里找不到: $pat）"; fi
+    done
+fi
+
+# 4) 引导脚本确实有两种角色（不是 README 吹的）
+if [[ -f "$ROOT/install.sh" ]]; then
+    install_has() { grep -q -- "$2" "$ROOT/install.sh" && ok "$1" || bad "$1"; }
+    install_has "install.sh 有服务端分支" "server)"
+    install_has "install.sh 有客户端分支" "client)"
+    install_has "install.sh 有菜单（不传参数时选角色）" "main_menu"
+    install_has "install.sh 客户端分支会取 Client/l.sh" "Client/l.sh"
+    install_has "install.sh 服务端分支会取 xray-panel.sh" "xray-panel.sh"
+    install_has "install.sh 支持 --status（只看不改）" "--status"
+fi
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -1,10 +1,27 @@
-# xray-core 一键脚本
+# X-Panel — Xray 服务端 / 客户端面板
 
-Xray 服务端节点管理面板。配置格式是 Xray 自己的 JSON。
+个人 Xray 核心管理面板：**服务端节点管理 + 客户端配置生成 + 分享**。
+两端内核都用 [XTLS/Xray-core](https://github.com/XTLS/Xray-core)，服务端配置格式是 Xray 自己的 JSON。
+
+## 一键安装
 
 ```bash
-bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/xray-panel.sh)
+bash <(curl -Ls https://github.com/mi1314cat/xray--core/raw/refs/heads/main/install.sh)
 ```
+
+跑起来先选角色：**1) 服务端**（节点 / 分享 / 证书 / Nginx / 诊断）、
+**2) 客户端**（装内核 + 面板 + Web UI）、3) 卸载。也可以直接带参数：
+
+```bash
+bash <(curl -Ls .../install.sh) server        # 直接进服务端面板
+bash <(curl -Ls .../install.sh) client        # 直接装 / 进客户端
+bash <(curl -Ls .../install.sh) uninstall     # 卸载（服务端 / 客户端 二选一）
+bash <(curl -Ls .../install.sh) --status      # 只报告状态，什么都不改
+```
+
+> 与 `mihomo--core` / `sing-box-core` 一致：**一个引导脚本 + 角色参数**。
+> `install.sh` 只是把两个入口接在一起，两个入口本身仍可单独跑：
+> 服务端 `xray-panel.sh`、客户端 `Client/l.sh`（见 [Client/README.md](Client/README.md)）。
 
 ## 面板
 

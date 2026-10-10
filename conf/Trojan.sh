@@ -238,7 +238,7 @@ add_config() {
         bash <(curl -fsSL https://github.com/mi1314cat/One-click-script/raw/refs/heads/main/domains.sh) \
             || { print_error "domains.sh 执行失败"; return 1; }
         print_info "正在生成 Reality 密钥（conf/XRevise.sh）..."
-        bash <(curl -fsSL https://github.com/mi1314cat/xary-core/raw/refs/heads/main/conf/XRevise.sh) \
+        bash <(curl -fsSL ${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/XRevise.sh) \
             || { print_error "XRevise.sh 执行失败"; return 1; }
         load_env "$INSTALL_DIR/install_info.env" || return 1
         load_env "/root/catmi/catmi.env" || return 1
