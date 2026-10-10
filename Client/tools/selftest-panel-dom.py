@@ -83,7 +83,7 @@ w.addEventListener('error', e => errs.push(e.message));
 // 白白报了一个不存在的 bug。表头在 thead 里，用 tbody 限定。
 const ROWS = '#node-list .nrow, #node-list .ncard, #node-list tbody tr';
 
-setTimeout(() => {
+setTimeout(async () => {
   const $ = s => d.querySelector(s);
   const $$ = s => [...d.querySelectorAll(s)];
 
@@ -97,11 +97,20 @@ setTimeout(() => {
   ck(!!$('.app') && !!$('.app > .side') && !!$('.app > .main'),
      '应用外壳 = 左侧导航 + 主工作区');
   const views = $$('.view');
-  ck(views.length === 4, '4 个视图 (' + views.length + ')');
+  ck(views.length === 5, '5 个视图（节点/状态/分享/配置/内核）(' + views.length + ')');
+  // ★ 视图必须在主工作区**里面**。这一条是事故后补的：多一个 </div> 会让浏览器
+  //   提前闭合 <main>，配置页/内核页就跑到外壳外面去了 —— 症状是"点配置一片空白，
+  //   内容在页面很下面"，而"有 4 个 .view"这种数量断言照样全绿。
+  //   jsdom 用的是和浏览器同一套 HTML5 解析，所以这条能真的抓到。
+  ck($$('.main > .view').length === 5,
+     '5 个视图都在 .main 里 (' + $$('.main > .view').length + ')');
+  const stray = views.filter(v => !v.closest('.main')).map(v => v.id);
+  ck(stray.length === 0, '没有视图掉到应用外壳外面' +
+     (stray.length ? ': ' + stray.join(',') : ''));
   ck(views.filter(v => v.classList.contains('on')).length === 1,
      '同一时刻只显示一个视图');
   const navBtns = $$('#nav button');
-  ck(navBtns.length === 4, '侧栏 4 个导航项');
+  ck(navBtns.length === 5, '侧栏 5 个导航项');
   ck(navBtns.filter(b => b.classList.contains('on')).length === 1,
      '侧栏只有一项处于选中态');
   ck(navBtns.filter(b => b.classList.contains('on'))[0]
@@ -220,6 +229,50 @@ setTimeout(() => {
   w.renameGroup(srows[1].getAttribute('data-key'), '组A');
   ck(!!$('.srow.renaming input.grename'), '重命名进入就地编辑态');
 
+  // ---- 「添加节点」的入口必须看得见 ----
+  // 用户的反馈就是这一条："我怎么找不到原本添加节点的地方了" ——
+  // 功能在弹窗里，但页面上看不出来，等于没有。所以两件事都要断言：
+  //   ① 节点页上有常驻的快速导入行 ② 弹窗里有预设按钮
+  w.go('nodes');
+  const qa = $('.quickadd'), qi = $('#quick-in');
+  ck(!!qa && !!qi, '节点页有常驻的「快速添加」输入框');
+  ck(!!$('.quickadd button'), '快速添加有「导入」按钮');
+  const addBtn = $$('button').find(x => /添加节点/.test(x.textContent));
+  ck(!!addBtn, '「＋ 添加节点」按钮在页面上（不是只在弹窗里）');
+  w.openAdd();
+  const pchips = $$('#preset-list .preset');
+  ck(pchips.length >= 6, '弹窗里有预设按钮 (' + pchips.length + ')');
+  ck(pchips.every(c => c.querySelector('b') && c.querySelector('span')),
+     '预设按钮有名字 + 说明');
+  ck(pchips.every(c => (c.getAttribute('title') || '').length > 4),
+     '预设按钮带提示（说明还要填什么）');
+  // 点第一个预设：字段必须真的被填好 —— 只渲染按钮不接线是最容易漏的一步
+  pchips[0].dispatchEvent(new w.MouseEvent('click', {bubbles: true}));
+  ck(($('#f-proto').textContent || '').length > 0, '点预设后进入表单并显示协议');
+  ck(($('#f-transport').value || '') !== '', '预设填好了传输 (' + $('#f-transport').value + ')');
+  ck(!!$('#f-fingerprint') && !!$('#f-ech'),
+     '表单有指纹与 ECH 字段（预设要用到的参数）');
+  w.closeAdd();
+
+  // ---- 局域网分享页 ----
+  // 夹具里那条 share_status 会返回一条启用 + 一条停用的链接。
+  // 断言的是"看得见、点得到、说清楚"：状态文字、地址、行数、按钮齐不齐。
+  w.go('share');
+  ck(!!$('#view-share.on'), '切到分享视图');
+  await new Promise(r => setTimeout(r, 60));
+  ck(($('#sh-addr').textContent || '').includes('18190'),
+     '分享页显示服务地址 (' + $('#sh-addr').textContent + ')');
+  ck(/运行中/.test($('#sh-state').textContent || ''),
+     '分享页显示服务在运行 (' + $('#sh-state').textContent.trim() + ')');
+  const srows2 = $$('#tb-share tr');
+  ck(srows2.length === 2, '两条分享链接都列出来了 (' + srows2.length + ')');
+  ck(srows2.some(r => /启用/.test(r.textContent)) && srows2.some(r => /已停用/.test(r.textContent)),
+     '启用/停用两种状态都显示');
+  ck($$('#tb-share button').length >= 6, '每条链接都有 复制/启用停用/删除 按钮');
+  ck(($('#sh-proxy').textContent || '').includes('SOCKS5'),
+     '分享页顺带给出局域网代理入口 (' + $('#sh-proxy').textContent + ')');
+  w.go('nodes');
+
   // 三种密度都要能渲染（同一份标记在三个视图里都要成立）
   for (const dens of ['list', 'grid', 'table']) {
     try {
@@ -272,7 +325,9 @@ def main():
     r = subprocess.run(["node", hpath, fixture, jsdom, opath],
                        capture_output=True, text=True, timeout=180)
     if r.returncode != 0 and not os.path.exists(opath):
-        print("jsdom 夹具失败:", (r.stderr or "").strip()[-500:]); return 1
+        err = (r.stderr or "").strip()
+        print("jsdom 夹具失败:", err[:400] + ("\n…\n" + err[-200:] if len(err) > 600 else ""))
+        return 1
     for ln in open(opath, encoding="utf-8").read().strip().splitlines():
         ck(ln.startswith("OK "), ln[3:])
     shutil.rmtree(tmp, ignore_errors=True)

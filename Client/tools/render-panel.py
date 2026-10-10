@@ -123,23 +123,84 @@ CONNINFO = {
               {"label": "HTTP", "url": "http://127.0.0.1:10808"}],
 }
 
+# 局域网分享的夹具：一条启用（用过 3 次）、一条停用。
+# 状态要能表达三件事：服务活没活、端口在不在听、有哪几条链接 ——
+# 少任何一件，用户拿着链接都不知道能不能用。
+SHARE = {
+    "host": "192.168.1.178", "port": "18190",
+    "unit": "xbd-share.service", "active": True, "listening": True, "enabled": True,
+    "socks": "192.168.1.178:1080", "http": "192.168.1.178:10809", "clients": 2,
+    "tokens": [
+        {"token": "852933b3b1dd0dd04ac32f9f", "enabled": True, "used": 3, "max_uses": 0,
+         "created_at": 1760000000,
+         "url": "http://192.168.1.178:18190/share/852933b3b1dd0dd04ac32f9f"},
+        {"token": "8d623760bd68595138ae875a", "enabled": False, "used": 0, "max_uses": 10,
+         "created_at": 1759990000,
+         "url": "http://192.168.1.178:18190/share/8d623760bd68595138ae875a"},
+    ],
+}
+
+def add_meta():
+    """预设与指纹白名单**从面板后端直接取**，不在这里抄一份。
+
+    抄一份的后果很具体：预设改了、夹具没改，于是"预设按钮点下去填的字段"
+    在自检里永远是对的，真机上却是错的 —— 夹具成了自我安慰。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    lib = os.path.join(os.path.dirname(here), "lib")
+    for path in (os.path.join(lib, "web"), lib):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    import importlib
+    pnl = importlib.import_module("panel")
+    try:
+        cmp_ = importlib.import_module("compat")
+        fps, hint = sorted(cmp_.FP_VALUES), cmp_.FP_HINT
+    except Exception:                                            # noqa: BLE001
+        fps, hint = ["chrome", "firefox"], ""
+    return {"presets": pnl.ADD_PRESETS, "fingerprints": fps,
+            "fingerprint_hint": hint}
+
+
+PREVIEW = {
+    "url": "http://192.168.1.178:18190/share/852933b3b1dd0dd04ac32f9f",
+    "bytes": 1180, "count": 8,
+    "note": "8 个节点：x-vless01-REALITY、x-vless02-XHTTP-CDN、x-vmess03-TLS-WS…",
+    "body": NL.join(["vless://00000000-0000-0000-0000-000000000000@rn.example.net:443"
+                     "?type=xhttp&security=tls#x-vless01-REALITY",
+                     "trojan://pw@jp1.example.net:443?security=reality#x-trojan04-REALITY",
+                     ""]),
+}
+
 STUB = """
 <script>
 /* 渲染夹具：把 /api/state 与 /api/action 换成合成数据，其余一切照旧。 */
 window.__FIXTURE__ = __FIXTURE_JSON__;
 window.__CONNINFO__ = __CONNINFO_JSON__;
+window.__SHARE__ = __SHARE_JSON__;
+window.__PREVIEW__ = __PREVIEW_JSON__;
+window.__ADDMETA__ = __ADDMETA_JSON__;
 (function(){
   const real = window.fetch;
+  const ok = obj => Promise.resolve({ok:true, status:200,
+    json: () => Promise.resolve(obj)});
   window.fetch = function(url, opt){
     const u = String((url && url.url) || url);
-    if (u.indexOf('/api/state') === 0) {
-      return Promise.resolve({ok:true, status:200,
-        json: () => Promise.resolve(window.__FIXTURE__)});
-    }
+    if (u.indexOf('/api/state') === 0)
+      return ok(window.__FIXTURE__);
     if (u.indexOf('/api/action') === 0) {
-      return Promise.resolve({ok:true, status:200,
-        json: () => Promise.resolve({ok:true,
-          message: JSON.stringify(window.__CONNINFO__)})});
+      // ★ 按动作名分发。上一版所有动作都回同一份 conninfo 载荷 ——
+      //   "分享"页拿到的是配置 JSON，于是那条路径在夹具里永远测不到
+      //   （页面上不报错、只是空的），真机上才暴露。
+      let act = '';
+      try { act = JSON.parse((opt && opt.body) || '{}').action || ''; } catch(e){}
+      if (act === 'share_status')
+        return ok({ok:true, message: JSON.stringify(window.__SHARE__)});
+      if (act === 'share_preview')
+        return ok({ok:true, message: JSON.stringify(window.__PREVIEW__)});
+      if (act === 'add_meta')
+        return ok({ok:true, message: JSON.stringify(window.__ADDMETA__)});
+      return ok({ok:true, message: JSON.stringify(window.__CONNINFO__)});
     }
     return real.apply(this, arguments);
   };
@@ -393,6 +454,28 @@ PROBE = """
     const app = document.querySelector('.app');
     rows.push('外壳实际宽度=' + (app ? Math.round(app.getBoundingClientRect().width) : '?')
       + ' 视口=' + window.innerWidth);
+    // ★ 视图必须在主工作区**里面**。多一个 </div> 就会让浏览器提前闭合
+    //   <main>，两页界面掉到外壳外面 —— 症状是"点配置一片空白、东西在下面"。
+    //   读几何位置最直接：掉出去的视图，顶端会在整个应用外壳之下。
+    const inMain = document.querySelectorAll('.main > .view').length;
+    const strayViews = [...document.querySelectorAll('.view')]
+      .filter(v => !v.closest('.main')).map(v => v.id);
+    const shellBottom = Math.round(
+      (document.querySelector('.app') || {getBoundingClientRect: () => ({bottom: 0})})
+        .getBoundingClientRect().bottom + window.scrollY);
+    const activeTop = Math.round(
+      (document.querySelector('.view.on') || {getBoundingClientRect: () => ({top: -1})})
+        .getBoundingClientRect().top + window.scrollY);
+    const allViews = document.querySelectorAll('.view').length;
+    rows.push('视图在主区内=' + inMain + '/' + allViews
+      + (strayViews.length ? ' ⚠ 掉出外壳: ' + strayViews.join(',') : '')
+      + ' 当前视图顶端=' + activeTop + ' 外壳底=' + shellBottom);
+    // 提示条：conninfo 之类的动作如果拿整份 JSON 当消息，这里会是几百字符，
+    // 页面顶部就被一大段 JSON 顶下去。正常应当在打开时是空的。
+    const mb = document.getElementById('msg');
+    const mt = mb ? (mb.textContent || '') : '';
+    rows.push('提示条 长度=' + mt.length + ' 可见=' + !!(mb && mb.classList.contains('on'))
+      + (mt.length > 200 ? ' ⚠ 顶部被长文本顶下去了: ' + JSON.stringify(mt.slice(0, 60)) : ''));
     const main = document.querySelector('.main');
     rows.push('主区宽度=' + (main ? Math.round(main.getBoundingClientRect().width) : '?')
       + ' (占视口 ' + (main ? Math.round(main.getBoundingClientRect().width / window.innerWidth * 100) : '?') + '%)');
@@ -465,7 +548,10 @@ PROBE = """
 
 html = page_html()
 stub = (STUB.replace("__FIXTURE_JSON__", js_json(state()))
-            .replace("__CONNINFO_JSON__", js_json(CONNINFO)))
+            .replace("__CONNINFO_JSON__", js_json(CONNINFO))
+            .replace("__SHARE_JSON__", js_json(SHARE))
+            .replace("__PREVIEW_JSON__", js_json(PREVIEW))
+            .replace("__ADDMETA_JSON__", js_json(add_meta())))
 # 夹具在页面自己的脚本之前执行即可。锚点必须用**结束标签**：
 # 页面里出现过字面量开始标签（注释里），按它替换会把脚本从中间劈开。
 anchor = "<script>"

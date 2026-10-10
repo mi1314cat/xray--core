@@ -391,7 +391,12 @@ require('fs').writeFileSync(process.argv[3], out.join('\n'));
                  # 1.04:1 这种不可能的数字。基准链错一层，结论就完全反了。
                  ("侧栏导航·未选中", "--dim", "--ov0", "--bg"),
                  ("侧栏导航·选中", "--fg", "--acc-bg2", "--bg"),
-                 ("品牌方块文字", "--on-acc", "--acc-btn", "--acc-btn")]
+                 ("品牌方块文字", "--on-acc", "--acc-btn", "--acc-btn"),
+                 # 添加节点弹窗（预设按钮）+ 节点页快速添加行
+                 ("预设按钮名", "--fg", "--ov0", "--card"),
+                 ("预设按钮说明", "--dim", "--ov0", "--card"),
+                 ("预设按钮悬停", "--acc-tag-text", "--acc-bg", "--card"),
+                 ("快速添加输入框", "--fg", "--input", "--card")]
         bad_pairs = []
         for label, fgv, bgv, basev in PAIRS:
             for tname, T in (("深色", TD), ("浅色", TL)):
@@ -467,9 +472,14 @@ require('fs').writeFileSync(process.argv[3], out.join('\n'));
     ck(re.search(r"\.nav button\.on\s*\{", bare) is not None,
        "侧栏导航有选中态")
     ck(re.search(r"\.chip\s*\{", bare) is not None, "顶栏状态 chip 有样式")
-    ck('id="view-nodes"' in page and 'id="view-status"' in page
-       and 'id="view-config"' in page and 'id="view-core"' in page,
-       "四个视图都在")
+    ck(all(('id="view-%s"' % v) in page
+           for v in ("nodes", "status", "share", "config", "core")),
+       "五个视图都在（节点/状态/分享/配置/内核）")
+    ck(page.count('data-view="') == 5, "侧栏导航项与视图一一对应（5 项）")
+    # 「分享」是后加的：它的入口必须真在侧栏里，不能只在 JS 里存在 ——
+    # 那样页面能跑，用户却永远点不到。
+    ck('data-view="share"' in page and "loadShare" in page,
+       "侧栏有「分享」入口且接线到 loadShare")
     ck('class="app"' in page and 'class="side"' in page and 'class="main"' in page,
        "应用外壳三件套齐（app / side / main）")
     # 桌面优先：窄屏才塌成顶部导航
@@ -508,6 +518,62 @@ require('fs').writeFileSync(process.argv[3], out.join('\n'));
     ck('name="viewport"' in page, "声明了 viewport（手机可用）")
     ck("data-theme" in page and ":root[data-theme=\"light\"]" in page,
        "CSS 与 JS 用同一个 data-theme 约定")
+
+    # ---- 结构：四个视图必须真的在 <main> 里 ----
+    # ★ 这一组是**补的**，起因是一次真实事故：`#view-status` 里多了一个 `</div>`，
+    #   浏览器于是把它和 <main>、<div class="app"> 一起提前闭合 ——
+    #   配置页与内核页跑到应用外壳**外面**去了。症状是"点配置一片空白，
+    #   内容在下面很远的地方"，而 div 数量是配平的、四个 section 也都在文档里，
+    #   所以按数量做的检查一个都没响。
+    #
+    #   数量配平 ≠ 嵌套正确。所以这里**模拟浏览器的树构造**（遇结束标签向下找
+    #   匹配项、找不到就忽略、找到就把中间的弹掉），再看每个视图的祖先链。
+    #   纯文本切片是抓不到的：出问题的那一版，四个 section 在文本上**都**位于
+    #   字面量 </main> 之前。
+    from html.parser import HTMLParser
+
+    VOID_TAGS = {"br", "img", "input", "meta", "link", "hr", "source", "area",
+                 "base", "col", "embed", "param", "track", "wbr"}
+    view_paths = {}
+    stack = []
+
+    class _Tree(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag in VOID_TAGS:
+                return
+            stack.append((tag, a.get("id", ""), a.get("class", "")))
+            if tag == "section" and "view" in a.get("class", ""):
+                view_paths[a.get("id", "")] = " > ".join(
+                    t + ("#" + i if i else "") for t, i, _c in stack)
+
+        def handle_endtag(self, tag):
+            if tag in VOID_TAGS:
+                return
+            for k in range(len(stack) - 1, -1, -1):
+                if stack[k][0] == tag:
+                    del stack[k:]
+                    return
+            # 找不到匹配 —— 浏览器会忽略，这里也忽略（但**不能**悄悄破坏栈）
+
+    _Tree(convert_charrefs=True).feed(page)
+    for vid in ("view-nodes", "view-status", "view-share", "view-config", "view-core"):
+        path = view_paths.get(vid, "")
+        ck("main" in path, "「%s」在 <main> 内" % vid, path or "没找到这个 section")
+
+    # 属性里吞掉标签 = 上一版那种"截断的 style 把 <option> 吃掉"。
+    # 这种错在浏览器里的表现是"下拉是空的 / 少一段内容"，光看代码很正常。
+    swallowed = []
+
+    class _Attr(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            for k, v in attrs:
+                if v and "<" in v:
+                    swallowed.append("%s[%s]" % (tag, k))
+
+    _Attr(convert_charrefs=True).feed(page)
+    ck(not swallowed, "没有属性吃掉后续标签（截断的 style/引号）",
+       "; ".join(swallowed[:4]))
 
     print("\n结果：%d 通过 / %d 失败" % (PASS, FAIL))
     return 1 if FAIL else 0

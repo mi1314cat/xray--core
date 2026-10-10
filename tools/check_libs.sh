@@ -2128,6 +2128,61 @@ else
     printf '  (跳过: Client/ 不存在)\n'
 fi
 
+# ---------------------------------------------------------------- 局域网分享 / 预设
+# 「功能存在」和「用户点得到」是两件事。这一组盯的是后者：
+# 分享本来只有 `xbd share`（命令行）能做，面板上没有入口就等于没有；
+# 预设按钮点下去要真的把字段填好，而不是只画几个好看的方块。
+group "分享与预设 (面板 · 与用户点得到的入口)"
+PANEL_PY="$ROOT/Client/lib/web/panel.py"
+# ★ 自带 helper，不借别处的：上一版这里写了个不存在的 assert_has，
+#   结果每一行都"command not found"、检查全跳过，而总数还是绿的 ——
+#   不会失败的守卫比没有守卫更糟（它让人以为查过了）。
+panel_has() { # <文件> <字面串> <说明>
+    if grep -qF -- "$2" "$1" 2>/dev/null; then
+        ok "$3"
+    else
+        bad "$3（面板里找不到: $2）"
+    fi
+}
+if [[ -f "$PANEL_PY" ]]; then
+    for pair in "分享页在侧栏|data-view=\"share\"" \
+                "分享页有服务状态|id=\"sh-state\"" \
+                "分享页有链接表|id=\"tb-share\"" \
+                "新建分享接线|shareNew(" \
+                "停用/启用接线|shareToggle(" \
+                "删除接线|shareRemove(" \
+                "预览接线|sharePreview(" \
+                "面板动作 share_status|\"share_status\"" \
+                "面板动作 share_new|\"share_new\"" \
+                "面板动作 share_toggle|\"share_toggle\"" \
+                "面板动作 share_remove|\"share_remove\"" \
+                "面板动作 share_preview|\"share_preview\"" \
+                "节点页常驻快速添加|id=\"quick-in\"" \
+                "弹窗预置容器|id=\"preset-list\"" \
+                "预设数据来自后端|act_add_meta" \
+                "面板动作 add_meta|\"add_meta\""; do
+        panel_has "$PANEL_PY" "${pair#*|}" "${pair%%|*}"
+    done
+
+    # 分享的单元名只许有一处定义：面板里的 U_SHARE 必须与 core.sh 一致，
+    # 写错就是"按钮点了、服务没动"，而且报错看起来像服务本身有问题。
+    cs_unit=$(grep -m1 '^XBD_U_SHARE=' "$ROOT/Client/lib/core.sh" | cut -d'"' -f2)
+    pn_unit=$(grep -m1 '^U_SHARE = ' "$PANEL_PY" | cut -d'"' -f2)
+    assert_eq "$pn_unit" "$cs_unit" "面板与 core.sh 用的是同一个分享单元名"
+
+    # 预设必须是**合法组合**：拿 compat.check_xray 逐个验，
+    # 和导入一条真实节点走的是同一套判定。写错一个组合，这里会红。
+    PREOUT=$(python3 "$ROOT/Client/tools/check-presets.py" 2>/dev/null)
+    assert_eq "$PREOUT" "OK" "面板预设全部是内核认的合法组合"
+
+    # 生成→解析往返：解析器认识的字段，build_link 必须写回去。
+    # 这条以前是漏的（fp/encryption/ech 只解析不生成，表单填了等于没填）。
+    RT=$(python3 "$ROOT/Client/lib/node.py" selftest 2>&1 | grep -c "往返不丢字段")
+    assert_eq "$RT" "1" "build_link 往返不丢字段（fp/encryption/ech/alpn）"
+else
+    printf '  (跳过: Client/lib/web/panel.py 不存在)\n'
+fi
+
 # ---------------------------------------------------------------- 汇总
 printf '\n\033[36m═══ 结果: %d 通过, %d 失败 ═══\033[0m\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

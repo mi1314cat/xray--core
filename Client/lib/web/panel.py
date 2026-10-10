@@ -36,6 +36,7 @@ U_XRAY = "xray-client.service"
 U_CHROMIUM = "chromium-browser-dialer.service"
 U_PANEL = "browser-dialer-panel.service"
 U_TIMER = "browser-dialer-health.timer"
+U_SHARE = "xbd-share.service"        # 局域网配置分发（xbd share / 面板「分享」页）
 
 STATE_PY = os.path.join(DIST, "lib", "state.py")
 COMPAT_PY = os.path.join(DIST, "lib", "compat.py")
@@ -914,6 +915,267 @@ def act_ech():
     return rc == 0, (out or err)
 
 
+# ------------------------------------------------------------------ 添加节点 ----
+# 「按预设添加」——对齐服务端面板 conf/*.sh 的建节点菜单（Reality / xHTTP-TLS /
+# Trojan-REALITY / Shadowsocks-2022 / Hysteria2 / VLESS-ECN）。
+#
+# 为什么要预设：手动表单有 5 个协议 × 若干传输 × 三种安全层，组合里有一部分是
+# **必然起不来**的（比如 ws + reality —— 内核实测报 "REALITY only supports RAW,
+# XHTTP and gRPC"）。让人从空白表单里自己拼，等于让他去踩这些坑；
+# 预设把"服务端实际会生成的那几种形状"直接摆出来，只需要填凭据。
+#
+# ★ 预设不是随便写的常量：selftest 里会用 compat.check_xray() 逐个验，
+#   和导入一条真实节点走的是**同一套判定**。写错一个组合，门禁会红。
+ADD_PRESETS = [
+    {"id": "reality", "label": "Reality", "sub": "vision + ML-KEM-768",
+     "proto": "vless", "transport": "tcp", "security": "reality",
+     "flow": "xtls-rprx-vision", "fingerprint": "chrome", "sni": "@addr",
+     "need": "地址、端口、UUID、公钥(pbk)；开了后量子的再填 encryption"},
+    {"id": "xhttp", "label": "VLESS-xHTTP", "sub": "TLS / 可走 CDN",
+     "proto": "vless", "transport": "xhttp", "security": "tls",
+     "path": "/", "mode": "auto", "fingerprint": "chrome", "sni": "@addr",
+     "need": "地址、端口、UUID、路径；CDN 场景把 Host/SNI 填成证书域名"},
+    {"id": "trojan-reality", "label": "Trojan", "sub": "REALITY 安全层",
+     "proto": "trojan", "transport": "tcp", "security": "reality",
+     "fingerprint": "chrome", "sni": "@addr",
+     "need": "地址、端口、密码、公钥(pbk)"},
+    {"id": "ss2022", "label": "Shadowsocks-2022", "sub": "aes-256-gcm",
+     "proto": "shadowsocks", "method": "2022-blake3-aes-256-gcm",
+     "transport": "tcp", "security": "none",
+     "need": "地址、端口、密码（服务端 conf/Shadowsocks.sh 生成的最高配置）"},
+    {"id": "hysteria2", "label": "Hysteria2", "sub": "QUIC / 抗丢包",
+     "proto": "hysteria2", "transport": "quic", "security": "tls", "sni": "@addr",
+     "need": "地址、端口、密码；自签证书要固定服务端证书指纹"},
+    {"id": "vless-ecn", "label": "VLESS-ECN", "sub": "tcp + ML-KEM-768",
+     "proto": "vless", "transport": "tcp", "security": "none",
+     "fingerprint": "chrome",
+     "need": "地址、端口、UUID，以及服务端给的 encryption（后量子加密串）"},
+]
+
+
+def act_add_meta():
+    """预设列表 + uTLS 指纹白名单，给「添加节点」的三个下拉用。
+
+    指纹白名单必须由后端给：内核遇到不认识的 fingerprint 会**整份配置构建失败**，
+    前端自己写一份"常见值"迟早和服务端的表漂移 —— 那就等于把必然起不来的
+    节点当合法值发给用户。
+    """
+    try:
+        sys.path.insert(0, os.path.join(DIST, "lib"))
+        import compat as _compat
+        fps = sorted(_compat.FP_VALUES)
+        hint = _compat.FP_HINT
+    except Exception:                                            # noqa: BLE001
+        fps, hint = ["chrome", "firefox", "safari", "ios", "android", "edge",
+                     "random", "randomized"], ""
+    return True, json.dumps({"presets": ADD_PRESETS, "fingerprints": fps,
+                             "fingerprint_hint": hint}, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------ 局域网分享 ----
+# 「配置分发」：局域网里的手机/笔记本用一个 URL 就能拉走本客户端的全部节点。
+# 这件事本来只有命令行（`xbd share ...`）能做，面板里看不见 —— 于是"有这个功能"
+# 和"用户知道有这个功能"是两回事。这里把它接到界面上。
+#
+# 复用 share_server 的 Store（token 的生成/落盘/计数规则只有一份），
+# 端口与监听地址沿用 share.env，服务生命周期交给 systemd 单元。
+SHARE_ENV = os.path.join(CONF, "share.env")
+
+
+def _share_store():
+    import share_server as S          # DIST/lib 已在 sys.path 上
+    return S
+
+
+def _share_cfg():
+    return (cfg_get(SHARE_ENV, "SHARE_HOST", ""), cfg_get(SHARE_ENV, "SHARE_PORT", ""))
+
+
+def _unit_active(unit):
+    rc, out, _err = sh(["systemctl", "is-active", unit])
+    return out.strip() == "active"
+
+
+def _tcp_listening(host, port):
+    try:
+        with socket.create_connection((host or "127.0.0.1", int(port)), timeout=2):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _share_url(token):
+    host, port = _share_cfg()
+    if not host or not port:
+        return ""
+    return f"http://{host}:{port}/share/{token}"
+
+
+def _share_rows():
+    S = _share_store()
+    rows = []
+    for m in S.Store.list_all():
+        tok = m.get("_token", "")
+        rows.append({
+            "token": tok,
+            "enabled": bool(m.get("enabled")),
+            "used": int(m.get("used_count", 0) or 0),
+            "max_uses": int(m.get("max_uses", 0) or 0),
+            "created_at": int(m.get("created_at", 0) or 0),
+            "url": _share_url(tok),
+        })
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return rows
+
+
+def act_share_status():
+    """分享状态 + 链接列表。
+
+    为什么要把"服务活着"和"端口在听"分开报：单元 active 但 bind 失败是真实
+    存在过的故障（端口被别的 share_server 抢走）。只报 active 会让用户拿到一个
+    打不开的链接，还以为是手机的问题。
+    """
+    host, port = _share_cfg()
+    active = _unit_active(U_SHARE)
+    listening = _tcp_listening(host, port) if port else False
+    rows = _share_rows()
+    # 本机代理入口一并带出去：分享出去的不只是"配置文件"，这两个入口也是
+    # 局域网设备能直接用的东西，用户不用再去状态页翻一遍。
+    p_env = os.path.join(CONF, "ports.env")
+    listen = cfg_get(p_env, "LISTEN_ADDR", "127.0.0.1")
+    socks = f"{listen}:{cfg_get(p_env, 'PORT_NORMAL', '1080')}"
+    http_in = f"{listen}:{cfg_get(p_env, 'PORT_LAN_HTTP', '10809')}"
+    data = {
+        "host": host, "port": port,
+        "unit": U_SHARE, "active": active, "listening": listening,
+        "enabled": active and listening,
+        "tokens": rows,
+        "socks": socks,
+        "http": http_in,
+        "clients": len(rows),
+    }
+    return True, json.dumps(data, ensure_ascii=False)
+
+
+def act_share_new():
+    """新建一条分享链接（必要时把服务拉起来）。"""
+    import ports as _ports
+    S = _share_store()
+    host = ""
+    rc, out, _err = sh(["python3", "-c",
+                        "import sys; sys.path.insert(0, %r); import ports; "
+                        "print(ports.detect_lan())" % os.path.join(DIST, "lib")])
+    if rc == 0 and out.strip():
+        host = out.strip().splitlines()[-1].strip()
+    if not host:
+        host = cfg_get(os.path.join(CONF, "ports.env"), "LISTEN_ADDR", "127.0.0.1")
+    # 端口现找一个没被占的：CC 上 10808/10809 都被 Xray 占着，写死一个必然撞。
+    port = 0
+    for cand in range(18190, 18290):
+        if not _ports.in_use(cand):
+            port = cand
+            break
+    if not port:
+        return False, "18190-18290 没有可用端口（本机可能起了太多分享服务）"
+    os.makedirs(CONF, exist_ok=True)
+    with open(SHARE_ENV, "w", encoding="utf-8") as fh:
+        fh.write("# 配置分发服务。局域网设备用这个 URL 拉本客户端的完整节点配置。\n")
+        fh.write(f"SHARE_HOST={host}\nSHARE_PORT={port}\nSHARE_HEALTH_UNIT={U_XRAY}\n")
+    token = S.Store.new_token()
+    S.Store.save(token, {"enabled": True, "created_at": int(time.time()),
+                         "max_uses": 0, "used_count": 0})
+    # 旧实例先清干净：脱离 unit 直接起的残留进程不跟着 systemctl 停，
+    # 于是新实例起在别的端口、用户却连到旧的（写成新端口 → 链接打不开）。
+    sh(["systemctl", "stop", U_SHARE])
+    sh(["pkill", "-f", os.path.join(DIST, "lib", "share_server.py")])
+    time.sleep(1)
+    rc, _out, err = sh(["systemctl", "enable", "--now", U_SHARE], timeout=60)
+    if rc != 0:
+        rc, _out, err = sh(["systemctl", "restart", U_SHARE], timeout=60)
+    time.sleep(1)
+    if not _tcp_listening(host, port):
+        return False, (f"链接已生成，但服务没有在 {host}:{port} 上监听 —— "
+                       f"端口可能被别的服务抢了。{err or ''}").strip()
+    return True, f"局域网分享已开启\n{_share_url(token)}"
+
+
+def act_share_toggle(token, enabled):
+    token = str(token or "").strip()
+    if len(token) < 16 or not token.isalnum():
+        return False, "token 不合法"
+    S = _share_store()
+    meta = S.Store.load(token)
+    if meta is None:
+        return False, "找不到这条分享链接"
+    meta["enabled"] = bool(enabled)
+    S.Store.save(token, meta)
+    if enabled:
+        # 启用时把服务一并拉起来：否则用户点"启用"看着成功了，链接依然是死的。
+        sh(["systemctl", "enable", "--now", U_SHARE], timeout=60)
+        host, port = _share_cfg()
+        if not _tcp_listening(host, port):
+            sh(["systemctl", "restart", U_SHARE], timeout=60)
+            time.sleep(1)
+        if not _tcp_listening(host, port):
+            return False, "链接已启用，但分享服务没能起来（看 journalctl -u " + U_SHARE + "）"
+    return True, ("已启用" if enabled else "已停用") + "：" + _share_url(token)
+
+
+def act_share_remove(token):
+    token = str(token or "").strip()
+    if len(token) < 16 or not token.isalnum():
+        return False, "token 不合法"
+    S = _share_store()
+    path = S.Store._path(token)
+    if not os.path.isfile(path):
+        return False, "找不到这条分享链接"
+    os.remove(path)
+    return True, "已删除这条分享链接（已拿到链接的设备再也拉不到配置）"
+
+
+def act_share_preview(token=""):
+    """面板自己去把分享地址拉一遍，把"手机看到的内容"显示出来。
+
+    为什么不在浏览器里 fetch：分享服务是**另一个端口**，跨源会被 CORS 挡掉，
+    而给它加 CORS 头等于让任意网页都能读走节点凭据 —— 那是拿安全换方便。
+    面板后端本来就在同一台机器上，直接走 HTTP 拉一次最干净。
+    """
+    import base64
+    import urllib.request
+    token = str(token or "").strip()
+    if not token:
+        rows = [r for r in _share_rows() if r["enabled"]]
+        if not rows:
+            return False, "还没有启用的分享链接，先点「新建分享链接」"
+        token = rows[0]["token"]
+    url = _share_url(token)
+    if not url:
+        return False, "分享服务还没配置地址（先新建一条链接）"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            raw = resp.read(200000)
+    except Exception as exc:                                    # noqa: BLE001
+        return False, f"拉取失败：{exc}"
+    text = raw.decode("utf-8", "replace")
+    # 载荷是 base64 订阅（也可能已经是明文链接）。两种都要能看。
+    plain = text
+    if "://" not in text[:200]:
+        try:
+            plain = base64.b64decode(text + "=" * (-len(text) % 4)).decode("utf-8", "replace")
+        except Exception:                                       # noqa: BLE001
+            plain = ""
+    lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
+    names = []
+    for ln in lines:
+        if "#" in ln:
+            names.append(ln.rsplit("#", 1)[1][:40])
+    note = (f"{len(lines)} 个节点" + ("：" + "、".join(names[:8]) + ("…" if len(names) > 8 else "")
+                                      if names else "")) if lines else "内容解不开（可能不是订阅格式）"
+    body = plain[:4000] if plain else text[:2000]
+    return True, json.dumps({"url": url, "bytes": len(raw), "count": len(lines),
+                             "note": note, "body": body}, ensure_ascii=False)
+
+
 DISPATCH = {
         "import": lambda p: act_import(str(p.get("uri", "")).strip(),
                                         str(p.get("sub_name", "")).strip()),
@@ -948,6 +1210,13 @@ DISPATCH = {
     "config_update": lambda p: act_config_update(),
     "diagnose": lambda p: act_diagnose(),
     "ech": lambda p: act_ech(),
+    # 局域网分享（配置分发）
+    "share_status": lambda p: act_share_status(),
+    "share_new": lambda p: act_share_new(),
+    "share_toggle": lambda p: act_share_toggle(p.get("token", ""), p.get("enabled", False)),
+    "share_remove": lambda p: act_share_remove(p.get("token", "")),
+    "share_preview": lambda p: act_share_preview(p.get("token", "")),
+    "add_meta": lambda p: act_add_meta(),
 }
 
 
@@ -1104,6 +1373,10 @@ text-transform:uppercase;letter-spacing:.05em}
 .row{display:flex;justify-content:space-between;align-items:center;padding:5px 0;
 border-bottom:1px solid var(--ov1);gap:10px}
 .row:last-child{border:0}
+/* 状态行里的下拉：按内容宽度，别撑满整行 —— 全局 input/select 是 100%，
+   那是给表单用的，放状态行里会把下拉拉成一条横贯整行的长条。 */
+.row .v{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.row select{width:auto;max-width:100%;padding:5px 8px;font-size:12px}
 .k{color:var(--dim);white-space:nowrap}
 .v{font-variant-numeric:tabular-nums;text-align:right}
 /* 圆点：背景色只加在 .dot 上。
@@ -1121,8 +1394,9 @@ button.pri{background:var(--acc-btn);border-color:var(--acc-btn);color:var(--on-
 button.danger{background:var(--bad-btn);border-color:var(--bad-btn);color:var(--on-acc);font-weight:600}
 button.sm{padding:5px 10px;font-size:12px}
 button:disabled{opacity:.4;cursor:not-allowed}
-input,select{background:var(--input);color:var(--fg);border:1px solid var(--line);
-border-radius:7px;padding:7px 10px;font-size:13px;width:100%}
+input,select,textarea{background:var(--input);color:var(--fg);border:1px solid var(--line);
+border-radius:7px;padding:7px 10px;font-size:13px;width:100%;font-family:inherit;box-sizing:border-box}
+textarea{resize:vertical;line-height:1.5}
 input:focus,select:focus{outline:none;border-color:var(--acc)}
 .bar{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;align-items:center}
 .bar>*{flex:0 0 auto}.bar input{flex:1 1 200px;min-width:120px}
@@ -1143,7 +1417,13 @@ margin:1px 3px 1px 0;white-space:nowrap}
    密度不是"把字调小"，而是每屏能塞下多少个**节点**。三十个节点时，
    表格一行要一行、卡片一行两行，紧凑列表能一行三个 —— 一屏能对比的节点
    数量差三倍，这才是真正决定"节点多了好不好用"的东西。 */
-.nlt{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 12px;align-items:center}
+/* 「快速添加」：常驻在节点页上的一行导入框。
+   上一版把粘贴入口整个搬进弹窗，用户就找不到"添加节点的地方"了 ——
+   所以这一行不折叠、不隐藏，贴进去回车即可。 */
+.quickadd{display:flex;gap:6px;flex-wrap:wrap}
+.quickadd input{flex:1 1 320px;min-width:0}
+.quickadd button{flex:0 0 auto}
+.nlt{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .nli{background:var(--ov2);border:1px solid var(--line);color:var(--fg);
  border-radius:7px;padding:6px 9px;font-size:12px;font-family:inherit}
 .nli#nq{flex:1 1 220px;min-width:160px}
@@ -1175,8 +1455,11 @@ margin:1px 3px 1px 0;white-space:nowrap}
    右边的"选中一个组、看它的节点"更好用, 只是需要给组留个固定的位置。
    固定在左边的好处: 组永远看得见, 不会因为展开/折叠而从视野里消失。 */
 .nodes-card{padding:0}
-.nodes-head{display:flex;align-items:center;gap:10px;padding:11px 13px;
- border-bottom:1px solid var(--line);flex-wrap:wrap}
+/* 头部三行：① 标题+添加按钮 ② 快速添加 ③ 搜索/排序/密度/批量。
+   上一版是 flex-wrap 横排 —— 快速添加被挤成 349px 宽，落在标题行右边，
+   看起来像"一个莫名其妙的输入框"。竖排之后每行各司其职，宽度也吃满。 */
+.nodes-head{display:flex;flex-direction:column;gap:9px;padding:11px 13px;
+ border-bottom:1px solid var(--line)}
 .nh-l{display:flex;align-items:center;gap:8px}
 .badge{background:var(--ov3);border-radius:20px;padding:1px 8px;
  font-size:11px;color:var(--dim)}
@@ -1209,6 +1492,15 @@ margin:1px 3px 1px 0;white-space:nowrap}
  font-weight:600;font-size:14px}
 .mhead button{margin-left:auto}
 .mbody{padding:16px}
+/* 预设按钮：弹窗第一屏的六个"形状"。点一下把协议/传输/安全层/流控/指纹
+   全部填好，用户只补地址与凭据 —— 对应服务端面板 conf/*.sh 的建节点菜单。 */
+.presets{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:7px;margin:4px 0 10px}
+.preset{display:flex;flex-direction:column;gap:2px;align-items:flex-start;text-align:left;
+  background:var(--ov0);border:1px solid var(--line);border-radius:9px;padding:8px 10px;
+  color:var(--fg);cursor:pointer;font-family:inherit}
+.preset:hover{border-color:var(--acc-line);background:var(--acc-bg)}
+.preset b{font-size:12.5px;font-weight:600}
+.preset span{font-size:11px;color:var(--dim)}
 .mgroup{color:var(--dim);font-size:11px;text-transform:uppercase;margin:14px 0 7px}
 .mgroup:first-child{margin-top:0}
 .mitem{display:block;width:100%;text-align:left;margin:0 0 5px;padding:9px 12px}
@@ -1462,6 +1754,8 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
         <span class="ico">▤</span>节点<span style="flex:1"></span><span class="n" id="nav-nodes">0</span></button>
       <button data-view="status" onclick="go('status')">
         <span class="ico">◉</span>状态</button>
+      <button data-view="share" onclick="go('share')">
+        <span class="ico">⇪</span>分享</button>
       <button data-view="config" onclick="go('config')">
         <span class="ico">⚙</span>配置</button>
       <button data-view="core" onclick="go('core')">
@@ -1485,11 +1779,17 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
 <div class="card nodes-card">
   <div class="nodes-head">
     <div class="nh-l">
-      <button class="pri sm" onclick="openAdd()" title="手动添加 / 粘贴链接 / 订阅 / 扫码 / Server Pull">＋ 添加节点</button>
+      <button class="pri sm" onclick="openAdd()" title="按预设 / 手动填 / 粘贴 / 扫码 / Server Pull">＋ 添加节点</button>
       <b>节点</b><span class="badge" id="side-count">0</span>
       <span class="chipbar">
         <label class="chk"><input type="checkbox" id="onlyavail" onchange="renderNodes()">仅可用</label>
       </span>
+    </div>
+    <div class="quickadd">
+      <input id="quick-in" placeholder="把分享链接 / 订阅地址 / Xray JSON / Mihomo YAML 贴在这里，回车导入"
+             onkeydown="quickKey(event)">
+      <button class="pri" onclick="quickAdd(this)">导入</button>
+      <button onclick="openAdd()" title="预设 / 手动 / 扫码 / Server Pull">更多方式…</button>
     </div>
     <div class="nlt">
       <input id="nq" class="nli wide" placeholder="搜索名称 / 地址 / 协议…" oninput="renderNodes()">
@@ -1561,22 +1861,18 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
     <div class="row"><span class="k">HTTP 入口</span><span class="v mono" id="s-hport">—</span></div>
     <div class="row"><span class="k">代理连通</span><span class="v" id="s-proxy">—</span></div>
     <div class="row"><span class="k">DNS</span><span class="v">
-        <select id="dns-mode" onchange="setDns(this.value)" style="background:rgba(255,255,255,.05);
-          border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8px;font-size:12px">
+        <select id="dns-mode" onchange="setDns(this.value)">
           <option value="off">不接管（系统 DNS）</option>
           <option value="standard">标准：加密 DNS</option>
           <option value="strict">严格防泄漏</option>
         </select></span></div>
     <div class="row"><span class="k">多出站</span><span class="v">
-        <select id="family-mode" onchange="setFamily(this.value)"
-                style="background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--fg);
-                       border-radius:6px;padding:4px 8px;font-size:12px;font-family:inherit">
+        <select id="family-mode" onchange="setFamily(this.value)">
           <option value="auto">auto：直连走 IPv4，DNS 按连通性选</option>
           <option value="v4">强制 IPv4</option>
           <option value="v6">强制 IPv6</option>
         </select>
-        <select id="multi-mode" onchange="setMulti(this.value)" style="background:rgba(255,
-          border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:5px 8p
+        <select id="multi-mode" onchange="setMulti(this.value)">
           <option value="off">关：单节点（切换需重启）</option>
           <option value="on">开：全部常驻（切换不断线）</option>
         </select></span></div>
@@ -1585,7 +1881,6 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
     <div class="hint">端口统一在下面的「端口设置」里改，这里只做显示 ——
       之前两处都能改，容易改重。</div>
   </div>
-</div>
 <div class="card"><h2>代理入口</h2>
   <div class="hint" style="margin:0 0 10px">本客户端<strong>不修改系统代理配置</strong>。
     下面这些入口照常提供，需要时在客户端或 shell 里指定即可。</div>
@@ -1595,6 +1890,38 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   <div class="row" style="margin-top:6px"><span class="k">旧版接管残留</span>
     <span class="v"><button id="tk-clean" onclick="cleanTakeover()">清理系统代理配置</button>
     <span class="hint" id="clean-note"></span></span></div>
+</div>
+    </section>
+
+    <section class="view" id="view-share">
+<div class="card"><h2>局域网分享（配置分发）</h2>
+  <div class="hint" style="margin:0 0 10px">把本客户端的<strong>全部节点</strong>做成一个地址，
+    局域网里的手机 / 笔记本在客户端里填这个地址就能整份拉走 ——
+    换设备时不用一个一个重新导入。</div>
+  <div class="row"><span class="k">分享服务</span><span class="v" id="sh-state">—</span></div>
+  <div class="row"><span class="k">服务地址</span><span class="v mono" id="sh-addr">—</span></div>
+  <div class="row"><span class="k">链接数量</span><span class="v" id="sh-count">—</span></div>
+  <div class="row"><span class="k">代理入口（也可直接用）</span>
+    <span class="v mono" id="sh-proxy">—</span></div>
+  <div class="bar">
+    <button class="pri" onclick="shareNew(this)">新建分享链接</button>
+    <button onclick="loadShare(this)">刷新</button>
+  </div>
+  <div class="hint" id="sh-note"></div>
+
+  <div style="margin-top:12px"><div class="k" style="margin-bottom:5px">已有链接</div>
+    <table><thead><tr><th>链接</th><th style="width:1%">已用</th>
+      <th style="width:1%">状态</th><th style="width:1%">操作</th></tr></thead>
+      <tbody id="tb-share"></tbody></table></div>
+  <div class="hint">停用或删除后链接立刻失效（已经拉到配置的设备不受影响，它们手里是副本）。</div>
+</div>
+<div class="card"><h2>分享出去的节点长什么样</h2>
+  <div class="hint" style="margin:0 0 10px">下面就是那条地址返回的内容（base64 订阅，v2rayN / Shadowrocket / Clash 系都能读）。
+    节点增删后自动跟着变，不用重新生成链接。</div>
+  <div class="bar"><button onclick="sharePreview(this)">拉一次看看</button>
+    <button onclick="copyText($('sh-preview').textContent, this)">复制</button></div>
+  <pre id="sh-preview">点「拉一次看看」…</pre>
+  <div class="hint" id="sh-preview-note"></div>
 </div>
     </section>
 
@@ -1652,6 +1979,8 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   <div class="mhead">添加节点<button class="sm" onclick="closeAdd()">关闭</button></div>
   <div class="mbody">
    <div id="add-menu">
+     <div class="mgroup">按预设添加（对齐服务端面板的建节点菜单）</div>
+     <div id="preset-list" class="presets"><span class="hint">正在读取预设…</span></div>
      <div class="mgroup">手动添加</div>
      <button class="mitem" onclick="pickProto('vless')">VLESS</button>
      <button class="mitem" onclick="pickProto('vmess')">VMess</button>
@@ -1668,6 +1997,7 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
    </div>
    <div id="add-form" style="display:none">
      <div class="mrow"><label>协议</label><span id="f-proto" class="mono"></span></div>
+     <div class="hint" id="add-preset-tip" style="margin:0 0 6px"></div>
      <div class="mrow"><label>名称</label><input id="f-name" placeholder="留空自动生成"></div>
      <div class="mrow"><label>地址</label><input id="f-address" placeholder="域名或 IP（浏览器拨号要求域名）"></div>
      <div class="mrow"><label>端口</label><input id="f-port" value="443" inputmode="numeric"></div>
@@ -1681,13 +2011,17 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
      <div class="mrow"><label>流控</label><select id="f-flow">
         <option value="">无</option><option value="xtls-rprx-vision">xtls-rprx-vision</option>
      </select></div>
+     <div class="mrow"><label>指纹</label>
+       <input id="f-fingerprint" list="fp-list" placeholder="uTLS 指纹，留空=不用；列表来自内核白名单">
+       <datalist id="fp-list"></datalist></div>
+     <div class="mrow"><label>ECH</label>
+       <input id="f-ech" placeholder="客户端 ECH 配置（服务端分享链接里的 ech=…，留空=不用）"></div>
      <div class="mfoot"><button class="sm" onclick="openAdd()">返回</button>
        <button class="pri" onclick="submitNode()">生成并导入</button></div>
    </div>
    <div id="add-paste" style="display:none">
      <div class="mgroup">把链接、订阅地址、Xray JSON 或 Mihomo YAML 整段贴进来</div>
-     <textarea id="add-text" rows="7" style="width:100%;background:rgba(255,255,255,.05);
-       border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:9px;font-family:inherit"></textarea>
+     <textarea id="add-text" rows="7"></textarea>
      <div class="hint" id="add-sub-name-row" style="display:none">
        订阅地址请填名称，导入后它就是一个分组，可以整组管理：<br>
        <input id="add-sub-name" placeholder="例如：我的机场 / 公司专线" style="width:260px;margin-top:5px">
@@ -1907,7 +2241,7 @@ function out(t){ $('out-card').style.display='block'; $('out').textContent=t; }
 // "这个应用有哪几块"，也找不到"当前在哪"。现在收成 4 个视图，侧栏常驻。
 // 视图状态存 localStorage：刷新后停在原来那一屏，而不是每次都弹回节点页。
 // ================================================================
-const VIEWS = {nodes:'节点', status:'状态', config:'配置', core:'内核'};
+const VIEWS = {nodes:'节点', status:'状态', share:'分享', config:'配置', core:'内核'};
 const VIEW_KEY = 'xray-panel-view';
 
 function go(v){
@@ -1919,6 +2253,9 @@ function go(v){
   const t = $('view-title'); if(t) t.textContent = VIEWS[v];
   try { localStorage.setItem(VIEW_KEY, v); } catch(e){}
   renderTop();
+  // 分享页的数据要现查（systemctl is-active + 端口探测），不进 5 秒轮询；
+  // 切过去时拉一次就够，其余靠页面上的「刷新」。
+  if(v === 'share' && typeof loadShare === 'function') loadShare();
 }
 
 // 顶栏状态条：Xray / 当前节点 / 出口 IP。
@@ -2364,12 +2701,14 @@ async function post(action, payload, label, btn){
 // 批量操作专用：不刷新面板状态，只回报成败。
 // post() 每次调用都会 load() 整个状态，批量三十个节点就是三十次全量重拉。
 async function postQuiet(action, payload){
+  // 成功返回整个响应对象（调用方既能 `if (await ...)` 也能取 message），
+  // 失败返回 false。返回对象而不是 true，是因为有些动作的 message 里带数据。
   try{
     const r = await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(Object.assign({action}, payload||{}))});
     const j = await r.json();
-    if (!j.ok) say(j.message || '操作失败', 'err');
-    return !!j.ok;
+    if (!j.ok) { say(j.message || '操作失败', 'err'); return false; }
+    return j;
   }catch(e){ say('请求失败：'+e, 'err'); return false; }
 }
 async function toggleMain(){
@@ -2418,9 +2757,76 @@ async function setPortOne(kind, btn){
   if (j.ok && el) el.value = '';
 }
 
-async function loadConn(btn){
-  const j = await post('conninfo', {}, '正在生成连接配置…', btn);
+// ---- 局域网分享（配置分发）----
+// 这块本来只有命令行（xbd share）能做。面板里能看到"服务活没活、地址是什么、
+// 有哪几条链接、手机拉到的到底是什么"，用户才敢把地址发给别人。
+async function loadShare(btn){
+  if (btn) btn.disabled = true;
+  const j = await postQuiet('share_status', {});
+  if (btn) btn.disabled = false;
+  if (!j || !j.ok) return;
+  let d; try { d = JSON.parse(j.message); } catch (e) { return; }
+  const el = $('sh-state');
+  if (el) el.innerHTML = d.enabled
+    ? '<span class="dot ok"></span>运行中'
+    : (d.active ? '<span class="dot warn"></span>服务在跑但端口没在听'
+                : '<span class="dot idle"></span>已停止');
+  if ($('sh-addr')) $('sh-addr').textContent = (d.host && d.port)
+    ? d.host + ':' + d.port : '（还没有配置，点「新建分享链接」）';
+  if ($('sh-count')) $('sh-count').textContent = d.clients + ' 条';
+  if ($('sh-proxy')) $('sh-proxy').textContent = 'SOCKS5 ' + d.socks + ' · HTTP ' + d.http;
+  if ($('sh-note')) $('sh-note').textContent = d.enabled
+    ? '只监听上面这个局域网地址，没有绑 0.0.0.0 —— 公网访问不到。'
+    : '要给别人用，点「新建分享链接」把服务拉起来。';
+  const tb = $('tb-share');
+  if (tb) {
+    tb.innerHTML = (d.tokens || []).map(t => `<tr>
+      <td class="mono" style="word-break:break-all">${ESC(t.url || '—')}</td>
+      <td class="nowrap">${t.used}${t.max_uses ? ' / ' + t.max_uses : ''}</td>
+      <td class="nowrap">${t.enabled ? '<span class="tag ok">启用</span>'
+                                     : '<span class="tag">已停用</span>'}</td>
+      <td class="nowrap"><button class="sm" onclick="copyText('${ESC(t.url)}', this)">复制</button>
+        <button class="sm" onclick="shareToggle('${ESC(t.token)}',${t.enabled ? 'false' : 'true'},this)"
+          >${t.enabled ? '停用' : '启用'}</button>
+        <button class="sm danger" onclick="shareRemove('${ESC(t.token)}',this)">删除</button></td>
+    </tr>`).join('') || '<tr><td colspan="4" class="hint">还没有链接。点「新建分享链接」。</td></tr>';
+  }
+}
+
+async function shareNew(btn){
+  const j = await post('share_new', {}, '正在开启局域网分享…', btn);
+  if (j.ok) { say(j.message.replace('\n', '　'), 'good'); loadShare(); }
+}
+
+async function shareToggle(token, on, btn){
+  const j = await post('share_toggle', {token, enabled: on}, on ? '正在启用…' : '正在停用…', btn);
+  if (j.ok) loadShare();
+}
+
+async function shareRemove(token, btn){
+  if (!confirm('删除这条分享链接？已经拿到链接的设备将再也拉不到配置（它们手里的副本不受影响）。')) return;
+  const j = await post('share_remove', {token}, '正在删除…', btn);
+  if (j.ok) loadShare();
+}
+
+async function sharePreview(btn){
+  const j = await post('share_preview', {}, '正在拉取分享内容…', btn);
   if (!j.ok) return;
+  let d; try { d = JSON.parse(j.message); } catch (e) { return say('内容解析失败', 'err'); }
+  $('sh-preview').textContent = d.body || '（空）';
+  $('sh-preview-note').textContent = d.url + ' → ' + d.bytes + ' 字节，' + d.note;
+}
+
+async function loadConn(btn){
+  // ★ 这里**不能**用 post(): 它会把返回的 message 原样显示在页面顶部。
+  //   conninfo 的 message 是整份配置的 JSON（好几百字符），于是每次打开面板
+  //   —— 页面加载时就会调这个函数 —— 顶部都会顶出一大段 JSON，
+  //   把真正的界面挤到下面去。用户看到的"点配置是白板、东西都在下面"
+  //   有一半是它。用 postQuiet: 成功不吭声，失败才说话。
+  if (btn) btn.disabled = true;
+  const j = await postQuiet('conninfo', {});
+  if (btn) btn.disabled = false;
+  if (!j || !j.ok) return say('连接配置生成失败', 'err');
   let d;
   try { d = JSON.parse(j.message); } catch (e) { return say('配置生成失败', 'err'); }
   $('conn-yaml').textContent = d.yaml;
@@ -2642,12 +3048,56 @@ const TRANS = {
 const NSEC = {shadowsocks:['none'], hysteria2:['none'], vless:['none','tls','reality'],
               vmess:['none','tls'], trojan:['none','tls','reality']};
 
+// 预设与指纹白名单都由后端给（见 act_add_meta）。前端不再自己写一份
+// "常见指纹" —— 内核遇到不认识的值会整份配置构建失败，两份表迟早漂移。
+let ADD_META = {presets: [], fingerprints: []};
+
+async function loadAddMeta(){
+  const j = await postQuiet('add_meta', {});
+  if (!j || !j.ok) return;
+  try { ADD_META = JSON.parse(j.message); } catch(e){ return; }
+  const box = $('preset-list');
+  if (box) box.innerHTML = (ADD_META.presets || []).map(p =>
+    `<button class="preset" onclick="pickPreset('${escAttr(p.id)}')" title="${escAttr(p.need || '')}">
+       <b>${ESC(p.label)}</b><span>${ESC(p.sub || '')}</span></button>`).join('')
+    || '<span class="hint">后端没有给出预设</span>';
+  const dl = $('fp-list');
+  if (dl) dl.innerHTML = (ADD_META.fingerprints || [])
+    .map(v => `<option value="${escAttr(v)}"></option>`).join('');
+}
+
+// 预设入口：把协议/传输/安全层/流控/指纹/路径一次填好，只留凭据给用户填。
+// 表单里能改的都能改 —— 预设是"起点"，不是"锁死的模板"。
+function pickPreset(id){
+  const p = (ADD_META.presets || []).find(x => x.id === id);
+  if (!p) return;
+  pickProto(p.proto);                      // 先把字段按协议重建
+  const set = (eid, v) => { const e = $(eid); if (e && v != null) e.value = v; };
+  if (p.transport) set('f-transport', p.transport);
+  if (p.security)  set('f-security', p.security);
+  onTransport();                            // 传输/安全变了要重建后面的字段
+  set('f-flow', p.flow || '');
+  set('f-method', p.method || '');
+  set('f-fingerprint', p.fingerprint || '');
+  set('f-path', p.path || '');
+  set('f-encryption', '');
+  if (p.sni === '@addr') {
+    // SNI 默认等于地址：地址还没填时留空，导入时会自己回填
+    const a = $('f-address');
+    if (a && a.value.trim()) set('f-sni', a.value.trim());
+  }
+  ADD.preset = id;
+  const tip = $('add-preset-tip');
+  if (tip) tip.textContent = '预设「' + p.label + '」：' + (p.need || '') ;
+}
+
 function pickProto(p){
   ADD.proto = p;
   ['add-menu','add-form','add-paste','add-qr','add-pull'].forEach(i=>$(i).style.display = (i==='add-form')?'':'none');
   $('f-proto').textContent = p;
   $('f-cred').innerHTML = (p==='vless'||p==='vmess')
     ? row('UUID', `<input id="f-uuid" placeholder="${p==='vmess'?'VMess UUID':'VLESS UUID'}">`)
+      + (p==='vless' ? row('加密', `<input id="f-encryption" placeholder="留空=none；服务端开了 ML-KEM 会给一串 mlkem768x25519plus…">`) : '')
     : (p==='shadowsocks'
         ? row('加密', `<select id="f-method"><option>aes-128-gcm</option><option>aes-256-gcm</option>
              <option>chacha20-ietf-poly1305</option><option>2022-blake3-aes-128-gcm</option>
@@ -2680,6 +3130,10 @@ function renderFields(){
   let h = '';
   const hostPath = ['ws','xhttp','httpupgrade'].includes(t);
   if (hostPath) h += row('路径', `<input id="f-path" placeholder="/">`);
+  if (t === 'xhttp') h += row('模式', `<select id="f-mode">
+      <option value="">默认（auto）</option><option value="auto">auto</option>
+      <option value="packet-up">packet-up</option><option value="stream-up">stream-up</option>
+    </select>`);
   if (['ws','xhttp','httpupgrade','grpc'].includes(t)) h += row('Host', '<input id="f-host">');
   if (t==='grpc') h += row('服务名', '<input id="f-service_name" placeholder="GunService">');
   if (sec==='tls'||sec==='reality'){
@@ -2710,7 +3164,12 @@ function collect(){
   if (v('f-uuid'))    n.uuid = v('f-uuid');
   if (v('f-password')) n.password = v('f-password');
   if (v('f-method'))   n.method = v('f-method');
-  for (const k of ['sni','host','path','service_name','flow',
+  if (v('f-encryption'))  n.encryption = v('f-encryption');
+  if (v('f-fingerprint')) n.fingerprint = v('f-fingerprint');
+  if (v('f-ech'))         n.ech = v('f-ech');
+  // 这些字段以前表单里根本没有，拼链接时也就无从谈起 —— 补齐的前提是
+  // 后端 build_link 也得写回去（node.py 的往返自检盯着这件事）。
+  for (const k of ['sni','host','path','service_name','flow','alpn','mode',
                    'reality_public_key','reality_short_id','reality_spider_x']){
     if (v('f-'+k)) n[k] = v('f-'+k);
   }
@@ -2738,6 +3197,19 @@ async function submitNode(){
   closeAdd();
   // 链接由后端当"消息"返回（DISPATCH 是两元组约定，带不了第三个字段）
   post('import', {uri: j.message}, '正在导入并做能力检查…');
+}
+
+// 「快速添加」：节点页上常驻的一行输入框。
+// 上一版把粘贴框整个搬进弹窗，结果用户找不到原来那个"添加节点的地方"了 ——
+// 能导入不等于看得见能导入。这里保留一行：贴进去回车即可，其余方式在弹窗里。
+function quickKey(ev){ if (ev.key === 'Enter') quickAdd(); }
+
+async function quickAdd(btn){
+  const el = $('quick-in');
+  const v = (el && el.value || '').trim();
+  if (!v) return say('请先粘贴内容', 'err');
+  const j = await post('import', {uri: v}, '正在导入并做能力检查…', btn);
+  if (j.ok && el) el.value = '';
 }
 
 async function submitPaste(){
@@ -2788,6 +3260,7 @@ async function checkNode(f, btn){
 try { go(localStorage.getItem(VIEW_KEY) || 'nodes'); } catch(e){ go('nodes'); }
 load();
 loadConn();
+loadAddMeta();     // 预设与指纹白名单：缺失时「添加节点」只剩手动一项
 setInterval(load, 5000);
 </script></body></html>
 """

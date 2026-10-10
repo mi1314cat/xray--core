@@ -732,6 +732,28 @@ def selftest() -> int:
     failed += 0 if good else 1
     print(f"  [{'PASS' if good else 'FAIL'}] 字段完整性（缺失: {missing or '无'}）")
 
+    # 生成 → 解析 的往返：解析器认识的字段，生成时必须原样写回去。
+    # 这一条是补的：fp / encryption / ech / alpn / mode 以前只解析不生成，
+    # 表单里填了、拼链接时被悄悄丢掉，导入回来少一半参数而界面毫无提示。
+    rt = {"name": "rt", "protocol": "vless", "address": "rt.example", "port": 443,
+          "uuid": "11111111-2222-3333-4444-555555555555", "transport": "tcp",
+          "security": "reality", "flow": "xtls-rprx-vision", "fingerprint": "chrome",
+          "encryption": "mlkem768x25519plus.native.0rtt.KEY",
+          "ech": "https://ech.example/config", "sni": "rt.example", "alpn": "h2",
+          "reality_public_key": "PBK", "reality_short_id": "0a",
+          "reality_spider_x": "/"}
+    try:
+        back = parse_node(build_link(rt))
+        lost = [k for k in ("fingerprint", "encryption", "ech", "flow", "alpn",
+                            "reality_public_key", "reality_short_id",
+                            "reality_spider_x", "sni")
+                if back.get(k) != rt[k]]
+        good = not lost
+    except Exception as exc:
+        good, lost = False, [f"异常: {exc}"]
+    failed += 0 if good else 1
+    print(f"  [{'PASS' if good else 'FAIL'}] 生成→解析往返不丢字段（丢: {lost or '无'}）")
+
     # 订阅解析
     sub = "\n".join([c[0] for c in cases[:3]])
     nodes = parse_subscription(sub)
@@ -804,7 +826,23 @@ def build_link(node: dict) -> str:
         q.append(("path", path))
     if transport in ("grpc", "xhttp") and node.get("service_name"):
         q.append(("serviceName", node["service_name"]))
+    # ★ 下面这几个以前**只解析不生成** —— 表单里填了、拼链接时被悄悄丢掉，
+    #   导入回来一看少一半参数，而界面上什么错都不报。解析器认识哪些键，
+    #   生成就得写哪些键，否则"手动建的"和"粘贴的"行为不一致。
+    if node.get("fingerprint"):
+        q.append(("fp", node["fingerprint"]))
+    if node.get("alpn"):
+        q.append(("alpn", node["alpn"]))
+    if node.get("mode") and transport == "xhttp":
+        # xhttp 的 mode（auto / packet-up / stream-up）走 mode= 参数
+        q.append(("mode", node["mode"]))
+    if node.get("header_type") and transport == "tcp":
+        q.append(("headerType", node["header_type"]))
+    if node.get("ech"):
+        q.append(("ech", node["ech"]))
     if proto == "vless":
+        if node.get("encryption"):
+            q.append(("encryption", node["encryption"]))
         if node.get("flow"):
             q.append(("flow", node["flow"]))
         if node.get("reality_public_key"):
