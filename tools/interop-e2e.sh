@@ -14,6 +14,9 @@
 #   ③ 声明在、原生地址 404 → **回退普通话**（并把原因打出来）
 #   ④ 带声明的地址与裸地址返回**逐字节相同**的内容（第三方客户端零影响）
 #   ⑤ 两条产品逐字段：URI 侧非空的字段原生侧必须一致（原生允许多带, 不许少）
+#   ⑥ **刷新**旧记录（互通之前建的）→ 补成对 + 补声明, token/地址不变, 幂等
+#   ⑦ **刷新**不抹互通字段（role/native_token/distribution/formats 保留）
+#   ⑧ 面板不谎报陈旧: 两个记录都带**当前生成器**版本号 (原生记录也要带)
 #
 # 用法:
 #   bash tools/interop-e2e.sh                  # 合成语料（默认）
@@ -258,6 +261,182 @@ if fails:
 print("✓ URI ⊆ 原生: %d 个节点逐字段一致（原生允许多带）" % len(uri_nodes))
 PY
 if [[ "${PIPESTATUS[0]}" = 0 ]]; then ok "两条产品一致（URI ⊆ 原生）"; else no "两条产品不一致（见上）"; fi
+
+echo
+echo "=== 9 · 刷新: 互通之前建的记录必须被补成「声明 + 成对」 ==="
+# 场景: 在互通代码 (da5fff0/32f65ef) 之前发出的分享 —— meta 里只有
+# name/tags/payload_schema, 没有原生产品, 地址上也没有声明。
+# 用公共服务的 update/delete 把第 2 步那条分享**还原成**那个形态
+# (这是记录数据, 不是产物文件), 再跑一次 conf/share.sh refresh。
+#
+# 期望 (就是"看起来成功、其实什么都没做"的那一类):
+#   ① 补出原生产品, 并与主记录**同一到期时间/同一次数上限**;
+#   ② 地址变成带声明的形态 (interop/kernel/distribution/formats/url-xray),
+#      而 **token 与不带声明的地址一字不变** —— 已发出的链接不能失效;
+#   ③ 幂等: 再刷一次不重复建原生, native_token 不变;
+#   ④ meta 不被抹: 已带互通字段的记录刷新后 role/native_token/distribution
+#      必须仍在 (旧实现是整体替换, 会静默把成对关系抹掉 → 撤销连带不到原生)。
+meta_of(){ # <list json> <token> <field, 支持 meta.x>
+  printf '%s' "$1" | python3 -c 'import json, sys
+tok, fld = sys.argv[1], sys.argv[2]
+v = ""
+try:
+    r = next((x for x in json.load(sys.stdin) if x.get("token") == tok), {})
+    cur = r
+    for k in fld.split("."):
+        cur = (cur or {}).get(k) if isinstance(cur, dict) else ""
+    v = cur
+except Exception:
+    v = ""
+print("" if v is None else (",".join(map(str, v)) if isinstance(v, list) else v))' "$2" "$3" 2>/dev/null
+}
+njson(){ # 原生记录条数 (content_type=application/json 是 X 分享里它唯一的用法)
+  printf '%s' "$1" | python3 -c 'import json,sys
+print(len([r for r in json.load(sys.stdin)
+           if str(r.get("content_type","")).startswith("application/json")]))' 2>/dev/null
+}
+declared(){ bash "$ROOT/conf/share.sh" list 2>&1 | grep -oE 'http://[^ ]+' | sed -n 1p; }
+
+LIST=$(SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" list 2>/dev/null)
+BEFORE_URL=$(declared)
+BEFORE_BASE=${BEFORE_URL%%\?*}
+BEFORE_SHA=$(meta_of "$LIST" "$PTOK" content_sha256)
+PNAME=$(meta_of "$LIST" "$PTOK" meta.name)
+PTAGS=$(meta_of "$LIST" "$PTOK" meta.tags)
+LEGACY=$(PNAME="$PNAME" PTAGS="$PTAGS" python3 -c 'import json, os
+print(json.dumps({"name": os.environ["PNAME"], "tags": os.environ["PTAGS"].split(","),
+                  "payload_schema": 2}, ensure_ascii=False))')
+SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" update \
+    --token "$PTOK" --meta "$LEGACY" >/dev/null 2>&1
+SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" delete \
+    --token "$NTOK" >/dev/null 2>&1
+LIST=$(SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" list 2>/dev/null)
+LEG_URL=$(declared)
+if [[ "$(njson "$LIST")" = 0 && "$LEG_URL" != *"url-xray"* && "${LEG_URL%%\?*}" = "$BEFORE_BASE" ]]; then
+  ok "已还原成互通之前的形态（无原生记录 / 地址无声明 / token 未变）"
+else
+  no "还原失败: native=$(njson "$LIST") url=$LEG_URL"
+fi
+
+REFRESH_OUT=$(bash "$ROOT/conf/share.sh" refresh 2>&1)
+printf '%s\n' "$REFRESH_OUT" | grep -E '刷新|补建|失败|不可达' | sed 's/^/  /'
+AFTER=$(SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" list 2>/dev/null)
+NTOK2=$(printf '%s' "$AFTER" | python3 -c 'import json,sys
+print(next((r["token"] for r in json.load(sys.stdin)
+            if (r.get("meta") or {}).get("role") == "native"), ""))' 2>/dev/null)
+AFTER_URL=$(declared)
+# ① 成对: 原生记录回来了, 且只有一条, content_type 是 JSON, 能解析出节点
+NATN=$(njson "$AFTER")
+NAT_NODES=$(curl -s "http://127.0.0.1:$PORT/share/$NTOK2" | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin).get("outbounds") or []))
+except Exception: print(0)' 2>/dev/null)
+[[ "$NATN" = 1 && -n "$NTOK2" && "${NAT_NODES:-0}" -gt 0 ]] \
+  && ok "刷新补建了原生产品（1 条, JSON, $NAT_NODES 个出站）" \
+  || no "没有补出原生产品 (native=$NATN tok=${NTOK2:0:8} outbounds=${NAT_NODES:-0})"
+# ② 声明: 地址上带齐, 且 token/base 不变
+if [[ "${AFTER_URL%%\?*}" = "$BEFORE_BASE" \
+      && "$AFTER_URL" = *"interop=1"* && "$AFTER_URL" = *"kernel=xray"* \
+      && "$AFTER_URL" = *"distribution=xray"* \
+      && "$AFTER_URL" = *"formats=uri%2Cxray"* && "$AFTER_URL" = *"url-xray="* ]]; then
+  ok "地址补上了声明且 token/基址未变（$(printf '%s' "$AFTER_URL" | sed 's/.*?//' | cut -c1-52)…）"
+else
+  no "声明没补上或地址变了: $AFTER_URL"
+fi
+# ③ 主记录 meta: 声明字段 + native_token 指向新记录, 内容哈希未变
+PMETA_OK=$(printf '%s' "$AFTER" | python3 -c 'import json,sys
+r = next((x for x in json.load(sys.stdin) if x.get("token") == sys.argv[1]), {})
+m = r.get("meta") or {}
+f = m.get("formats") or []
+f = f if isinstance(f, list) else [f]
+print("ok" if (m.get("role") == "primary" and m.get("interop") == 1
+               and m.get("kernel") == "xray" and m.get("distribution") == "xray"
+               and m.get("kernel_version") and "xray" in f
+               and m.get("native_token") == sys.argv[2]) else
+      "bad role=%r interop=%r dist=%r formats=%r ntok=%r" % (
+          m.get("role"), m.get("interop"), m.get("distribution"), f,
+          (m.get("native_token") or "")[:8]))' "$PTOK" "$NTOK2" 2>/dev/null)
+[[ "$PMETA_OK" = ok ]] && ok "主记录 meta 写了完整声明, native_token 指向新记录" \
+                       || no "主记录 meta 不对: $PMETA_OK"
+[[ "$(meta_of "$AFTER" "$PTOK" content_sha256)" = "$BEFORE_SHA" ]] \
+  && ok "普通话内容未被这次刷新改动（sha 相同 $BEFORE_SHA）" \
+  || no "普通话内容被改动了: $BEFORE_SHA → $(meta_of "$AFTER" "$PTOK" content_sha256)"
+# ④ 成对语义: 到期时间与次数上限同源 (一条永久一条 24h 会让用户以为原生自己坏了)
+PAIR=$(printf '%s' "$AFTER" | python3 -c 'import json,sys
+recs = json.load(sys.stdin)
+p = next((x for x in recs if x.get("token") == sys.argv[1]), {})
+n = next((x for x in recs if x.get("token") == sys.argv[2]), {})
+print("ok" if (p.get("expires_at") == n.get("expires_at")
+               and p.get("max_uses") == n.get("max_uses")) else
+      "bad exp %s/%s uses %s/%s" % (p.get("expires_at"), n.get("expires_at"),
+                                    p.get("max_uses"), n.get("max_uses")))' "$PTOK" "$NTOK2" 2>/dev/null)
+[[ "$PAIR" = ok ]] && ok "原生产品与主记录同到期时间/同次数上限" || no "成对语义不一致: $PAIR"
+# ⑤ 幂等: 再刷一次不重复建原生
+bash "$ROOT/conf/share.sh" refresh >/dev/null 2>&1
+AFTER2=$(SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" list 2>/dev/null)
+NTOK3=$(printf '%s' "$AFTER2" | python3 -c 'import json,sys
+print(next((r["token"] for r in json.load(sys.stdin)
+            if (r.get("meta") or {}).get("role") == "native"), ""))' 2>/dev/null)
+[[ "$(njson "$AFTER2")" = 1 && "$NTOK3" = "$NTOK2" ]] \
+  && ok "幂等: 再刷一次仍是 1 条原生, native_token 未变" \
+  || no "幂等被破坏: native=$(njson "$AFTER2") ${NTOK2:0:8} → ${NTOK3:0:8}"
+# ⑥ meta 不被抹: 把 schema 改成旧版 (逼刷新走更新分支), 互通字段必须留住
+BAD_META=$(printf '%s' "$AFTER2" | python3 -c 'import json,sys
+m = dict(next((x.get("meta") or {} for x in json.load(sys.stdin)
+               if x.get("token") == sys.argv[1]), {}))
+m["payload_schema"] = 1
+print(json.dumps(m, ensure_ascii=False))' "$PTOK" 2>/dev/null)
+SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" update \
+    --token "$PTOK" --meta "$BAD_META" >/dev/null 2>&1
+bash "$ROOT/conf/share.sh" refresh >/dev/null 2>&1
+AFTER3=$(SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" list 2>/dev/null)
+KEEP=$(printf '%s' "$AFTER3" | python3 -c 'import json,sys
+r = next((x for x in json.load(sys.stdin) if x.get("token") == sys.argv[1]), {})
+m = r.get("meta") or {}
+f = m.get("formats") or []
+f = f if isinstance(f, list) else [f]
+print("ok" if (m.get("role") == "primary" and m.get("native_token") == sys.argv[2]
+               and m.get("distribution") == "xray" and "xray" in f) else
+      "bad role=%r ntok=%r dist=%r formats=%r" % (
+          m.get("role"), (m.get("native_token") or "")[:8],
+          m.get("distribution"), f))' "$PTOK" "$NTOK2" 2>/dev/null)
+[[ "$KEEP" = ok && "$(meta_of "$AFTER3" "$PTOK" meta.payload_schema)" = 2 ]] \
+  && ok "刷新保留互通字段（role/native_token/distribution/formats 未被整体替换抹掉）" \
+  || no "互通字段被抹掉了: $KEEP schema=$(meta_of "$AFTER3" "$PTOK" meta.payload_schema)"
+
+echo
+echo "=== 10 · 面板不得谎报『陈旧!』（原生记录也必须带生成器版本号） ==="
+# 原生 JSON 由 native.py 生成, 普通话 base64 由 share_payload.py 生成 —— 但
+# "陈旧"的判据是 meta.payload_schema **一个**字段。原生记录不带号 (或带一个
+# 面板不认识的号), 面板就会把每条原生都标成"陈旧!"并劝用户去 refresh ——
+# 假警报, 用户会以为订阅坏了。这里断言: 刚建/刚刷过的分享, 两个记录都显示
+# "最新", 且都带**当前**生成器版本号。
+LISTNOW=$(bash "$ROOT/conf/share.sh" list 2>&1)
+printf '%s\n' "$LISTNOW" | grep -E 'TOKEN|x-|陈旧' | sed 's/^/  /'
+# 两个条件一起断言: 少了后半条, "一条原生记录都没有" 也会让"没有陈旧"成立 ——
+# 那正是"因为什么都没做所以没有假警报"的假绿。
+if printf '%s' "$LISTNOW" | grep '陈旧' >/dev/null; then
+  no "面板把最新内容报成『陈旧!』（假警报）"
+elif ! printf '%s' "$LISTNOW" | grep '原生' >/dev/null; then
+  no "列表里根本没有原生记录 —— 『没有陈旧』不算通过（什么都没做）"
+else
+  ok "面板没有谎报陈旧（列表里确有原生记录, 且全部显示最新）"
+fi
+SCHEMAS=$(printf '%s' "$AFTER3" | python3 -c 'import json,sys
+p = n = None
+for r in json.load(sys.stdin):
+    m = r.get("meta") or {}
+    if m.get("role") == "native":
+        n = m.get("payload_schema")
+    elif m.get("role") == "primary":
+        p = m.get("payload_schema")
+print("%s/%s" % (p, n))' 2>/dev/null)
+WANT_SCH=$(LIB="$ROOT/conf/lib" python3 -c 'import os, sys
+sys.path.insert(0, os.environ["LIB"])
+import share_payload
+print("%s/%s" % (share_payload.PAYLOAD_SCHEMA, share_payload.PAYLOAD_SCHEMA))' 2>/dev/null)
+[[ "$SCHEMAS" = "$WANT_SCH" ]] \
+  && ok "两个记录都带当前生成器版本号（主/原生=$SCHEMAS, 期望 $WANT_SCH）" \
+  || no "版本号不对: 主/原生=$SCHEMAS 期望 $WANT_SCH"
 
 echo
 echo "=== 结果: $pass 通过, $fail 失败 ==="
