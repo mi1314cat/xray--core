@@ -38,6 +38,52 @@ CONF_DIR="$BASE_DIR/conf"
 OUT_DIR="$BASE_DIR/out"
 mkdir -p "$CONF_DIR" "$OUT_DIR"
 
+# ---------------------------------------------------------------- hy2 带宽口径
+# 显式设置 = $BASE_DIR/.hy2-bandwidth (两列空白分隔的 Mbps 文本, 与 mihomo 侧
+# 同名文件同一格式)。没有/不合法 → 默认 上行 60 / 下行 200 (用户偏好:
+# 上行 60, 下行 150~200 取 200)。逐字段校验: 写坏一个不影响另一个。
+#
+# ★ 与 conf/lib/nodes.py 的 hy2_bandwidth() **同一口径** —— 分享链接走那份
+#   实现, 本脚本写产物走这份; 一个读文件一个写死的话, 同一个节点从面板发出去
+#   和从脚本发出去描述的就不是同一件事 (旧代码写死 up=50 就是这个毛病)。
+HY2_UP_DEFAULT=60
+HY2_DOWN_DEFAULT=200
+hy2_bandwidth() {   # → "<up> <down>"
+    local up="" down="" f="$BASE_DIR/.hy2-bandwidth"
+    if [[ -f "$f" ]]; then read -r up down < "$f" 2>/dev/null || true; fi
+    [[ "$up" =~ ^[0-9]+$ ]] || up="$HY2_UP_DEFAULT"
+    [[ "$down" =~ ^[0-9]+$ ]] || down="$HY2_DOWN_DEFAULT"
+    printf '%s %s' "$up" "$down"
+}
+
+# ---------------------------------------------------------------- 产物只重建
+# hy2_share-<NN>.txt 唯一的写入方是 add_config（新增节点），所以口径改过之后
+# 已发出的产物永远是旧的。这里给一条**非交互、不新建节点、不碰内核**的重建路径。
+#
+# 链接实现**只从 conf/lib/nodes.py 的 build_share_link() 取**（与订阅载荷同一份）；
+# 现有产物里有、新链接里没有的安全参数（sni/pin/insecure/alpn/obfs≠none）一律
+# **拒绝写**并报出原因 —— 实测 hysteria-04 的证书文件被删掉后新推导拿不到 sni,
+# 而"没有 sni"的链接客户端必然校验失败（CC 实测 204 vs 000）。宁可留着不一致。
+#
+# 不加 --apply 是 dry-run；面板直跑 `hysteria2.sh sync-products --apply` 才写盘。
+sync_products() {
+    local d self py
+    self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    py=""
+    for d in "$self/lib" "$BASE_DIR/../conf/lib" "/root/conf/lib"; do
+        [[ -f "$d/hy2_products.py" ]] && { py="$d/hy2_products.py"; break; }
+    done
+    if [[ -z "$py" ]]; then
+        print_error "找不到 conf/lib/hy2_products.py —— 无法重建产物"
+        return 1
+    fi
+    XRAY_BASE_DIR="$BASE_DIR" XRAY_BASE="${XRAY_BASE:-$BASE_DIR}" \
+      XRAY_CONF_DIR="$CONF_DIR" XRAY_OUT_DIR="$OUT_DIR" \
+      XRAY_SHARE_DIR="${SHARE_DIR:-$BASE_DIR/out/share}" \
+      python3 "$py" --conf-dir "$CONF_DIR" --out-dir "$OUT_DIR" \
+        --share-dir "${SHARE_DIR:-$BASE_DIR/out/share}" "$@"
+}
+
 # 自签证书专用目录（仅有自签时写入，外部证书不复制）
 CERT_DIR="$BASE_DIR/Hysteria2"
 mkdir -p "$CERT_DIR"
@@ -732,15 +778,18 @@ EOF
     #   实测见同一份文档)。所以这里也从来没有别的 obfs 值可写。
     local link mport=""
     [[ -n "$HOP_RANGE" ]] && mport="mport=$HOP_RANGE&"
+    # 带宽只在这里取一次: 链接 / Xray 客户端 JSON / mihomo YAML 三处共用同一个数
+    local hy2_up hy2_down
+    read -r hy2_up hy2_down <<<"$(hy2_bandwidth)"
     if [[ "$CERT_TRUSTED" == "true" ]]; then
         # 真 CA 证书 → 正常校验，无 insecure
         # up/down 与 upmbps/downmbps 两种名字都写 —— mihomo 只认 `up/down`
         # （裸数字 = Mbps），sing-box 面板与本项目脚本只认 `upmbps/downmbps`。
         # 只写一种就是实测过的坑: 旧链接里的 upmbps=50 被 mihomo 整条丢掉。
-        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&insecure=0&alpn=h3&up=50&down=200&upmbps=50&downmbps=200#hysteria-$index"
+        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&insecure=0&alpn=h3&up=$hy2_up&down=$hy2_down&upmbps=$hy2_up&downmbps=$hy2_down#hysteria-$index"
     else
         # 自签 → 用 pin (hex, URI规范)，不再使用 insecure= 参数（兼容新Xray内核）
-        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&alpn=h3&pin=$cert_hex_pin&up=50&down=200&upmbps=50&downmbps=200#hysteria-$index"
+        link="hysteria2://$uuid@$server_ip:$hysteria_port?${mport}sni=$domain&alpn=h3&pin=$cert_hex_pin&up=$hy2_up&down=$hy2_down&upmbps=$hy2_up&downmbps=$hy2_down#hysteria-$index"
     fi
 
     # ---- Xray 客户端 JSON 片段 (pinnedPeerCertSha256 用 hex, v26.3.27 实测) ----
@@ -757,7 +806,7 @@ EOF
         "network": "hysteria",
         "security": "tls",
         "tlsSettings": { "serverName": "$domain", "alpn": ["h3"] },
-        "finalmask": { "quicParams": { "brutalUp": "50 mbps", "brutalDown": "200 mbps" } },
+        "finalmask": { "quicParams": { "brutalUp": "$hy2_up mbps", "brutalDown": "$hy2_down mbps" } },
         "hysteriaSettings": { "version": 2, "auth": "$uuid" }
       }
     }
@@ -781,7 +830,7 @@ EOF
           "pinnedPeerCertSha256": "$cert_hex_pin"
         },
         "hysteriaSettings": { "version": 2, "auth": "$uuid" },
-        "finalmask": { "quicParams": { "brutalUp": "50 mbps", "brutalDown": "200 mbps" } }
+        "finalmask": { "quicParams": { "brutalUp": "$hy2_up mbps", "brutalDown": "$hy2_down mbps" } }
       }
     }
   ]
@@ -800,8 +849,8 @@ proxies:
     type: hysteria2
     server: $server_ip
     port: $hysteria_port
-    up: "50 Mbps"
-    down: "200 Mbps"
+    up: "$hy2_up Mbps"
+    down: "$hy2_down Mbps"
     password: $uuid
     sni: $domain
     alpn:
@@ -816,8 +865,8 @@ proxies:
     type: hysteria2
     server: $server_ip
     port: $hysteria_port
-    up: "50 Mbps"
-    down: "200 Mbps"
+    up: "$hy2_up Mbps"
+    down: "$hy2_down Mbps"
     password: $uuid
     sni: $domain
     fingerprint: $cert_hex_pin
@@ -959,9 +1008,10 @@ main_menu() {
 # 直跑入口: add = 由 Batch Generator (conf/batch.sh) 无交互调用 add_config;
 # 不带参数 = 原有交互菜单 (单协议行为不变)
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    if [[ "${1:-}" == "add" ]]; then
-        add_config
-    else
-        main_menu
-    fi
+    case "${1:-}" in
+        add)           add_config ;;
+        # 只重建 out/hy2_share-<NN>.txt（非交互）。--apply 才写盘。
+        sync-products) shift; sync_products "$@" ;;
+        *)             main_menu ;;
+    esac
 fi

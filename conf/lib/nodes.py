@@ -315,14 +315,40 @@ DEFAULT_FRONT_PORT = 443        # nginx 前端默认端口 (与 deploy.py 的 pu
 
 # hysteria2 链接的带宽/ALPN 默认值。
 #
-# 与 conf/hysteria2.sh 生成同一个节点时写死的那组数一模一样
-# (链接里 upmbps=50&downmbps=200, 客户端 JSON 里 up:"50mbps"/down:"200mbps"),
-# 也与 mihomo 里 hysteria2 的默认 up/down 语义 (裸数字 = Mbps) 一致。
-# 分享层不能比节点自己的客户端产物少字段 —— 同一个节点从面板发出去和从
-# 脚本发出去必须描述同一件事。要改按节点走 share_meta 的 upmbps/downmbps。
-DEFAULT_HY2_UP = 50
+# ★ 口径只有一条, 与 conf/hysteria2.sh 的 hy2_bandwidth() 逐字对齐 ——
+#   一个读文件一个写死, 等于"面板发出去的链接"和"脚本写出来的产物"描述的不是
+#   同一件事, 而下一个建节点的人只会看脚本那半边:
+#     显式设置 = ${XRAY_BASE}/.hy2-bandwidth, 两列空白分隔的 Mbps 文本
+#                (与 mihomo 侧 src/lib/env.sh 的同名文件同一格式)
+#     优先级   = .hy2-bandwidth → share_meta 的 upmbps/downmbps (逐节点记录;
+#                生产上目前为空, 保留为兼容入口) → 默认
+#     默认     = 上行 60 / 下行 200 (用户偏好: 上行 60, 下行 150~200 取 200)
+#   逐字段校验: 两列里写坏一个, 另一个仍然生效。
+#   旧的 `up=50&down=200` 两头都不对: 默认不是 60/200, 而且硬编码意味着
+#   "用户显式设过"根本无处可设。
+DEFAULT_HY2_UP = 60
 DEFAULT_HY2_DOWN = 200
 DEFAULT_HY2_ALPN = "h3"
+HY2_BW_FILENAME = ".hy2-bandwidth"
+
+
+def hy2_bw_path():
+    """显式带宽设置文件 —— 与 conf/hysteria2.sh、mihomo 侧同一个路径口径。"""
+    base = (os.environ.get("XRAY_BASE") or os.environ.get("XRAY_BASE_DIR")
+            or "/root/catmi/xray")
+    return os.path.join(base, HY2_BW_FILENAME)
+
+
+def hy2_bandwidth():
+    """读显式带宽 → (up|None, down|None)。文件不在/该字段不合法 → None。"""
+    try:
+        with open(hy2_bw_path(), encoding="utf-8") as fh:
+            parts = fh.read().split()
+    except OSError:
+        return None, None
+    up = int(parts[0]) if parts and parts[0].isdigit() else None
+    down = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    return up, down
 
 
 def is_loopback_bound(n) -> bool:
@@ -635,8 +661,12 @@ def build_share_link(n, meta=None, notes=None):
         # hy2 走 QUIC, ALPN 必须是 h3 (节点自己的 tlsSettings.alpn 就是 h3);
         # 不写的话客户端可能一个 ALPN 都不带, 服务端直接不应答。
         q["alpn"] = n.get("alpn") or meta.get("alpn") or DEFAULT_HY2_ALPN
-        up = meta.get("upmbps") or meta.get("up") or DEFAULT_HY2_UP
-        down = meta.get("downmbps") or meta.get("down") or DEFAULT_HY2_DOWN
+        # 显式设置 (.hy2-bandwidth) 优先; 没有才看逐节点记录, 最后才是默认
+        bw_up, bw_down = hy2_bandwidth()
+        up = (bw_up if bw_up is not None
+              else (meta.get("upmbps") or meta.get("up") or DEFAULT_HY2_UP))
+        down = (bw_down if bw_down is not None
+                else (meta.get("downmbps") or meta.get("down") or DEFAULT_HY2_DOWN))
         q["up"] = up
         q["down"] = down
         q["upmbps"] = up

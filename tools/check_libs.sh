@@ -4636,6 +4636,87 @@ assert_eq "$(dval DIFF_IS_UNSUPPORTED)" "1" \
 assert_eq "$(dval COUNTS)" "10/9/1" \
     "节点数关系: uri = native + unsupported（10 = 9 + 1）"
 
+group "hysteria2 带宽口径与产物只重建 (60/200 · .hy2-bandwidth · 无损拒绝)"
+# 两件事一起钉:
+#  ① 带宽口径只有一条 —— 默认 60/200 (用户偏好), 显式设置走
+#     ${XRAY_BASE}/.hy2-bandwidth (与 mihomo 侧同名文件同格式)。
+#     旧实现两头都不对: 默认 50/200 且两处硬编码, "用户设过"无处可设。
+#  ② hy2_share-<NN>.txt 有**只重建**路径 (不新建节点、不碰内核), 而且
+#     **无损**: 旧产物里有、新链接里没有的安全参数 (sni/pin/…) 一律拒绝写。
+#     实测: RN 上 hysteria-04 的证书文件被续期流程删掉后, 新推导拿不到 sni,
+#     而"没有 sni"的 hy2 链接在 CC 上实测 000 (有 sni → 204)。
+HY2T="$TMP/hy2t"; rm -rf "$HY2T"; mkdir -p "$HY2T/conf" "$HY2T/out/share"
+hy2_fixture() {   # <idx> <auth> <port> [declared-domain]
+    local extra=""
+    [[ -n "${4:-}" ]] && extra="\"_serverName\": \"$4\","
+    cat > "$HY2T/conf/hysteria-$1.json" <<EOF
+{${extra}
+  "inbounds": [{"listen": "0.0.0.0", "port": $3, "protocol": "hysteria",
+    "settings": {"version": 2, "clients": [{"auth": "$2"}]},
+    "streamSettings": {"network": "hysteria", "security": "tls",
+      "tlsSettings": {"alpn": ["h3"],
+        "certificates": [{"certificateFile": "/nonexistent/c$1_cert.pem", "keyFile": "/nonexistent/c$1_key.pem"}]}},
+    "tag": "hysteria-$1"}]}
+EOF
+    echo "{\"host\": \"1.2.3.4\", \"port\": $3, \"name\": \"hysteria-$1\", \"tag\": \"hysteria-$1\"}" \
+        > "$HY2T/out/share/hysteria-$1.json"
+}
+hy2_fixture 02 auth-02 29602 hy2.example   # 域名可从片段声明推出 → 可重建
+hy2_fixture 04 auth-04 29604 ""            # 推不出 → 必须拒绝 (旧产物有 sni)
+printf 'hysteria2://auth-02@1.2.3.4:29602?obfs=none&sni=hy2.example&insecure=0&alpn=h3&up=50&down=200&upmbps=50&downmbps=200#hysteria-02\n' > "$HY2T/out/hy2_share-02.txt"
+printf 'hysteria2://auth-04@1.2.3.4:29604?obfs=none&sni=moontv.6896698.xyz&insecure=0&alpn=h3&up=50&down=200&upmbps=50&downmbps=200#hysteria-04\n' > "$HY2T/out/hy2_share-04.txt"
+cp "$HY2T/out/hy2_share-04.txt" "$HY2T/04.orig"
+hy2_sync() {   # [--apply]
+    XRAY_BASE_DIR="$HY2T" XRAY_BASE="$HY2T" XRAY_CONF_DIR="$HY2T/conf" \
+    XRAY_OUT_DIR="$HY2T/out" XRAY_SHARE_DIR="$HY2T/out/share" \
+    bash "$ROOT/conf/hysteria2.sh" sync-products "$@" 2>&1
+}
+assert_eq "$(LIB="$LIB" python3 -c 'import os,sys
+sys.path.insert(0, os.environ["LIB"])
+import nodes
+print(nodes.DEFAULT_HY2_UP, nodes.DEFAULT_HY2_DOWN)' 2>/dev/null)" "60 200" \
+    "默认带宽 = 上行 60 / 下行 200（旧实现是 50/200）"
+OUT1=$(hy2_sync)
+printf '%s\n' "$OUT1" | grep -E 'NODE|SUMMARY' | sed 's/^/      /'
+printf '%s' "$OUT1" | grep 'NODE hysteria-02 verdict=ok changed=up:50->60' >/dev/null \
+    && ok "无覆盖文件时按默认 60/200 重建（并报出改了哪几个参数）" \
+    || bad "默认口径没生效（期望 up:50->60）"
+printf '%s' "$OUT1" | grep 'NODE hysteria-04 verdict=refused lost=sni' >/dev/null \
+    && ok "无损拒绝: 推不出 sni 的节点拒绝重建（不写一份没 sni 的产物）" \
+    || bad "hysteria-04 没有被无损拒绝 —— 会把'客户端必然校验失败'的链接写进产物"
+cmp -s "$HY2T/out/hy2_share-04.txt" "$HY2T/04.orig" \
+    && ok "被拒绝的节点产物一字未动" || bad "被拒绝的节点产物被改了"
+printf '45 170\n' > "$HY2T/.hy2-bandwidth"
+OUT2=$(hy2_sync)
+printf '%s' "$OUT2" | grep 'NODE hysteria-02 verdict=ok changed=up:50->45,down:200->170' >/dev/null \
+    && ok "显式覆盖 .hy2-bandwidth=45 170 生效（up/down/upmbps/downmbps 四个字段一起）" \
+    || bad "覆盖文件没生效: $(printf '%s' "$OUT2" | grep NODE | head -1)"
+hy2_sync --apply >/dev/null 2>&1
+grep -q 'up=45&down=170&upmbps=45&downmbps=170' "$HY2T/out/hy2_share-02.txt" \
+    && ok "--apply 真的写盘了（45/170, sni 保留, obfs 已去掉）" \
+    || bad "--apply 没写盘或内容不对: $(cat "$HY2T/out/hy2_share-02.txt")"
+rm -f "$HY2T/.hy2-bandwidth"
+OUT3=$(hy2_sync)
+printf '%s' "$OUT3" | grep 'NODE hysteria-02 verdict=ok changed=up:45->60,down:170->200' >/dev/null \
+    && ok "删掉覆盖文件 → 回到默认 60/200（覆盖不是单向的）" \
+    || bad "删掉覆盖文件后没有回到默认: $(printf '%s' "$OUT3" | grep NODE | head -1)"
+# 产物与订阅载荷必须**逐字节相同** —— 链接只有 nodes.build_share_link() 一处实现
+SAME=$(XRAY_BASE_DIR="$HY2T" XRAY_BASE="$HY2T" python3 - "$ROOT" "$HY2T" <<'PYX'
+import os, sys
+root, T = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(root, "conf", "lib"))
+import nodes, share_meta
+ns, _b = nodes.collect(T + "/conf")
+by = {n["tag"]: n for n in ns}
+link = nodes.build_share_link(by["hysteria-02"],
+                             share_meta.load(T + "/out/share", "hysteria-02") or {})
+print("1" if link == open(T + "/out/hy2_share-02.txt").read().strip() else "0")
+PYX
+)
+assert_eq "$SAME" "1" "重建出来的产物与订阅载荷逐字节相同（链接只有一处实现）"
+grep -q 'sync-products' "$ROOT/conf/hysteria2.sh" && ok "非交互的产物重建入口存在" \
+    || bad "hysteria2.sh 没有 sync-products 入口（产物无法在不新建节点的前提下重建）"
+
 group "vendored proxy_node_compat 与 canonical 逐字节一致"
 # X 客户端里的 proxy_node_compat 是 canonical（proxy-node-compat 仓库）的
 # vendored 副本。它不是"参考实现"，是**实际参与判定**的那份：
