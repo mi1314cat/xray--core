@@ -1849,8 +1849,10 @@ done
 assert_eq "$(S_GET tls2 sni)" "" "拿不到域名时不写 sni (宁可省略也不写 IP)"
 assert_eq "$(S_GET re1 sni)" "re.example.com" "REALITY 的 sni 仍取 serverNames"
 assert_eq "$(S_GET hy2 alpn)" "h3" "hy2 链接带 alpn=h3"
-assert_eq "$(S_GET hy2 up)" "50" "hy2 链接带 up= (mihomo 认的名字)"
-assert_eq "$(S_GET hy2 upmbps)" "50" "hy2 链接带 upmbps= (sing-box 面板认的名字)"
+# 值来自 ./conf/lib/nodes.py 的带宽口径 (默认 60/200, 可被 ${XRAY_BASE}/.hy2-bandwidth
+# 覆盖) —— 这两条钉的是"两个名字都写", 不是那个常数; 常数另有一组断言钉住。
+assert_eq "$(S_GET hy2 up)" "60" "hy2 链接带 up= (mihomo 认的名字)"
+assert_eq "$(S_GET hy2 upmbps)" "60" "hy2 链接带 upmbps= (sing-box 面板认的名字)"
 
 # ------------------------------------------------- 客户端链路: 链接参数不许丢
 # 分享层补齐了参数, 客户端这一跳又丢 —— 实机现场: CC 上正在跑的 hysteria2
@@ -1974,7 +1976,8 @@ grep -q '"finalmask": { "quicParams": { "brutalUp"' "$ROOT/conf/hysteria2.sh" \
 grep -q '"up": "50mbps"' "$ROOT/conf/hysteria2.sh" \
     && bad "hysteria2.sh 仍在写已废弃的 hysteriaSettings.up/down" \
     || ok "hysteria2.sh 不再写已废弃的 hysteriaSettings.up/down"
-grep -q 'up=50&down=200&upmbps=50&downmbps=200' "$ROOT/conf/hysteria2.sh" \
+grep -q 'up=$hy2_up&down=$hy2_down&upmbps=$hy2_up&downmbps=$hy2_down' "$ROOT/conf/hysteria2.sh" \
+    && ! grep -q 'up=50&down=200' "$ROOT/conf/hysteria2.sh" \
     && ok "hysteria2.sh 的分享链接两种带宽名字都写 (mihomo 只认 up/down)" \
     || bad "hysteria2.sh 的分享链接少了 up=/down= (mihomo 会整条丢掉 upmbps=)"
 
@@ -4690,16 +4693,32 @@ printf '45 170\n' > "$HY2T/.hy2-bandwidth"
 OUT2=$(hy2_sync)
 printf '%s' "$OUT2" | grep 'NODE hysteria-02 verdict=ok changed=up:50->45,down:200->170' >/dev/null \
     && ok "显式覆盖 .hy2-bandwidth=45 170 生效（up/down/upmbps/downmbps 四个字段一起）" \
-    || bad "覆盖文件没生效: $(printf '%s' "$OUT2" | grep NODE | head -1)"
+    || bad "覆盖文件没生效: $(printf '%s' "$OUT2" | grep NODE | sed -n 1p)"
+# ★ 三个消费者一个口径: 覆盖文件在时, 链接(URI) / 原生文档(native.py) / 脚本产物
+#   必须都是 45/170。native.py 曾经漏读这个文件 —— 那样会出现"链接 45/170、
+#   原生 60/200"的两条产品不一致（端到端逐字段断言会红, 但那时已经发出去了）。
+CONSIST=$(XRAY_BASE_DIR="$HY2T" XRAY_BASE="$HY2T" python3 - "$ROOT" "$HY2T" <<'PYC'
+import os, sys, json
+root, T = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(root, "conf", "lib"))
+import nodes, share_meta, native
+ns, _b = nodes.collect(T + "/conf")
+by = {n["tag"]: n for n in ns}
+n, meta = by["hysteria-02"], (share_meta.load(T + "/out/share", "hysteria-02") or {})
+link = nodes.build_share_link(n, meta)
+doc, _m, _n2, _r, _u, _no = native.build_document(["hysteria-02"], T + "/conf", T + "/out/share")
+ob = (doc or {}).get("outbounds", [{}])[0]
+qp = ((ob.get("streamSettings") or {}).get("finalmask") or {}).get("quicParams") or {}
+ok = ("up=45&down=170" in link and "upmbps=45&downmbps=170" in link
+      and qp.get("brutalUp") == "45 mbps" and qp.get("brutalDown") == "170 mbps")
+print("1" if ok else "0 link=%s brutalUp=%r brutalDown=%r" % (link[-90:], qp.get("brutalUp"), qp.get("brutalDown")))
+PYC
+)
+assert_eq "$CONSIST" "1" "三个消费者同一口径: URI 链接 / 原生 brutalUp·Down / 覆盖文件（45/170）"
 hy2_sync --apply >/dev/null 2>&1
 grep -q 'up=45&down=170&upmbps=45&downmbps=170' "$HY2T/out/hy2_share-02.txt" \
     && ok "--apply 真的写盘了（45/170, sni 保留, obfs 已去掉）" \
     || bad "--apply 没写盘或内容不对: $(cat "$HY2T/out/hy2_share-02.txt")"
-rm -f "$HY2T/.hy2-bandwidth"
-OUT3=$(hy2_sync)
-printf '%s' "$OUT3" | grep 'NODE hysteria-02 verdict=ok changed=up:45->60,down:170->200' >/dev/null \
-    && ok "删掉覆盖文件 → 回到默认 60/200（覆盖不是单向的）" \
-    || bad "删掉覆盖文件后没有回到默认: $(printf '%s' "$OUT3" | grep NODE | head -1)"
 # 产物与订阅载荷必须**逐字节相同** —— 链接只有 nodes.build_share_link() 一处实现
 SAME=$(XRAY_BASE_DIR="$HY2T" XRAY_BASE="$HY2T" python3 - "$ROOT" "$HY2T" <<'PYX'
 import os, sys
@@ -4714,6 +4733,11 @@ print("1" if link == open(T + "/out/hy2_share-02.txt").read().strip() else "0")
 PYX
 )
 assert_eq "$SAME" "1" "重建出来的产物与订阅载荷逐字节相同（链接只有一处实现）"
+rm -f "$HY2T/.hy2-bandwidth"
+OUT3=$(hy2_sync)
+printf '%s' "$OUT3" | grep 'NODE hysteria-02 verdict=ok changed=up:45->60,down:170->200' >/dev/null \
+    && ok "删掉覆盖文件 → 回到默认 60/200（覆盖不是单向的）" \
+    || bad "删掉覆盖文件后没有回到默认: $(printf '%s' "$OUT3" | grep NODE | sed -n 1p)"
 grep -q 'sync-products' "$ROOT/conf/hysteria2.sh" && ok "非交互的产物重建入口存在" \
     || bad "hysteria2.sh 没有 sync-products 入口（产物无法在不新建节点的前提下重建）"
 

@@ -274,8 +274,16 @@ def build_outbound(n, meta=None, conf_dir=None, notes=None):
             hs["auth"] = n["password"]
         stream["hysteriaSettings"] = hs
         qp = {}
-        up = _bandwidth(meta.get("upmbps") or meta.get("up") or N.DEFAULT_HY2_UP)
-        down = _bandwidth(meta.get("downmbps") or meta.get("down") or N.DEFAULT_HY2_DOWN)
+        # ★ 带宽必须与链接侧（nodes.build_share_link）、脚本侧（hysteria2.sh）
+        #   **同一个口径** —— 三个消费者, 一个口径:
+        #   .hy2-bandwidth → share_meta → 默认 60/200。
+        #   这里原来漏了第一步: 覆盖文件存在时链接写 45/170 而原生写 60/200,
+        #   两条产品对不上（端到端的"URI ⊆ 原生"逐字段断言会红）。
+        bw_up, bw_down = N.hy2_bandwidth()
+        up = _bandwidth(bw_up if bw_up is not None
+                        else (meta.get("upmbps") or meta.get("up") or N.DEFAULT_HY2_UP))
+        down = _bandwidth(bw_down if bw_down is not None
+                          else (meta.get("downmbps") or meta.get("down") or N.DEFAULT_HY2_DOWN))
         if up:
             qp["brutalUp"] = up
         if down:
