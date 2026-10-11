@@ -159,20 +159,36 @@ def declare_url(url, decl) -> str:
 def parse_declaration(text):
     """从订阅地址（或裸查询串）里读声明。读不到返回 None。
 
+    三种入参形态都要认（docstring 承诺了就得做到）:
+        ① 完整地址      http://h:9443/share/tok?interop=1&…
+        ② "?" 开头的查询串  ?interop=1&…
+        ③ **裸查询串**      interop=1&…&url-xray=http://h:9443/share/n
+
     只读**查询串**: 片段里的同名字段一律不认（那是别的客户端的显示名载体,
     同一份语义有两套载体必然漂移）。任何异常都返回 None（"没有声明"）,
     **绝不抛** —— 一个畸形地址不该让客户端连普通话都拉不了。
+
+    ★ 判"这是完整地址还是裸查询串"必须看**开头有没有 scheme**
+      （`^scheme://`）, **不能**看"串里有没有 `://`":
+      裸查询串里的 url-* 值本身就含 `://`（第三方/手工调试时不会被百分号编码）。
+      实测: urlsplit("interop=1&…&url-xray=http://h:9443/share/n") 的
+      scheme/netloc 都是空、path 吞掉整串, `.query` = "" ——
+      于是声明被当成"没有查询串", 客户端**静默走普通话且不报错**。
+      (X 自己的 declaration_query() 会把 url-* 编码, 所以只有外部入参能踩到;
+       但"承诺支持裸查询串"就包含了"值没编码"这一种。)
     """
     try:
         s = str(text or "").strip()
         if not s:
             return None
-        if "?" in s and "://" in s or s.startswith("?"):
-            q = urllib.parse.urlsplit(s).query if "://" in s else s.lstrip("?")
-        elif "=" in s and "://" not in s:
-            q = s                      # 裸查询串（测试/手工调试用）
+        if s.startswith("?"):
+            q = s.lstrip("?")                       # ② "?a=b&c=d"
+        elif urllib.parse.urlsplit(s).scheme:        # ① 完整地址: **真探测 scheme**
+            q = urllib.parse.urlsplit(s).query
+        elif "=" in s:
+            q = s                                    # ③ 裸查询串
         else:
-            q = ""                     # 没有查询串 → 没有声明
+            q = ""                                   # 没有查询串 → 没有声明
         raw = {}
         for k, v in urllib.parse.parse_qsl(q, keep_blank_values=True):
             raw.setdefault(k, v)       # 同名参数取第一个（声明是我们自己写的）
@@ -280,9 +296,17 @@ def binary_candidates():
 def xray_version_text(bins=None):
     """跑 `xray version` → (版本号, 发行版标签)。探测不到返回 ("", "")。
 
-    **真探测, 不写死**。发行版标签取版本行首词小写（官方二进制 → `xray`）,
-    与 compat2 的 distribution 同源 —— 声明里那个标签必须和 compat 用来判能力的
-    那个标签是同一个字符串, 否则"声明匹配上了、能力判定却按另一个名字走"。
+    **真探测, 不写死**。发行版标签取**内核二进制版本行的首词小写**
+    （官方二进制 → `xray`）。
+
+    ★ 这个标签与 compat 侧的 distribution **不是同一套词表, 是刻意分开的**:
+      对**同一个**官方二进制, compat2.xray_target() 给 `distribution=None`
+      （compat 把 None 当 `upstream`）, 而 interop 这里给 `"xray"` —— 两者
+      本来就不相等（门禁把这两个值一起钉住）。原因是它们回答两个不同的问题:
+      interop 答"你能读哪种原生产物"（声明里的 distribution 只需等于**本实现
+      自报**的标签）, compat 答"你是哪个发行版、适用哪些能力规则"。
+      `decide()` 只比较声明与本实现自报的标签, **不跨层比较** —— 谁照旧注释
+      去把两套词表"对齐"成一个字符串, 就会坏掉其中一边。
     XBD_XRAY_VERSION 只为本项目既有的测试/离线场景预留（与 compat2 一致）。
     """
     forced = os.environ.get("XBD_XRAY_VERSION", "").strip()
@@ -325,7 +349,9 @@ def self_facts(prefix=None) -> dict:
     if not name:
         return {"kernel": "xray", "distribution": "", "version": "",
                 "ok": False, "note": "xray 二进制探测不到（版本行取不到）"}
-    # 官方二进制的首词就是 `xray`; 别的名字按 fork 处理（compat2 同口径）。
+    # 官方二进制的首词就是 `xray`; 别的名字按 fork 处理 —— fork 判定与 compat2
+    # 同口径, 但**官方**这一档两边不同: 这里返回 `xray`, compat2 返回 None
+    # (compat 当 upstream)。见 xray_version_text 的注释。
     return {"kernel": "xray", "distribution": name, "version": ver,
             "ok": True, "note": ""}
 
