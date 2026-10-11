@@ -2194,85 +2194,6 @@ assert_eq "$(CH2 nobw_src)" "SKIPPED" "没读到带宽时来源为空, 不冒充
 assert_eq "$(CH2 unknown_proto)" "raised" "没把白名单放宽成\"什么都收\": 不认识的协议仍然报错"
 assert_eq "$(CH2 trojan_pin)" "abcdef01" "同一处共享改动: 非 hysteria 产物的 pin 也读到了(小写归一)"
 
-# ---- 跨内核 compat: 同一条链接在不同内核的**解析器**上表达力不同 ----
-#
-# 现场: TROJAN-03(trojan+REALITY) 链接本身带齐 pbk/sid, Xray/sing-box 都能用,
-# mihomo 却恒 000。根因(mihomo v1.19.32 回环对照 + 源码):
-#   common/convert/converter.go 的 `case "trojan"` 从不读 security/pbk/sid
-#   → reality-opts 永远缺失 → 只按**裸 TLS** 拨号(日志里连 REALITY 行都没有)。
-#   同一个节点写成 YAML 显式带 reality-opts → 204; YAML 去掉 reality-opts → 000。
-# 所以这是"URI 表达力"的第二层: 链接格式装得下(全局行), 但**这个内核的解析实现
-# 读不读**是逐内核的。规则行必须带 target_kernel, 且**不许外溢**(否则 Xray 会被判错)。
-group "跨内核 compat: mihomo 的 trojan 链接解析器丢 reality (逐内核规则不外溢)"
-CH3=$(python3 - "$ROOT" <<'PYEOF'
-import json, os, sys
-root = sys.argv[1]
-sys.path.insert(0, os.path.join(root, "Client", "lib"))
-from proxy_node_compat import check_node, Target, Registry, default_registry_path
-
-LINK = ("trojan://LV7CpzX9Jc8vWuhP0YV0@107.173.154.178:29602?security=reality&type=tcp"
-        "&sni=audio-ssl.itunes.apple.com&fp=chrome&sid=b860a9f0"
-        "&pbk=GiR4k0uVRhKEWlfD9oRjjv-C0STrp5M0uP3kRIT2pgU#TROJAN-03")
-def ok(cond, desc):
-    # 逐条**即时**打印: 生成器后半段崩了, 前面已经判定的证据也不会丢
-    # (旧写法是攒到末尾一次性 print —— 中途异常 = 这组检查一条都不算, 静默全绿)
-    print(("OK " if cond else "NO ") + desc, flush=True)
-
-
-def note(desc):
-    print("NO " + desc, flush=True)
-
-
-reg = Registry.load(default_registry_path())
-rows = [u for u in reg.uri_rules if u.get("uri_rule_id") == "uri.trojan.reality@mihomo"]
-ok(len(rows) == 1, "注册表里有 uri.trojan.reality@mihomo 这一行")
-row = rows[0] if rows else {}
-ok(row.get("target_kernel") == "mihomo", "该行带 target_kernel=mihomo(逐内核, 不是全局)")
-ok(row.get("representation") == "NONE", "representation=NONE(reality 参数一个都到不了 mihomo)")
-ok(len(row.get("loss") or []) >= 3, "loss 逐字段写清(pbk / sid / server_names 各一条)")
-ok(bool(row.get("workaround")), "给了 workaround(YAML 形态的 reality-opts)")
-ev = set(reg.evidence.keys())
-ok(all(i in ev for i in (row.get("evidence") or [])),
-   "证据 id 在 evidence 表里能解析(不是悬空引用)")
-
-r_m = check_node(LINK, Target(kernel="mihomo", distribution="upstream", version="1.19.32")).to_dict()
-ok(r_m["levels"].get("uri") == "SUPPORTED_WITH_LOSS",
-   "mihomo + trojan/REALITY 链接: uri 层判 SUPPORTED_WITH_LOSS(不再当作能连)")
-ok(any(l.get("rule") == "uri.trojan.reality@mihomo" for l in r_m.get("losses", [])),
-   "损失条目指向该规则(可审计)")
-ok(r_m.get("status") in ("SUPPORTED_WITH_LOSS", "UNSUPPORTED"),
-   "总判定至少带损失(status=%s)" % r_m.get("status"))
-
-r_x = check_node(LINK, Target(kernel="xray", distribution="upstream", version="26.3.27")).to_dict()
-ok(r_x["levels"].get("uri") != "SUPPORTED_WITH_LOSS",
-   "同一条链接在 xray 上**不被**这行波及(逐内核规则不许外溢)")
-ok(not any(l.get("rule") == "uri.trojan.reality@mihomo" for l in r_x.get("losses", [])),
-   "xray 的损失表里没有 mihomo 那条规则")
-ok(r_x.get("status") == "SUPPORTED", "xray 上仍是 SUPPORTED(与修复前逐字相同)")
-
-ok(reg.uri_rule("trojan", "standard:reality") is None,
-   "不给内核时取不到这颗逐内核行(不猜、不拿别家结论顶替)")
-ok((reg.uri_rule("trojan", "standard:reality", "mihomo") or {}).get("uri_rule_id")
-   == "uri.trojan.reality@mihomo", "给了 mihomo 才取到它")
-ok((reg.uri_rule("ss", "standard:reality", "mihomo") or {}).get("uri_rule_id") == "uri.ss.reality",
-   "全局行仍然是回退(ss 那条不受影响)")
-kernels = {u.get("target_kernel") for u in reg.uri_rules if u.get("target_kernel")}
-ok(kernels <= {"xray", "mihomo", "singbox"}, "所有 target_kernel 取值都是已知内核: %s" % sorted(kernels))
-legacy = [u for u in reg.uri_rules if not u.get("target_kernel")]
-ok(all(reg.uri_rule(u["scheme"], u["feature"]) is not None for u in legacy),
-   "旧调用形式对所有全局行仍然取得到(向后兼容)")
-PYEOF
-)
-while IFS= read -r ln; do
-    case "$ln" in
-        "OK "*) ok "${ln#OK }" ;;
-        "NO "*) bad "${ln#NO }" ;;
-    esac
-done <<< "$CH3"
-# 生成器崩了/没输出 = 这组检查被静默跳过。本项目吃过"检查根本没跑却全绿"的亏,
-# 所以这里必须当场红, 不许当成"没有失败"。
-[[ "$CH3" == *"OK "* || "$CH3" == *"NO "* ]]     && ok "compat 断言生成器有输出（没有静默跳过）"     || bad "compat 断言生成器没有输出（崩溃/被跳过）: $(printf '%s' "$CH3" | tail -1)"
-
 # 内核在就用真内核把"旧世代产物 → 配置"这一条验穿: 带宽搬到了 finalmask, 配置起得来
 XK2="${XRAY_BIN:-}"
 [[ -z "$XK2" && -x /root/catmi/xray/xrayls ]] && XK2=/root/catmi/xray/xrayls
@@ -4041,40 +3962,6 @@ assert_eq "$(mux_gen "$MUXT/tcp-mux.json" "$MUXT/o6.json" --no-mux)" "null" \
 # 开的时候必须说风险（用户要求：要能开，但要在 stderr 说明风险）
 grep -q 'concurrency=8' "$MX/log-o3.json.txt" && ok "开 mux 时 stderr 给出风险提示" \
     || bad "开 mux 时没有风险提示"
-# XHTTP 拒绝要写进 compat 的"运行期事实"，否则它对 XHTTP 节点的结论比现实悲观
-python3 - "$ROOT" <<'PY' > "$MX/compat_mux.txt"
-import importlib.util, os, sys
-root = sys.argv[1]
-spec = importlib.util.spec_from_file_location("c2", os.path.join(root, "Client/lib/compat2.py"))
-c2 = importlib.util.module_from_spec(spec); spec.loader.exec_module(c2)
-node = {"protocol": "vless", "transport": "xhttp", "security": "tls", "mux": True}
-on, why = c2.effective_mux(node)
-print("declined=%s" % (not on))
-print("tcp_on=%s" % c2.effective_mux({"protocol": "vless", "transport": "tcp", "mux": True})[0])
-print("default_off=%s" % (not c2.effective_mux({"protocol": "vless", "transport": "tcp", "mux": False})[0]))
-PY
-grep -q 'declined=True' "$MX/compat_mux.txt" && ok "compat2 认定 XHTTP 下 mux 被拒（与实际一致）" \
-    || bad "compat2 仍以为 XHTTP 会开 mux —— 两侧判据漂移"
-grep -q 'tcp_on=True' "$MX/compat_mux.txt" && ok "compat2 认定非 XHTTP 会开" || bad "compat2 漏判非 XHTTP 的 mux"
-grep -q 'default_off=True' "$MX/compat_mux.txt" && ok "compat2 默认不开（与 genconfig 一致）" \
-    || bad "compat2 默认还认为会开"
-# ★ 两侧判据是**抄的一份**（compat2 要能独立跑，不 import genconfig）。抄就得锁：
-#   一条门禁逐项比对键集合，漂移当场红。
-python3 - "$ROOT" <<'PY' > "$MX/mux_keys.txt"
-import importlib.util, os, sys
-root = sys.argv[1]
-def load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
-g = load("g", os.path.join(root, "Client/lib/genconfig.py"))
-c = load("c", os.path.join(root, "Client/lib/compat2.py"))
-gt, gp = set(g.MUX_FORBIDDEN_TRANSPORTS), set(g.MUX_FORBIDDEN_PROTOCOLS)
-ct, cp = set(c._MUX_FORBIDDEN_TRANSPORTS), set(c._MUX_FORBIDDEN_PROTOCOLS)
-print("same=%s" % (gt == ct and gp == cp))
-print("g=%s c=%s" % (sorted(gt | gp), sorted(ct | cp)))
-PY
-grep -q 'same=True' "$MX/mux_keys.txt" && ok "genconfig 与 compat2 的 mux 判据键集合一致（防漂移）" \
-    || bad "两处 mux 判据漂移: $(grep -m1 '^g=' "$MX/mux_keys.txt")"
 
 # 节点生成侧：mihomo 的 smux 是另一套协议，不能冒充 mux.cool
 python3 - "$ROOT" <<'PY' > "$MX/smux.txt"
@@ -4348,229 +4235,6 @@ else
     ok "没有现行脚本引用孤儿链 (.sh/.py 非注释行)"
 fi
 
-# ---------------------------------------------------------------- 三家互通
-#
-# 服务端在**分享地址**上声明内核/发行版/可用格式, 客户端据此单方面决定拉原生
-# 还是拉普通话。设计: proxy-node-compat/docs/three-way-interop.md
-#
-# 这一组锁四件事。缺任何一件, "看起来能用"都会盖住静默失效:
-#   ① 决策规则: 同内核同发行版→原生; 跨内核/声明缺失/声明不认识/发行版不在
-#      清单→普通话（不猜）。
-#   ② 两份 interop.py **逐字节相同**（服务端 conf/lib 与客户端 Client/lib 各
-#      一份 vendored 副本）—— 字段名对不上时, 表现是"静默全部走普通话",
-#      没有任何报错。
-#   ③ 端到端（tools/interop-e2e.sh）: 真 share.sh create + 真客户端 xbd
-#      node sub, 含"同内核走原生 / 声明缺失回退 / 原生 404 回退"三条路径,
-#      以及"带声明与裸地址逐字节相同"（第三方客户端零影响）。
-#   ④ 两条产品逐字段一致（URI ⊆ 原生）—— 见 e2e 的第 8 步。
-group "三家互通 (内核声明 → 原生/普通话)"
-XRAY_INTEROP="$LIB/interop.py"
-XRAY_INTEROP_C="$ROOT/Client/lib/interop.py"
-[[ -f "$XRAY_INTEROP" ]] && ok "服务端 conf/lib/interop.py 存在" || bad "缺 conf/lib/interop.py"
-[[ -f "$XRAY_INTEROP_C" ]] && ok "客户端 Client/lib/interop.py 存在" || bad "缺 Client/lib/interop.py"
-assert_eq "$(sha256sum "$XRAY_INTEROP" 2>/dev/null | awk '{print $1}')" \
-          "$(sha256sum "$XRAY_INTEROP_C" 2>/dev/null | awk '{print $1}')" \
-          "两份 interop.py 逐字节相同（服务端/客户端同一份定义）"
-
-# ---- ① 决策规则（纯函数, 不依赖网络与内核）----
-DEC() { # <订阅地址> <本机内核> <本机发行版> → "内核|原因"
-    python3 - "$XRAY_INTEROP" "$@" <<'PY'
-import sys, os
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-import interop
-decl = interop.parse_declaration(sys.argv[2])
-choice, reason, url, _d = interop.decide(decl, sys.argv[3], sys.argv[4])
-print("%s|%s" % (choice, reason))
-PY
-}
-SAME_URL='http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=http%3A%2F%2Fh%3A9443%2Fshare%2Fbbbb'
-assert_eq "$(DEC "$SAME_URL" xray xray)" "native|native-listed" \
-    "同内核同发行版 → 原生"
-assert_eq "$(DEC "$SAME_URL" sing-box sing-box)" "uri|cross-kernel" \
-    "跨内核（SB 客户端遇到 X 服务端）→ 普通话"
-assert_eq "$(DEC 'http://h:9443/share/aaaa' xray xray)" "uri|no-declaration" \
-    "声明缺失 → 普通话（不是报错）"
-assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=9&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=http%3A%2F%2Fh%2Fb' xray xray)" \
-    "uri|unknown-schema" "声明规范版本不认识 → 普通话"
-assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=v2ray&distribution=v2ray&formats=uri' xray xray)" \
-    "uri|unknown-kernel" "声明的内核不在词表里 → 普通话"
-assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray-lx&formats=uri%2Cxray-lx&url-xray-lx=http%3A%2F%2Fh%2Fb' xray xray)" \
-    "uri|distribution-not-listed" "同内核但发行版(fork)不在清单 → 普通话（不猜原生）"
-assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray' xray xray)" \
-    "uri|no-url-for-format" "声明了格式却没给地址 → 普通话"
-assert_eq "$(DEC 'http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=file%3A%2F%2F%2Fetc%2Fpasswd' xray xray)" \
-    "uri|bad-native-url" "原生地址不是 http(s) → 普通话（不去取 file://）"
-assert_eq "$(DEC "$SAME_URL" "" "")" "uri|self-unknown" \
-    "本机发行版探测不出来 → 普通话（不猜自己是官方版）"
-# 「给了地址」= 「声明这个格式」: 只写 url-xray 而 formats 里没有它, 是自相矛盾的
-# 声明 —— 生成器必须补齐, 否则客户端永远走普通话而地址上明明挂着原生。
-DECL_Q=$(python3 - "$XRAY_INTEROP" <<'PY'
-import sys, os
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-import interop
-d = interop.build_declaration("xray", "xray", "26.3.27", formats=("uri",),
-                              urls={"xray": "http://h/b"})
-print(",".join(d["formats"]))
-PY
-)
-assert_eq "$DECL_Q" "uri,xray" "只给 url-xray 时 formats 自动补上 xray"
-
-# ---- ② 声明只读查询串（片段里的同名字段不许当声明）----
-FRAG_ONLY=$(DEC 'http://h:9443/share/aaaa#interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray' xray xray)
-assert_eq "$FRAG_ONLY" "uri|no-declaration" "片段里的同名字段不算声明（载体只有查询串）"
-# 生成声明时保留地址上原有的第三方参数（有些面板会带自己的参数）
-KEEPQ=$(python3 - "$XRAY_INTEROP" <<'PY'
-import sys, os
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-import interop
-u = interop.declare_url("http://h:9443/share/a?token=zzz",
-                        interop.build_declaration("xray", "xray"))
-print("token=zzz" in u and "interop=1" in u and u.count("interop=1") == 1)
-PY
-)
-assert_eq "$KEEPQ" "True" "并声明时保留地址上原有的其它参数, 且不重复叠加"
-
-# ---- ②b 三种入参形态必须**等价**（完整地址 / "?" 开头 / 裸查询串）----
-# docstring 承诺支持"或裸查询串", 而裸查询串里的 url-* 值**没被编码**时它自己
-# 就带字面 `://`。判"是不是完整地址"若看**子串** `://`, 就会把它当完整地址 →
-# urlsplit() 的 query 是空串 → 静默 no-declaration（不报错, 走普通话）。
-# 两种错法都在这里被挡住:
-#   · 原实现 `"=" in s and "://" not in s` → 裸查询串掉进 else
-#   · "改成看子串 ://" 的错修法 → 依然走完整地址分支, query 为空
-# 断言的是**决策三项逐字段相同**, 不是"能读出来"而已。
-THREE=$(python3 - "$XRAY_INTEROP" <<'PY'
-import sys, os
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-import interop
-NAT = "http://h:9443/share/bbbb"
-decl = interop.build_declaration("xray", "xray", "26.3.27",
-                                 formats=("uri", "xray"), urls={"xray": NAT})
-bare = ("interop=1&kernel=xray&distribution=xray&version=26.3.27"
-        "&formats=uri,xray&url-xray=" + NAT)
-forms = (bare, "?" + bare,
-         "http://h:9443/share/aaaa?" + interop.declaration_query(decl))
-for s in forms:
-    d = interop.parse_declaration(s)
-    if not d or not d.get("recognized"):
-        print("UNRECOGNIZED")
-        continue
-    c, r, u, _ = interop.decide(d, "xray", "xray")
-    print("%s|%s|%s" % (c, r, u))
-PY
-)
-THREE_BARE=$(printf '%s' "$THREE" | sed -n 1p)
-assert_eq "$THREE_BARE" "native|native-listed|http://h:9443/share/bbbb" \
-    "裸查询串（url 值未编码, 带字面 ://）→ 认得出声明并走原生"
-assert_eq "$(printf '%s' "$THREE" | sed -n 2p)" "$THREE_BARE" \
-    "『?』+ 裸查询串 与裸查询串: 决策三项相同"
-assert_eq "$(printf '%s' "$THREE" | sed -n 3p)" "$THREE_BARE" \
-    "完整订阅地址 与裸查询串: 决策三项相同"
-SELFQ=$(python3 - "$XRAY_INTEROP" <<'PY'
-import sys, os
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-import interop
-d = interop.parse_declaration(interop.declaration_query(
-    interop.build_declaration("xray", "xray", "26.3.27",
-                              formats=("uri", "xray"), urls={"xray": "http://h/b"})))
-print(bool(d and d.get("recognized")))
-PY
-)
-assert_eq "$SELFQ" "True" "declaration_query() 的产物能被 parse_declaration() 读回"
-
-# ---- ②c 两套"发行版"词表**刻意分开**（别照旧注释去"对齐"它们）----
-# interop 的 distribution 取二进制版本行首词小写（官方 → `xray`）;
-# compat2 对**同一个**二进制给 `distribution=None`（compat 当 upstream）。
-# 两者回答不同问题, 本来就不相等 —— 两个值一起钉住: 任一边被"对齐"就红。
-# XBD_XRAY_VERSION 是既有的离线替身, 语义与真官方二进制一致（首词 xray）。
-VOCAB=$(XBD_XRAY_VERSION=26.3.27 python3 - "$XRAY_INTEROP" "$ROOT/Client/lib" <<'PY'
-import json, os, sys
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-sys.path.insert(0, sys.argv[2])
-import interop
-import compat2
-sf = interop.self_facts()
-try:
-    dist = compat2.xray_target().distribution
-except Exception as exc:                                        # noqa: BLE001
-    dist = "compat2-error: %s" % exc
-print(json.dumps({"interop": sf.get("distribution"), "compat2": dist}))
-PY
-)
-assert_eq "$(printf '%s' "$VOCAB" | python3 -c 'import json,sys
-print(json.load(sys.stdin).get("interop"))' 2>/dev/null)" "xray" \
-    "interop 发行版标签: 官方二进制 → 'xray'（声明用语）"
-assert_eq "$(printf '%s' "$VOCAB" | python3 -c 'import json,sys
-d = json.load(sys.stdin).get("compat2")
-print("None" if d is None else d)' 2>/dev/null)" "None" \
-    "compat2 对同一二进制 → distribution=None（≠ 'xray'; 两套词表刻意分开）"
-
-# ---- ③ 原生产品生成器的边界 ----
-NATIVE_PY="$LIB/native.py"
-[[ -f "$NATIVE_PY" ]] && ok "conf/lib/native.py（原生产品生成器）存在" || bad "缺 conf/lib/native.py"
-ECHV=$(python3 - "$NATIVE_PY" <<'PY'
-import sys, os
-sys.path.insert(0, os.path.dirname(sys.argv[1]))
-import native
-# RN 生产 vless-xhttp08 的真值对（`xray tls ech -i` 现验过, 见 §报告）
-K = ("ACAeHgJriV0xujYELoel7l+Avsa2y7yjytil2vOQSlCdLgBl/g0AYQAAIAAgP6zoBwcqbFn"
-     "Pyw2P1mY5ivBpuY6XvO+omOwChaYR3QIAJAABAAEAAQACAAEAAwACAAEAAgACAAIAAwAD"
-     "AAEAAwACAAMAAwASbW9vbnR2LjY4OTY2OTgueHl6AAA=")
-WANT = ("AGX+DQBhAAAgACA/rOgHBypsWc/LDY/WZjmK8Gm5jpe876iY7AKFphHdAgAkAAEAAQABAAIA"
-        "AQADAAIAAQACAAIAAgADAAMAAQADAAIAAwADABJtb29udHYuNjg5NjY5OC54eXoAAA==")
-print(native.ech_config_list(K) == WANT)
-print("|".join([native.ech_config_list(""), native.ech_config_list("not-base64!!")]))
-print("|".join([native._bandwidth(50), native._bandwidth("1.5g"),
-                native._bandwidth("bogus")]))
-PY
-)
-assert_eq "$(printf '%s' "$ECHV" | sed -n 1p)" "True" \
-    "echServerKeys → ECHConfigList（与 xray tls ech -i 逐字节相同）"
-assert_eq "$(printf '%s' "$ECHV" | sed -n 2p)" "|" \
-    "坏/空 echServerKeys 不猜值（返回空）"
-assert_eq "$(printf '%s' "$ECHV" | sed -n 3p)" "50 mbps|1.5 gbps|" \
-    "链接侧带宽 → Xray Bandwidth 语法（裸数字=Mbps; 认不出留空）"
-
-# ---- ④ 端到端（真 share.sh + 真分享服务 + 真 xbd 入口）----
-# 需要 proxy-share-service 的源码（公共组件, 独立端口/独立数据目录, 不碰生产）。
-# 它退出 3 = 找不到服务源码 → 这一条**必须失败**, 不能算通过: 端到端没跑就是没跑。
-E2E_OUT=$(TW_XRAY_VERSION="${XBD_XRAY_VERSION:-26.3.27}" \
-          TW_WORK="${TMP:-/tmp}/interop-e2e" TW_PORT=0 \
-          bash "$ROOT/tools/interop-e2e.sh" 2>&1)
-E2E_RC=$?
-E2E_SUM=$(printf '%s' "$E2E_OUT" | grep -oE '结果: [0-9]+ 通过, [0-9]+ 失败' | tail -1)
-if [[ $E2E_RC -eq 0 && "$E2E_SUM" == *", 0 失败"* ]]; then
-    ok "端到端: $E2E_SUM"
-else
-    bad "端到端: ${E2E_SUM:-没跑起来(rc=$E2E_RC)}"
-    printf '%s\n' "$E2E_OUT" | tail -25 | sed 's/^/      /'
-fi
-# 三条路径要单独可见 —— 汇总为 0 失败时仍然要确认它们真的都断言过
-for _k in '本次拉取: 原生' '本次拉取: 普通话' '逐字节相同' 'URI ⊆ 原生'; do
-    # 用 >/dev/null 而不是 grep -q: -q 命中即退出会让上游 printf 吃 SIGPIPE,
-    # 在 pipefail 下整条命令变成 141（随机判反）。
-    if printf '%s' "$E2E_OUT" | grep "$_k" >/dev/null; then
-        ok "端到端覆盖: $_k"
-    else
-        bad "端到端没有覆盖: $_k"
-    fi
-done
-
-# ---- 分享刷新: 互通之前发出的链接必须被"补成对 + 补声明" ----
-# 真实执行在 tools/interop-e2e.sh §9 (真 share.sh + 真分享服务记录)。
-# 这里按**性质逐条**核对它确实证明了 —— 只看汇总"0 失败"会把
-# "§9 根本没跑 / 跑的是老脚本" 当成通过, 那正是本项目最忌讳的假绿。
-group "分享刷新 (share.sh refresh: 旧记录补成对, 声明不被抹)"
-for _k in '刷新补建了原生产品' '地址补上了声明且 token/基址未变' \
-          '普通话内容未被这次刷新改动' '原生产品与主记录同到期时间/同次数上限' \
-          '幂等: 再刷一次仍是 1 条原生' '刷新保留互通字段' \
-          '面板没有谎报陈旧' '两个记录都带当前生成器版本号'; do
-    if printf '%s' "$E2E_OUT" | grep "$_k" >/dev/null; then
-        ok "刷新断言覆盖: $_k"
-    else
-        bad "刷新断言没有覆盖: $_k"
-    fi
-done
-
 # 门禁脚本自己也会骗人: 之前有两条检查调了根本**不存在**的断言函数
 # （assert_has / pass），bash 只往 stderr 丢一句 "command not found",
 # 检查项既不通过也不失败 —— 看起来全绿, 其实什么都没验。
@@ -4579,136 +4243,6 @@ done
 # 所以改成运行时兜: bash 找不到命令时会走 command_not_found_handle,
 # 谁被静默跳过当场就记账。子 shell 里加的 FAIL 会丢, 所以落一份文件,
 # 最后按文件判定。
-group "两条产品的节点集合 (URI 拒发的节点, 原生也不许发)"
-# 实测生产的失效 (2026-10-11, RN): URI 产品 6 个节点而原生 7 个, 多出来的那条
-# 正是 URI 路径因"载荷与 per-node 产物不一致"拒发的 SS2022-01。根因是原生路径
-# 只跑了**第一道**发布闸门 (build_share_link 的"不该发布"), 没跑**第二道**
-# (nodes.verify_against_products 的一致性校验)。两条产品给不同的人、发布的节点
-# 却不一样, 是 native.py 开头写明"不许发生"的事; 客户端还会把多出来的那条按
-# 自己的规则过滤掉, 于是"原生 7 个只导入 6 个"看起来像客户端 bug。
-DUAL=$(python3 - "$ROOT" <<'PYEOF'
-import os, shutil, subprocess, sys, tempfile
-root = sys.argv[1]
-work = tempfile.mkdtemp(prefix="dual-")
-subprocess.run(["python3", os.path.join(root, "tools", "interop-corpus.py"), work],
-               check=True, capture_output=True)
-conf, share, out = work + "/conf", work + "/out/share", work + "/out"
-os.environ.update(XRAY_CONF_DIR=conf, XRAY_SHARE_DIR=share, XRAY_OUT_DIR=out)
-sys.path.insert(0, os.path.join(root, "conf", "lib"))
-import nodes, share_meta, share_payload, native
-ns, _bad = nodes.collect(conf)
-tags = [n["tag"] for n in ns]
-by = {n["tag"]: n for n in ns}
-T = "t-tcp-reality"        # 独占凭据的节点 (共享凭据那批会一改全改)
-link = nodes.build_share_link(by[T], share_meta.load(share, T) or {})
-open(os.path.join(out, "tcp-share-01.txt"), "w").write(link.replace(":29605", ":29698") + "\n")
-_pl, missing, nometa, _bad2, refused, _n, inconsistent = share_payload.build_payload(tags, full=True)
-inc_uri = {t for t, _ in inconsistent}
-gone = set(missing) | set(nometa) | {t for t, _ in refused} | inc_uri
-uri_kept = [t for t in tags if t not in gone]
-doc, _m2, _n2, refused2, unsup2, _n3 = native.build_document(tags, conf, share)
-nat_tags = {o["tag"] for o in (doc or {}).get("outbounds", [])}
-name_of = {}
-for t in tags:
-    l = nodes.build_share_link(by[t], share_meta.load(share, t) or {})
-    if l:
-        name_of[t] = native._link_name(l)
-uri_names = {name_of[t] for t in uri_kept if t in name_of}
-unsup_names = {name_of[t] for t, _ in unsup2 if t in name_of}
-print("INCONSISTENT_URI=%s" % ",".join(sorted(inc_uri)))
-print("REFUSED_NATIVE=%s" % ",".join(sorted(t for t, _ in refused2)))
-print("NATIVE_HAS_REFUSED=%d" % (1 if name_of.get(T) in nat_tags else 0))
-print("NATIVE_SUBSET_URI=%d" % (1 if nat_tags <= uri_names else 0))
-print("DIFF_IS_UNSUPPORTED=%d" % (1 if (uri_names - nat_tags) == unsup_names else 0))
-print("COUNTS=%d/%d/%d" % (len(uri_names), len(nat_tags), len(unsup_names)))
-shutil.rmtree(work, ignore_errors=True)
-PYEOF
-)
-dval() { printf '%s\n' "$DUAL" | grep "^$1=" | cut -d= -f2-; }
-[[ -n "$DUAL" ]] && ok "双产品一致性台跑起来了" || bad "双产品一致性台没跑起来"
-assert_eq "$(dval INCONSISTENT_URI)" "t-tcp-reality" \
-    "构造有效: URI 路径确实拒发了与 per-node 产物不一致的节点"
-assert_eq "$(dval NATIVE_HAS_REFUSED)" "0" \
-    "URI 拒发的节点**不在**原生文档里（修复前: 在, 且 7 vs 6）"
-assert_eq "$(dval REFUSED_NATIVE)" "t-tcp-reality" \
-    "原生路径也把这条报成拒发（不是静默少一个）"
-assert_eq "$(dval NATIVE_SUBSET_URI)" "1" \
-    "原生节点集合 ⊆ URI 节点集合（原生不许发出 URI 没发的节点）"
-assert_eq "$(dval DIFF_IS_UNSUPPORTED)" "1" \
-    "两者差集 = 原生无表达能力的协议（socks/http）, 且是报出来的"
-assert_eq "$(dval COUNTS)" "10/9/1" \
-    "节点数关系: uri = native + unsupported（10 = 9 + 1）"
-
-group "声明缩短: 不写 version + 同源相对路径（解析侧拼回绝对）"
-# 用户拍的板: 声明太长。两条改动 —— ① 不再产出 `version`（内核版本没有丢:
-# 原生产品里自描述）; ② url-<fmt> 与主地址**同源**时写相对引用 `/share/<token>`。
-# 解析侧把相对引用拼回绝对（放在 parse_declaration 里, decide() 签名不动）,
-# 旧格式（绝对 + version）必须照样判 native。
-SHORT=$(python3 - "$XRAY_INTEROP" <<'PYD'
-import json, os, subprocess, sys
-ip = sys.argv[1]
-def cli(*args):
-    return subprocess.run([sys.executable, ip, "declare", *args],
-                          capture_output=True, text=True).stdout.strip()
-same = cli("--kernel", "xray", "--distribution", "xray",
-           "--url", "http://h:9443/share/aaaa",
-           "--url-xray", "http://h:9443/share/bbbb")
-cross = cli("--kernel", "xray", "--distribution", "xray",
-            "--url", "http://h:9443/share/aaaa",
-            "--url-xray", "http://other:9443/share/bbbb")
-sys.path.insert(0, os.path.dirname(ip))
-import interop
-def dec(u):
-    c, r, url, _d = interop.decide(interop.parse_declaration(u), "xray", "xray")
-    return "%s|%s|%s" % (c, r, url)
-rel = same                                    # 新格式: 相对引用
-oldfmt = ("http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray"
-          "&version=26.3.27&formats=uri%2Cxray"
-          "&url-xray=http%3A%2F%2Fh%3A9443%2Fshare%2Fbbbb")
-relman = ("http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray"
-          "&formats=uri%2Cxray&url-xray=%2Fshare%2Fbbbb")
-mal1 = "http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=%2Fshare%2F"
-mal2 = "http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=%2F%2Fother.host%2Fx"
-print(json.dumps({
-    "has_version": "version=" in same,
-    "rel_query": same.split("?", 1)[1],
-    "cross_query": cross.split("?", 1)[1],
-    "rel_decide": dec(rel),
-    "rel_manual": dec(relman),
-    "old_decide": dec(oldfmt),
-    "mal1": dec(mal1), "mal2": dec(mal2),
-    "len_old": len(oldfmt), "len_new": len(rel),
-}, ensure_ascii=False))
-PYD
-)
-qv() { printf '%s' "$SHORT" | python3 -c 'import json,sys
-print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1" 2>/dev/null; }
-assert_eq "$(qv has_version)" "False" "声明格式对空 version 不输出（declaration_query 不写空值）"
-# ★ 真正要钉的是**服务端调用方**: 旧代码在 conf/share.sh 里显式传了 --version。
-#   只测 CLI 的话, 修复前也"通过"（因为这里本来就没传）—— 等于没测。
-if grep -q 'interop.py" declare --kernel xray' "$ROOT/conf/share.sh" \
-   && ! grep -q -- '--version "' "$ROOT/conf/share.sh"; then
-    ok "服务端产出侧（conf/share.sh）不再向 declare 传 --version（版本仍在原生产品里自描述）"
-else
-    bad "conf/share.sh 仍在传 --version（或 declare 调用点没了）—— 地址不会变短"
-fi
-assert_eq "$(qv rel_query)" "interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=%2Fshare%2Fbbbb" \
-    "同源 → url-xray 写成相对引用 /share/<token>（不再重复 host:port）"
-assert_eq "$(qv cross_query)" "interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=http%3A%2F%2Fother%3A9443%2Fshare%2Fbbbb" \
-    "异源 → 仍然写绝对地址（相对引用跨源没有意义）"
-assert_eq "$(qv rel_decide)" "native|native-listed|http://h:9443/share/bbbb" \
-    "解析侧把相对引用拼成绝对地址, decide() 判 native（签名未改）"
-assert_eq "$(qv old_decide)" "native|native-listed|http://h:9443/share/bbbb" \
-    "向后兼容: 旧格式（绝对地址 + 带 version）照样判 native"
-# ★ 手写一条**相对引用**向量直接喂解析器（不依赖上面那条由 CLI 现产的串）——
-#   这样"解析侧能拼回绝对"这条在**修复前**才会真的红（那时 url-xray 是绝对地址,
-#   这条断言等于没测）。
-assert_eq "$(qv rel_manual)" "native|native-listed|http://h:9443/share/bbbb" \
-    "解析侧: 手写的相对引用声明也要拼成绝对并判 native"
-assert_eq "$(qv mal1)" "uri|bad-native-url|" "空 token（/share/）不猜 → 保持原样 → bad-native-url"
-assert_eq "$(qv mal2)" "uri|bad-native-url|" "协议相对（//other.host/x）不猜 → 保持原样 → bad-native-url"
-printf '      长度: 旧格式 %s → 新格式 %s 字节\n' "$(qv len_old)" "$(qv len_new)"
-
 group "订阅解析: 不认的链接不许静默丢（M 的 # 注释方言也要吃）"
 # 现场: M 的普通话发 19 条（明文 + 头两行 `#` 注释）, xbd 只说"解析出 15 个" ——
 # anytls×3 + tuic×1 被 `except: continue` 静默吃掉; SB 13 条只出 8 条
@@ -4800,27 +4334,23 @@ OUT2=$(hy2_sync)
 printf '%s' "$OUT2" | grep 'NODE hysteria-02 verdict=ok changed=up:50->45,down:200->170' >/dev/null \
     && ok "显式覆盖 .hy2-bandwidth=45 170 生效（up/down/upmbps/downmbps 四个字段一起）" \
     || bad "覆盖文件没生效: $(printf '%s' "$OUT2" | grep NODE | sed -n 1p)"
-# ★ 三个消费者一个口径: 覆盖文件在时, 链接(URI) / 原生文档(native.py) / 脚本产物
-#   必须都是 45/170。native.py 曾经漏读这个文件 —— 那样会出现"链接 45/170、
-#   原生 60/200"的两条产品不一致（端到端逐字段断言会红, 但那时已经发出去了）。
+# ★ 两个消费者一个口径: 覆盖文件在时, 链接(URI) 与 脚本产物(hysteria2.sh sync-products)
+#   必须都是 45/170。两者漂移会出现"链接 45/170、产物 60/200"的产物不一致。
+#   （原为三个消费者, 第三个是 native.py 的原生文档 —— 原生路径随三家互通回退一并移除。）
 CONSIST=$(XRAY_BASE_DIR="$HY2T" XRAY_BASE="$HY2T" python3 - "$ROOT" "$HY2T" <<'PYC'
-import os, sys, json
+import os, sys
 root, T = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.path.join(root, "conf", "lib"))
-import nodes, share_meta, native
+import nodes, share_meta
 ns, _b = nodes.collect(T + "/conf")
 by = {n["tag"]: n for n in ns}
 n, meta = by["hysteria-02"], (share_meta.load(T + "/out/share", "hysteria-02") or {})
 link = nodes.build_share_link(n, meta)
-doc, _m, _n2, _r, _u, _no = native.build_document(["hysteria-02"], T + "/conf", T + "/out/share")
-ob = (doc or {}).get("outbounds", [{}])[0]
-qp = ((ob.get("streamSettings") or {}).get("finalmask") or {}).get("quicParams") or {}
-ok = ("up=45&down=170" in link and "upmbps=45&downmbps=170" in link
-      and qp.get("brutalUp") == "45 mbps" and qp.get("brutalDown") == "170 mbps")
-print("1" if ok else "0 link=%s brutalUp=%r brutalDown=%r" % (link[-90:], qp.get("brutalUp"), qp.get("brutalDown")))
+ok = ("up=45&down=170" in link and "upmbps=45&downmbps=170" in link)
+print("1" if ok else "0 link=%s" % link[-90:])
 PYC
 )
-assert_eq "$CONSIST" "1" "三个消费者同一口径: URI 链接 / 原生 brutalUp·Down / 覆盖文件（45/170）"
+assert_eq "$CONSIST" "1" "URI 链接读 .hy2-bandwidth 覆盖（up=45&down=170&upmbps=45&downmbps=170）"
 hy2_sync --apply >/dev/null 2>&1
 grep -q 'up=45&down=170&upmbps=45&downmbps=170' "$HY2T/out/hy2_share-02.txt" \
     && ok "--apply 真的写盘了（45/170, sni 保留, obfs 已去掉）" \
@@ -4846,36 +4376,6 @@ printf '%s' "$OUT3" | grep 'NODE hysteria-02 verdict=ok changed=up:45->60,down:1
     || bad "删掉覆盖文件后没有回到默认: $(printf '%s' "$OUT3" | grep NODE | sed -n 1p)"
 grep -q 'sync-products' "$ROOT/conf/hysteria2.sh" && ok "非交互的产物重建入口存在" \
     || bad "hysteria2.sh 没有 sync-products 入口（产物无法在不新建节点的前提下重建）"
-
-group "vendored proxy_node_compat 与 canonical 逐字节一致"
-# X 客户端里的 proxy_node_compat 是 canonical（proxy-node-compat 仓库）的
-# vendored 副本。它不是"参考实现"，是**实际参与判定**的那份：
-#   · uri.py 缺 encryption=none 哨兵 → 每条常规 vless 链接被假判 UNSUPPORTED
-#   · cli.py 的硬编码 scheme 白名单 → 白名单外的真实链接被当文件路径，整批崩
-#   · rules.json 少规则 → 少一条结论（静默少，不报错）
-# 所以这里钉**逐字节**相同。路径不存在 = **失败**，绝不"找不到就跳过"。
-CANO="$ROOT/../proxy-node-compat/proxy_node_compat"
-VCAN="__init__.py __main__.py model.py registry.py engine.py uri.py cli.py data/rules.json"
-if [[ -d "$CANO" ]]; then
-    ok "canonical 目录存在 ($CANO)"
-    for f in $VCAN; do
-        if [[ ! -f "$CANO/$f" ]]; then
-            bad "canonical 缺文件: $f（清单要跟着 canonical 一起改）"
-        elif [[ ! -f "$ROOT/Client/lib/proxy_node_compat/$f" ]]; then
-            bad "vendored 缺文件: $f"
-        elif cmp -s "$CANO/$f" "$ROOT/Client/lib/proxy_node_compat/$f"; then
-            ok "逐字节相同: $f"
-        else
-            bad "漂移: $f (canonical $(sha256sum "$CANO/$f" | cut -c1-16)… ≠ vendored $(sha256sum "$ROOT/Client/lib/proxy_node_compat/$f" | cut -c1-16)…)"
-        fi
-    done
-    # 多一个文件同样是漂移（比如 canonical 删了某个模块，vendored 还留着旧的）
-    VN=$(find "$ROOT/Client/lib/proxy_node_compat" -type f -not -path '*__pycache__*' | wc -l)
-    [[ "$VN" = 8 ]] && ok "vendored 正好 8 个文件（无多余残留）" \
-                    || bad "vendored 文件数=$VN（期望 8 —— 有残留或缺失）"
-else
-    bad "canonical 目录不存在: $CANO —— 这一组**不许跳过**（vendored 一致性没有验证）"
-fi
 
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
