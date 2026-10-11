@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 from .engine import Target, evaluate
@@ -34,11 +35,16 @@ def _target_from_args(a: argparse.Namespace) -> Target:
                   evaluated_at=a.evaluated_at)
 
 
+_URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
 def _load(uri_or_file: str) -> NodeProfile:
-    if uri_or_file.startswith(("vless://", "vmess://", "trojan://", "ss://", "hysteria2://",
-                               "hy2://", "tuic://", "anytls://", "socks://", "http://",
-                               "https://", "socks5://")):
-        return parse_uri(uri_or_file)
+    # 泛化到**任何** `<scheme>://`（原来是一张硬编码白名单）:
+    # 白名单外的真实链接（如 naive+https://…）会被当成文件路径 → FileNotFoundError
+    # 直接崩掉整批检查。认不出的 scheme 必须走 parse_uri → unknown: 协议 → UNKNOWN
+    # （"绝不让整批解析失败"），而不是抛文件不存在。
+    if _URI_RE.match(uri_or_file.strip()):
+        return parse_uri(uri_or_file.strip())
     with open(uri_or_file, encoding="utf-8") as fh:
         text = fh.read().strip()
     if text.startswith("{"):
@@ -73,6 +79,18 @@ def _render(profile: NodeProfile, target: Target, res, as_json: bool,
         out.append(f"   🟡 注意: {wn.get('code')} —— {wn.get('detail')}")
     for un in res.unknowns:
         out.append(f"   ❓ 未知: {un.get('what')} —— {un.get('why')}")
+    # URI 规则携带、但**不影响判定**的事实：必须打出来，否则读者会以为它们参与过结论
+    for inf in getattr(res, "informational", []) or []:
+        bits = []
+        if inf.get("carrier"):
+            bits.append(f"承载形态={inf['carrier']}")
+        if inf.get("spec_added_at"):
+            bits.append(f"规范引入={inf['spec_added_at']}")
+        if inf.get("workaround"):
+            bits.append(f"绕行={inf['workaround']}")
+        if bits:
+            out.append(f"   ⓘ 参考（不影响判定）: {inf.get('feature')} —— "
+                       + "；".join(bits) + f"  ({inf.get('rule')})")
     if verbose and res.evidence:
         out.append("   证据:")
         for ev in res.evidence:
