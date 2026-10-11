@@ -385,6 +385,10 @@ def build_document(tags, conf_dir=None, share_dir=None, facts=None, notes=None):
         facts = interop.self_facts()
 
     outbounds, missing, nometa, refused, unsupported = [], [], [], [], []
+    # [(tag, link)] —— 第二道发布闸门 (载荷 ↔ per-node 产物一致性) 的输入。
+    # 链接必须是 build_share_link() 的产物, 与 URI 路径同一处实现。
+    pairs = []
+    built = []
     for t in tags:
         n = by_tag.get(t)
         if not n:
@@ -406,7 +410,30 @@ def build_document(tags, conf_dir=None, share_dir=None, facts=None, notes=None):
             else:
                 nometa.append(t)
             continue
-        outbounds.append(ob)
+        built.append((t, ob))
+        link = N.build_share_link(n, meta)
+        if link:
+            pairs.append((t, link))
+
+    # ★ 与 URI 路径**同一条**发布闸门 —— 之前这里只跑了第一道。
+    #   build_share_link() 挡的是"不该发布"(只绑回环 / REALITY 缺公钥 …);
+    #   还有第二道 verify_against_products(): 同一条链接的两条生成路径
+    #   (订阅载荷 vs per-node 产物) 在端点/SNI/ECH 上漂移时必须拒发。
+    #   URI 路径两道都跑, 原生只跑第一道 —— 实测生产后果 (2026-10-11):
+    #   URI 产品 6 个节点 / 原生 7 个, 多出来的那条正是 URI 侧因不一致拒发的
+    #   SS2022-01 (产物 107.173.154.178:39839 vs 载荷 mensura.cdn-apple.com:39839)。
+    #   两条产品给不同的人、发布的节点却不一样, 是本文件开头写明的**不许发生**
+    #   的事; 客户端那条多出来的节点还会被自己的过滤器丢掉, 于是"原生 7 个
+    #   导入 6 个", 看起来像客户端 bug。
+    out_dir = (os.environ.get("XRAY_OUT_DIR")
+               or os.path.dirname(os.path.abspath(share_dir.rstrip("/"))))
+    kept, badpairs, _checked, _unchecked = N.verify_against_products(
+        pairs, out_dir, notes=notes)
+    if badpairs:
+        kept_tags = {t for t, _ in kept}
+        refused.extend(badpairs)
+        built = [(t, ob) for t, ob in built if t in kept_tags]
+    outbounds = [ob for _t, ob in built]
     if notes is not None and bad:
         notes.append("片段解析失败 %d 个: %s" % (
             len(bad), ",".join(b for b, _ in bad)))

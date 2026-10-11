@@ -4427,6 +4427,80 @@ PY
 )
 assert_eq "$KEEPQ" "True" "并声明时保留地址上原有的其它参数, 且不重复叠加"
 
+# ---- ②b 三种入参形态必须**等价**（完整地址 / "?" 开头 / 裸查询串）----
+# docstring 承诺支持"或裸查询串", 而裸查询串里的 url-* 值**没被编码**时它自己
+# 就带字面 `://`。判"是不是完整地址"若看**子串** `://`, 就会把它当完整地址 →
+# urlsplit() 的 query 是空串 → 静默 no-declaration（不报错, 走普通话）。
+# 两种错法都在这里被挡住:
+#   · 原实现 `"=" in s and "://" not in s` → 裸查询串掉进 else
+#   · "改成看子串 ://" 的错修法 → 依然走完整地址分支, query 为空
+# 断言的是**决策三项逐字段相同**, 不是"能读出来"而已。
+THREE=$(python3 - "$XRAY_INTEROP" <<'PY'
+import sys, os
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import interop
+NAT = "http://h:9443/share/bbbb"
+decl = interop.build_declaration("xray", "xray", "26.3.27",
+                                 formats=("uri", "xray"), urls={"xray": NAT})
+bare = ("interop=1&kernel=xray&distribution=xray&version=26.3.27"
+        "&formats=uri,xray&url-xray=" + NAT)
+forms = (bare, "?" + bare,
+         "http://h:9443/share/aaaa?" + interop.declaration_query(decl))
+for s in forms:
+    d = interop.parse_declaration(s)
+    if not d or not d.get("recognized"):
+        print("UNRECOGNIZED")
+        continue
+    c, r, u, _ = interop.decide(d, "xray", "xray")
+    print("%s|%s|%s" % (c, r, u))
+PY
+)
+THREE_BARE=$(printf '%s' "$THREE" | sed -n 1p)
+assert_eq "$THREE_BARE" "native|native-listed|http://h:9443/share/bbbb" \
+    "裸查询串（url 值未编码, 带字面 ://）→ 认得出声明并走原生"
+assert_eq "$(printf '%s' "$THREE" | sed -n 2p)" "$THREE_BARE" \
+    "『?』+ 裸查询串 与裸查询串: 决策三项相同"
+assert_eq "$(printf '%s' "$THREE" | sed -n 3p)" "$THREE_BARE" \
+    "完整订阅地址 与裸查询串: 决策三项相同"
+SELFQ=$(python3 - "$XRAY_INTEROP" <<'PY'
+import sys, os
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import interop
+d = interop.parse_declaration(interop.declaration_query(
+    interop.build_declaration("xray", "xray", "26.3.27",
+                              formats=("uri", "xray"), urls={"xray": "http://h/b"})))
+print(bool(d and d.get("recognized")))
+PY
+)
+assert_eq "$SELFQ" "True" "declaration_query() 的产物能被 parse_declaration() 读回"
+
+# ---- ②c 两套"发行版"词表**刻意分开**（别照旧注释去"对齐"它们）----
+# interop 的 distribution 取二进制版本行首词小写（官方 → `xray`）;
+# compat2 对**同一个**二进制给 `distribution=None`（compat 当 upstream）。
+# 两者回答不同问题, 本来就不相等 —— 两个值一起钉住: 任一边被"对齐"就红。
+# XBD_XRAY_VERSION 是既有的离线替身, 语义与真官方二进制一致（首词 xray）。
+VOCAB=$(XBD_XRAY_VERSION=26.3.27 python3 - "$XRAY_INTEROP" "$ROOT/Client/lib" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+sys.path.insert(0, sys.argv[2])
+import interop
+import compat2
+sf = interop.self_facts()
+try:
+    dist = compat2.xray_target().distribution
+except Exception as exc:                                        # noqa: BLE001
+    dist = "compat2-error: %s" % exc
+print(json.dumps({"interop": sf.get("distribution"), "compat2": dist}))
+PY
+)
+assert_eq "$(printf '%s' "$VOCAB" | python3 -c 'import json,sys
+print(json.load(sys.stdin).get("interop"))' 2>/dev/null)" "xray" \
+    "interop 发行版标签: 官方二进制 → 'xray'（声明用语）"
+assert_eq "$(printf '%s' "$VOCAB" | python3 -c 'import json,sys
+d = json.load(sys.stdin).get("compat2")
+print("None" if d is None else d)' 2>/dev/null)" "None" \
+    "compat2 对同一二进制 → distribution=None（≠ 'xray'; 两套词表刻意分开）"
+
 # ---- ③ 原生产品生成器的边界 ----
 NATIVE_PY="$LIB/native.py"
 [[ -f "$NATIVE_PY" ]] && ok "conf/lib/native.py（原生产品生成器）存在" || bad "缺 conf/lib/native.py"
@@ -4478,6 +4552,22 @@ for _k in '本次拉取: 原生' '本次拉取: 普通话' '逐字节相同' 'UR
     fi
 done
 
+# ---- 分享刷新: 互通之前发出的链接必须被"补成对 + 补声明" ----
+# 真实执行在 tools/interop-e2e.sh §9 (真 share.sh + 真分享服务记录)。
+# 这里按**性质逐条**核对它确实证明了 —— 只看汇总"0 失败"会把
+# "§9 根本没跑 / 跑的是老脚本" 当成通过, 那正是本项目最忌讳的假绿。
+group "分享刷新 (share.sh refresh: 旧记录补成对, 声明不被抹)"
+for _k in '刷新补建了原生产品' '地址补上了声明且 token/基址未变' \
+          '普通话内容未被这次刷新改动' '原生产品与主记录同到期时间/同次数上限' \
+          '幂等: 再刷一次仍是 1 条原生' '刷新保留互通字段' \
+          '面板没有谎报陈旧' '两个记录都带当前生成器版本号'; do
+    if printf '%s' "$E2E_OUT" | grep "$_k" >/dev/null; then
+        ok "刷新断言覆盖: $_k"
+    else
+        bad "刷新断言没有覆盖: $_k"
+    fi
+done
+
 # 门禁脚本自己也会骗人: 之前有两条检查调了根本**不存在**的断言函数
 # （assert_has / pass），bash 只往 stderr 丢一句 "command not found",
 # 检查项既不通过也不失败 —— 看起来全绿, 其实什么都没验。
@@ -4486,6 +4576,96 @@ done
 # 所以改成运行时兜: bash 找不到命令时会走 command_not_found_handle,
 # 谁被静默跳过当场就记账。子 shell 里加的 FAIL 会丢, 所以落一份文件,
 # 最后按文件判定。
+group "两条产品的节点集合 (URI 拒发的节点, 原生也不许发)"
+# 实测生产的失效 (2026-10-11, RN): URI 产品 6 个节点而原生 7 个, 多出来的那条
+# 正是 URI 路径因"载荷与 per-node 产物不一致"拒发的 SS2022-01。根因是原生路径
+# 只跑了**第一道**发布闸门 (build_share_link 的"不该发布"), 没跑**第二道**
+# (nodes.verify_against_products 的一致性校验)。两条产品给不同的人、发布的节点
+# 却不一样, 是 native.py 开头写明"不许发生"的事; 客户端还会把多出来的那条按
+# 自己的规则过滤掉, 于是"原生 7 个只导入 6 个"看起来像客户端 bug。
+DUAL=$(python3 - "$ROOT" <<'PYEOF'
+import os, shutil, subprocess, sys, tempfile
+root = sys.argv[1]
+work = tempfile.mkdtemp(prefix="dual-")
+subprocess.run(["python3", os.path.join(root, "tools", "interop-corpus.py"), work],
+               check=True, capture_output=True)
+conf, share, out = work + "/conf", work + "/out/share", work + "/out"
+os.environ.update(XRAY_CONF_DIR=conf, XRAY_SHARE_DIR=share, XRAY_OUT_DIR=out)
+sys.path.insert(0, os.path.join(root, "conf", "lib"))
+import nodes, share_meta, share_payload, native
+ns, _bad = nodes.collect(conf)
+tags = [n["tag"] for n in ns]
+by = {n["tag"]: n for n in ns}
+T = "t-tcp-reality"        # 独占凭据的节点 (共享凭据那批会一改全改)
+link = nodes.build_share_link(by[T], share_meta.load(share, T) or {})
+open(os.path.join(out, "tcp-share-01.txt"), "w").write(link.replace(":29605", ":29698") + "\n")
+_pl, missing, nometa, _bad2, refused, _n, inconsistent = share_payload.build_payload(tags, full=True)
+inc_uri = {t for t, _ in inconsistent}
+gone = set(missing) | set(nometa) | {t for t, _ in refused} | inc_uri
+uri_kept = [t for t in tags if t not in gone]
+doc, _m2, _n2, refused2, unsup2, _n3 = native.build_document(tags, conf, share)
+nat_tags = {o["tag"] for o in (doc or {}).get("outbounds", [])}
+name_of = {}
+for t in tags:
+    l = nodes.build_share_link(by[t], share_meta.load(share, t) or {})
+    if l:
+        name_of[t] = native._link_name(l)
+uri_names = {name_of[t] for t in uri_kept if t in name_of}
+unsup_names = {name_of[t] for t, _ in unsup2 if t in name_of}
+print("INCONSISTENT_URI=%s" % ",".join(sorted(inc_uri)))
+print("REFUSED_NATIVE=%s" % ",".join(sorted(t for t, _ in refused2)))
+print("NATIVE_HAS_REFUSED=%d" % (1 if name_of.get(T) in nat_tags else 0))
+print("NATIVE_SUBSET_URI=%d" % (1 if nat_tags <= uri_names else 0))
+print("DIFF_IS_UNSUPPORTED=%d" % (1 if (uri_names - nat_tags) == unsup_names else 0))
+print("COUNTS=%d/%d/%d" % (len(uri_names), len(nat_tags), len(unsup_names)))
+shutil.rmtree(work, ignore_errors=True)
+PYEOF
+)
+dval() { printf '%s\n' "$DUAL" | grep "^$1=" | cut -d= -f2-; }
+[[ -n "$DUAL" ]] && ok "双产品一致性台跑起来了" || bad "双产品一致性台没跑起来"
+assert_eq "$(dval INCONSISTENT_URI)" "t-tcp-reality" \
+    "构造有效: URI 路径确实拒发了与 per-node 产物不一致的节点"
+assert_eq "$(dval NATIVE_HAS_REFUSED)" "0" \
+    "URI 拒发的节点**不在**原生文档里（修复前: 在, 且 7 vs 6）"
+assert_eq "$(dval REFUSED_NATIVE)" "t-tcp-reality" \
+    "原生路径也把这条报成拒发（不是静默少一个）"
+assert_eq "$(dval NATIVE_SUBSET_URI)" "1" \
+    "原生节点集合 ⊆ URI 节点集合（原生不许发出 URI 没发的节点）"
+assert_eq "$(dval DIFF_IS_UNSUPPORTED)" "1" \
+    "两者差集 = 原生无表达能力的协议（socks/http）, 且是报出来的"
+assert_eq "$(dval COUNTS)" "10/9/1" \
+    "节点数关系: uri = native + unsupported（10 = 9 + 1）"
+
+group "vendored proxy_node_compat 与 canonical 逐字节一致"
+# X 客户端里的 proxy_node_compat 是 canonical（proxy-node-compat 仓库）的
+# vendored 副本。它不是"参考实现"，是**实际参与判定**的那份：
+#   · uri.py 缺 encryption=none 哨兵 → 每条常规 vless 链接被假判 UNSUPPORTED
+#   · cli.py 的硬编码 scheme 白名单 → 白名单外的真实链接被当文件路径，整批崩
+#   · rules.json 少规则 → 少一条结论（静默少，不报错）
+# 所以这里钉**逐字节**相同。路径不存在 = **失败**，绝不"找不到就跳过"。
+CANO="$ROOT/../proxy-node-compat/proxy_node_compat"
+VCAN="__init__.py __main__.py model.py registry.py engine.py uri.py cli.py data/rules.json"
+if [[ -d "$CANO" ]]; then
+    ok "canonical 目录存在 ($CANO)"
+    for f in $VCAN; do
+        if [[ ! -f "$CANO/$f" ]]; then
+            bad "canonical 缺文件: $f（清单要跟着 canonical 一起改）"
+        elif [[ ! -f "$ROOT/Client/lib/proxy_node_compat/$f" ]]; then
+            bad "vendored 缺文件: $f"
+        elif cmp -s "$CANO/$f" "$ROOT/Client/lib/proxy_node_compat/$f"; then
+            ok "逐字节相同: $f"
+        else
+            bad "漂移: $f (canonical $(sha256sum "$CANO/$f" | cut -c1-16)… ≠ vendored $(sha256sum "$ROOT/Client/lib/proxy_node_compat/$f" | cut -c1-16)…)"
+        fi
+    done
+    # 多一个文件同样是漂移（比如 canonical 删了某个模块，vendored 还留着旧的）
+    VN=$(find "$ROOT/Client/lib/proxy_node_compat" -type f -not -path '*__pycache__*' | wc -l)
+    [[ "$VN" = 8 ]] && ok "vendored 正好 8 个文件（无多余残留）" \
+                    || bad "vendored 文件数=$VN（期望 8 —— 有残留或缺失）"
+else
+    bad "canonical 目录不存在: $CANO —— 这一组**不许跳过**（vendored 一致性没有验证）"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
