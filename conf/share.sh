@@ -263,8 +263,12 @@ x_share_declare_url() { # <主地址> <发行版> <版本> [原生地址]
     local url="$1" dist="$2" ver="$3" native="${4:-}"
     local -a extra=()
     [[ -n "$native" && -n "$dist" ]] && extra=(--url-"$dist" "$native")
+    # ★ 不再在地址上产出 `version`（用户拍的板: 声明太长）。内核版本没有丢 ——
+    #   原生产品里自描述（native.py 的 {"interop","kernel","distribution",
+    #   "version","source"}）, 客户端拉原生产品就能看到。解析侧仍然接受
+    #   `version`（第三方可能写），只是不参与决策。
     python "$LIB_DIR/interop.py" declare --kernel xray --distribution "$dist" \
-        --version "$ver" --url "$url" "${extra[@]}" 2>/dev/null
+        --url "$url" "${extra[@]}" 2>/dev/null
 }
 
 # 一条分享记录 → 该给用户的**带声明地址**。

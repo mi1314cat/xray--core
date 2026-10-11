@@ -4639,6 +4639,76 @@ assert_eq "$(dval DIFF_IS_UNSUPPORTED)" "1" \
 assert_eq "$(dval COUNTS)" "10/9/1" \
     "节点数关系: uri = native + unsupported（10 = 9 + 1）"
 
+group "声明缩短: 不写 version + 同源相对路径（解析侧拼回绝对）"
+# 用户拍的板: 声明太长。两条改动 —— ① 不再产出 `version`（内核版本没有丢:
+# 原生产品里自描述）; ② url-<fmt> 与主地址**同源**时写相对引用 `/share/<token>`。
+# 解析侧把相对引用拼回绝对（放在 parse_declaration 里, decide() 签名不动）,
+# 旧格式（绝对 + version）必须照样判 native。
+SHORT=$(python3 - "$XRAY_INTEROP" <<'PYD'
+import json, os, subprocess, sys
+ip = sys.argv[1]
+def cli(*args):
+    return subprocess.run([sys.executable, ip, "declare", *args],
+                          capture_output=True, text=True).stdout.strip()
+same = cli("--kernel", "xray", "--distribution", "xray",
+           "--url", "http://h:9443/share/aaaa",
+           "--url-xray", "http://h:9443/share/bbbb")
+cross = cli("--kernel", "xray", "--distribution", "xray",
+            "--url", "http://h:9443/share/aaaa",
+            "--url-xray", "http://other:9443/share/bbbb")
+sys.path.insert(0, os.path.dirname(ip))
+import interop
+def dec(u):
+    c, r, url, _d = interop.decide(interop.parse_declaration(u), "xray", "xray")
+    return "%s|%s|%s" % (c, r, url)
+rel = same                                    # 新格式: 相对引用
+oldfmt = ("http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray"
+          "&version=26.3.27&formats=uri%2Cxray"
+          "&url-xray=http%3A%2F%2Fh%3A9443%2Fshare%2Fbbbb")
+relman = ("http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray"
+          "&formats=uri%2Cxray&url-xray=%2Fshare%2Fbbbb")
+mal1 = "http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=%2Fshare%2F"
+mal2 = "http://h:9443/share/aaaa?interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=%2F%2Fother.host%2Fx"
+print(json.dumps({
+    "has_version": "version=" in same,
+    "rel_query": same.split("?", 1)[1],
+    "cross_query": cross.split("?", 1)[1],
+    "rel_decide": dec(rel),
+    "rel_manual": dec(relman),
+    "old_decide": dec(oldfmt),
+    "mal1": dec(mal1), "mal2": dec(mal2),
+    "len_old": len(oldfmt), "len_new": len(rel),
+}, ensure_ascii=False))
+PYD
+)
+qv() { printf '%s' "$SHORT" | python3 -c 'import json,sys
+print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1" 2>/dev/null; }
+assert_eq "$(qv has_version)" "False" "声明格式对空 version 不输出（declaration_query 不写空值）"
+# ★ 真正要钉的是**服务端调用方**: 旧代码在 conf/share.sh 里显式传了 --version。
+#   只测 CLI 的话, 修复前也"通过"（因为这里本来就没传）—— 等于没测。
+if grep -q 'interop.py" declare --kernel xray' "$ROOT/conf/share.sh" \
+   && ! grep -q -- '--version "' "$ROOT/conf/share.sh"; then
+    ok "服务端产出侧（conf/share.sh）不再向 declare 传 --version（版本仍在原生产品里自描述）"
+else
+    bad "conf/share.sh 仍在传 --version（或 declare 调用点没了）—— 地址不会变短"
+fi
+assert_eq "$(qv rel_query)" "interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=%2Fshare%2Fbbbb" \
+    "同源 → url-xray 写成相对引用 /share/<token>（不再重复 host:port）"
+assert_eq "$(qv cross_query)" "interop=1&kernel=xray&distribution=xray&formats=uri%2Cxray&url-xray=http%3A%2F%2Fother%3A9443%2Fshare%2Fbbbb" \
+    "异源 → 仍然写绝对地址（相对引用跨源没有意义）"
+assert_eq "$(qv rel_decide)" "native|native-listed|http://h:9443/share/bbbb" \
+    "解析侧把相对引用拼成绝对地址, decide() 判 native（签名未改）"
+assert_eq "$(qv old_decide)" "native|native-listed|http://h:9443/share/bbbb" \
+    "向后兼容: 旧格式（绝对地址 + 带 version）照样判 native"
+# ★ 手写一条**相对引用**向量直接喂解析器（不依赖上面那条由 CLI 现产的串）——
+#   这样"解析侧能拼回绝对"这条在**修复前**才会真的红（那时 url-xray 是绝对地址,
+#   这条断言等于没测）。
+assert_eq "$(qv rel_manual)" "native|native-listed|http://h:9443/share/bbbb" \
+    "解析侧: 手写的相对引用声明也要拼成绝对并判 native"
+assert_eq "$(qv mal1)" "uri|bad-native-url|" "空 token（/share/）不猜 → 保持原样 → bad-native-url"
+assert_eq "$(qv mal2)" "uri|bad-native-url|" "协议相对（//other.host/x）不猜 → 保持原样 → bad-native-url"
+printf '      长度: 旧格式 %s → 新格式 %s 字节\n' "$(qv len_old)" "$(qv len_new)"
+
 group "订阅解析: 不认的链接不许静默丢（M 的 # 注释方言也要吃）"
 # 现场: M 的普通话发 19 条（明文 + 头两行 `#` 注释）, xbd 只说"解析出 15 个" ——
 # anytls×3 + tuic×1 被 `except: continue` 静默吃掉; SB 13 条只出 8 条

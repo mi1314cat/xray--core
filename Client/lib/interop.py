@@ -156,6 +156,31 @@ def declare_url(url, decl) -> str:
         (u.scheme, u.netloc, u.path, urllib.parse.urlencode(q + extra), frag))
 
 
+def relative_native_url(url, base):
+    """取件地址与主地址**同源**时写成相对引用（`/share/<token>`）。
+
+    协议允许绝对与相对两种写法, 用户觉得绝对地址太长（同源时 host:port 是重复
+    信息）—— 这里只做"同源 → 去掉 `scheme://netloc`"这一件事:
+
+      · 异源 → 原样返回绝对地址（相对引用跨源没有意义）;
+      · 带 query/fragment → 原样返回（本函数的语义只有"同一个源上的路径"）;
+      · 路径不像个真东西（空 token `/share/`、协议相对 `//other.host/x`）→
+        原样返回 —— **不猜**: 一个客户端解析不出所以然的相对引用比一条长地址更糟。
+    """
+    u = urllib.parse.urlsplit(str(url or "").strip())
+    b = urllib.parse.urlsplit(str(base or "").strip())
+    if not (u.scheme and u.netloc and b.scheme and b.netloc):
+        return str(url or "").strip()
+    if (u.scheme.lower(), u.netloc.lower()) != (b.scheme.lower(), b.netloc.lower()):
+        return str(url or "").strip()
+    path = u.path or "/"
+    if u.query or u.fragment or not path.startswith("/") or path.startswith("//"):
+        return str(url or "").strip()
+    if not path.split("/")[-1]:          # 末段为空（`/share/`）→ 空 token, 不缩短
+        return str(url or "").strip()
+    return path
+
+
 def parse_declaration(text):
     """从订阅地址（或裸查询串）里读声明。读不到返回 None。
 
@@ -200,9 +225,23 @@ def parse_declaration(text):
         except ValueError:
             schema = -1
         urls = {}
+        # ★ 相对引用（`/share/<token>`）在这里解析成绝对地址 —— 就放在解析层,
+        #   所以 `decide()` 的签名与逻辑都不用动。只认"以 / 开头"这一种形式,
+        #   且**不做**通用 urljoin（那会顺带接受 `../` 之类, 不是我们要的语义）;
+        #   解析不出 / 不像真实路径（空 token、`//host/x` 协议相对）→ **原样保留**,
+        #   让 decide() 照旧判 bad-native-url（**不猜**）。
+        _base = urllib.parse.urlsplit(s) if "://" in s else None
+        _origin = ("%s://%s" % (_base.scheme, _base.netloc)
+                   if _base and _base.scheme and _base.netloc else "")
         for k, v in low.items():
             if k.startswith(URL_PREFIX) and len(k) > len(URL_PREFIX):
-                urls[k[len(URL_PREFIX):]] = str(v or "").strip()
+                val = str(v or "").strip()
+                # 末段必须非空 —— `/share/` 是空 token, 拼成
+                # `http://h:9443/share/` 看起来合法却是一条死链, **不猜**。
+                if (_origin and val.startswith("/") and not val.startswith("//")
+                        and val.split("/")[-1]):
+                    val = _origin + val
+                urls[k[len(URL_PREFIX):]] = val
         fmts = [normalize_label(x) for x in
                 str(low.get(PARAM_FORMATS, "")).split(",") if x.strip()]
         return {
@@ -406,6 +445,8 @@ def main(argv):
         for i, a in enumerate(argv):
             if a.startswith("--url-"):
                 urls[a[len("--url-"):]] = opt(a)
+        _base = opt("--url")
+        urls = {k: relative_native_url(v, _base) for k, v in urls.items()}
         decl = build_declaration(opt("--kernel"), opt("--distribution"),
                                  opt("--version"),
                                  formats=opt("--formats", FORMAT_URI).split(","),
