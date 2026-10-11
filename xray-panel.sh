@@ -96,6 +96,26 @@ xray_fetch_to() {
     return 1
 }
 
+# 确保会话缓存目录存在，并把它**留在父 shell 里**。
+#
+# ★ 这个函数存在的唯一理由是一个踩过的坑（2026-10-11 线上复现）:
+#   `f=$(xray_fetch "$rel")` 是**命令替换 = 子 shell**，而 xray_fetch 里唯一
+#   给 `_XRAY_CACHE` 赋值的地方就在那里面 —— 赋值出了子 shell 就没了。
+#   后果不是"少个缓存"，是**两级坏**:
+#     ① `xray_ensure_lib` 开头 `[[ -n "$_XRAY_CACHE" ]] || return 0` 直接返回，
+#        `$CACHE/lib/` **从来没被铺过**；
+#     ② 子脚本是从 `$CACHE/conf_node.sh` 跑的，它按 `dirname $BASH_SOURCE/lib`
+#        找依赖 → 落在空目录上 → `[X] 取不到 /tmp/.xray-panel.XXXX/lib/print.sh
+#        —— 提示函数不可用`，整个子菜单点不动。
+#   而且每次 fetch 都新开一个 mktemp 目录（缓存等于没有，/tmp 里越堆越多）。
+#   从**仓库检出目录**跑（也就是 `self/$rel` 命中那一路）永远看不到这个 ——
+#   所以它是"本地开发一切正常、用户用公网一键安装就坏"的那类缺陷。
+#   建目录必须在**调 xray_fetch 之前**做，否则 $f 和 lib/ 会落在两个不同目录。
+xray_cache_dir() {
+    [[ -n "$_XRAY_CACHE" ]] || _XRAY_CACHE="$(mktemp -d /tmp/.xray-panel.XXXXXX 2>/dev/null)"
+    printf '%s' "$_XRAY_CACHE"
+}
+
 # xray_fetch <仓库相对路径> -> stdout 打印本地路径; 失败非 0
 xray_fetch() {
     local rel="$1" self dest
@@ -166,6 +186,10 @@ xray_ensure_lib() {
 xray_run() {
     local rel="$1"; shift
     local f base
+    # ★ 缓存目录必须**先**在父 shell 里建好（见 xray_cache_dir 的注释）：
+    #   晚一行，$f 与 $CACHE/lib/ 就会落在两个不同的 mktemp 目录里，
+    #   症状是子脚本报 "取不到 .../lib/print.sh"。
+    xray_cache_dir >/dev/null
     if ! f=$(xray_fetch "$rel"); then
         echo -e "${RED}[Error]${PLAIN} 取不到 $rel —— 镜像链全不通 (检查网络, 或设 XRAY_REPO_PROXY)"
         return 1
@@ -227,6 +251,7 @@ fi
 
 # 建节点之前问一次"服务器标识（节点名前缀）"（旗帜由 naming 负责）。
 _srv_ask_name() {
+    xray_cache_dir >/dev/null
     xray_ensure_lib >/dev/null 2>&1
     local lib="$_XRAY_CACHE/lib/naming.sh"
     [[ -f "$lib" ]] || return 0
