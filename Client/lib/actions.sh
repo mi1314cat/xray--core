@@ -708,11 +708,30 @@ except Exception: print("")' "$2" 2>/dev/null || true
 # 永远返回 0: 调用方按"节点数"判断, 不靠退出码 —— 本文件是 `set -e`,
 # 让 helper 带非 0 退出会在赋值处直接把整个命令打断。
 _sub_fetch_nodes() {      # <地址> <输出json文件>
-  local url="$1" out="$2" body=""
+  local url="$1" out="$2" body="" rep=""
   : > "$out"
   body=$(curl -sL --max-time 60 "$url" 2>/dev/null) || body=""
   [ -n "$body" ] || { printf '0'; return 0; }
-  printf '%s' "$body" | python3 "$XBD_LIBDIR/node.py" subscription - > "$out" 2>/dev/null || true
+  # ★ 解析器不认的行必须报出来（node.py:parse_subscription 的注释里有现场）:
+  #   "服务端发 19 条 / 客户端说解析出 15 个" 这件事以前没有任何痕迹。
+  #   注释行（M 的普通话头两行 `# …`）不算未识别 —— 那是合法方言。
+  rep=$(mktemp)
+  printf '%s' "$body" | python3 "$XBD_LIBDIR/node.py" subscription - --report "$rep" > "$out" 2>/dev/null || true
+  python3 - "$rep" >&2 <<'PYREP' || true
+import collections, json, sys
+try:
+    un = [x for x in json.load(open(sys.argv[1])) if isinstance(x, dict)]
+except Exception:
+    un = []
+if un:
+    c = collections.Counter((x.get("scheme") or "?") for x in un)
+    print("[!] 订阅里有 %d 条本客户端**解析器不认**的链接（%s）—— 没有导入, "
+          "也不在下面那句「解析出 N 个」里" % (
+              len(un), ", ".join("%s×%d" % (k, v) for k, v in sorted(c.items()))))
+    for x in un[:8]:
+        print("      · %s:// %s" % (x.get("scheme") or "?", (x.get("head") or "")[:76]))
+PYREP
+  rm -f "$rep"
   python3 -c 'import json,sys
 try: print(len(json.load(open(sys.argv[1]))))
 except Exception: print(0)' "$out" 2>/dev/null || printf '0'

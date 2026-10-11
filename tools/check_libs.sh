@@ -4639,6 +4639,42 @@ assert_eq "$(dval DIFF_IS_UNSUPPORTED)" "1" \
 assert_eq "$(dval COUNTS)" "10/9/1" \
     "节点数关系: uri = native + unsupported（10 = 9 + 1）"
 
+group "订阅解析: 不认的链接不许静默丢（M 的 # 注释方言也要吃）"
+# 现场: M 的普通话发 19 条（明文 + 头两行 `#` 注释）, xbd 只说"解析出 15 个" ——
+# anytls×3 + tuic×1 被 `except: continue` 静默吃掉; SB 13 条只出 8 条
+# （anytls×2 + naive+https + shadowtls + tuic）。注释行是**合法方言**（不算未识别）,
+# 但"不认的链接"必须有账。这一组钉住三件事: 注释被正确跳过 / 不认的落盘可查 /
+# 调用方（订阅抓取）真的用了这个开关。
+SUBF="$TMP/sub-dialects.txt"
+cat > "$SUBF" <<'SUBEOF'
+# mihomo--core 自动生成的分享链接 (URI 列表, tag=all)
+# 共 4 条; 与原生 YAML 产品同一批节点
+vless://aaaaaaaa-1111-2222-3333-444444444444@1.2.3.4:443?encryption=none&security=tls&type=ws&sni=a.example&path=/x#n1
+anytls://pw@1.2.3.4:8443?sni=c.example#anytls1
+tuic://uuuu:pw@1.2.3.4:8443?sni=d.example#tuic1
+vless://bbbbbbbb-1111-2222-3333-444444444444@1.2.3.4:443?encryption=none#n2
+SUBEOF
+SUBREP="$TMP/sub-rep.json"
+SUBN=$(python3 "$ROOT/Client/lib/node.py" subscription - --report "$SUBREP" < "$SUBF" 2>/dev/null \
+       | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin)))
+except Exception: print(-1)' 2>/dev/null)
+assert_eq "$SUBN" "2" "注释行(#)不产生节点、也不影响解析数（M/SB 的明文方言都吃）"
+SUBUN=$(python3 - "$SUBREP" <<'PYU'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("missing"); raise SystemExit
+print(",".join(sorted(str(x.get("scheme", "")) for x in d if isinstance(x, dict))))
+PYU
+)
+assert_eq "$SUBUN" "anytls,tuic" \
+    "解析器不认的链接逐条落盘（scheme 可查; 注释行不在清单里）—— 修复前这里是 missing"
+grep -q -- '--report' "$ROOT/Client/lib/actions.sh" \
+    && ok "订阅抓取路径接上了 --report（不认的链接会打给用户，不再只有一个数字）" \
+    || bad "订阅抓取没有接 --report —— 清单没人看，等于没修"
+
 group "hysteria2 带宽口径与产物只重建 (60/200 · .hy2-bandwidth · 无损拒绝)"
 # 两件事一起钉:
 #  ① 带宽口径只有一条 —— 默认 60/200 (用户偏好), 显式设置走

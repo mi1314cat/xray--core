@@ -1040,8 +1040,16 @@ def _parse_yaml_all(text: str) -> list[dict]:
     return out
 
 
-def parse_subscription(text: str) -> list[dict]:
-    """订阅内容 → 节点列表。自动识别 base64 编码、多行文本与**原生产品**。"""
+def parse_subscription(text: str, unrecognized: list | None = None) -> list[dict]:
+    """订阅内容 → 节点列表。自动识别 base64 编码、多行文本与**原生产品**。
+
+    `unrecognized` 给了就顺手把"解析器不认的行"记进去（[{scheme, head}]）。
+    ★ 这不是锦上添花: 以前这些行被 `except: continue` **静默吃掉** ——
+      实测 M 的普通话发 19 条, 这里只出 15 条（anytls×3 + tuic×1 消失),
+      SB 发 13 条只出 8 条（anytls×2 + naive+https + shadowtls + tuic),
+      而对外只有一句"解析出 N 个节点", 用户永远不知道少了什么。
+      注释行（`# …`, M 的普通话头两行就是）**不算**未识别 —— 那是合法方言。
+    """
     body = text.strip()
     # 原生产品（Xray JSON 文档）：订阅路径必须认它，否则同内核走原生这条路
     # 会以"订阅里没有解析出节点"告终（而内容其实完全正确）。
@@ -1055,10 +1063,19 @@ def parse_subscription(text: str) -> list[dict]:
     for line in body.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
-            continue
+            continue                      # 注释是合法方言（M 的普通话头两行就是）
         try:
             nodes.append(parse_node(line))
         except Exception:
+            # ★ 不认的行不许静默丢: 服务端 19 条这里出 15 条, 而对外只有
+            #   "解析出 N 个节点" —— 少的 4 条没有任何交代（见函数 docstring）。
+            m = re.match(r"\s*([A-Za-z][A-Za-z0-9+.\-]*)://", line)
+            if unrecognized is not None and m:
+                # 只记**看起来是链接**的行（有 scheme://）。404 的 JSON 错误体
+                # （`{"error": …}`）不算"解析器不认的链接" —— 报它只会误导
+                # （实测: 死地址那格的告警变成"1 条…（?×1）"，而真正的原因是 404）。
+                unrecognized.append({"scheme": m.group(1).lower(),
+                                     "head": line[:100]})
             continue
     return nodes
 
@@ -1382,6 +1399,14 @@ def main(argv: list[str]) -> int:
         return 2
     cmd = argv[1]
 
+    # --report PATH: 把"解析器不认的行"落盘（订阅路径用; 见 parse_subscription）
+    report_path = ""
+    if "--report" in argv:
+        _i = argv.index("--report")
+        if _i + 1 < len(argv):
+            report_path = argv[_i + 1]
+        argv = argv[:_i] + argv[_i + 2:]
+
     if cmd == "selftest":
         return selftest()
 
@@ -1402,7 +1427,11 @@ def main(argv: list[str]) -> int:
         elif cmd == "multi":
             print(json.dumps(parse_many(raw), ensure_ascii=False))
         elif cmd == "subscription":
-            nodes = parse_subscription(raw)
+            unrecognized: list = []
+            nodes = parse_subscription(raw, unrecognized)
+            if report_path:
+                with open(report_path, "w", encoding="utf-8") as fh:
+                    json.dump(unrecognized, fh, ensure_ascii=False)
             print(json.dumps(nodes, ensure_ascii=False, indent=2))
         elif cmd == "field":
             node = parse_node(raw)
