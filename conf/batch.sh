@@ -326,6 +326,35 @@ batch_main() {
         new_files+=("$f")
     done
 
+    # ---- 先补证书, 再统一验证 ----
+    #
+    # ★ 顺序不能反。证书没了的时候, verify.sh 会报一长串
+    #   "failed to build TLS config > failed to parse certificate",
+    #   没人看得出真因是文件不在磁盘上。先跑 x_cert_ensure: 能补就补上,
+    #   补不上就明确告诉用户是哪张证书、去哪张卡, 再交给内核校验。
+    #
+    #   没有这一步, "证书莫名丢失"就是一个只在重启时才炸的静默故障 ——
+    #   10-08 和 10-12 都是这样发现的, 两次都是别人的续签顺手删的,
+    #   不是我们删的, 但最后是我们这边的节点起不来。
+    # batch.sh 既能被面板 source (库已加载), 也能 `bash conf/batch.sh --auto`
+    # 单独跑 (库没加载)。所以这里按需补载一次 cert.sh —— 用 declare -F 直接
+    # 判断的话, 单独跑那条路会**静默跳过**证书检查, 恰好是最需要它的场景。
+    if ! declare -F x_cert_ensure >/dev/null 2>&1; then
+        local _cdir _cf
+        _cdir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+        for _cf in "$_cdir/lib/cert.sh" "$_cdir/cert.sh"; do
+            [[ -r "$_cf" ]] && { source "$_cf"; break; }
+        done
+    fi
+    if declare -F x_cert_ensure >/dev/null 2>&1; then
+        if ! x_cert_ensure "$CONF_DIR"/*.json; then
+            print_error "有证书缺失且无法自动恢复, 已中止 (不写坏配置)"
+            return 1
+        fi
+    else
+        print_warn "证书自检不可用 (未找到 lib/cert.sh), 跳过证书缺失检查"
+    fi
+
     # ---- 统一验证 (复用 conf/verify.sh 的 check, 不自行假设检查命令) ----
     echo >&2
     print_title "统一配置校验"

@@ -80,6 +80,131 @@ _preset_security_allows() {
     esac
 }
 
+# ---------------------------------------------------------------- 档位
+#
+# ★ 为什么给预置分档
+#
+# 「预置总数」和「全协议该默认带哪些」是两件事。分不清就会得到一个
+# 27 项的大列表, 用户挑花眼 —— 而其中相当一部分**根本不该默认出现在
+# 全协议一键生成里**:
+#
+#   socks / http     本地代理档 (无认证的 SOCKS5/HTTP 暴露到公网等于开代理),
+#                    只在同一局域网或本机用;
+#   裸 TCP + TLS     隧道用法。没有 REALITY 的握手伪装, TLS ClientHello
+#                    特征明显, 抗 DPI 最差的一档;
+#   WS / gRPC        官方已在文档顶部标了 danger / 弃用, 迁移目标是 XHTTP,
+#                    留着是为了兼容老客户端, 不是为了新装;
+#   裸 TCP 无加密    仅限内网。
+#
+# 用户的要求原话: 「全协议一定要是适合于现在的网络环境, 适合于客户端能
+# 稳定地、隐蔽地去连接到服务端」。
+#
+# 所以分四档, 全协议一键生成只取 core + cdn:
+#   core    直连, 抗 DPI 最强, 不依赖域名/证书
+#   cdn     走 Cloudflare 橙云, 有 CDN + ECH
+#   compat  官方已弃用, 只为兼容老客户端保留
+#   special 特殊用法 (本地代理 / 隧道 / 内网), 不进默认全协议
+
+
+# 每个档位在菜单里的一句话说明
+_p_tier_desc() {
+    case "$1" in
+        core)    printf '直连 · 抗 DPI 最强 · 不依赖域名和证书' ;;
+        cdn)     printf '走 Cloudflare 橙云 · 可开 ECH · 适合被墙与限速环境' ;;
+        compat)  printf '官方已弃用 · 仅供兼容老客户端 · 新装不建议' ;;
+        special) printf '特殊用法 (本地代理 / 隧道 / 内网) · 不进默认全协议' ;;
+        *)       printf '' ;;
+    esac
+}
+
+# 全协议一键生成只取这两档
+_P_TIERS_DEFAULT="core cdn"
+
+# ---------------------------------------------------------------- 档位表
+#
+# ★ 为什么用独立表, 不把档位塞进 X_PRESETS 那一行
+#
+#   X_PRESETS 每一行的字段数**本来就不统一**: VLESS 的行尾部带 extras
+#   (mlkem,mldsa65 / none|none), 别的协议不带。而读取方 (x_preset_list /
+#   preset_batch) 是按位置 cut -f4/-f5 取名字和说明的 —— 在行尾追加一个
+#   字段, 就会让"有的行多一个尾字段"这件事变成"有的行多两个", 迟早有人
+#   按位置读错。所以档位单独一张表, 按 "协议:序号" 索引, 零风险。
+#
+# 分档标准 (对应用户的要求「适合于现在的网络环境, 适合于客户端能稳定地、
+# 隐蔽地去连接到服务端」):
+#   core    直连 · 抗 DPI 最强 · 不依赖域名/证书      → 进默认全协议
+#   cdn     走 Cloudflare 橙云 · 可开 ECH             → 进默认全协议
+#   compat  官方已弃用 (WS/gRPC), 只为兼容老客户端    → 不进
+#   special 特殊用法 (本地代理/隧道/内网/裸 TCP)      → 不进
+
+_P_TIER_DEFAULT="core cdn"
+
+_P_TIERS_table() {
+    # 协议:序号  格式
+    cat <<'TIERS'
+vless:1 core
+vless:2 core
+vless:3 special
+vless:4 cdn
+vless:5 cdn
+vless:6 core
+vless:7 compat
+vless:8 compat
+vless:9 compat
+vless:10 special
+trojan:1 core
+trojan:2 cdn
+trojan:3 compat
+trojan:4 compat
+trojan:5 special
+vmess:1 cdn
+vmess:2 compat
+vmess:3 compat
+vmess:4 special
+shadowsocks:1 core
+shadowsocks:2 special
+shadowsocks:3 special
+hysteria2:1 core
+socks:1 special
+socks:2 special
+http:1 special
+http:2 special
+TIERS
+}
+
+# 该协议第 n 个预置的档位; 查不到一律按 special (宁可不默认推, 也不误推)
+_p_tier_of() { # <协议> <序号>
+    local t
+    # 表里是 "协议:序号 档位" (冒号在第一段里, 空格分隔两段), 所以按空格切,
+    # 再把第一段按冒号拆。之前用 -F: 切全行, 结果 $1 是 "vless:1"、
+    # $2 是 "core", 与协议/序号完全对不上 —— 查不到就走了 special 兜底,
+    # 于是**所有**预置都被当成特殊用途, 默认全协议一个都没有 (静默为空)。
+    t=$(_P_TIERS_table | awk -v key="$1:$2" '$1==key {print $2; exit}')
+    printf '%s' "${t:-special}"
+}
+
+# 该协议里属于默认全协议 (core+cdn) 的序号, 空格分隔
+_p_default_indexes() { # <协议>
+    local d t i n out=""
+    d=" $_P_TIER_DEFAULT "
+    n=$(x_preset_count "$1" 2>/dev/null) || n=0
+    for i in $(seq 1 "$n"); do
+        t=$(_p_tier_of "$1" "$i")
+        case "$d" in *" $t "*) out="$out $i";; esac
+    done
+    printf '%s' "${out# }"
+}
+
+_p_tier_desc() {
+    case "$1" in
+        core)    printf '直连 · 抗 DPI 最强 · 不依赖域名和证书' ;;
+        cdn)     printf '走 Cloudflare 橙云 · 可开 ECH · 适合被墙与限速环境' ;;
+        compat)  printf '官方已弃用 · 仅供兼容老客户端 · 新装不建议' ;;
+        special) printf '特殊用法 (本地代理 / 隧道 / 内网) · 不进默认全协议' ;;
+        *)       printf '' ;;
+    esac
+}
+
 X_PRESETS=(
     # ---------- VLESS ----------
     # REALITY 预设挂在本段。抗 DPI 最强, 不需要域名和证书。
@@ -92,30 +217,25 @@ X_PRESETS=(
     "vless|ws|tls|⑦ WS + TLS（官方已弃用）|⚠ 官方文档顶部已挂 danger: \"推荐换用 XHTTP\". 迁移目标 XHTTP H2 & H3 — 只有在服务端/CDN 明确只吃 WS 时才选它"
     "vless|grpc|tls|⑧ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ④"
     "vless|httpupgrade|tls|⑨ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ④"
-    "vless|tcp|tls|⑩ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用"
-
+    "vless|tcp|tls|⑩ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用|"
     # ---------- Trojan ----------
     "trojan|tcp|reality|① 隐匿优先 · REALITY + Vision|裸 TCP + REALITY; Trojan 侧最抗 DPI 的组合"
     "trojan|xhttp|tls|② CDN 友好 · XHTTP + TLS|★ 官方主推传输; 可走 Cloudflare 橙云 (与 VLESS 口径一致)"
     "trojan|ws|tls|③ WS + TLS（官方已弃用）|⚠ 官方推荐换用 XHTTP; 只在服务端只吃 WS 时选它"
     "trojan|grpc|tls|④ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
-    "trojan|tcp|tls|⑤ 裸 TCP + TLS|最常见的默认选择"
-
+    "trojan|tcp|tls|⑤ 裸 TCP + TLS|最常见的默认选择|"
     # ---------- VMess ----------
     "vmess|xhttp|tls|① CDN 友好 · XHTTP + TLS|★ 官方主推传输 (与 VLESS/Trojan 口径一致)"
     "vmess|ws|tls|② WS + TLS（官方已弃用）|⚠ 官方推荐换用 XHTTP"
     "vmess|grpc|tls|③ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
-    "vmess|tcp|tls|④ 裸 TCP + TLS|改连 TCP 伪装, 需要 VMess 自身配置"
-
+    "vmess|tcp|tls|④ 裸 TCP + TLS|改连 TCP 伪装, 需要 VMess 自身配置|"
     # ---------- Shadowsocks ----------
     "shadowsocks|tcp|reality|① 隐匿优先 · REALITY|裸 TCP + REALITY; 协议本身简单, 靠 REALITY 补抗识别"
     "shadowsocks|tcp|tls|② 裸 TCP + TLS|标准用法"
-    "shadowsocks|tcp|none|③ 裸 TCP · 无加密|仅在同一局域网内使用; 跨公网务必换前两个"
-
+    "shadowsocks|tcp|none|③ 裸 TCP · 无加密|仅在同一局域网内使用; 跨公网务必换前两个|"
     # ---------- Hysteria2 ----------
     # hysteria2 走 UDP, 传输固定, 只有 TLS 一档。
-    "hysteria2|hysteria|tls|① 标准 (UDP + TLS)|Hysteria2 只支持 UDP; 抗弱网能力来自协议本身, 不靠传输伪装"
-
+    "hysteria2|hysteria|tls|① 标准 (UDP + TLS)|Hysteria2 只支持 UDP; 抗弱网能力来自协议本身, 不靠传输伪装|"
     # ---------- 本地代理 (无加密) ----------
     "socks|tcp|none|① SOCKS5 · 无认证|仅本机或可信内网; 暴露到公网等于开放代理"
     "socks|tcp|tls|② SOCKS5 + TLS|需要认证能力时仍建议另加认证"
@@ -147,16 +267,45 @@ x_preset_field() {
 
 # 列出某协议的预置 (交互式选择用)
 x_preset_list() {
-    local p="$1" row n=0 cnt
+    # $2 = "all"(默认) | "default"(只列 core+cdn)
+    local p="$1" only="${2:-all}" row n=0 cnt tier tdesc mark
     cnt=$(x_preset_count "$p")
     [[ "$cnt" -gt 0 ]] || { printf '协议 %s 没有预置\n' "$p" >&2; return 1; }
+    if [[ "$only" == "default" ]]; then
+        # 编号会**跳号** (如 1,2,4,5) —— 这是故意的: 编号就是预置序号,
+        # 用户在命令行里敲的 `vless:4` 必须指同一项。重新编号的话,
+        # 菜单里看到的 3 和实际生效的第 4 项会对不上, 而这种错不会报错,
+        # 只会让用户拿到一个自己没点的配置。
+        printf '  \033[2m(★ = 默认全协议会带; 编号有跳号是正常的, 它就是预置序号)\033[0m\n' >&2
+    fi
     for row in "${X_PRESETS[@]}"; do
         [[ "${row%%|*}" == "$p" ]] || continue
         n=$((n+1))
-        printf '  %s) %s\n' "$n" "$(printf '%s' "$row" | cut -d'|' -f4)" >&2
+        tier=$(_p_tier_of "$p" "$n")
+        if [[ "$only" == "default" ]]; then
+            case " $_P_TIER_DEFAULT " in *" $tier "*) ;; *) continue ;; esac
+        fi
+        # 默认全协议会带的那几项标 ★, 其余说清为什么不用 ——
+        # 只写"不推荐"而不说理由, 用户会当成脚本有偏好而不是有依据。
+        case "$tier" in
+            core|cdn) mark='★' ;;
+            *)        mark=' ' ;;
+        esac
+        printf '  %s) %s%s\n' "$n" "$mark" "$(printf '%s' "$row" | cut -d'|' -f4)" >&2
         printf '     %s\n'     "$(printf '%s' "$row" | cut -d'|' -f5)" >&2
+        tdesc=$(_p_tier_desc "$tier")
+        [[ -n "$tdesc" ]] && printf '     \033[2m[%s] %s\033[0m\n' "$tier" "$tdesc" >&2
     done
     return 0
+}
+
+# 某个协议默认全协议用哪几项 —— 批量生成与菜单显示共用这一处口径,
+# 免得"菜单里写着默认"与"实际生成了什么"两处对不上。
+x_preset_default_list() { # <协议>
+    local p="$1" idx
+    for idx in $(_p_default_indexes "$p"); do
+        printf '%s ' "$idx"
+    done
 }
 
 # 挑一个预置, 输出 "传输 加密 显示名 说明" 供调用方用

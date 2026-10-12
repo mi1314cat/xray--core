@@ -438,10 +438,36 @@ CS=$(timeout 20 bash -c "source '$ROOT/conf/cert.sh'; echo DONE" 2>&1 | grep -c 
 assert_eq "$CS" "0" "source cert.sh 不弹菜单"
 
 # 系统 CA 包不该出现在"我的证书"里
+#
+# ★ 这条以前写的是"总数 <= 8"。但 x_cert_search_dirs 里**硬编码了一批真实
+#   目录** (/home/web/certs、/etc/letsencrypt/live、/root/catmi/certs …),
+#   X_CERT_EXTRA_DIRS 只是额外加一条, 拦不住那些。所以计数跟着**宿主机状态**
+#   走: 10-12 用户重新签发了两张证书, /home/web/certs 从 0 张变 2 张,
+#   总数就顶破了 8 —— 测试红了, 但代码没坏。
+#
+#   这种"看着像回归、其实是环境变了"的红最耗人: 第一反应永远是去改代码。
+#   改成自足: 造一张 CA 包 + 一张真证书放临时目录, 只断言**包被滤掉、
+#   证书还在**。跟宿主状态彻底无关。
+CE2="$TMP/certfilter"; mkdir -p "$CE2"
+# _x_skip_bundle 判的是"这个文件里塞了几张证书", 不是文件名 —— 所以必须造
+# 一份真的多证书 PEM, 拿随机字节当证书它认不出来, 测出来的就不是过滤器。
+openssl crl2pkcs7 -nocrl -certfile /etc/ssl/certs/ca-certificates.crt 2>/dev/null \
+    | openssl pkcs7 -print_certs 2>/dev/null > "$CE2/ca-certificates.crt"
+[[ -s "$CE2/ca-certificates.crt" ]] || { head -3 /etc/ssl/certs/ca-certificates.crt > "$CE2/ca-certificates.crt"; }
+cp /etc/letsencrypt/live/*/fullchain.pem "$CE2/my.real.pem" 2>/dev/null \
+    || cp /root/catmi/certs/*_cert.pem "$CE2/my.real.pem" 2>/dev/null \
+    || openssl req -x509 -newkey rsa:2048 -nodes -keyout /dev/null -out "$CE2/my.real.pem" -days 1 -subj "/CN=x" 2>/dev/null
 CL=$(bash -c "source '$ROOT/conf/lib/cert.sh'
-  export X_CERT_NGINX_DIRS='$CE/a' XRAY_BASE='$CE' X_CERT_EXTRA_DIRS='$CE/a'
-  x_cert_list | wc -l")
-[[ "$CL" -le 8 ]] && ok "系统 CA 包已过滤 (剩 $CL 个)" || bad "证书列表被系统 CA 淹没: $CL 个"
+  export X_CERT_NGINX_DIRS='$CE2' XRAY_BASE='$CE2' X_CERT_EXTRA_DIRS='$CE2'
+  x_cert_list")
+CLN=$(printf '%s' "$CL" | grep -c . || true)
+CLB=$(printf '%s' "$CL" | grep -c 'ca-certificates' || true)
+CLG=$(printf '%s' "$CL" | grep -c 'my.real.pem' || true)
+if [[ "$CLB" == "0" && "$CLG" == "1" ]]; then
+    ok "系统 CA 包被滤掉, 用户自己的证书留下 (与宿主状态无关)"
+else
+    bad "CA 包过滤异常: 包命中 $CLB 次, 自己证书命中 $CLG 次"
+fi
 
 # 未定义 CONF_DIR 时不能静默退出 (set -u 下会终止整个 shell)
 GU=$(env -u CONF_DIR -u MAIN_CONFIG -u XRAY_BASE timeout 20 bash -c "
@@ -5338,6 +5364,78 @@ printf '%s' "$OUT3" | grep 'NODE hysteria-02 verdict=ok changed=up:45->60,down:1
     || bad "删掉覆盖文件后没有回到默认: $(printf '%s' "$OUT3" | grep NODE | sed -n 1p)"
 grep -q 'sync-products' "$ROOT/conf/hysteria2.sh" && ok "非交互的产物重建入口存在" \
     || bad "hysteria2.sh 没有 sync-products 入口（产物无法在不新建节点的前提下重建）"
+
+# ---------------------------------------------------------------- 证书丢失
+# 用户报告: "X 内核有时候会将我们那个证书库里面的证书莫名其妙的就少了一些
+# 东西, 另外两个内核就从来没有发生过。"
+#
+# 真因 (RN, 2026-10-12 查实): lib/cert.sh 里的 x_cert_sync() 定义了却**从来没
+# 被调用过** —— 全项目零调用点。于是 10-08 设计的保护 (复制一份到项目目录、
+# 配置只引用项目目录) 从来没接上线, 片段至今指向 /home/web/certs, 那个目录
+# 归 KPanel 管, 续签时先删 lineage 再重新签发, 中途失败磁盘上就只剩私钥。
+#
+# 所以这里测三件事, 少一件都不够:
+#   1. sync 真的会把证书搬进项目目录 (当初就是没接上, 不能只有函数存在);
+#   2. 证书没了以后能自己补回来 (而不是等重启炸);
+#   3. 补不回来时返回非 0 且点名是哪张证书 —— 静默放过等于没做。
+group "证书丢失防护 (2026-10-12 事故回归)"
+CERT_T=$(mktemp -d)
+CT_PROJ="$CERT_T/project"; CT_LE="$CERT_T/le"; CT_LIN="$CT_LE/ct.test.local"; CT_CONF="$CERT_T/conf"
+mkdir -p "$CT_PROJ" "$CT_LIN" "$CT_CONF"
+# 目录结构照抄 letsencrypt: <src>/<域名>/{fullchain,privkey}.pem
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$CT_LIN/privkey.pem" \
+    -out "$CT_LIN/fullchain.pem" -days 30 -subj "/CN=ct.test.local" >/dev/null 2>&1
+cat > "$CT_CONF/f.json" <<CTEOF
+{"certificateFile":"$CT_PROJ/ct.test.local_cert.pem","keyFile":"$CT_PROJ/ct.test.local_key.pem"}
+CTEOF
+
+(
+    export X_CERT_DIR="$CT_PROJ"
+    # 直接 source 整个文件 —— 用 sed 截取函数段看着省事, 但 x_cert_ensure 依赖
+    # x_cert_sync/x_cert_project_dir, 截漏任何依赖都表现为"功能失效",
+    # 测出来的是**测试自己造的问题**, 不是产品问题 (这轮已经踩过一次)。
+    source "$ROOT/conf/lib/cert.sh" 2>/dev/null || true
+    # lib 里的告警走 print_*。**必须真的输出到 stderr** —— 下面要断言
+    # "补不回时点名了是哪张证书", 而我把 print_error 写成空函数的话,
+    # 断言永远失败, 而失败原因是我自己把话说没了 (第二轮踩的同一个坑:
+    # 测试自己造的问题长得像产品问题)。
+    print_info() { printf '[Info] %s\n' "$1" >&2; }
+    print_warn() { printf '[Warn] %s\n' "$1" >&2; }
+    print_error() { printf '[Error] %s\n' "$1" >&2; }
+    declare -F x_cert_sync >/dev/null || { echo "NO_SYNC" > "$CERT_T/.r"; exit 0; }
+
+    x_cert_sync "$CT_LE" >/dev/null 2>&1
+    [[ -f "$CT_PROJ/ct.test.local_cert.pem" ]] || { echo "NO_POPULATE" > "$CERT_T/.r"; exit 0; }
+
+    rm -f "$CT_PROJ/ct.test.local_cert.pem"
+    x_cert_ensure "$CT_CONF/f.json" "$CT_LE" >/dev/null 2>&1
+    [[ -f "$CT_PROJ/ct.test.local_cert.pem" ]] || { echo "NO_RECOVER" > "$CERT_T/.r"; exit 0; }
+
+    rm -f "$CT_PROJ/ct.test.local_cert.pem"; rm -rf "$CT_LE"
+    x_cert_ensure "$CT_CONF/f.json" "$CT_LE" >"$CERT_T/.out" 2>&1
+    [[ $? -eq 0 ]] && { echo "SILENT_OK" > "$CERT_T/.r"; exit 0; }
+    grep -q 'ct.test.local_cert.pem' "$CERT_T/.out" || { echo "VAGUE" > "$CERT_T/.r"; exit 0; }
+    echo "PASS" > "$CERT_T/.r"
+) 2>/dev/null
+CERT_R=$(cat "$CERT_T/.r" 2>/dev/null || echo NORUN)
+case "$CERT_R" in
+    PASS)   ok "证书丢失 → 自动补回; 补不回时报名并返回非 0" ;;
+    NO_SYNC)   bad "lib/cert.sh 里没有 x_cert_sync (当初就是它没接上)" ;;
+    NO_POPULATE) bad "x_cert_sync 没把证书搬进项目目录" ;;
+    NO_RECOVER) bad "证书被删后 x_cert_ensure 没补回来" ;;
+    SILENT_OK)  bad "证书彻底没了 x_cert_ensure 仍返回 0 —— 会静默写坏配置" ;;
+    VAGUE)      bad "补不回时没有点名是哪张证书 (只该报人话, 不该报内核栈)" ;;
+    *)          bad "证书丢失防护回归用例没跑起来" ;;
+esac
+# 这个事故的直接成因: sync 有定义但没人调用。
+CALLS=$(grep -rl 'x_cert_sync\|x_cert_ensure' "$ROOT/conf" "$ROOT/tools" 2>/dev/null \
+        | grep -v 'lib/cert\.sh$' | wc -l)
+[[ "$CALLS" -ge 2 ]] && ok "sync/ensure 有真实调用点 ($CALLS 个文件), 不是死函数" \
+                     || bad "x_cert_sync / x_cert_ensure 仍然没有调用点 (死函数 = 保护没生效)"
+grep -q 'x_cert_migrate' "$ROOT/conf/cert.sh" \
+    && ok "证书菜单里能迁到项目目录 (新节点以外的存量也能改)" \
+    || bad "证书菜单没有迁移入口 —— 存量片段会一直指着会被删的目录"
+rm -rf "$CERT_T"
 
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then

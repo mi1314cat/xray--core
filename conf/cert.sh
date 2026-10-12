@@ -368,6 +368,34 @@ _cr_do_gc() {
 }
 
 # ---------------------------------------------------------------- 5 容器里的
+# ★ 迁移到项目目录 —— 修"证书被别人的续签顺手删掉"的根治动作。
+_cr_do_migrate() {
+    local dir="${XRAY_CONF_DIR:-$XRAY_BASE/conf}"
+    local -a frags=()
+    local f
+    shopt -s nullglob
+    for f in "$dir"/*.json; do [[ -f "$f" ]] && frags+=("$f"); done
+    shopt -u nullglob
+    if [[ ${#frags[@]} -eq 0 ]]; then
+        _yl "  $dir 下没有片段"
+        return 0
+    fi
+    printf '\n' >&2
+    _cr "  将把片段里指向外部目录的证书路径改到: $(x_cert_project_dir)"
+    _yl "  外部目录 = KPanel / nginx / acme.sh / letsencrypt —— 那些不归我们管,"
+    _yl "  它们的续签会先删后签, 中途失败磁盘上就只剩私钥。"
+    _yl "  每个被改的片段都会留一份 .bak-时间戳。"
+    printf '\n' >&2
+    local ans
+    ans=$(ui_ask "开始迁移这 ${#frags[@]} 个片段?" "")
+    [[ "$ans" == "y" || "$ans" == "Y" || "$ans" == "yes" ]] || { _yl "  已取消"; return 0; }
+    printf '\n' >&2
+    x_cert_migrate "${frags[@]}" || { _rd "  有片段没能改写, 请人工看一眼"; return 1; }
+    printf '\n' >&2
+    _gr "  迁移完成。建议接着跑 1) 体检 确认内核还能加载。"
+    printf '  %s' >&2
+}
+
 _cr_do_container() {
     local -a cs
     mapfile -t cs < <(x_cert_container_certs)
@@ -412,6 +440,7 @@ _cr_menu() {
         ui_menu 4 "回收未引用     只删没有任何引用的（需确认）"
         ui_menu 5 "容器里的证书   主机 GC 看不到的那部分"
         ui_menu 6 "搜索范围       证书会从哪些目录被发现"
+        ui_menu 7 "迁到项目目录   改掉指向外部目录的证书路径 (根治丢失)"
         ui_menu 0 "返回"
         # ★ 上面 ui_menu 画一遍就够了。原来这后面还跟着七行 _gr "  2) …" 的
         #   原样复刻, 于是每轮循环菜单都出现两遍 (值还各不相同: 这里的
@@ -430,6 +459,7 @@ _cr_menu() {
             4) _cr_do_gc; ui_pause ;;
             5) _cr_do_container; ui_pause ;;
             6) _cr_do_where; ui_pause ;;
+            7) _cr_do_migrate; ui_pause ;;
             0|"") return 0 ;;
             *) _rd "  无效选项: $c" ;;
         esac

@@ -321,6 +321,31 @@ scan_certs() {
     local -a search_dirs=()
     local -a labels=()
 
+    # 0) ★ 先同步, 再搜索 —— 而且项目目录排在**最前面**
+    #
+    #   证书丢失的根因 (RN, 2026-10-12 查实):
+    #   lib/cert.sh 里的 x_cert_sync() 定义了却**从来没被调用过**
+    #   (全项目零调用点), 于是 /root/catmi/certs 这个"项目自己的目录"
+    #   一直是空的 —— 里面只剩 10-08 手工测试时留下的两个 _key.pem。
+    #   搜索又找不到它, 就一路退到 /home/web/certs (KPanel 的目录),
+    #   片段里存的就是那个路径。而 KPanel 的续签脚本会**先删 lineage
+    #   再重新签发**, 中途失败磁盘上就只剩私钥了 —— 于是节点静默失效,
+    #   重启才暴露。
+    #
+    #   10-08 写在 lib/cert.sh 注释里的那套保护 (复制一份到项目目录、
+    #   配置只引用项目目录) 从来没接上线, 这次是真的接上:
+    #     · 每次找证书前先 x_cert_sync, 从 letsencrypt 拉一份到项目目录;
+    #     · 项目目录排第一, 片段里存 /root/catmi/certs/... 而不是
+    #       /home/web/certs/... —— KPanel 那边被删被改都不再影响我们。
+    if declare -F x_cert_sync >/dev/null 2>&1; then
+        x_cert_sync /etc/letsencrypt/live >/dev/null 2>&1 || true
+    fi
+    local _proj
+    _proj="$(x_cert_project_dir 2>/dev/null || echo /root/catmi/certs)"
+    if [[ -d "$_proj" ]]; then
+        search_dirs+=("$_proj"); labels+=(catmi-project)
+    fi
+
     # 1) catmi 证书目录 + 根目录
     if [[ -d /root/catmi/cloudflare/certs ]]; then
         search_dirs+=(/root/catmi/cloudflare/certs); labels+=(catmi/cloudflare-certs)

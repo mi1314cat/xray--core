@@ -430,6 +430,124 @@ x_cert_sync() {
     [[ "$copied" == "1" ]]
 }
 
+# ★ 兜底: 片段引用的证书不见了, 先试着从 letsencrypt 拉回来, 再报错。
+#
+# 为什么要有这道: 证书丢失的故障形态太安静了 ——
+#   · nginx 已经把证书读进内存, 网站照常能开;
+#   · xray 服务还活着 (启动时证书还在);
+#   · 只有**重启**才炸, 而报错是一大串 infra/conf 栈, 没人看得出是证书没了。
+#   10-08 和这次 10-12 都是这样。所以不能等到内核报错才发现, 得在
+#   **校验配置之前**自己先查一遍。
+#
+# 用法: x_cert_ensure <配置文件...>  [letsencrypt源目录]  → 返回 0 = 全都齐了
+#
+# 第二个参数是给测试/别的 CA 布局用的 —— 写死 /etc/letsencrypt/live 的话,
+# 在用 acme.sh 或别的目录的机器上补不回来, 而且测试根本没法隔离
+# (我第一版就踩了: 场景三想模拟"证书彻底没了", 结果它从真的
+# /etc/letsencrypt/live 里又捞回来一张, 场景直接测废了)。
+x_cert_ensure() {
+    local dir proj f want base restored=0 missing=0
+    local le_src="${2:-/etc/letsencrypt/live}"
+    proj="$(x_cert_project_dir)"
+
+    # 先照常同步一次 (多数"丢失"其实是没同步, 这一步就好了)
+    x_cert_sync "$le_src" >/dev/null 2>&1 || true
+
+    for dir in "$@"; do
+        [[ -f "$dir" ]] || continue
+        # 把片段里所有 *_cert.pem 引用挖出来
+        while IFS= read -r f; do
+            want=$(clean_cert_path "$f")
+            [[ -f "$want" ]] && continue
+            base=$(basename "$want")
+            base=${base%_cert.pem}
+            # 缺的是证书还是私钥, 两种都试
+            if [[ -f "$proj/${base}_cert.pem" && -f "$proj/${base}_key.pem" ]]; then
+                if [[ ! -f "$want" ]] || ! cmp -s "$proj/${base}_cert.pem" "$want"; then
+                    cp -f "$proj/${base}_cert.pem" "$want" 2>/dev/null && \
+                    { restored=$((restored+1)); continue; }
+                fi
+            fi
+            # 直接从 letsencrypt 恢复
+            if [[ -f "${le_src}/${base}/fullchain.pem" ]]; then
+                if cp -f "${le_src}/${base}/fullchain.pem" "$want" 2>/dev/null; then
+                    print_info "证书已从 letsencrypt 恢复: $base"
+                    restored=$((restored+1)); continue
+                fi
+            fi
+            missing=$((missing+1))
+            print_error "证书缺失且无法恢复: $want"
+            print_error "  这个片段引用的证书不在磁盘上, 内核重启时会起不来。"
+            print_error "  重新签发: 菜单 5) 证书管理 → 申请/续期; 或手动"
+            print_error "  cp /etc/letsencrypt/live/<域名>/fullchain.pem $want"
+        done < <(grep -ohE '[A-Za-z0-9_./-]*_cert\.pem|[A-Za-z0-9_./-]*cert-[A-Za-z0-9.-]+\.crt' "$dir" 2>/dev/null | sort -u)
+    done
+    [[ "$missing" -eq 0 ]]
+}
+
+# ★ 迁移: 把已有片段里指向"别人家目录"的证书路径改到项目目录
+#
+#   为什么必须迁: x_cert_ensure 只能在**文件确实不见了**的时候救。
+#   而现在生产里的片段写的是 /home/web/certs/... —— 那个目录归 KPanel 管,
+#   它的续签脚本先删后签, 中途失败磁盘上就只剩私钥。只要还指着那个目录,
+#   我们就永远处在"等它被删"的状态里, 救火只是最后一道。
+#
+#   迁完之后的差别: 别人续签/删文件 → 我们无感; 我们自己的续签走
+#   x_cert_sync, 有 let's encrypt 做底, 而且改动只在自己目录里。
+#
+#   用法: x_cert_migrate <片段...>  → 返回 0 = 没有需要迁的 (或全迁完)
+x_cert_migrate() {
+    local f proj from to n_changed=0 n_skip=0
+    proj="$(x_cert_project_dir)"
+    mkdir -p "$proj"
+
+    # 候选来源目录: 这些都是"不归我们管"的目录
+    local -a foreign=(
+        /home/web/certs
+        /etc/nginx/certs /etc/nginx/ssl
+        /etc/letsencrypt/live
+        /root/catmi/cloudflare/certs /root/.acme.sh
+    )
+
+    for f in "$@"; do
+        [[ -f "$f" ]] || continue
+        for from in "${foreign[@]}"; do
+            [[ -d "$from" ]] || continue
+            to="$proj"
+            # 逐个域名找对应的 fullchain / *.crt
+            while IFS= read -r path; do
+                base=$(basename "$path")
+                base=${base%_cert.pem}; base=${base%_key.pem}
+                # cert-*.<domain>.crt 这种 nginx 命名
+                base=${base#cert-}; base=${base%.crt}; base=${base%.pem}
+                [[ -z "$base" ]] && continue
+                srcc=""
+                [[ -f "$from/${base}_cert.pem" ]] && srcc="$from/${base}_cert.pem"
+                [[ -z "$srcc" && -f "$from/${base}.crt" ]] && srcc="$from/${base}.crt"
+                [[ -z "$srcc" && -f "$from/$base/fullchain.pem" ]] && srcc="$from/$base/fullchain.pem"
+                [[ -z "$srcc" ]] && continue
+                # 先落到项目目录, 再改引用
+                cp -f "$srcc" "$proj/${base}_cert.pem" 2>/dev/null || continue
+                [[ -f "$from/${base}_key.pem" ]] && cp -f "$from/${base}_key.pem" "$proj/${base}_key.pem" 2>/dev/null
+                chmod 600 "$proj/${base}_key.pem" 2>/dev/null
+            done < <(grep -ohE "${from}/[A-Za-z0-9_./-]+\.pem" "$f" 2>/dev/null | sort -u)
+
+            if grep -q "$from" "$f" 2>/dev/null; then
+                cp -p "$f" "$f.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null
+                sed -i "s#${from}/#${proj}/#g" "$f" 2>/dev/null && n_changed=$((n_changed+1)) \
+                    || n_skip=$((n_skip+1))
+            fi
+        done
+    done
+    [[ "$n_changed" -gt 0 ]] && printf '  已迁移 %s 个片段的证书路径 → %s\n' "$n_changed" "$proj" >&2
+    [[ "$n_skip" -eq 0 ]]
+}
+
+# 从 JSON 里取出的证书路径去掉引号和逗号尾巴
+clean_cert_path() {
+    printf '%s' "${1//[\",]}"
+}
+
 # 项目目录里某张证书是否可用。
 # 不只看文件在不在 —— 从 letsencrypt 同步过来的可能已经过期, 而内核
 # 不检查有效期, 只会在握手时把客户端拒掉。
