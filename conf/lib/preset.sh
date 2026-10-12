@@ -120,6 +120,105 @@ _p_tier_desc() {
 # 全协议一键生成只取这两档
 _P_TIERS_DEFAULT="core cdn"
 
+# ---------------------------------------------------- 上下行分离的三个组合
+#
+# ★ 为什么单独一张表, 不塞进 X_PRESETS
+#
+#   X_PRESETS 描述的是"一个节点长什么样"(协议|传输|加密层|名字|说明|extras),
+#   而上下行分离描述的是**两段各自怎么走**。一个节点有两组安全层, 一行放不下。
+#   硬塞进去会让 protocol|transport|security 这一列含义漂移 —— 那一列现在
+#   被 REALITY 白名单 (_P_REALITY_TRANSPORTS) 和各处判断依赖着。
+#
+# 字段: 上行安全层|下行安全层|下行是否挂 nginx|默认开 ECH|监听档位
+#
+# ★ 监听档位 (第 5 列) 不是"哪段走 CDN", 而是"**谁直连 xray 端口**":
+#
+#     cdn    → xray 监听 0.0.0.0   (公网可达)
+#     nginx  → xray 监听 127.0.0.1 (只有本机 nginx 能连)
+#
+#   判据只有一条: **只要有任何一段是客户端直连的, 就必须监听 0.0.0.0**。
+#   0.0.0.0 是包含 127.0.0.1 的, 所以 nginx 反代照样能连上 —— 反过来不行,
+#   监听 127.0.0.1 时直连的那一段永远连不上, 而且内核不报错。
+#
+#     cdn-cdn     两段都经 nginx → nginx
+#     cdn-reality 下行直连       → cdn
+#     reality-cdn 上行直连       → cdn
+#
+#   我原来按"下行是否挂 nginx"推档位, 于是 cdn-reality 推成"直连" —— 但
+#   **直连不是一个档位**, deploy.py 只认 cdn / nginx, 直接报
+#   "未知接入档位: direct"。档位名和"直连"这个概念被混在一起了。
+#
+#   cdn-cdn     上行 CDN(Cloudflare TLS) + 下行 CDN
+#               —— 两段都走橙云, 藏得最深; 默认开 ECH, 否则真实 SNI 会外泄,
+#                  域名字面可探测。**最稳, 但多一跳且吃 CF 的限制。**
+#   cdn-reality 上行 CDN(Cloudflare TLS) + 下行 REALITY
+#               —— 上行藏进 CDN, 下行直连并用 REALITY 握手伪装。上行被封时
+#                  下行仍可能通 (反向不行: CF 被封则两段一起废)。
+#   reality-cdn 上行 REALITY + 下行 CDN
+#               —— 现成的预置 ⑥ 就是这个形态。
+#
+# ★ 两条硬约束 (实测, 不是风格问题)
+#
+#   1. 上下行**端口必须相同**: 会话表 h.sessions 挂在每个 inbound 自己身上
+#      (hub.go:39/464), 下行 GET 到别的端口就查不到会话。CDN 与直连的差别
+#      只能体现在**网络路径**上 —— 所以两段 nginx 都要 proxy_pass 到同一个
+#      xray 端口。
+#   2. 上下行**path 必须相同**: 服务端只用顶层 xhttpSettings.path 校验下行
+#      请求 (hub.go:461), 入站那份 downloadSettings 不参与校验。差异要
+#      体现在域名上, 不是路径上。
+#
+_P_SPLIT_MODES="cdn-cdn cdn-reality reality-cdn"
+
+_p_split_field() { # <模式> <第几列>
+    case "$1:$2" in
+        cdn-cdn:1)      echo "tls"     ;;
+        cdn-cdn:2)      echo "tls"     ;;
+        cdn-cdn:3)      echo "yes"     ;;   # 两段都挂 nginx
+        cdn-cdn:4)      echo "yes"     ;;   # ★ 默认开 ECH
+        cdn-cdn:5)      echo "nginx"   ;;   # 两段都经 nginx → 127.0.0.1
+        cdn-reality:1)  echo "tls"     ;;
+        cdn-reality:2)  echo "reality" ;;
+        cdn-reality:3)  echo "no"      ;;   # 下行直连, 不挂 nginx
+        cdn-reality:4)  echo "yes"     ;;
+        cdn-reality:5)  echo "cdn"     ;;   # 下行直连 → 必须 0.0.0.0
+        reality-cdn:1)  echo "reality" ;;
+        reality-cdn:2)  echo "tls"     ;;
+        reality-cdn:3)  echo "yes"     ;;   # 只有上行不挂, 下行走 CDN
+        reality-cdn:4)  echo "no"      ;;   # 上行 REALITY 无 TLS, 没 ECH 可开
+        reality-cdn:5)  echo "cdn"     ;;   # 上行直连 → 必须 0.0.0.0
+        *) return 1 ;;
+    esac
+}
+
+x_split_modes() { printf '%s\n' $_P_SPLIT_MODES; }
+
+x_split_ul_sec() { _p_split_field "$1" 1; }
+x_split_dl_sec() { _p_split_field "$1" 2; }
+x_split_dl_cdn() { _p_split_field "$1" 3; }
+x_split_ech()    { _p_split_field "$1" 4; }
+x_split_tier()   { _p_split_field "$1" 5; }
+
+x_split_title() {
+    case "$1" in
+        cdn-cdn)     printf '上行 CDN + 下行 CDN' ;;
+        cdn-reality) printf '上行 CDN + 下行 REALITY' ;;
+        reality-cdn) printf '上行 REALITY + 下行 CDN' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+x_split_desc() {
+    case "$1" in
+        cdn-cdn)
+            printf '两段都走 Cloudflare 橙云, 默认开 ECH。藏得最深, 域名字面不外泄; 代价是多一跳 + 受 CF 限制。' ;;
+        cdn-reality)
+            printf '上行藏进 CDN, 下行直连并用 REALITY 握手伪装。上行被打时下行可能仍通 (反过来不行: CF 挂了两段一起废)。' ;;
+        reality-cdn)
+            printf '上行用 REALITY 直连伪装, 下行走 CDN。最常见的折中: 上行不经过第三方。' ;;
+        *) printf '' ;;
+    esac
+}
+
 # ---------------------------------------------------------------- 档位表
 #
 # ★ 为什么用独立表, 不把档位塞进 X_PRESETS 那一行

@@ -3583,10 +3583,18 @@ R=dict(private_key="a"*43, public_key="b"*43, sni="www.cloudflare.com",
 base=dict(tag="t", port=18443)
 def build(**kw):
     return B.build("vless","xhttp","reality", dict(base, **R, **kw))
-a=build(xhttp_mode="stream-up", dl_address="203.0.113.9", dl_security="reality")
+# ★ 下行 REALITY 的公钥字段是 **password**, 不是 publicKey。
+#   下行 REALITY 是服务端**扮演客户端**连出去, 所以那是一份客户端配置,
+#   客户端侧内核要的字段名就是 password。实测写 publicKey 时内核报:
+#       Failed to build REALITY config. > empty "password"
+#   报错里没有半个字提 publicKey, 照着报错查会绕很大一圈。
+#   (上行入站那侧仍然是 publicKey —— 那边是服务端角色, 别一起改。)
+a=build(xhttp_mode="stream-up", dl_address="203.0.113.9", dl_security="reality",
+        dl_public_key="b"*43, dl_short_id="ab", dl_sni="www.cloudflare.com")
 d=a["inbounds"][0]["streamSettings"]["xhttpSettings"]["downloadSettings"]
-out=[d["address"], str(d["port"]), d["security"], d["realitySettings"]["serverName"],
-     str(d["realitySettings"]["publicKey"][:4])]
+rs=d["realitySettings"]
+out=[d["address"], str(d["port"]), d["security"], rs["serverName"],
+     str(rs["password"][:4])]
 b=build(xhttp_mode="stream-up")            # 不配 = 不该有 downloadSettings
 out.append("no-dl" if "downloadSettings" not in b["inbounds"][0]["streamSettings"]["xhttpSettings"] else "LEAK")
 print(",".join(out))
@@ -5464,6 +5472,149 @@ rm -rf /tmp/sbx-probe
 # ---------------------------------------------------------------- CDN 自动配
 # 借鉴 sing-box-core 的 cdn_autosetup / batch_next_port。三个 bug 值得钉住,
 # 它们的共同点是**静默失败**: 屏幕上一切正常, 功能从来没发生过。
+# ---------------------------------------------------- 上下行分离的三个组合
+group "xHTTP 上下行分离 (上行CDN/下行CDN, 上行CDN/下行REALITY, 上行REALITY/下行CDN)"
+source "$ROOT/conf/lib/preset.sh"
+
+# ① 三个模式都在, 且字段对得上
+if x_split_modes 2>/dev/null | grep -qx cdn-cdn \
+   && x_split_modes 2>/dev/null | grep -qx cdn-reality \
+   && x_split_modes 2>/dev/null | grep -qx reality-cdn
+then ok "三个分离模式都在"
+else bad "分离模式表缺项"
+fi
+
+check_split() { # <模式> <上行> <下行> <下行挂nginx> <ECH> <监听档位>
+    local m="$1" ul="$2" dl="$3" ngnx="$4" ech="$5" tier="$6"
+    # 五项拼成一串比。别用 "$ul $(...)" 这种插值写法 —— 变量名后面跟 $( )
+    # 时 bash 会把 ${ul_ul_sec} 那类名字也吃掉, 实测 got 变成
+    # "tls tls tls tls yes yes yes yes nginx nginx" (每个值出现两次)。
+    # 一行行拼。用 printf 一次成型, 避开 bash 的变量名边界坑:
+    #   "$m" 后面紧跟 $( 时, bash 会接着找 $m_ul_sec 这种更长的名字,
+    #   实测 got 变成 "tls tls tls tls yes yes yes yes nginx nginx"
+    #   (每个值出现两次) —— 而报错只说"字段不对", 完全看不出是断言写坏了。
+    local got
+    printf -v got '%s %s %s %s %s' \
+        "$(x_split_ul_sec "$m" 2>/dev/null)" \
+        "$(x_split_dl_sec "$m" 2>/dev/null)" \
+        "$(x_split_dl_cdn "$m" 2>/dev/null)" \
+        "$(x_split_ech "$m" 2>/dev/null)" \
+        "$(x_split_tier "$m" 2>/dev/null)"
+    local want="$ul $dl $ngnx $ech $tier"
+    if [[ "$got" == "$want" ]]; then ok "$m → $ul / $dl"
+    else bad "$m 字段不对: 期望 [$want] 实得 [$got]"; fi
+}
+check_split cdn-cdn     tls      tls      yes yes nginx
+check_split cdn-reality tls      reality  no  yes cdn
+check_split reality-cdn reality  tls      yes no  cdn
+
+# ② 监听档位: 有任一段直连就必须 0.0.0.0 (cdn), 全经 nginx 才 127.0.0.1 (nginx)
+#    判错的后果很隐蔽 —— 档位选 nginx 时 xray 只监听 127.0.0.1, 客户端直连
+#    那一段永远连不上, 而内核不报错。
+if [[ "$(x_split_tier cdn-reality)" == "cdn" && "$(x_split_tier reality-cdn)" == "cdn" \
+   && "$(x_split_tier cdn-cdn)" == "nginx" ]]
+then ok "有直连段就监听 0.0.0.0 (cdn), 全经 nginx 才收窄 (nginx)"
+else bad "监听档位不对: 直连段必须 cdn(0.0.0.0), 选成 nginx(127.0.0.1) 时直连段连不上"
+fi
+
+# ③ 未知模式要报错而不是默默当直连
+if x_split_ul_sec nosuchmode >/dev/null 2>&1; then
+    bad "未知分离模式没被拒绝 (会照直生成一个普通节点)"
+else ok "未知分离模式被拒绝"; fi
+
+# ④ 扫描器用 | 而不是 tab —— tab 是 IFS 空白, `a\t\tb` 里那个空字段
+#    会被折叠掉, 后面所有列前移一位。实测踩过: path 跑进"下行域名"列,
+#    nginx_apply 于是去找一个叫 "/cdn-cdn-20000" 的 server_name。
+if grep -qF "IFS=" "$ROOT/tools/cdn_auto.sh" \
+   && grep -qF "join(r) for r in rows)" "$ROOT/tools/cdn_auto.sh" \
+   && grep -qF '"|".join(r)' "$ROOT/tools/cdn_auto.sh" \
+   && ! grep -qF "IFS=\$'\\t' read" "$ROOT/tools/cdn_auto.sh"
+then ok "扫描结果用 | 分隔 (tab 会让空字段消失导致列错位)"
+else bad "扫描还用 tab 分隔 → 中间空字段被折叠, path 跑进域名列"
+fi
+
+# ⑤ 下行 REALITY 的字段名是 password, 不是 publicKey。
+#    服务端扮演客户端去连, 内核要 password; 写 publicKey 时内核报的是
+#    `empty "password"` —— 报错里没有半个字提 publicKey, 照着查会绕远路。
+if grep -qF '"password": _rpw' "$ROOT/conf/lib/node_build.py"
+then ok "下行 REALITY 用 password 字段"
+else bad "下行 REALITY 还在用 publicKey → 内核报 empty \"password\""
+fi
+
+# ⑥ 下行 REALITY 缺凭据要当场点名缺哪个, 不能让内核报 empty "password"
+if grep -qF "下行 REALITY 缺少参数" "$ROOT/conf/lib/node_build.py"
+then ok "缺凭据时点名 serverName/password/shortId"
+else bad "缺凭据时只有内核那句 empty password, 用户不知道要补什么"
+fi
+
+# ⑦ 每个分离节点要有自己的 path —— nginx 一个 server 只有一条 location /,
+#    同域名跑两个分离节点 (不同端口) 会互相覆盖, 流量全打到先插的端口,
+#    而两个节点都显示"生成成功"。
+if grep -qF '"/%s-%s" % (split, port)' "$ROOT/tools/preset_batch.sh"
+then ok "分离节点按 模式-端口 生成各自的 path"
+else bad "分离节点共用一个 path → 同域名多节点在 nginx 里互相覆盖"
+fi
+
+# ⑧ 端到端: 三个模式各自生成, downloadSettings 存在, 下行加密层正确
+SPT=$(mktemp -d); mkdir -p "$SPT/conf"
+cat > "$SPT/dnsplit.py" <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["LIB"])
+import node_build as B
+
+out = {}
+for mode, ul, dl in (("cdn-cdn", "tls", "tls"),
+                     ("cdn-reality", "tls", "reality"),
+                     ("reality-cdn", "reality", "tls")):
+    o = {"port": 20001, "path": "/" + mode,
+         "dl_address": "d.example.com", "dl_security": dl, "dl_mode": "stream-up"}
+    if ul == "reality":
+        # 上行 REALITY: 入站那侧要私钥/公钥/短id/伪装地址, 缺一个
+        # _check_reality 就会先拦下来 —— 连 downloadSettings 都还没生成。
+        # (这三个模式里只有 reality-cdn 的上行是 REALITY。)
+        o["private_key"] = "a" * 43
+        o["public_key"] = "b" * 43
+        o["short_id"] = "ab"
+        o["dest"] = "www.cloudflare.com:443"
+    if dl == "reality":
+        # 下行 REALITY 是服务端扮演客户端 —— 三个凭据一个都不能少
+        o["dl_sni"] = "s.example.com"
+        o["dl_public_key"] = "k" * 43
+        o["dl_short_id"] = "0123456789abcdef"
+    node = B.build("vless", "xhttp", ul, o)
+    d = (node.get("inbounds") or [{}])[0]
+    xh = (d.get("streamSettings") or {}).get("xhttpSettings") or {}
+    got = xh.get("downloadSettings") or {}
+    out[mode] = {"sec": got.get("security"),
+                 "mode": (got.get("xhttpSettings") or {}).get("mode"),
+                 "path": (got.get("xhttpSettings") or {}).get("path"),
+                 "port": got.get("port"), "addr": got.get("address")}
+print(json.dumps(out))
+PYEOF
+SPT_OUT=$(LIB="$ROOT/conf/lib" python3 "$SPT/dnsplit.py" 2>&1)
+# ★ 用 grep >/dev/null 而不是 grep -q: 产出方 (printf) 会因为 -q 提前退出而
+#   吃 SIGPIPE(141), 套件自己的门禁 (EARLY) 就是盯这个的。写新断言时踩了自己
+#   的门禁 —— 门禁本身是对的, 所以是断言该改。
+if printf '%s' "$SPT_OUT" | grep 'cdn-cdn' >/dev/null \
+   && printf '%s' "$SPT_OUT" | grep '"sec": "reality"' >/dev/null \
+   && printf '%s' "$SPT_OUT" | grep '"sec": "tls"' >/dev/null; then
+    ok "三个模式的 downloadSettings 生成正确 (含下行 reality)"
+else
+    bad "downloadSettings 不对: $(printf '%s' "$SPT_OUT" | tr -d '\n' | cut -c1-160)"
+fi
+
+# ⑨ mode 必须是 stream-up —— auto 在 REALITY 下退化成 stream-one (合流),
+#    用户以为分离了, 实际是一条连接上双工。
+if printf '%s' "$SPT_OUT" | grep '"mode": "stream-up"' >/dev/null; then
+    ok "下行 mode 显式 stream-up (auto 在 REALITY 下会退化成合流)"
+else bad "下行 mode 不是 stream-up"; fi
+
+# ⑩ 上下行端口必须一致 —— 会话表 per-inbound, 不同端口下行直接断
+if printf '%s' "$SPT_OUT" | grep '"port": 20001' >/dev/null; then
+    ok "下行端口与 inbound 一致 (会话表 per-inbound)"
+else bad "下行端口与 inbound 不一致 → 下行会话查不到"; fi
+rm -rf "$SPT"
+
 group "CDN 自动配 nginx (三个静默失败)"
 NGT=$(mktemp -d); mkdir -p "$NGT/nginx" "$NGT/conf"
 cat > "$NGT/nginx/a.example.com.conf" <<'NGEOF'
@@ -5505,10 +5656,14 @@ fi
 if python3 - "$ROOT/tools/cdn_auto.sh" <<'PYEOF'
 import sys
 s = open(sys.argv[1], encoding="utf-8").read()
-sys.exit(0 if 'i.get("_domain")' not in s else 1)
+#   判据不是"文件里不能出现 _domain", 而是**它不能是主要来源**。
+#   上行域名现在按这个顺序取: _meta.domain → 环境变量(生成时入参) → _domain。
+#   把 _meta 和入参拿掉、只剩 _domain 才是最坏情况 (片段里真没有它,
+#   于是永远扫不到 → 自动配置静默跳过)。所以查的是**前两路还在不在**。
+sys.exit(0 if ('UL_DOMAINS' in s and 'meta.get("domain")' in s) else 1)
 PYEOF
-then ok "扫描器不再指望片段里有 _domain (本来就没有)"
-else bad "扫描器还在找 _domain → 永远扫不到 → 自动配置静默跳过"
+then ok "上行域名从 _meta / 生成时入参取, 不再只指望片段里的 _domain"
+else bad "上行域名只靠 _domain → 片段里本来就没有 → 永远扫不到"
 fi
 
 # ③ --dry-run 不能写死在参数里: 写了就只是预演, 磁盘上一个字没改,

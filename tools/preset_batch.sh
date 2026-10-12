@@ -148,6 +148,11 @@ node_no=0
 
 for spec in "${SPECS[@]}"; do
   IFS=':' read -r proto idx tier <<< "$spec"
+
+  # ★ 上下行分离: 档位位置写 split:<模式>, 于是 tier 里带的是模式名。
+  #   xHTTP 才有"下行"这一段 —— 别的传输没有, 所以先卡住, 而不是把一个
+  #   没人认的 tier 传下去 (那会生成一个普通节点, 看着成功, 但完全不是
+  #   用户要的形态)。
   tier="${tier:-$TIER_DEFAULT}"
 
   cnt=$(x_preset_count "$proto" 2>/dev/null || echo 0)
@@ -161,6 +166,29 @@ for spec in "${SPECS[@]}"; do
   tr=$(x_preset_field "$proto" "$idx" 2)
   sec=$(x_preset_field "$proto" "$idx" 3)
   disp=$(x_preset_field "$proto" "$idx" 4)
+
+  SPLIT=""; DL_DOMAIN=""; ECH_ON="no"; SPLIT_DLSEC=""
+  if [[ "$tier" == split:* ]]; then
+    SPLIT="${tier#split:}"
+    if ! declare -F x_split_ul_sec >/dev/null; then
+      _e "  $spec: 读不到分离模式表 (preset.sh 没加载?)"; fail=$((fail+1)); continue; fi
+    if ! x_split_ul_sec "$SPLIT" >/dev/null 2>&1; then
+      _e "  $spec: 未知分离模式 $SPLIT (可选: $(x_split_modes | tr '\n' ' '))"
+      fail=$((fail+1)); continue; fi
+    if [[ "$tr" != "xhttp" ]]; then
+      _e "  $spec: 上下行分离只对 xhttp 有意义, $tr 没有下行这一段"
+      fail=$((fail+1)); continue; fi
+    # 覆盖预置里写死的安全层 (预置 ① 自己是 REALITY, 但 cdn-cdn 的上行是 TLS)
+    sec=$(x_split_ul_sec "$SPLIT")
+    # 监听档位由模式表给 (第 5 列)。判据是"有没有哪一段是客户端直连的":
+    # 有就必须监听 0.0.0.0, 全经 nginx 才收窄到 127.0.0.1。
+    # 顺带: 下行是直连时不挂 nginx —— 给它挂站点只会在 nginx 里留一段
+    # 指向不存在路径的反代。
+    tier=$(x_split_tier "$SPLIT")
+    ECH_ON=$(x_split_ech "$SPLIT")
+    _y "    $(x_split_title "$SPLIT") — $(x_split_desc "$SPLIT")"
+    [[ "$ECH_ON" == yes ]] && _y "    ECH: 默认开"
+  fi
 
   # 预置表合法性由 x_preset_ask 兜底, 这里再查一次组合。
   #
@@ -264,16 +292,68 @@ PY
       _e "  $disp 需要域名 (TLS 要证书 / nginx 档要挂站点)。设 X_BATCH_DOMAIN 或 X_BATCH_DOMAIN_BASE"
       fail=$((fail+1)); continue
     fi
+
+    # 上下行分离的下行地址。
+    #
+    # ★ 只有一个域名**不是**错误 —— 用户原话: "如果只有一个域名的情况, 这个
+    #   时候其实也可以, 只是我们的配置用的是同一个域名而已。这其实就是多
+    #   了一个功能, 就是两个域名。"
+    #   所以默认 DL_DOMAIN 就是上行那个域名, 而 cdn-reality 这类"下行直连"
+    #   的模式默认用**服务器自己的地址** (没有下行域名时, 连回同一个入口
+    #   也对 —— 上下行仍然分开, 只是都从同一个地址进)。
+    if [[ -n "$SPLIT" ]]; then
+      SPLIT_DLSEC=$(x_split_dl_sec "$SPLIT")
+      if [ "$(x_split_dl_cdn "$SPLIT")" = yes ]; then
+        # 下行也走 CDN: 可以是另一个域名, 也可以就是同一个 (最常见)
+        DL_DOMAIN="${X_BATCH_DL_DOMAIN:-$domain}"
+        if [[ "$DL_DOMAIN" != "$domain" ]]; then
+          _y "    下行域名: $DL_DOMAIN (与上行不同)"
+        else
+          _y "    下行域名: $DL_DOMAIN (与上行同一个 —— 上下行仍分开, 共用入口)"
+        fi
+      else
+        # 下行直连: 用 X_BATCH_DL_ADDRESS 给的地址, 默认与上行同一个入口
+        DL_DOMAIN="${X_BATCH_DL_ADDRESS:-${X_BATCH_DL_DOMAIN:-$domain}}"
+        _y "    下行: 直连 $DL_DOMAIN ($SPLIT_DLSEC) —— 不挂 nginx"
+      fi
+    fi
   fi
 
-  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" <<'PY'
+  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" <<'PY'
 import json, sys
-proto,tr,sec,tag,port,tier,cred,extra,domain = sys.argv[1:10]
+proto,tr,sec,tag,port,tier,cred,extra,domain,split,dl_dom,ech_on,dlsec,dlsni,dlpub,dlsid,node_path = sys.argv[1:18]
 o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
      "port":int(port),"tier":tier}
 if domain: o["domain"] = domain
 o.update(json.loads(cred))
 o.update(json.loads(extra))
+
+if split:
+    # ★ 上下行分离要三样, 少一样就退化成"看着分离、其实合流":
+    #   dl_address   下行连到哪 (域名或 IP)
+    #   dl_security  下行那一段用什么加密层
+    #   dl_mode      xhttp mode —— auto 在 REALITY 下会退化成 stream-one
+    #               (合流), 所以**必须显式指定**; 用户以为分离了, 实际
+    #               是一条连接上双工。
+    # ★ 每个分离节点要**自己的** path。同一个域名上跑两个分离节点
+    #   (比如 cdn-cdn 与 reality-cdn 共用下行域名) 时, nginx 一个 server
+    #   只有一条 location /, 两条节点会互相覆盖 —— 流量全打到先插的端口,
+    #   而节点都显示"生成成功"。
+    #   path 同时也是 xHTTP 的真实路由, 一节点一个正合适。
+    #   要共用 path (真要那么干) 就设 X_BATCH_SPLIT_PATH=/x。
+    o["path"] = node_path or ("/%s-%s" % (split, port))
+    o["dl_address"] = dl_dom
+    o["dl_security"] = dlsec or sec
+    o["dl_mode"] = "stream-up"
+    o["dl_ech"] = (ech_on == "yes")
+    if (dlsec or sec) == "reality":
+        # 下行 REALITY 需要自己的 serverName / 公钥 / 短 ID。
+        # 优先用 dl_* 专用的, 没给就回落到上行那组 —— 上下行打同一个
+        # inbound 时其实可以是同一组凭据。
+        o["dl_sni"] = dlsni
+        o["dl_public_key"] = dlpub
+        o["dl_short_id"] = dlsid
+o["split_mode"] = split if split else ""
 print(json.dumps(o))
 PY
 )

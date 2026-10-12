@@ -376,12 +376,35 @@ def _xhttp_download_settings(transport, security, opts):
     if dsec == "none":
         dl["security"] = "none"
     elif dsec == "reality":
+        # ★ 下行 REALITY 是**服务端扮演客户端**去连出去, 所以这是一份**客户端**
+        #   配置, 字段名与服务端入站那边不同: 内核要的是 `password`。
+        #   原来这里写的是 `publicKey`, 于是 -test 直接:
+        #       Failed to build REALITY config. > empty "password"
+        #   —— 报错里只提 password, 一个字没提 publicKey, 照着报错查会绕远路。
+        _rpw = (opts.get("dl_public_key") or opts.get("public_key") or "").strip()
+        _rsni = (opts.get("dl_sni") or opts.get("sni") or "").strip()
+        _rsid = (opts.get("dl_short_id") or opts.get("short_id") or "").strip()
+        # ★ 缺凭据要**当场说清楚缺哪个**, 而不是让内核报 empty "password"。
+        #   上下行分离 + 下行 REALITY 意味着要额外给一组 REALITY 参数,
+        #   而这三个字段一个都不能空 (serverName 也不例外, 空的话 REALITY
+        #   握手拿不到有效的 SNI)。
+        _miss = [n for n, v in (("serverName", _rsni), ("password", _rpw),
+                                ("shortId", _rsid)) if not v]
+        if _miss:
+            raise ValueError(
+                "下行 REALITY 缺少参数: " + ", ".join(_miss) + "\n"
+                "  原因: 下行 REALITY 是服务端扮演客户端连出去, 字段名是 "
+                "password (不是 publicKey), 且三者都不能空。\n"
+                "  给法 (conf/vlessxhttpecn.sh 或 preset_batch.sh):\n"
+                "    dl_sni         = 伪装用的域名 (SNI, 不必解析到本机)\n"
+                "    dl_public_key  = REALITY 公钥 (xray x25519 输出的 Password)\n"
+                "    dl_short_id    = 短 ID (十六进制, 长度 <= 16, 偶数位)")
         dl["security"] = "reality"
         dl["realitySettings"] = {
-            "serverName": opts.get("dl_sni") or opts.get("sni") or "",
-            "fingerprint": opts.get("fingerprint") or "chrome",
-            "publicKey": opts.get("dl_public_key") or opts.get("public_key") or "",
-            "shortId": opts.get("dl_short_id") or opts.get("short_id") or "",
+            "serverName": _rsni,
+            "fingerprint": opts.get("dl_fingerprint") or opts.get("fingerprint") or "chrome",
+            "password": _rpw,
+            "shortId": _rsid,
             "spiderX": opts.get("spider_x") or "/",
         }
     else:

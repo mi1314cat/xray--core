@@ -40,7 +40,9 @@ _cdlib_resolve() {
     #   一次是这个函数的 $d/../lib (少了一级 conf);
     #   每次的表现都是"功能从来没发生过, 而屏幕上没有任何提示"。
     #   所以这里: 找不到就**喊出来**, 绝不安静返回。
-    for c in "$d/../conf" "$d/.." "$d" "$REPO/conf"; do
+    # ${REPO:-} : 脚本跑在 set -u 下, 直接写 $REPO 会因未绑定而整段崩 ——
+    # 而崩在这里等于"整个自动配置不生效", 且报错跟真实原因毫无关系。
+    for c in "$d/../conf" "$d/.." "$d" "${REPO:-}/conf"; do
         if [[ -r "$c/lib/nginx_apply.py" ]]; then
             _CDLIB_DIR="$(cd "$c" && pwd)"
             return 0
@@ -53,11 +55,23 @@ _cdlib_resolve() {
 # 从片段读出 (域名, 端口, 传输, 是否CDN, 下行域名)。
 # 用 python 解析 JSON, 不用 grep —— 正则去猜字段迟早猜错, 而猜错的表现是
 # "配了 nginx 但域名是空的", 用户看不出来。
-_cd_scan() {                      # <file>... → 每行 5 个字段, TAB 分隔
-    python3 - "$@" <<'PY' 2>/dev/null
-import json, sys
+_cd_scan() {                      # <file>... → 每行 5 字段, 用 | 分隔
+    # ★ 分隔符必须是**非空白**字符。tab 算 IFS 空白, 于是
+    #   `a		b`(中间是空字段) 会被折叠成 `a	b` —— 空字段消失, 后面所有列
+    #   往前挪一位。实测踩过: path 跑进了"下行域名"列, nginx_apply 于是去找
+    #   一个叫 "/cdn-cdn-20000" 的 server_name, 报"找不到域名 /cdn-cdn-20000"。
+    #   报错里那个"域名"一眼就能看出不对劲 —— 是路径不是域名。
+    python3 - "$@" <<'PY'
+import json, os, sys
 
-out, seen = [], set()
+UL_DOMAINS = os.environ.get("_CD_UL_DOMAINS", "")   # 上行域名, 生成时的入参
+
+def site_for(sec):
+    """这一段要不要挂 nginx 站点。
+    reality 是直连握手 (没有 TLS, nginx 根本接不了), 其余都要。"""
+    return (sec or "none") != "reality"
+
+rows, seen = [], set()
 for f in sys.argv[1:]:
     try:
         d = json.load(open(f, encoding="utf-8"))
@@ -68,22 +82,66 @@ for f in sys.argv[1:]:
         tr = ss.get("network") or "raw"
         if tr not in ("ws", "grpc", "h2", "httpupgrade", "xhttp"):
             continue
-        sec = ss.get("security") or "none"
-        # 片段里**没有** _domain / _meta —— 生成时域名是入参, 写在分享元数据里,
-        # 不进内核配置。所以这里只吐 (端口, 传输, 安全层), 域名由调用方给。
-        # 我原来在这里找 `_domain`, 找了半天全是 None, 于是"没有走 CDN 的
-        # 节点" → 静默返回 0 → 自动配置从来没发生过, 而没有任何报错。
-        k = (str(i.get("port") or ""), tr, sec)
-        if not k[0] or k in seen:
+        port = str(i.get("port") or "")
+        if not port:
             continue
-        seen.add(k)
-        out.append("\t".join(k))
-print("\n".join(out))
+        xh = ss.get("xhttpSettings") or {}
+        dl = xh.get("downloadSettings") or {}
+        path = (xh.get("path") or "/")
+
+        # ★ 直接读**生成出来的 downloadSettings**, 不再从外部变量推。
+        #
+        #   原来我只看上行: sec != reality 才算数。于是 reality-cdn 那种
+        #   "上行 REALITY + 下行 CDN" 被整体跳过 —— 而它的**下行**正要走
+        #   Cloudflare, 恰恰最需要站点。结果是三个分离节点只认出两个,
+        #   少配的那个到运行时才 502。
+        #
+        #   下行的地址与加密层就写在片段里, 不用猜, 也不会漏。
+        ups = [(i.get("_domain") or ss.get("security") or "", site_for(ss.get("security")))]
+        downs = []
+        if dl.get("address"):
+            downs.append((dl.get("address"), site_for(dl.get("security"))))
+
+        # ★ 上行域名**不在片段里** —— 它是生成时的入参, 实测三份片段的
+        #   _meta.domain 全是 None。所以上行走环境变量传进来。
+        #   下行则**在片段里** (downloadSettings.address), 直接读 —— 读生成
+        #   出来的配置比重新推导可靠: 它就是内核最后会用的那个值。
+        meta = i.get("_meta") if isinstance(i.get("_meta"), dict) else {}
+        dom = meta.get("domain") or i.get("_domain") or (UL_DOMAINS.split(",")[0] if UL_DOMAINS else "")
+        dl_dom = meta.get("dl_domain") or dl.get("address") or ""
+
+        want = []
+        if dom:
+            want.append((dom, site_for(ss.get("security"))))
+        if dl_dom:
+            want.append((dl_dom, site_for(dl.get("security"))))
+        for d_, needs in want:
+            if not needs:
+                continue
+            k = (d_, port, tr)
+            if k in seen:
+                continue
+            seen.add(k)
+            # ★ 第四列 (同组下行域名) **只在下行也是 TLS 时**填。
+            #   下行是 REALITY 时填了它, _cd_apply 会把它当成"第二个 CDN
+            #   域名"交给 nginx_apply --domain a,b —— 于是去站点文件里找一个
+            #   叫 203.0.113.9 的 server_name, 找不到, 报
+            #   "找不到域名 203.0.113.9 的站点文件"。
+            #   REALITY 下行是**直连**的, 本来就不该有站点。
+            is_dl_tls = (dl_dom and d_ != dl_dom and dl.get("security") != "reality")
+            # ★ 带上这个节点自己的 path。nginx 一个 server 只有一条
+            #   location /, 所以同一个域名上跑两个分离节点 (不同端口) 时,
+            #   第二个必须落在**各自的 path** 上, 否则两条 location / 打架,
+            #   流量全被转到先插的那个端口 —— 而节点看起来都"生成成功"。
+            #   nginx_apply 本来就按 `域名|/path` 打标记, 一节点一 path
+            #   互不干扰, 删节点也只摘自己那一条。
+            rows.append((d_, port, tr, dl_dom if is_dl_tls else "", path))
+print("\n".join("|".join(r) for r in rows))
 PY
 }
 
-_cd_apply() {                     # <dom> <port> <tr> <cdn> <dl> [dry]
-    local dom="$1" port="$2" tr="$3" cdn="$4" dl="$5" dry="${6:-}"
+_cd_apply() {                     # <dom> <port> <tr> <cdn> <dl> <path> [dry]
+    local dom="$1" port="$2" tr="$3" cdn="$4" dl="$5" path="${6:-}" dry="${7:-}"
     _cdlib_resolve || return 1
     local apy="$_CDLIB_DIR/lib/nginx_apply.py"
     [[ -r "$apy" ]] || { printf '[Error] 找不到 nginx_apply.py\n' >&2; return 1; }
@@ -107,6 +165,10 @@ _cd_apply() {                     # <dom> <port> <tr> <cdn> <dl> [dry]
     #   自动配置的核心就是"真的写进去", 预演必须由调用方显式要。
     local -a a=(--domain "$dom_arg" --port "$port" --transport "$tr")
     [[ -n "$dry" ]] && a+=(--dry-run)
+    # 一节点一 path: nginx 里按 path 分段, 同域名多个节点互不覆盖。
+    # 只在非根路径时才传 —— 传 --path / 和不传是同一件事, 但显式传能让
+    # nginx_apply 打出 `域名|/` 这个标记, 删除时按同一套规则找得到。
+    [[ -n "$path" ]] && a+=(--path "$path")
     [[ "$cdn" == "1" ]] && a+=(--cdn)
     # 回源 SNI 用**上行**那个域名 —— 下行域名是给客户端用的, 源站证书
     # 签的是上行域名, 用下行域名做 SNI 会证书不匹配。
@@ -123,7 +185,7 @@ x_cdn_autosetup() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --check) dry="--dry-run"; shift ;;
-            --domain) dom="$2"; shift 2 ;;
+            --domain) dom="$2"; export _CD_UL_DOMAINS="$2"; shift 2 ;;
             --downlink-domain) dl="$2"; shift 2 ;;
             *) break ;;
         esac
@@ -131,25 +193,38 @@ x_cdn_autosetup() {
     local rows; rows=$(_cd_scan "$@")
     [[ -z "$rows" ]] && return 0                       # 照抄 SB: 没 CDN 就安静
 
-    # 只有传了域名才谈得上 CDN 档 —— REALITY 直连节点没有域名概念。
-    # 没域名就安静返回, 但要说一句, 免得用户以为"配过了"。
-    if [[ -z "$dom" ]]; then
-        printf '  (没有域名, 跳过 nginx 自动配置 —— 这几个是直连节点)\n' >&2
-        return 0
-    fi
-
-    local n=0 port tr sec
-    while IFS=$'\t' read -r port tr sec; do
-        [[ "$sec" != "reality" ]] && n=$((n+1))
+    local n=0 d0 port tr dl2 npath
+    while IFS='|' read -r d0 port tr dl2 npath; do
+        [[ -n "$d0" ]] && n=$((n+1))
     done <<< "$rows"
     [[ $n -eq 0 ]] && return 0
 
-    printf '  自动配置 Nginx (CDN) —— %s 个节点\n' "$n" >&2
+    printf '  自动配置 Nginx (CDN) —— %s 个站点\n' "$n" >&2
+
+    # ★ 双域名会产出**两行**: 一行是上行 (第四列带下行域名), 一行是下行的
+    #   单域名。照直跑两遍的话第二遍是重复劳动 —— nginx_apply 幂等, 所以
+    #   结果不会错, 只是白跑一遍还多打一行"已存在"。
+    #   所以先把"已经作为别人下行出现过"的域名收集起来, 跳过它们的独立行:
+    #   双域名的活儿由上行那一行一次做完。
+    # 双域名会产出两行 (上行那行带下行域名, 下行是独立一行)。第一行一次
+    # 做完两个域名, 所以把"已经作为别人下行出现过"的域名跳过 —— 去重要
+    # 连**端口与 path** 一起比, 只比域名会漏节点。
+    local -a paired=()
+    while IFS='|' read -r d0 port tr dl2 npath; do
+        [[ -n "$dl2" ]] && paired+=("$dl2@$port@$npath")
+    done <<< "$rows"
+
     local ok=0 bad=0
-    while IFS=$'\t' read -r port tr sec; do
-        # REALITY 是直连的, 不该挂 nginx
-        [[ "$sec" == "reality" ]] && continue
-        if _cd_apply "$dom" "$port" "$tr" "1" "$dl" "$dry"; then
+    while IFS='|' read -r d0 port tr dl2 npath; do
+        [[ -z "$d0" ]] && continue
+        if [[ -z "$dl2" ]]; then
+            local skip=0 q
+            for q in "${paired[@]:-}"; do [[ "$q" == "$d0@$port@$npath" ]] && skip=1; done
+            [[ $skip -eq 1 ]] && continue
+        fi
+        # 行内第一列就是**这个域名**, 下行域名在第四列 —— 双域名时 nginx_apply
+        # 会为两个域名各找站点文件各插一段 (它们的 server 块本来就分开)。
+        if _cd_apply "$d0" "$port" "$tr" "1" "$dl2" "$npath" "$dry"; then
             ok=$((ok+1))
         else
             bad=$((bad+1))
@@ -179,7 +254,7 @@ x_cdn_prune_stale() {
     #   没了却还反代到不存在的端口 → Cloudflare 回源 502。
     #   所以这里继续往下走, 让 live 为空 = 全部都是孤儿。
     local live=""
-    [[ ${#frags[@]} -gt 0 ]] && live=$(_cd_scan "${frags[@]}" | cut -f1 | sort -u | tr '\n' ',' | sed 's/,$//')
+    [[ ${#frags[@]} -gt 0 ]] && live=$(_cd_scan "${frags[@]}" | cut -d'|' -f1 | sort -u | tr '\n' ',' | sed 's/,$//')
     [[ -z "$live" ]] && live="__none__"
     python3 "$apy" --prune-orphans "$live" 2>&1 || true
 }
