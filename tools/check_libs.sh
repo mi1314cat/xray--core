@@ -5842,6 +5842,37 @@ else
     bad "$_missing 个老脚本没接补发布 → 那条入口建的节点仍然不可分享"
 fi
 
+# reality-cdn 走不通是**实测**出来的 (裸 REALITY+tcp 环回 200、REALITY+xhttp
+# 环回 200, 唯独"上行 REALITY + 下行普通 TLS"不通), 不是猜测。菜单必须在生成
+# 之前说出来 —— 否则用户建完、分享出去、客户端导入了才发现连不上。
+group "已知不通的组合要提前说 (reality-cdn)"
+SM="$ROOT/tools/split_menu.sh"
+warn_line=$(awk '/SPLIT. = reality-cdn/{print NR; exit}' "$SM")
+gen_line=$(awk '/确认生成/{print NR; exit}' "$SM")
+if [ -n "${warn_line:-}" ]; then
+    ok "菜单对 reality-cdn 有专门提示"
+else
+    bad "菜单没有提示 reality-cdn 已知不通 → 用户会建完才发现连不上"
+fi
+# 注意: 这一段刻意不写 `| head` / `| grep -q`。pipefail 下产出方会吃 SIGPIPE(141),
+# 判断会反过来 —— 项目自己的 lint 就会拦下来。这里一律用 awk 全量读取。
+if grep -qF 'per-inbound' "$SM" >/dev/null 2>&1; then
+    ok "提示里写清了为什么不通 (会话表 per-inbound vs 普通 TLS)"
+else
+    bad "提示里没说明原因, 用户无法判断该不该用"
+fi
+if grep -qF 'cdn-reality' "$SM" >/dev/null 2>&1; then
+    ok "提示里指了可靠的替代组合"
+else
+    bad "提示里没说该用哪个替代组合"
+fi
+if [ -n "${warn_line:-}" ] && [ -n "${gen_line:-}" ] && [ "${warn_line:-0}" -lt "${gen_line:-0}" ]; then
+    ok "提示在生成之前 (第 $warn_line 行 < 第 $gen_line 行)"
+else
+    bad "提示不在生成之前 —— 等于没用 (提示 $warn_line / 生成 $gen_line)"
+fi
+bash -n "$SM" 2>/dev/null && ok "split_menu.sh 语法正常" || bad "split_menu.sh 语法错"
+
 group "分离节点自检工具 (把实测结论交给用户)"
 grep -qF 'invalid Read on closed Body' "$ROOT/tools/xhttp_doctor.sh" \
     && ok "认得那句唯一的线索" || bad "认不出 invalid Read on closed Body"

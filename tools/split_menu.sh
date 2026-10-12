@@ -129,6 +129,27 @@ if [ "$(x_split_dl_cdn "$SPLIT")" = yes ]; then
 else
     _in "  nginx: 下行直连, **不挂站点**; 端口会对公网开放 (客户端要直连)"
 fi
+
+# ★ reality-cdn 已知不通, 生成之前就说清楚。
+#   上行 REALITY 的 inbound 只认 REALITY 握手, 而下行要走 Cloudflare/nginx,
+#   那是**普通 TLS** —— 两条要求互相冲突, nginx 代理过去对不上, 服务端
+#   一行 inbound 都不会有。实测记录见 docs/HANDOVER-known-issues.md 第二节。
+#   在这里提示, 好过让人建完、分享出去、客户端导入了才发现连不上。
+if [ "$SPLIT" = reality-cdn ]; then
+    echo >&2
+    _wn "  ⚠ 这个组合实测不通, 请先读完再决定:"
+    _in "    · 上行 REALITY + 下行走 CDN 两条要求互相冲突"
+    _in "    · 上下行必须同一个 inbound 同端口 (会话表 per-inbound),"
+    _in "      而那个 inbound 是 REALITY 的, nginx 用普通 TLS 代理过去对不上"
+    _in "    · 想用上下行分离, 现在可靠的是 cdn-cdn 与 cdn-reality"
+    _in "    · 详情: docs/HANDOVER-known-issues.md 第二节"
+    printf '  仍然生成? [y/N]: '
+    read -r go2
+    case "$go2" in
+        [yY]*) ;;
+        *) echo >&2; echo "  已取消"; exit 0 ;;
+    esac
+fi
 echo >&2
 printf '  确认生成? [y/N]: '
 read -r go
