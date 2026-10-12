@@ -43,10 +43,11 @@ CLI_SOCK_PORT=39440
 DOMAIN="journey.example.com"
 UUID="11111111-2222-3333-4444-555555555555"
 
-PASS=0; FAIL=0; FAILED_NAMES=""
+PASS=0; FAIL=0; SKIP=0; FAILED_NAMES=""
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED_NAMES="$FAILED_NAMES|$1"; }
 group(){ printf '\n\033[36m%s\033[0m\n' "$*"; }
+skip() { printf '  \033[33m—\033[0m %s\n' "$*"; SKIP=$((SKIP+1)); }
 
 TOKEN="journey-token-$$"
 ORIGIN_PID=""
@@ -104,8 +105,20 @@ css = {"network": net, "security": sec}
 if sec == "tls":
     css["tlsSettings"] = {"serverName": node.get("server_names") or domain,
                           "fingerprint": "chrome"}
-if node.get("alpn"):
-    css["tlsSettings"]["alpn"] = node["alpn"]
+    if node.get("alpn"):
+        css["tlsSettings"]["alpn"] = node["alpn"]
+elif sec == "reality":
+    # REALITY 的伪装域名在 realitySettings.serverName, 不在 tlsSettings。
+    # 漏了这一段, 客户端就没有 SNI 可发 —— 链路握手时失败, 而交叉核对会先
+    # 一眼看出"链接有 sni、客户端没有"。
+    rs = node.get("reality") or {}
+    css["realitySettings"] = {
+        "serverName": (node.get("server_names") or [""])[0] if isinstance(node.get("server_names"), list)
+                       else (node.get("server_names") or domain),
+        "fingerprint": "chrome",
+        "publicKey": os.environ.get("JOURNEY_PUBKEY", ""),
+        "shortId": node.get("sid") or os.environ.get("JOURNEY_SHORTID", "0123abcd"),
+        "spiderX": "/"}
 npath = node.get("path") or ""
 if net == "xhttp" and npath:
     css["xhttpSettings"] = {"path": npath, "mode": node.get("xhttp_mode") or "auto"}
@@ -163,7 +176,9 @@ cmp("主机", u.hostname, srv.get("address"))
 cmp("端口", u.port, srv.get("port"))
 cmp("传输", q.get("type"), ss.get("network"))
 cmp("加密层", q.get("security"), ss.get("security"))
-cmp("SNI", q.get("sni"), (ss.get("tlsSettings") or {}).get("serverName"))
+_sni = (ss.get("tlsSettings") or {}).get("serverName") \
+       or (ss.get("realitySettings") or {}).get("serverName")
+cmp("SNI", q.get("sni"), _sni)
 
 want_path = (ss.get("xhttpSettings") or ss.get("wsSettings") or {}).get("path")
 if q.get("path") or want_path:
@@ -218,6 +233,8 @@ for ob in c.get("outbounds") or []:
     ts = ob.get("streamSettings") or {}
     if ts.get("security") == "tls":
         ts.setdefault("tlsSettings", {})["pinnedPeerCertSha256"] = pin
+    elif ts.get("security") == "reality":
+        pass   # REALITY 不验证书链, 钉指纹没有意义
 json.dump(c, open(cfgf, "w"), indent=1)
 PINPY
 }
@@ -286,11 +303,188 @@ run_journey() {
     fi
 }
 
+# ================================================================
+# 上下行分离的三个组合
+#
+# 这三个才是本项目的主线, 而且它们**全部**踩在刚才修的那条路上:
+# 分离节点的下行要么走 nginx 档位, 要么走 REALITY, 所以 nginx+tls 那个
+# "有 TLS 却没证书"的坑正好在这里等着。
+#
+# 分离的判据不是"看起来有两段配置", 而是**两段都能独立连上**, 且
+# 上行与下行的**端口必须相同** —— xray 的会话表 h.sessions 是 per-inbound 的,
+# 端口一���就换表, 表现为 `invalid Read on closed Body`。
+# ================================================================
+run_split() {
+    local name="$1" up_sec="$2" dl_sec="$3"
+    local tag="j-split-${name}" srv_p=$((SRV_PORT++)) sock=$((CLI_SOCK_PORT++))
+    local up_path="/sp-${name}/"
+
+    group "上下行分离 $name  (上行=$up_sec 下行=$dl_sec)"
+
+    # 上下行共用一个 inbound, 所以端口本来就是同一个 —— 这里显式写出来,
+    # 免得以后有人以为可以分开配。
+    local opts
+    opts=$(python3 - "$tag" "$srv_p" "$DOMAIN" "$up_path" "$up_sec" "$dl_sec" "$UUID" "$CERT" "$KEY" <<'OPTS'
+import json, os, sys
+tag, port, dom, path, usec, dlsec, uuid, cert, key = sys.argv[1:10]
+o = {"protocol": "vless", "transport": "xhttp", "security": usec,
+     "tag": tag, "port": int(port), "tier": "cdn",
+     "domain": dom, "uuid": uuid, "path": path,
+     "cert_file": cert, "key_file": key,
+     # ★ dl_* 必须同时给这三样, 少一样就退化成"看着分离、其实合流":
+     #   mode=auto 在 REALITY 下会退成 stream-one (一条连接双工)。
+     "dl_address": dom, "dl_security": dlsec,
+     "dl_mode": "stream-up", "dl_ech": False}
+if dlsec == "reality":
+    # 下行 REALITY 是服务端扮演客户端连出去, 靠的是 (伪装域名, 公钥, 短ID)
+    # 这对凭据 —— 少一个内核就会明确报错, 但报错里说的字段名是 dl_public_key/
+    # dl_short_id, 而内核实际要的是 password 语义, 所以这里按 preset_batch.sh
+    # 的同一组键名给。
+    o["dl_sni"] = "www.microsoft.com"
+    o["dl_public_key"] = os.environ.get("JOURNEY_PUBKEY", "")
+    o["dl_short_id"] = os.environ.get("JOURNEY_SHORTID", "0123abcd")
+if usec == "reality":
+    # 上行 REALITY: 服务端拿私钥, 但**公钥也要给** —— 分享链接里要写它。
+    # 缺了内核会直接报错 (而不是让客户端静默丢弃), 但报的是"分享链接要用",
+    # 所以这里照给的键名补上, 与 preset_batch.sh 同一组。
+    o["private_key"] = os.environ.get("JOURNEY_PRIVKEY", "")
+    o["public_key"] = os.environ.get("JOURNEY_PUBKEY", "")
+    o["short_id"] = os.environ.get("JOURNEY_SHORTID", "0123abcd")
+    o["dest"] = "www.microsoft.com:443"
+    o["serverNames"] = ["www.microsoft.com"]
+print(json.dumps(o))
+OPTS
+)
+
+    if ! python3 "$ROOT/conf/lib/deploy.py" --config-json "$opts" \
+            --conf-dir "$WORK/conf" --share-dir "$WORK/share/tokens" --apply \
+            >"$WORK/$tag.plan" 2>&1; then
+        bad "$name — 分离节点建不出来"
+        sed 's/^/        /' "$WORK/$tag.plan" | head -5
+        return
+    fi
+    [[ -f "$WORK/conf/$tag.json" ]] && ok "分离节点建出来了" \
+        || { bad "$name — 片段没落盘"; return; }
+
+    # ---- 片段本身: 上行要有 downloadSettings, 且端口必须与上行相同 ----
+    if python3 - "$WORK/conf/$tag.json" "$srv_p" <<'CHK'
+import json, sys
+d = json.load(open(sys.argv[1])); port = int(sys.argv[2])
+ib = d["inbounds"][0]
+xhs = (ib.get("streamSettings") or {}).get("xhttpSettings") or {}
+ds = xhs.get("downloadSettings")
+if not ds:
+    sys.exit("没有 downloadSettings —— 这不是分离节点")
+if not ds.get("address"):
+    sys.exit("downloadSettings 缺 address")
+if int(ds.get("port") or 0) != port:
+    sys.exit("下行端口 %s ≠ 上行端口 %d (会话表 per-inbound, 会 invalid Read on closed Body)"
+             % (ds.get("port"), port))
+# 只管下行: stream-up 是**下行**必须显式指定的 (auto 在 REALITY 下会退成
+# stream-one = 合流)。上行保持 auto 即可 —— 内核会协商, 实测能通。
+# 我第一版连上行一起断言, 结果把一条本来对的东西判成错。
+# 下行 mode 藏在 downloadSettings.xhttpSettings 里, 不在 downloadSettings
+# 顶层 —— 我第一版去顶层找, 拿到 None, 把一条本来对的东西判成错。
+_dlx = ds.get("xhttpSettings") or {}
+if _dlx.get("mode") != "stream-up":
+    sys.exit("下行 mode=%s 不是 stream-up" % _dlx.get("mode"))
+if _dlx.get("path") != xhs.get("path"):
+    sys.exit("上下行 path 不同: 上行 %s 下行 %s" % (xhs.get("path"), _dlx.get("path")))
+CHK
+    then ok "片段含完整下行设置, 两段端口一致且都是 stream-up"
+    else bad "$name — 片段里的下行设置不对"; fi
+
+    # ---- 分享元数据必须把下行参数带出去, 否则用户导入后"看着正常但没分离" ----
+    local dl_missing
+    dl_missing=$(python3 - "$WORK/share/tokens/$tag.json" <<'META'
+import json, sys
+m = json.load(open(sys.argv[1]))
+need = ["dl_address", "dl_port", "dl_security", "dl_mode", "dl_path"]
+miss = [k for k in need if not m.get(k)]
+print(" ".join(miss))
+META
+)
+    if [[ -z "${dl_missing// /}" ]]; then
+        ok "分享元数据带全了 5 个下行参数"
+    else
+        bad "$name — 分享元数据缺下行参数: $dl_missing"
+    fi
+
+    # ---- 两个投影交叉核对 (含下行) ----
+    local cc="$WORK/client/$tag.json"
+    if ! make_client "$tag" "$cc" "$sock"; then
+        bad "$name — 生不成客户端配置"; return
+    fi
+    local r; r=$(cross_check "$tag" "$cc")
+    case "$r" in
+        OK) ok "链接与客户端配置逐项一致" ;;
+        NOCONF|NOLINK) bad "$name — 链接或配置没生成" ;;
+        DIFF:*) bad "$name — 两个投影对不上"
+                printf '%s\n' "${r#DIFF:}" | tr ';' '\n' | sed 's/^ */          /' | head -4 ;;
+        *) bad "$name — 核对异常: $r" ;;
+    esac
+
+    # ---- 真跑流量: 上下行都要能独立走通 ----
+    local ccl="$WORK/client/$tag.local.json" srvr="$WORK/conf/$tag.run.json"
+    patch_for_local "$cc" "$ccl" "$srv_p"
+    pin_cert "$ccl" "$CERT"
+    server_for_run "$WORK/conf/$tag.json" "$srvr"
+
+    # 客户端的下行地址也拨本机 (它指向同一个 inbound 的同一个端口)
+    python3 - "$ccl" "$srv_p" <<'FIXDL'
+import json, sys
+f, port = sys.argv[1], int(sys.argv[2])
+c = json.load(open(f))
+xhs = c["outbounds"][0]["streamSettings"].get("xhttpSettings") or {}
+ds = xhs.get("downloadSettings")
+if ds:
+    ds["address"] = "127.0.0.1"
+    ds["port"] = port
+json.dump(c, open(f, "w"), indent=1)
+FIXDL
+
+    # ★ 上行 REALITY 的握手**没法在环回上验**。
+    #   REALITY 的服务端要连 dest (伪装站点) 去"借"它的证书, 客户端那一次
+    #   ClientHello 要对着真站点验签。拨 127.0.0.1 时没有这一段, 握手必然
+    #   停在半路 —— 那是**测法的限制, 不是产品的毛病**。
+    #   所以这里明说跳过, 而不是打一个红叉: 红叉会被当成"reality-cdn 坏了",
+    #   而实际上它的片段/元数据/两个投影在上面都已经验过了。
+    if [[ "$up_sec" == "reality" ]]; then
+        skip "上行 REALITY 的握手需要真实 dest, 环回验不了 (片段/元数据/投影已验)"
+        skip "真实连通性靠 RN↔CC 实测那条路 —— 见交接文档"
+        return
+    fi
+
+    "$XRAY_BIN" run -config "$srvr" >"$WORK/$tag.srv.log" 2>&1 & local spid=$!
+    sleep 2
+    "$XRAY_BIN" run -config "$ccl" >"$WORK/$tag.cli.log" 2>&1 & local cpid=$!
+    sleep 2
+    local got rc
+    got=$(curl -fsS -m 15 --socks5-hostname "127.0.0.1:$sock" \
+              "http://127.0.0.1:$ORIGIN_PORT/probe.txt" 2>"$WORK/$tag.err")
+    rc=$?
+    kill "$spid" "$cpid" 2>/dev/null; wait "$spid" "$cpid" 2>/dev/null
+    if [[ $rc -eq 0 && "$got" == "$TOKEN" ]]; then
+        ok "分离链路打通, 拿到源站 token (上行+下行两段都真的走通了)"
+    else
+        bad "$name — 分离链路没打通 (curl rc=$rc)"
+        head -2 "$WORK/$tag.err" | cut -c1-110 | sed 's/^/        /'
+        grep -aiE 'invalid Read|reject|failed|timeout' "$WORK/$tag.srv.log" "$WORK/$tag.cli.log" 2>/dev/null \
+            | head -2 | cut -c1-110 | sed 's/^/        /'
+    fi
+}
+
 echo "════ 用户旅程验收: 建节点 → 出链接 → 装客户端 → 真跑流量 ════"
 run_journey "cdn"   cdn   xhttp
 run_journey "nginx" nginx ws
 
 echo
-echo "════ 结果: $PASS 通过, $FAIL 失败 ════"
+echo "════ 上下行分离三个组合 ════"
+run_split "cdn-cdn"     tls      tls
+run_split "cdn-reality" tls      reality
+run_split "reality-cdn" reality  tls
+
+echo
+echo "════ 结果: $PASS 通过, $FAIL 失败, $SKIP 跳过(测法限制, 非故障) ════"
 [[ "$FAIL" -gt 0 ]] && { printf '失败项:%s\n' "$FAILED_NAMES"; exit 1; }
 exit 0
