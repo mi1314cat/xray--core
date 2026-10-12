@@ -814,6 +814,55 @@ def _yaml_entry_to_node(entry: dict) -> dict:
         n["mode"] = str(xh.get("mode") or "")
         headers = xh.get("headers") or {}
         n["host"] = str(headers.get("Host") or headers.get("host") or n["host"])
+        # ---- 上下行分离 ----
+        #
+        # ★ 这里以前**完全没读** download-settings, 于是从 mihomo 节点文件
+        #   导入一个上下行分离的节点时, 读出来的是**合流**节点, 而且没有任何
+        #   提示。之前"mihomo 表达不了上下行分离"是误判 —— 官方文档里有,
+        #   缺的只是我们这一侧的读取代码。
+        #
+        #   形状见官方文档: 分 xhttp 部分与 proxy 部分, 且是**逐项覆盖**
+        #   (没写的沿用上行), 所以读的时候也要"缺了就继承上行"。
+        _ds = xh.get("download-settings")
+        if isinstance(_ds, dict):
+            _ds = {str(k).lower(): v for k, v in _ds.items()}
+            _dl_server = str(_ds.get("server") or "").strip()
+            if _dl_server:
+                n["dl_address"] = _dl_server
+                _dl_port = _ds.get("port")
+                # 转 int: 内核的 downloadSettings.port 要数字
+                if isinstance(_dl_port, int):
+                    n["dl_port"] = _dl_port
+                elif isinstance(_dl_port, str) and _dl_port.isdigit():
+                    n["dl_port"] = int(_dl_port)
+                _ro = _ds.get("reality-opts")
+                if isinstance(_ro, dict) and _ro.get("public-key"):
+                    n["dl_security"] = "reality"
+                    n["dl_public_key"] = str(_ro["public-key"])
+                    if _ro.get("short-id"):
+                        n["dl_short_id"] = str(_ro["short-id"])
+                elif _ds.get("tls") is True:
+                    n["dl_security"] = "tls"
+                elif _ds.get("tls") is False:
+                    n["dl_security"] = "none"
+                # 逐项覆盖: 缺了就沿用上行
+                if _ds.get("path"):
+                    n["dl_path"] = str(_ds["path"])
+                if _ds.get("host"):
+                    n["dl_host"] = str(_ds["host"])
+                if _ds.get("mode"):
+                    n["dl_mode"] = str(_ds["mode"])
+                _dsni = str(_ds.get("servername") or "").strip()
+                if _dsni:
+                    n["dl_sni"] = _dsni
+                _dech = _ds.get("ech-opts")
+                if isinstance(_dech, dict):
+                    if _dech.get("config"):
+                        n["dl_ech"] = str(_dech["config"])
+                    elif _dech.get("enable"):
+                        n["dl_ech_enable"] = True
+                if _ds.get("certificate"):
+                    n["dl_pinned_cert_sha256"] = str(_ds["certificate"])
     if entry.get("ech-opts"):
         # mihomo 的形状是 {enable: bool, config: "<ECHConfigList>"}。
         # config 才是能下发的值；只有 enable: true 时**拿不到配置**，不能瞎猜 ——

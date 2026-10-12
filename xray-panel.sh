@@ -146,6 +146,10 @@ _XRAY_LIB_FILES=(
     deploy.py dns_edit.py nginx_apply.py naming.py node_build.py nodes.py
     share_meta.py share_payload.py token_store.py
     hy2_products.py
+    # to_mihomo.py = 节点 → mihomo YAML。产物要两种客户端格式, 而 mihomo 的
+    # 字段名/嵌套与 Xray 完全不同 (xhttp-opts vs xhttpSettings), 转不了,
+    # 只能各写各的; 少了它就只剩 Xray JSON 一份产物。
+    to_mihomo.py
 )
 
 # 把 conf/lib/ 铺到"脚本旁边", 也就是 $_XRAY_CACHE/lib/。

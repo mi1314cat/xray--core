@@ -3766,6 +3766,80 @@ assert_eq "$(grep -c "get('dl_domain'" "$ROOT/conf/node.sh" 2>/dev/null)" "1" \
 assert_eq "$(grep -c 'domain="\$domain,\$dl_domain"' "$ROOT/conf/node.sh" 2>/dev/null)" "1" \
     "删单个节点时把两个域名一起交给 nginx_apply 摘"
 
+# ------------------------------------------------- mihomo YAML 产物
+group "mihomo YAML (上下行分离)"
+
+MH=$(python3 - "$LIB" "$ROOT" <<'PYX'
+import sys, os
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, os.path.join(sys.argv[2], "Client", "lib"))
+import to_mihomo as M
+import node as ND
+
+N = dict(protocol="vless", address="cdn.example.com", port=443,
+         id="11111111-1111-1111-1111-111111111111", network="xhttp",
+         security="reality", sni="www.cloudflare.com", fingerprint="chrome",
+         reality_public_key="b"*43, reality_short_id="abcd",
+         path="/x", mode="stream-up",
+         dl_address="203.0.113.9", dl_port=8443, dl_security="reality",
+         dl_sni="www.cloudflare.com", dl_public_key="c"*43, dl_short_id="ef01")
+
+# 1) 生成: 官方形状 = download-settings 里同时有 xhttp 部分与 proxy 部分
+p = M.proxy(N)
+ds = (p.get("xhttp-opts") or {}).get("download-settings") or {}
+out = ["server" if ds.get("server") == "203.0.113.9" else "-",
+       "port" if ds.get("port") == 8443 else "-",
+       "reality" if (ds.get("reality-opts") or {}).get("public-key") == "c"*43 else "-",
+       "sni" if ds.get("servername") == "www.cloudflare.com" else "-",
+       "tls" if ds.get("tls") is True else "-",
+       "path" if ds.get("path") == "/x" else "-",
+       "mode" if ds.get("mode") == "stream-up" else "-"]
+
+# 2) 不配下行就没有 download-settings
+N2 = {k: v for k, v in N.items() if not k.startswith("dl_")}
+out.append("clean" if "download-settings" not in (M.proxy(N2).get("xhttp-opts") or {}) else "NOISE")
+
+# 3) 往返: 我们生成的 YAML 我们自己读得回来
+back = ND.parse_mihomo_yaml(M._dump({"proxies": [p]}))
+out += ["rt" if back.get("dl_address") == "203.0.113.9" else "-",
+        str(back.get("dl_port", "?")),
+        "rt-sec" if back.get("dl_security") == "reality" else "-"]
+
+# 4) 必须拒绝的两种
+N3 = dict(N); N3["reality_public_key"] = ""; N3.pop("dl_public_key")
+out.append("nopbk" if M.proxy(N3) is None else "LEAK")
+N4 = dict(N, protocol="trojan", password="pw")
+out.append("vless-only" if M.proxy(N4) is None else "LEAK")
+print(",".join(out))
+PYX
+)
+assert_eq "$MH" \
+  "server,port,reality,sni,tls,path,mode,clean,rt,8443,rt-sec,nopbk,vless-only" \
+  "mihomo YAML 带 download-settings (xhttp 部分 + proxy 部分), 可往返, 缺公钥/非 VLESS 被拒"
+
+# 下行公钥缺省沿用上行 (双域名/同端口是同一把密钥) —— 必须与 node_build 同规则
+MH2=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import to_mihomo as M
+N = dict(protocol="vless", address="a.com", port=443,
+         id="11111111-1111-1111-1111-111111111111", network="xhttp",
+         security="reality", sni="s.com", reality_public_key="b"*43,
+         path="/x", mode="stream-up", dl_address="1.2.3.4", dl_security="reality")
+ds = (M.proxy(N).get("xhttp-opts") or {}).get("download-settings") or {}
+a = (ds.get("reality-opts") or {}).get("public-key") == "b"*43
+N2 = dict(N, dl_public_key="c"*43)
+ds2 = (M.proxy(N2).get("xhttp-opts") or {}).get("download-settings") or {}
+b = (ds2.get("reality-opts") or {}).get("public-key") == "c"*43
+print(("inherit" if a else "BROKEN") + "," + ("override" if b else "BROKEN"))
+PYX
+)
+assert_eq "$MH2" "inherit,override" \
+    "mihomo 下行公钥: 缺省沿用上行 (同服务器双域名), 显式给值则覆盖"
+
+# 上传前验证脚本必须在
+assert_ne0 "$(grep -c '而不是' "$ROOT/tools/prepush_check.sh" 2>/dev/null)" \
+    "上传前验证脚本在仓库里 (tools/prepush_check.sh)"
+
 # ------------------------------------------------- 服务器标识 (借鉴 SB)
 group "服务器标识 (旗帜 + 默认值)"
 
