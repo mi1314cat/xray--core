@@ -3469,6 +3469,356 @@ case "$EN" in *mlkem*) ok "第 6 列: 推荐首选带 ML-KEM" ;; *) bad "第 6 �
 EN2=$(bash -c "source '$LIB/preset.sh'; x_preset_ask vless </dev/null 2>/dev/null | wc -l")
 assert_eq "$EN2" "0" "x_preset_ask 取消时不输出"
 
+# ------------------------------------------------- XHTTP 上下行分离
+group "XHTTP 上下行分离"
+
+# 内核只认这四个 mode, 其余硬报错。这里提前拦, 好给一句人话。
+NM3=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import node_build as B
+base = dict(tag="t", port=34567, private_key="a"*43, public_key="b"*43,
+            sni="www.cloudflare.com", dest="www.cloudflare.com:443", short_id="abcd")
+out = []
+for m in ("stream-up","packet-up","stream-one","auto"):
+    try:
+        r = B.build("vless","xhttp","reality", dict(base, xhttp_mode=m))
+        out.append(r["inbounds"][0]["streamSettings"]["xhttpSettings"]["mode"])
+    except Exception as e:
+        out.append("ERR")
+bad = ""
+for m in ("bogus","","packet_up"):
+    try:
+        B.build("vless","xhttp","reality", dict(base, xhttp_mode=m))
+        bad = m
+    except Exception:
+        pass
+print(",".join(out) + "|bad=" + (bad or "none"))
+PYX
+)
+assert_eq "${NM3%|bad=*}" "stream-up,packet-up,stream-one,auto" "xhttp 四个 mode 都能生成且原样写入"
+assert_eq "${NM3##*bad=}" "none" "非法 xhttp mode 在生成前就被拦 (不必等 xray -test)"
+
+# ★ Vision(XTLS) + 非裸TCP: xray run -test **放行**, 真连立刻失败
+#   ("XTLS only supports TLS and REALITY directly for now.")。必须在生成前拦。
+XV=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import node_build as B
+base = dict(tag="t", port=34567, private_key="a"*43, public_key="b"*43,
+            sni="www.cloudflare.com", dest="www.cloudflare.com:443", short_id="abcd")
+res = []
+for tr in ("xhttp","grpc"):
+    try:
+        B.build("vless",tr,"reality", dict(base, flow="xtls-rprx-vision")); res.append("LEAK")
+    except Exception: res.append("blocked")
+# 裸 TCP 必须仍然放行 —— 这条要防的是"拦过头"
+try:
+    B.build("vless","raw","reality", dict(base, flow="xtls-rprx-vision")); res.append("ok")
+except Exception: res.append("BLOCKED-VALID")
+print(",".join(res))
+PYX
+)
+assert_eq "$XV" "blocked,blocked,ok" "Vision 与非裸TCP 在生成前被拦, 裸TCP 不受影响"
+
+# REALITY + xHTTP 必须是合法组合 (内核: "REALITY only supports RAW, XHTTP and gRPC")
+RL=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import node_build as B
+base = dict(tag="t", port=34567, private_key="a"*43, public_key="b"*43,
+            sni="www.cloudflare.com", dest="www.cloudflare.com:443", short_id="abcd",
+            xhttp_mode="stream-up")
+try:
+    B.build("vless","xhttp","reality", dict(base)); print("ok")
+except Exception as e: print("ERR:" + str(e)[:50])
+PYX
+)
+assert_eq "$RL" "ok" "REALITY + xHTTP (上下行分离) 能生成"
+
+# 预置表里必须有这一档, 且不能带 flow (XTLS 与 xhttp 冲突)
+PX=$(bash -c "source '$LIB/preset.sh'; x_preset_count vless" 2>/dev/null)
+PXE=""
+for ((i=1;i<=PX;i++)); do
+    if [[ "$(bash -c "source '$LIB/preset.sh'; x_preset_field vless $i 4" 2>/dev/null)" == *"上下行分离"* ]]; then
+        PXE="$(bash -c "source '$LIB/preset.sh'; x_preset_field vless $i 2")/$(bash -c "source '$LIB/preset.sh'; x_preset_field vless $i 3")"
+    fi
+done
+assert_eq "$PXE" "xhttp/reality" "预置表含「REALITY + XHTTP 上下行分离」档"
+
+# ------------------------------------------------- 上下行分离全链路
+group "上下行分离 (downloadSettings)"
+
+CDL="$TMP/cdl"; mkdir -p "$CDL"
+
+# ---- 1) 服务端生成 ----
+DS=$(python3 - "$LIB" <<'PYX'
+import sys, json; sys.path.insert(0, sys.argv[1])
+import node_build as B
+R=dict(private_key="a"*43, public_key="b"*43, sni="www.cloudflare.com",
+       dest="www.cloudflare.com:443", short_id="ab", fingerprint="chrome")
+base=dict(tag="t", port=18443)
+def build(**kw):
+    return B.build("vless","xhttp","reality", dict(base, **R, **kw))
+a=build(xhttp_mode="stream-up", dl_address="203.0.113.9", dl_security="reality")
+d=a["inbounds"][0]["streamSettings"]["xhttpSettings"]["downloadSettings"]
+out=[d["address"], str(d["port"]), d["security"], d["realitySettings"]["serverName"],
+     str(d["realitySettings"]["publicKey"][:4])]
+b=build(xhttp_mode="stream-up")            # 不配 = 不该有 downloadSettings
+out.append("no-dl" if "downloadSettings" not in b["inbounds"][0]["streamSettings"]["xhttpSettings"] else "LEAK")
+print(",".join(out))
+PYX
+)
+assert_eq "$DS" "203.0.113.9,18443,reality,www.cloudflare.com,bbbb,no-dl" \
+    "downloadSettings 落进服务端配置 (地址/端口/密钥/SNI), 不配时不出现"
+
+# ---- 2) 硬约束: 下行 path 必须等于上行 (RN 真连实测) ----
+DPATH=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import node_build as B
+R=dict(private_key="a"*43, public_key="b"*43, sni="www.cloudflare.com",
+       dest="www.cloudflare.com:443", short_id="ab")
+res=[]
+for name,kw in (("same", dict(dl_address="b.com")),
+                ("diff", dict(dl_address="b.com", dl_path="/down"))):
+    try:
+        c=B.build("vless","xhttp","reality",
+                  dict(R, tag="t", port=18443, xhttp_mode="stream-up", path="/up", **kw))
+        d=c["inbounds"][0]["streamSettings"]["xhttpSettings"]["downloadSettings"]
+        top=c["inbounds"][0]["streamSettings"]["xhttpSettings"]["path"]
+        res.append(name+":"+("OK" if d["xhttpSettings"]["path"]==top else "MISMATCH"))
+    except Exception: res.append(name+":blocked")
+print(",".join(res))
+PYX
+)
+assert_eq "$DPATH" "same:OK,diff:blocked" \
+    "下行 path 必须等于上行 (服务端只认顶层 path, hub.go:461)"
+
+# ---- 3) 硬约束: 端口必须与本 inbound 相同 ----
+DP=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import node_build as B
+R=dict(private_key="a"*43, public_key="b"*43, sni="www.cloudflare.com",
+       dest="www.cloudflare.com:443", short_id="ab")
+res=[]
+# ★ 每个用例都必须带 dl_address —— 没有下行地址时本来就不该拦,
+#   那样写出来的期望值会把"测错了"伪装成"代码没生效"。
+for name,kw in (("stream-one", dict(xhttp_mode="stream-one", dl_address="b.com")),
+                ("wrong-port", dict(xhttp_mode="stream-up", dl_address="b.com", dl_port=9999)),
+                ("ok", dict(xhttp_mode="stream-up", dl_address="b.com"))):
+    try:
+        B.build("vless","xhttp","reality", dict(R, tag="t", port=18443, **kw)); res.append(name+":LEAK")
+    except Exception: res.append(name+":blocked")
+print(",".join(res))
+PYX
+)
+assert_eq "$DP" "stream-one:blocked,wrong-port:blocked,ok:LEAK" \
+    "stream-one+dl 与 下行端口不一致 都在生成前被拦, 合法组合放行"
+
+# ---- 3) 分享链接: 上下行参数 + mode + path ----
+SP=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import nodes as N
+meta={"public_key":"b"*43,"short_id":"abcd","fingerprint":"chrome","name":"n","enabled":True}
+n=dict(tag="t",protocol="vless",id="u",port=443,network="xhttp",address="a.example.com",
+       sni="www.cloudflare.com",path="/real-x",security="reality",mode="stream-up",
+       published=True, dl_address="1.2.3.4", dl_port=443, dl_security="reality",
+       dl_sni="www.cloudflare.com", dl_public_key="b"*43, dl_short_id="abcd")
+l=N.build_share_link(n, meta) or ""
+out=["dlad" if "dlad=1.2.3.4" in l else "-",
+     "dlport" if "dlport=443" in l else "-",
+     "mode" if "mode=stream-up" in l else "-",
+     "path" if "path=" in l else "-"]
+n2=dict(n); [n2.pop(k,None) for k in ("dl_address","dl_port","dl_security","dl_sni",
+                                     "dl_public_key","dl_short_id")]
+l2=N.build_share_link(n2, meta) or ""
+out.append("clean" if "dlad=" not in l2 else "NOISE")
+print(",".join(out))
+PYX
+)
+assert_eq "$SP" "dlad,dlport,mode,path,clean" \
+    "分享链接带 dl*/mode/path, 且不配上下行时不添噪声"
+
+# ---- 4) path 曾在 tls 分支里 => REALITY + 路径型传输会丢 (回归) ----
+PT=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import nodes as N
+meta={"public_key":"b"*43,"short_id":"abcd","fingerprint":"chrome","name":"n","enabled":True}
+miss=[]
+for sec in ("reality","tls"):
+    for net in ("xhttp","ws","grpc","httpupgrade"):
+        n=dict(tag="t",protocol="vless",id="u",port=443,network=net,address="a.example.com",
+               sni="www.cloudflare.com",path="/real-x",security=sec,published=True)
+        if "path=" not in (N.build_share_link(n, meta) or ""): miss.append(sec+"/"+net)
+print(",".join(miss) if miss else "none")
+PYX
+)
+assert_eq "$PT" "none" "REALITY/TLS × xhttp/ws/grpc/httpupgrade 的分享链接都带 path"
+
+# ---- 5) 客户端产物 (genconfig) ----
+GC=$(python3 - "$ROOT" <<'PYX'
+import sys, json, subprocess, tempfile, os
+root=sys.argv[1]
+sys.path.insert(0, os.path.join(root,"Client","lib"))
+import node as ND
+n={"address":"a.example.com","port":443,"protocol":"vless","transport":"xhttp",
+   "uuid":"11111111-1111-1111-1111-111111111111","security":"reality",
+   "sni":"www.cloudflare.com","fingerprint":"chrome","reality_public_key":"b"*43,
+   "reality_short_id":"abcd","path":"/x","mode":"stream-up",
+   "dl_address":"1.2.3.4","dl_port":443,"dl_security":"reality",
+   "dl_sni":"www.cloudflare.com","dl_public_key":"b"*43,"dl_short_id":"abcd"}
+d=tempfile.mkdtemp()
+np=os.path.join(d,"n.json"); json.dump(n,open(np,"w"))
+op=os.path.join(d,"o.json")
+subprocess.run([sys.executable,"lib/genconfig.py","--node",np,"--output",op,
+                "--mode","normal"],cwd=os.path.join(root,"Client"),
+               capture_output=True)
+c=json.load(open(op))
+xh=c["outbounds"][0]["streamSettings"]["xhttpSettings"]
+dl=xh.get("downloadSettings")
+if not dl: print("NO-DL"); raise SystemExit
+mp=os.path.join(d,"m.json")
+json.dump({"inbounds":[{"tag":"s","port":13999,"listen":"127.0.0.1","protocol":"socks",
+                        "settings":{"auth":"noauth"}}],
+           "outbounds":[c["outbounds"][0]]}, open(mp,"w"))
+k=subprocess.run(["/usr/local/bin/xray","run","-test","-config",mp],capture_output=True,text=True)
+print(",".join([dl["address"], str(dl["port"]), dl["security"],
+                str(dl["realitySettings"]["publicKey"][:4]),
+                dl["xhttpSettings"]["path"],
+                "OK" if "Configuration OK" in (k.stdout+k.stderr) else "KERNEL-REJECT"]))
+PYX
+)
+assert_eq "$GC" "1.2.3.4,443,reality,bbbb,/x,OK" \
+    "客户端产物带 downloadSettings (客户端侧用公钥) 且内核接受, 下行 path 与上行一致"
+
+# ---- 6) 客户端解析 dl_port 必须是 int ----
+PT2=$(python3 - "$ROOT" <<'PYX'
+import sys, os
+sys.path.insert(0, os.path.join(sys.argv[1],"Client","lib"))
+import node as ND
+l=("vless://u@a.example:443?encryption=none&security=tls&type=xhttp&path=%2Fx"
+   "&dlad=1.2.3.4&dlport=443&dlsec=tls")
+n=ND.parse_node(l)
+print(type(n.get("dl_port")).__name__)
+PYX
+)
+assert_eq "$PT2" "int" "分享链接里的 dlport 解析成 int (内核要数字, 字符串会 unmarshal 失败)"
+
+# ------------------------------------------------- nginx 双域名 + 连带清理
+group "nginx 双域名与连带清理"
+
+NG="$TMP/ngroot"; rm -rf "$NG"; mkdir -p "$NG"
+printf 'server {\n    listen 443 ssl;\n    server_name up.example.com;\n    location /myapp { proxy_pass http://127.0.0.1:3000; }\n}\n' > "$NG/a.conf"
+printf 'server {\n    listen 443 ssl;\n    server_name down.example.com;\n}\n' > "$NG/b.conf"
+NGA="$NG/a.conf"; NGB="$NG/b.conf"
+
+na() { NGINX_CONF_ROOTS="$NG" python3 "$LIB/nginx_apply.py" "$@" 2>&1; }
+nrc() { NGINX_CONF_ROOTS="$NG" python3 "$LIB/nginx_apply.py" "$@" >/dev/null 2>&1; echo $?; }
+
+# ---- 1) 双域名插入 ----
+# ★ 两次插入的参数必须**完全一致** —— 少传一个 --origin-sni 就会让生成的
+#   proxy_ssl_name 从具体域名变成 $host, 内容真的变了, 那不是幂等性坏掉。
+nrc --domain up.example.com,down.example.com --port 8443 --transport xhttp \
+    --cdn --origin-tls --origin-sni up.example.com --nginx none >/dev/null
+NA_C=$(cat "$NGA"); NB_C=$(cat "$NGB")
+assert_eq "$(grep -c 'xray-core BEGIN up.example.com' "$NGA")" "1" "双域名: 上行域名插进 a.conf"
+assert_eq "$(grep -c 'xray-core BEGIN down.example.com' "$NGB")" "1" "双域名: 下行域名插进 b.conf (各自找站点文件)"
+# ★ 双层 TLS (照 SB): xray inbound 自带 TLS 时, 回源必须是 https://,
+#   否则 nginx 向期待 TLS 的 xray 发明文 -> 502 / connection reset, xray 侧无日志。
+assert_eq "$(grep -c 'proxy_pass https://127.0.0.1:8443' "$NGA" "$NGB" | grep -c ':1')" "2" \
+    "双域名两段都用 https:// 回源 (双层 TLS)"
+assert_eq "$(grep -c 'proxy_ssl_server_name on' "$NGA" "$NGB" | grep -c ':1')" "2" "两段都带回源 SNI"
+assert_eq "$(grep -c 'proxy_buffering off' "$NGA" "$NGB" | grep -c ':1')" "2" \
+    "xhttp 关缓冲 (下行是长连接 GET, 缓冲了就不流式)"
+
+# ---- 2) 幂等 ----
+# 存的是"两文件各自的内容", 比较时逐份比 —— cat 拼接和 printf 拼接的
+# 分隔符不同, 比哈希会得到一个与幂等性无关的假失败。
+na --domain up.example.com,down.example.com --port 8443 --transport xhttp \
+   --cdn --origin-tls --origin-sni up.example.com --nginx none >/dev/null
+assert_eq "$(cat "$NGA")$(cat "$NGB")" "$NA_C$NB_C" \
+    "双域名重复插入是幂等的 (不产生第二份)"
+
+# ---- 3) 只删一个域名 ----
+nrc --domain up.example.com --port 8443 --transport xhttp --cdn --nginx none --remove >/dev/null
+assert_eq "$(grep -c 'xray-core BEGIN up.example.com' "$NGA")" "0" "删上行域名: 该段已摘"
+assert_eq "$(grep -c 'xray-core BEGIN down.example.com' "$NGB")" "1" "删上行域名: 下行域名的那段**保留**"
+assert_eq "$(grep -c '/myapp' "$NGA")" "1" "站点自有 location 没被误伤"
+
+# ---- 4) 删干净后逐字还原 ----
+nrc --domain down.example.com --port 8443 --transport xhttp --cdn --nginx none --remove >/dev/null
+assert_eq "$(grep -c 'xray-core BEGIN' "$NGA" "$NGB" | grep -c ':0')" "2" "两域名都删后无任何残留标记"
+
+# ---- 5) 删不存在的域名 = 干净 no-op ----
+NGSNAP=$(md5sum "$NGA" "$NGB" | md5sum)
+nrc --domain nope.example.com --port 8443 --nginx none --remove >/dev/null
+assert_eq "$(md5sum "$NGA" "$NGB" | md5sum)" "$NGSNAP" "删不存在的域名: 站点一个字节都没动"
+
+# ---- 6) 删节点/清空全部 必须调用 nginx 清理 ----
+CB=$(grep -c 'prune_nginx_after_wipe' "$ROOT/conf/batch.sh" 2>/dev/null)
+assert_ne0 "$CB" "清空全部/重建 会调用 nginx 片段清理"
+# 1 次定义 + 2 次调用 (clear_all_nodes / rebuild_all)
+assert_eq "$(grep -c '< <(_collect_nginx_targets)' "$ROOT/conf/batch.sh" 2>/dev/null)" "2" \
+    "清空与重建都在**删除前**收集要摘的片段 (删完就读不出域名了)"
+# 收集器必须把双域名的下行域名也算进去
+assert_eq "$(grep -c 'dl_domain' "$ROOT/conf/batch.sh" 2>/dev/null)" "1" \
+    "收集器认双域名的下行域名 (两段都要摘)"
+# node.sh 的单节点删除也要认双域名
+assert_eq "$(grep -c "get('dl_domain'" "$ROOT/conf/node.sh" 2>/dev/null)" "1" \
+    "删单个节点时也读 share_meta 的 dl_domain (下行域名)"
+assert_eq "$(grep -c 'domain="\$domain,\$dl_domain"' "$ROOT/conf/node.sh" 2>/dev/null)" "1" \
+    "删单个节点时把两个域名一起交给 nginx_apply 摘"
+
+# ------------------------------------------------- 服务器标识 (借鉴 SB)
+group "服务器标识 (旗帜 + 默认值)"
+
+NM="$TMP/nm"; mkdir -p "$NM"
+
+# ★ 默认值必须是 **旗帜 + hostname**, 不能是光一个 "X"。
+#   两台机器都跑同一个 Xray 面板, 前缀都是 "X" 时, 用户什么都没做也分不出
+#   哪个节点属于哪台 —— 是默认值让他分不出来的, 所以默认值本身要带区分度。
+DN=$(XRAY_BASE="$NM" python3 "$LIB/naming.py" default 2>/dev/null)
+HN=$(hostname 2>/dev/null | tr -d '\r\n')
+[[ -z "$HN" ]] && HN=$(tr -d '\r\n' < /proc/sys/kernel/hostname 2>/dev/null)
+if [[ -n "$HN" ]]; then
+    case "$DN" in
+        *"$HN"*) ok "默认服务器标识含主机名: $DN" ;;
+        *) bad "默认服务器标识应含主机名 (得到 '$DN', 主机名 '$HN')" ;;
+    esac
+else
+    ok "默认服务器标识可生成: ${DN:-(空)}"
+fi
+
+# 改名字时旗帜不能丢 —— 旗帜是**服务器的属性**, 不是名字的一部分
+# (SB 在这条上踩过一次: 提示里写着 🇺🇸 myserver, 用户输入短名字后旗帜就没了)
+A=$(XRAY_BASE="$NM" python3 "$LIB/naming.py" set "HK1" 2>/dev/null)
+B=$(XRAY_BASE="$NM" python3 "$LIB/naming.py" set "HK-relay" 2>/dev/null)
+AF=$(printf '%s' "$A" | grep -om1 -P '[\x{1F1E6}-\x{1F1FF}]{2}' || true)
+BF=$(printf '%s' "$B" | grep -om1 -P '[\x{1F1E6}-\x{1F1FF}]{2}' || true)
+if [[ -n "$AF" && "$AF" == "$BF" ]]; then
+    ok "改名后旗帜仍在: $A -> $B"
+else
+    # 查不到旗帜 (离线) 时至少不能变成两个不同的旗帜
+    if [[ -z "$AF" && -z "$BF" ]]; then ok "改名后旗帜一致 (本次无旗帜, 离线)"
+    else bad "改名丢了旗帜: '$A' -> '$B'" ; fi
+fi
+
+# prefix 必须是纯 ASCII —— tag 要进配置文件和文件路径
+PFX=$(XRAY_BASE="$NM" python3 "$LIB/naming.py" prefix 2>/dev/null)
+case "$PFX" in
+    *[!a-zA-Z0-9_-]*) bad "prefix 含非 ASCII (tag 不安全): $PFX" ;;
+    *) ok "prefix 是纯 ASCII: $PFX" ;;
+esac
+
+# 显示名必须非空 —— 空 fragment 会让客户端退化成用域名当名字
+DN2=$(XRAY_BASE="$NM" python3 "$LIB/naming.py" display "x-vless01-TLS" 2>/dev/null)
+[[ -n "$DN2" ]] && ok "显示名非空: $DN2" || bad "显示名为空"
+DN3=$(XRAY_BASE="$NM" python3 "$LIB/naming.py" display "" 2>/dev/null)
+[[ -n "$DN3" ]] && ok "空 tag 也有非空名字: $DN3" || bad "空 tag 拿到空名字"
+
+# ★ batch 的"服务器标识"必须落在 naming.py 那一份缓存上, 不能自己另存一份。
+#   原来 batch.sh 写的是 $XRAY_BASE/.server-name, 而单协议建节点走 naming.py 的
+#   NAME_CACHE —— 两个位置、两个答案, 于是同一个客户端里前缀忽有忽无。
+BS=$(grep -c 'naming.py" set' "$ROOT/conf/batch.sh" 2>/dev/null)
+assert_eq "$BS" "1" "batch 的服务器标识落到 naming.py 缓存 (不另存一份)"
+
 # ---------------------------------------------------------------- 预置建节点
 group "预置建节点 (mknode → deploy)"
 MK="$TMP/mk"; mkdir -p "$MK/conf" "$MK/share"

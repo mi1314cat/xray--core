@@ -564,6 +564,7 @@ def _trim_blanks(lines, idx):
 
 # ---------------------------------------------------------------- 生成片段
 def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
+                origin_tls=False, origin_sni="",
                  path="/"):
     """生成 location 级片段 (带缩进和标记)。
 
@@ -602,14 +603,44 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
         return L
 
     if cdn:
-        L.append(f"{ind}# CDN 接入: 回源到本机, 边缘负责 TLS 与就近接入")
-        L.append(f"{ind}location {path} {{")
-        L.append(f"{inner}proxy_pass http://127.0.0.1:{port};")
+        # ★ 双层 TLS (照 sing-box-core 的 cdn.sh):
+        #     客户端 ──TLS──► Cloudflare ──TLS──► Nginx ──TLS──► xray
+        #   nginx 终止掉 Cloudflare 的 TLS 之后, 会用**新的 TLS 连接**去连 xray;
+        #   而 xray 的 inbound 自己还开着 TLS (它也有证书)。所以回源必须是
+        #   https:// —— 写成 http:// 就是向期待 TLS 的 xray 发明文, xray 立刻
+        #   关连接, 表现为 CDN 回源 **502 / connection reset by peer**,
+        #   而 **xray 侧毫无日志** (最难查的那一类故障)。
+        #
+        #   回源还要带 SNI (`proxy_ssl_server_name on` + proxy_ssl_name),
+        #   否则 xray 选不出对应证书。
+        if origin_tls:
+            L.append(f"{ind}# CDN 接入: 回源到本机 (双层 TLS —— xray inbound 自带 TLS)")
+            L.append(f"{ind}location {path} {{")
+            L.append(f"{inner}proxy_pass https://127.0.0.1:{port};")
+            L.append(f"{inner}proxy_ssl_server_name on;")
+            if origin_sni:
+                L.append(f"{inner}proxy_ssl_name {origin_sni};")
+            else:
+                L.append(f"{inner}proxy_ssl_name $host;")
+        else:
+            L.append(f"{ind}# CDN 接入: 回源到本机, 边缘负责 TLS 与就近接入")
+            L.append(f"{ind}location {path} {{")
+            L.append(f"{inner}proxy_pass http://127.0.0.1:{port};")
         L.append(f"{inner}proxy_http_version 1.1;")
         L.append(f"{inner}proxy_set_header Host $host;")
         L.append(f"{inner}proxy_set_header X-Real-IP $remote_addr;")
         L.append(f"{inner}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
         L.append(f"{inner}proxy_set_header X-Forwarded-Proto $scheme;")
+        # ★ XHTTP 必须关缓冲。
+        #   下行是一条长连接 GET, nginx 一缓冲它就不再流式下发 —— 表现是
+        #   "能连上但极慢/最后卡住", 而不是报错, 极难定位。
+        #   源码 hub.go:367-376 也是无条件下发 X-Accel-Buffering: no
+        #   (注释写明就是给 nginx 用的)。
+        if transport == "xhttp":
+            L.append(f"{inner}proxy_buffering off;")
+            L.append(f"{inner}proxy_request_buffering off;")
+            L.append(f"{inner}proxy_read_timeout 300s;")
+            L.append(f"{inner}proxy_send_timeout 300s;")
         L.append(f"{ind}}}")
     else:
         L.append(f"{ind}location {path} {{")
@@ -1078,6 +1109,7 @@ def apply(args):
             return 2
         block = render_block(domain, args.port, args.block,
                              args.cdn, args.transport,
+                             origin_tls=args.origin_tls, origin_sni=args.origin_sni,
                              ind=" " * (args.indent or 4),
                              path=path_wanted or "/")
 
@@ -1097,8 +1129,13 @@ def apply(args):
     s, e = sb
 
     if args.indent == 0 and not args.upstream_port:
+        # ★ 这里原来漏了 origin_tls/origin_sni —— 于是 --origin-tls 明明给了,
+        #   生成出来的仍是 proxy_pass http://, 而 xray inbound 自带 TLS 时
+        #   那是 502 / connection reset, xray 侧还毫无日志。
         block = render_block(domain, args.port, args.block, args.cdn,
                              args.transport, ind=detect_indent(lines, e),
+                             origin_tls=args.origin_tls,
+                             origin_sni=args.origin_sni,
                              path=path_wanted or "/")
 
     # 回源打的是 443 (或 CDN 回源端口)。选到了非 TLS 块也不拒绝 —— 用户可能
@@ -1241,6 +1278,125 @@ def find_all_marked_spans_all(lines, dirs=False):
     return out
 
 
+# ------------------------------------------------------------------ 双域名
+#
+# 上下行分离里"两个域名"的形态: 上行打域名 A、下行打域名 B, **两段都要有
+# location, 且两段都 proxy_pass 到同一个 xray 端口**。
+#
+#   客户端 ──上行──► 域名A ──► nginx ──┐
+#                                     ├──► 【同一个 xray xhttp inbound】:X
+#   客户端 ──下行──► 域名B ──► nginx ──┘
+#
+# ★ 端口必须相同: xHTTP 的会话表挂在**每个 inbound 自己**上 (hub.go:39/464),
+#   上行在 A 建的会话, 下行到 B 找不到 —— 实测跨端口下行 http=000。
+#   所以这里不是"两个后端", 是"两个入口指向一个后端"。
+#
+# ★ 删除时必须**两段都摘**: 只摘一段的话, 站点里会留下一个指向活端口的
+#   location —— 它不会报任何错, 但那个域名会继续把流量转给这个节点,
+#   用户删了节点却还留着一条"活的"CDN 入口。
+
+
+def insert_dual(args, domains):
+    """给多个域名各插一段, 全部成功才算成功。"""
+    done, failed = [], []
+    for d in domains:
+        rc = _insert_one(args, d)
+        (done if rc == 0 else failed).append(d)
+    if failed and done:
+        # 一半成功是最难收拾的状态: 回滚已插入的那些, 别留下半套配置。
+        for d in done:
+            try:
+                remove_for(args, d)
+            except Exception:
+                pass
+        print("已有域名 %s 插入成功, 但 %s 失败 —— 已回滚, 不留半套配置"
+              % (", ".join(done), ", ".join(failed)), file=sys.stderr)
+        return 1
+    if failed:
+        print("全部失败: %s" % ", ".join(failed), file=sys.stderr)
+        return 1
+    return 0
+
+
+def remove_dual(args, domains):
+    """删多域名: 逐个摘, 汇总结果, 全成功才返回 0。"""
+    bad = []
+    for d in domains:
+        if remove_for(args, d) != 0:
+            bad.append(d)
+    if bad:
+        print("以下域名摘不干净: %s —— 站点里可能残留指向已删节点的 location"
+              % ", ".join(bad), file=sys.stderr)
+        return 1
+    return 0
+
+
+def _run_insert(args):
+    """跑一次单域名插入 (复用既有逻辑, 不复制)。"""
+    import shlex
+    argv = []
+    for k, v in vars(args).items():
+        if v in (None, False):
+            continue
+        flag = "--" + k.replace("_", "-")
+        if v is True:
+            argv.append(flag)
+        else:
+            argv += [flag, str(v)]
+    sys.argv = ["nginx_apply.py"] + argv
+    return main()
+
+
+def _run_remove(args):
+    sys.argv = ["nginx_apply.py"] + _remove_argv(args)
+    return main()
+
+
+def _remove_argv(args):
+    argv = []
+    for k, v in vars(args).items():
+        if k in ("remove", "remove_all") or v in (None, False):
+            continue
+        flag = "--" + k.replace("_", "-")
+        if v is True:
+            argv.append(flag)
+        else:
+            argv += [flag, str(v)]
+    return argv + ["--remove"]
+
+
+def _domains_of(args):
+    """要操作哪些域名: --domain 可以给多个 (逗号分隔), 也可重复 --domain。"""
+    out = []
+    for d in (args.domain or "").split(","):
+        d = d.strip()
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def _per_domain(args, domain):
+    a = argparse.Namespace(**vars(args))
+    a.domain = domain
+    # ★ 双域名时**丢掉 --file**: 两个域名很可能在**两个不同的站点文件**里
+    #   (各自一个 server 块), 而 --file 只能指一个。强行套用会把第二段
+    #   插进第一个域名的文件里 —— 于是第二个域名根本没被配置, 而工具
+    #   还报成功。交给 find_site 各自找, 才是"插入两段给 nginx"的意思。
+    a.file = None
+    return a
+
+
+def _insert_one(args, domain):
+    return _run_insert(_per_domain(args, domain))
+
+
+def remove_for(args, domain):
+    a = _per_domain(args, domain)
+    a.remove = True
+    a.remove_all = False
+    return _run_remove(a)
+
+
 def main():
     p = argparse.ArgumentParser(description="nginx 站点配置幂等管理")
     p.add_argument("--file", help="站点配置文件")
@@ -1250,6 +1406,10 @@ def main():
     p.add_argument("--transport", default="ws",
                    choices=["ws", "grpc", "h2", "httpupgrade", "tcp", "xhttp"])
     p.add_argument("--cdn", action="store_true", help="CDN 接入模式")
+    p.add_argument("--origin-tls", action="store_true",
+                   help="回源走 TLS (xray inbound 自带证书时必须开; 照 SB 的双层 TLS)")
+    p.add_argument("--origin-sni", default="",
+                   help="回源 SNI; 留空用 $host")
     p.add_argument("--remove", action="store_true", help="移除本工具插入的内容")
     p.add_argument("--all", dest="remove_all", action="store_true",
                    help="配合 --remove: 明确表示「该域名下所有路径都摘掉」"
@@ -1324,6 +1484,16 @@ def main():
         print("[错误] 需要 --domain (或用 --prune-backups / --list-backups / "
               "--prune-orphans)", file=sys.stderr)
         return 2
+
+    # ---- 双域名 (上下行分离的"两个域名"形态) ----
+    # --domain "a.com,b.com" 时走这里: 两段都插 / 两段都摘。
+    # 端口仍然只有**一个** —— 两段都 proxy_pass 到同一个 xray 端口, 因为
+    # xHTTP 的会话表是 per-inbound 的, 跨端口下行必然断 (实测 http=000)。
+    _doms = _domains_of(args)
+    if len(_doms) > 1:
+        if args.remove:
+            return remove_dual(args, _doms)
+        return insert_dual(args, _doms)
 
     if not args.file:
         found = find_site(args.domain, args.docker)

@@ -65,15 +65,89 @@ class NodeError(ValueError):
     """规格不合法。消息直接面向用户, 不需要再包装。"""
 
 
-def _check_combo(protocol, transport, security):
+# flow=xtls-rprx-vision (XTLS) 只在**裸 TCP 直接承载**时成立。
+#
+# ★ 这条不是推测, 是实测出来的 —— 而且是最阴的那一类:
+#
+#   `xray run -test` **放行** `reality + xhttp + flow=xtls-rprx-vision`
+#   (它只校验 flow 这个名字合不合法), 但真跑起来立刻挂, 客户端日志:
+#
+#       proxy/vless/outbound: XTLS only supports TLS and REALITY directly for now.
+#
+#   端到端实测 (真内核 + 真 REALITY + 公网伪装目标):
+#       REALITY + 裸TCP  + Vision   → 下载 http=200  ✓
+#       REALITY + xHTTP  无 flow     → 下载 http=200  ✓
+#       REALITY + xHTTP  + Vision   → 下载 http=000  ✗
+#
+#   不在这里拦住, 用户拿到的就是一个"配好了、校验通过、就是连不上"的节点。
+#   内核自己也知道这条规矩, 报错原文就是 "directly" —— 中间隔了一层 HTTP
+#   传输就不是"直接"了。
+_XTLS_TRANSPORTS = ("raw", "tcp")
+
+
+# xhttpSettings.mode 的合法值 (内核只认这四个, 别的直接拒)
+#   照内核 infra/conf/xhttp 的解析逻辑, 见 _check_combo 里的说明。
+_XHTTP_MODES = ("auto", "stream-up", "packet-up", "stream-one")
+
+
+def _check_combo(protocol, transport, security, opts=None):
+    opts = opts or {}
     allowed = SECURITY_TRANSPORTS.get(security)
     if allowed is not None and transport not in allowed:
         raise NodeError(
             f"{security} 不能与 {transport} 组合 "
             f"(只支持 {'/'.join(sorted(allowed))})。\n"
-            f"  原因: REALITY 的握手伪装要求客户端直连目标站点, "
-            f"WS/gRPC/XHTTP 的封装层会破坏握手。"
+            f"  REALITY 的传输白名单照内核源码: "
+            f"\"REALITY only supports RAW, XHTTP and gRPC for now.\""
         )
+
+    # ---- flow(XTLS) 只能在裸 TCP 上 ----
+    # 见 _XTLS_TRANSPORTS 处的实测记录: xray run -test 放行、真连失败,
+    # 是最阴的一类"看着配好了其实连不上"。必须在生成前拦。
+    flow = opts.get("flow") or ""
+    if flow and flow != "none" and transport not in _XTLS_TRANSPORTS:
+        raise NodeError(
+            f"flow={flow} (XTLS) 只能在裸 TCP 上用, 不能配 {transport} 传输。\n"
+            f"  内核原文: \"XTLS only supports TLS and REALITY directly for now.\"\n"
+            f"  ⚠ xray run -test **不会**拦这个组合 —— 配置能校验通过, 真连起来立刻失败。\n"
+            f"  要么去掉 flow (推荐), 要么换成 tcp/raw 传输。"
+        )
+
+    # ---- xhttp 的 mode ----
+    # 内核对非法值是硬报错, 但那要等到 xray run -test 才看得到;
+    # 这里提前拦, 报的是"你填错了什么"。
+    mode = opts.get("xhttp_mode")
+    if mode and mode not in _XHTTP_MODES:
+        raise NodeError(
+            f"xhttp 模式 {mode!r} 不合法, 只能是: "
+            f"{' / '.join(_XHTTP_MODES)}。\n"
+            f"  提醒: auto 在 **REALITY 下会退化成 stream-one (上下行合流)** —— "
+            f"要上下行分离得显式选 stream-up。"
+        )
+
+    # ---- 上下行分离 (downloadSettings) ----
+    if (opts.get("dl_address") or "").strip():
+        # ① 内核明确禁止, 但**只在运行期**才报 —— `-test` 根本不执行这段检查
+        #    (`infra/conf/transport_internet.go:439-441`), 实测 6 种组合全部
+        #    "Configuration OK"。不拦就是"看着配好了、连上就断"。
+        if (mode or "auto") == "stream-one":
+            raise NodeError(
+                "stream-one 是上下行**合流**模式, 不能配 downloadSettings。\n"
+                f"  内核原文: Can not use \"downloadSettings\" in \"stream-one\" mode.\n"
+                f"  ⚠ 这条检查在 xray run -test 阶段不会执行, 配置能校验通过、"
+                f"真连起来立刻失败。要分离请选 stream-up 或 packet-up。"
+            )
+        # ② 端口必须与本 inbound 相同 (会话表 per-inbound, 见 _xhttp_download_settings)
+        dport = opts.get("dl_port")
+        if dport and int(dport) != int(opts.get("port") or 0):
+            raise NodeError(
+                f"下行端口 {dport} 与本节点端口 {opts.get('port')} 不一致 —— 连不上。\n"
+                f"  原因: xHTTP 的会话表挂在**每个 inbound 自己**上 (hub.go:39/464), "
+                f"上行 POST 建好的会话, 下行 GET 到另一个端口就找不到, 连接直接断。\n"
+                f"  实测: 同一 inbound 同端口下行 http=200; 两个 inbound 下行 http=000。\n"
+                f"  CDN 与直连的差别只能体现在**网络路径**上 —— 两段 nginx "
+                f"都要 proxy_pass 到同一个 xray 端口。"
+            )
 
 
 def _stream_settings(transport, security, opts):
@@ -162,6 +236,9 @@ def _stream_settings(transport, security, opts):
             xh["path"] = opts["path"]
         if opts.get("host"):
             xh["host"] = opts["host"]
+        dl = _xhttp_download_settings(transport, security, opts)
+        if dl:
+            xh["downloadSettings"] = dl
         ss["xhttpSettings"] = xh
 
     elif transport == "grpc":
@@ -263,8 +340,86 @@ def _check_reality(opts):
         raise NodeError(f"REALITY 公钥格式不对: {pb[:40]!r}。与私钥同格式。")
 
 
+def _xhttp_download_settings(transport, security, opts):
+    """上下行分离 —— 下行那一套独立的目的地与 TLS/REALITY。
+
+    内核对上/下行是分开建连接的 (`dialer.go:403-440`): 只要 `downloadSettings`
+    非空, 就用**另一套** StreamConfig 重建一个 client, 连**另一个地址**。
+    所以下行可以换 IP / 端口 / 证书 / REALITY 密钥 / SNI / path。
+
+    ★ 端口必须与本 inbound 相同 —— 这不是风格问题, 是硬约束:
+      会话表 `h.sessions` 是挂在**每个 inbound 自己**的 requestHandler 上的
+      (`hub.go:39` / `hub.go:464`)。上行 POST 在 A 端口建会话, 下行 GET 到
+      B 端口就查不到, 连接直接断。
+
+      实测 (同一台机、同一套证书, 只改上下行是否同端口):
+        同一 inbound 同端口        -> 下行 http=200  ✓
+        同一 inbound 下行指死端口   -> 下行 http=000  (证明 downloadSettings 真在用)
+        两个 inbound (TLS上/REALITY下) -> 下行 http=000  ✗ 会话不共享
+        两个 inbound (TLS上/TLS下)     -> 下行 http=000  ✗
+
+      所以 CDN 与直连的差别只能体现在**网络路径**上, 不能体现在端口上:
+      两段 nginx 都要 proxy_pass 到**同一个** xray 端口。
+    """
+    addr = (opts.get("dl_address") or "").strip()
+    if not addr:
+        return None
+
+    # 端口默认跟本 inbound 一样; 用户显式给了不同的, 在 _check_combo 里报。
+    port = int(opts.get("dl_port") or opts.get("port") or 0)
+
+    dl = {"address": addr, "port": port, "network": transport}
+
+    # 下行的加密层: 默认与上行一致, 可以单独换 (最常见的用法是上行走 CDN 的
+    # TLS、下行走直连的 REALITY, 或者反过来)。
+    dsec = opts.get("dl_security") or security
+    if dsec == "none":
+        dl["security"] = "none"
+    elif dsec == "reality":
+        dl["security"] = "reality"
+        dl["realitySettings"] = {
+            "serverName": opts.get("dl_sni") or opts.get("sni") or "",
+            "fingerprint": opts.get("fingerprint") or "chrome",
+            "publicKey": opts.get("dl_public_key") or opts.get("public_key") or "",
+            "shortId": opts.get("dl_short_id") or opts.get("short_id") or "",
+            "spiderX": opts.get("spider_x") or "/",
+        }
+    else:
+        dl["security"] = "tls"
+        dl["tlsSettings"] = {"serverName": opts.get("dl_sni") or opts.get("sni") or ""}
+
+    # ★ 下行 path 必须与上行**完全相同**, 不是"可以不同"。
+    #   实测 (RN, 真连): 把下行 path 设成另一个值, 服务端直接拒:
+    #       [Info] transport/internet/splithttp: failed to validate path,
+    #              request:/downlink-path-3k2/<sessionId>, config:/uplink-path-7x9/
+    #   原因在源码 hub.go:461 —— 入站的请求处理器只认**顶层**
+    #   xhttpSettings.path (l.config.GetNormalizedPath()), 入站那份
+    #   downloadSettings 只用来建第二个 dialer, **不参与 path 校验**。
+    #   所以下行请求带的路径必须与上行 path 一致, 服务端才认。
+    #   于是: 服务端这里不该下发 dl_path (它会被忽略), 客户端也必须与上行一致。
+    if (opts.get("dl_path") or "").strip() and \
+            (opts["dl_path"].strip() != (opts.get("path") or "/").strip()):
+        raise ValueError(
+            "下行 path 与上行不一致 —— 这是连不上的, 内核不接受。\n"
+            "  实测: 服务端只用顶层 xhttpSettings.path 校验下行请求\n"
+            "        (hub.go:461), 入站的 downloadSettings.path 根本不参与。\n"
+            f"  下行 {opts['dl_path']} vs 上行 {opts.get('path') or '/'}\n"
+            "  上下行共用同一个 path 才对 —— 差异要体现在域名/CDN 那一侧。")
+    xh = {"path": opts.get("path") or "/",
+          "mode": opts.get("dl_mode") or opts.get("xhttp_mode") or "auto"}
+    # ★ 绝不用 `extra`: 内核里 `extra` 非空会**整体替换**整个 xhttpSettings
+    #   (`infra/conf/transport_internet.go:269-278`), 只保留 host/path/mode,
+    #   其余字段静默回默认值 —— 而且 `-test` 不会报任何错。
+    dl["xhttpSettings"] = xh
+    return dl
+
+
 def _settings(protocol, opts):
-    """协议级 settings。"""
+    """协议级 settings。
+
+    ★ flow 与传输的相容性在 build() 里查 (那里才知道 transport) ——
+      原来误放在这里, 于是引用了一个本函数没有的名字, 直接 NameError。
+    """
     if protocol == "vless":
         client = {"id": opts.get("uuid") or str(_uuid.uuid4())}
         if opts.get("flow"):
@@ -308,7 +463,7 @@ def build(protocol, transport, security, opts=None):
     opts.setdefault("listen", "0.0.0.0")
     opts.setdefault("tag", f"{protocol}-{transport}-{security}")
 
-    _check_combo(protocol, transport, security)
+    _check_combo(protocol, transport, security, opts)
 
     # 必填校验放在生成之前。直接让 _settings 取 opts["password"] 的话, 缺参数
     # 抛的是 KeyError: 'password' —— 用户看到的是 Python 内部错误, 不知道

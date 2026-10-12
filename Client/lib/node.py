@@ -45,6 +45,17 @@ DEFAULT_NODE = {
     "path": "",
     "host": "",
     "mode": "",                # xhttp mode
+    # ---- 上下行分离 (分享链接里的 dlad/dlport/dlsec/dlsni/dlpbk/dlsid/dlpath) ----
+    # ★ 以前分享链接根本不带这些, 换设备导入就退化成合流 —— REALITY 下
+    #   auto 解析成 stream-one, 而节点看起来一切正常, 只是"没在分离"。
+    "dl_address": "",
+    "dl_port": 0,
+    "dl_security": "",
+    "dl_sni": "",
+    "dl_public_key": "",
+    "dl_short_id": "",
+    "dl_path": "",
+    "dl_pinned_cert_sha256": "",
     # WebSocket early data 长度。0 = 不启用。
     # 官方 browser_dialer 文档推荐 ?ed=2048；实测定量结论：
     #   浏览器路径下若没有 ed，内嵌页面会读 task.extra.protocol 抛 TypeError（extra 是空的），
@@ -313,6 +324,16 @@ def parse_vless(uri: str) -> dict:
         "host": q.get("host") or "",
         "path": q.get("path") or "",
         "mode": q.get("mode") or "",
+        # ---- 上下行分离 ----
+        # dlport 解析成 int 是必须的: 它最终要写进 downloadSettings.port,
+        # 而内核要的是**数字**; 留成字符串会 "cannot unmarshal string"。
+        "dl_address": q.get("dlad") or "",
+        "dl_port": int(q["dlport"]) if (q.get("dlport") or "").isdigit() else 0,
+        "dl_security": (q.get("dlsec") or "").lower(),
+        "dl_sni": q.get("dlsni") or "",
+        "dl_public_key": q.get("dlpbk") or "",
+        "dl_short_id": q.get("dlsid") or "",
+        "dl_path": q.get("dlpath") or "",
         "extra": q.get("extra") or "",
         "flow": q.get("flow") or "",
         "fingerprint": q.get("fp") or "",

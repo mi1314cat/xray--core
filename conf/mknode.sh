@@ -242,6 +242,45 @@ mk_run() {
 
     local cred; cred=$(mk_ask_credential "$proto") || return 1
 
+    # ---- XHTTP 的上下行模式 (mode) ----
+    #
+    # ★ 这是 XHTTP 最容易被误解的一个旋钮, 所以必须让用户看见:
+    #
+    #   内核 dialer.go 的解析顺序:
+    #       auto + 非 REALITY        -> packet-up  (上下行分开)
+    #       auto + REALITY           -> stream-one  (**合流**, 不分!)
+    #       stream-up                -> 上下行分开 (下行独立 GET / 上行独立 POST)
+    #       packet-up                -> 上下行分开 (每个上行包一个 POST)
+    #
+    #   也就是说: 选了 REALITY 又不管 mode, 得到的**恰恰是不分离**的那一种。
+    #   用户以为"我用了 XHTTP 所以上下行分开了", 实际上没有。
+    local xhttp_mode=""
+    if [[ "$tr" == "xhttp" ]]; then
+        local def_m="auto"
+        # REALITY + auto = 合流, 这不是用户以为的那回事 —— 默认改成 stream-up
+        [[ "$sec" == "reality" ]] && def_m="stream-up"
+        echo
+        _y "  XHTTP 的上下行模式:"
+        printf "    %s 1) stream-up    上下行分开: 下行独立 GET, 上行独立 POST (推荐)%s\n" "$_CYN" "$_RST"
+        printf "    %s 2) packet-up    上下行分开, 每个上行包一个 POST (更碎, 请求更多)%s\n" "$_CYN" "$_RST"
+        printf "    %s 3) stream-one   合流: 双向都走同一条 POST%s\n" "$_CYN" "$_RST"
+        printf "    %s 4) auto         让内核决定%s\n" "$_CYN" "$_RST"
+        if [[ "$sec" == "reality" ]]; then
+            _y "        注意: REALITY 下 auto 会退化成 stream-one (合流), 所以这里默认不是 auto"
+        fi
+        local mc
+        mc=$(ui_ask_num "上下行模式 [1-4, 回车=$def_m]" 1 4) || return 0
+        case "${mc:-1}" in
+            1) xhttp_mode="stream-up" ;;
+            2) xhttp_mode="packet-up" ;;
+            3) xhttp_mode="stream-one" ;;
+            *) xhttp_mode="auto" ;;
+        esac
+        # 回车 = 走默认值: REALITY 下默认分离, 其余默认 auto
+        [[ -z "${mc:-}" ]] && xhttp_mode="$def_m"
+        _g "    上下行模式: $xhttp_mode"
+    fi
+
     # ---- 组装规格 ----
     #
     # ★ 命名统一走 conf/lib/naming.sh, 不再各处随手拼。
@@ -301,6 +340,7 @@ mk_run() {
                 MK_TAG="$tag" MK_PORT="$port" MK_CRED="$cred" \
                 MK_DOMAIN="$domain" MK_TIER="$tier" \
                 MK_DECRYPTION="$mk_dec" MK_MLDSA_SEED="$mldsa_seed" MK_MLDSA_VERIFY="$mldsa_verify" \
+                MK_XHTTP_MODE="$xhttp_mode" \
                 python3 - <<'PY'
 import json, os
 proto = os.environ["MK_PROTOCOL"]; cred = os.environ.get("MK_CRED", "")
@@ -316,6 +356,8 @@ _ms = os.environ.get("MK_MLDSA_SEED", "")
 if _ms: opts["mldsa65_seed"] = _ms
 _mv = os.environ.get("MK_MLDSA_VERIFY", "")
 if _mv: opts["mldsa65_verify"] = _mv
+_xm = os.environ.get("MK_XHTTP_MODE", "")
+if _xm: opts["xhttp_mode"] = _xm
 if proto in ("vless", "vmess"):
     opts["uuid"] = cred
     # ★ flow 只在**裸 TCP** 上加。

@@ -308,6 +308,26 @@ print(m.get('host', ''))
 " 2>/dev/null)
     [[ -n "$domain" ]] || { warn "该节点是 nginx 档但没记域名, 无法自动摘除 nginx 片段"; return 0; }
 
+    # ---- 双域名 (上下行分离的"两个域名"形态) ----
+    #
+    # 上行域名与下行域名各自都要有一段 nginx location, **两段都 proxy_pass 到
+    # 同一个 xray 端口** (xHTTP 会话表是 per-inbound 的, 跨端口下行必断)。
+    # 删节点时必须**两段都摘** —— 只摘一段的话, 站点里会留下一个指向
+    # 已删节点的 location: 它不报任何错, 但那个域名还会把流量转过来,
+    # 用户以为删干净了, 其实还留着一个入口。
+    local dl_domain=""
+    dl_domain=$(SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
+import os, sys
+sys.path.insert(0, os.environ['LIB'])
+import share_meta
+m = share_meta.load(os.environ['SHARE_DIR'], os.environ['TAG']) or {}
+print(m.get('dl_domain', '') or m.get('dl_host', '') or '')
+" 2>/dev/null)
+    if [[ -n "$dl_domain" && "$dl_domain" != "$domain" ]]; then
+        domain="$domain,$dl_domain"
+        info "双域名节点: 两段都要摘 ($domain)"
+    fi
+
     # 端口与传输从片段里取 (删除前调用)
     local f; f=$(node_file "$tag")
     port=$(py -c 'import json,sys

@@ -506,6 +506,49 @@ def link_sni(n, meta=None):
     return ""
 
 
+def split_params(n, meta=None):
+    """上下行分离在分享链接里的参数。
+
+    用的都是**短参数名** (跟 sid/pbk/spx 一个风格), 因为分享链接的长度会
+    直接影响很多客户端的剪贴板/二维码处理:
+
+      dlad  下行地址 (域名或 IP)
+      dlport 下行端口 —— 必须与上行同一个 (会话表 per-inbound, 见 node_build)
+      dlsec 下行加密层: tls / reality / none
+      dlsni 下行 SNI (TLS 与 REALITY 都要)
+      dlpbk 下行 REALITY 公钥 (服务端写的 privateKey, 客户端要用 publicKey)
+      dlsid 下行 shortId
+      dlpath 下行 path (默认与上行相同)
+
+    没有下行地址时返回空 dict —— 链接与原来**逐字节相同**, 不给存量链接添噪声。
+    """
+    addr = (n.get("dl_address") or (meta or {}).get("dl_address") or "").strip()
+    if not addr:
+        return {}
+    out = {"dlad": addr}
+    port = n.get("dl_port") or (meta or {}).get("dl_port")
+    if port:
+        out["dlport"] = port
+    sec = n.get("dl_security") or (meta or {}).get("dl_security") or n.get("security") or "none"
+    out["dlsec"] = sec
+    sni = n.get("dl_sni") or (meta or {}).get("dl_sni") or n.get("sni") or (meta or {}).get("sni")
+    if sni:
+        out["dlsni"] = sni
+    if sec == "reality":
+        pbk = n.get("dl_public_key") or (meta or {}).get("dl_public_key") \
+              or (meta or {}).get("public_key")
+        sid = n.get("dl_short_id") or (meta or {}).get("dl_short_id") \
+              or (meta or {}).get("short_id")
+        if pbk:
+            out["dlpbk"] = pbk
+        if sid:
+            out["dlsid"] = sid
+    p = n.get("dl_path") or (meta or {}).get("dl_path")
+    if p:
+        out["dlpath"] = p
+    return out
+
+
 def build_share_link(n, meta=None, notes=None):
     """从节点视图生成 Xray 分享链接。
 
@@ -589,10 +632,27 @@ def build_share_link(n, meta=None, notes=None):
             ech = ech_param(n, host)
             if ech:
                 q["ech"] = ech
-            if n.get("path"):
-                q["path"] = n["path"]
             if n.get("network") == "ws":
                 q["host"] = meta.get("host_header", "")
+        # ★ path 原来**只写在 tls 分支里** —— 于是 REALITY + ws/xhttp/grpc/
+        #   httpupgrade 这四种组合的分享链接**不带 path**。客户端导入后按
+        #   "/x" 去连, 服务端却是 "/real" 之类的路径, 直接 404, 而且**没有任何
+        #   报错**: 节点显示正常, 只是永远连不上。
+        #   这四条路径型传输与 security 无关, 所以必须挪到分支外面。
+        if n.get("path"):
+            q["path"] = n["path"]
+        # ---- xhttp 的 mode ----
+        # ★ 以前链接里根本不带 mode, 客户端一律退回 auto。而 auto 在 REALITY 下
+        #   解析成 stream-one (上下行**合流**) —— 分享出去再导入, 节点看起来
+        #   一切正常, 只是没在分离。显式写了才不丢。
+        if n.get("network") == "xhttp" and n.get("mode"):
+            q["mode"] = n["mode"]
+        # ---- 上下行分离 ----
+        # 分享链接是节点搬家的唯一途径, 下行那一套目的地不带过去,
+        # 换台设备导入就退化成合流, 而且**看不出**。
+        # ★ 放在 tls/reality 分支**外面** —— 放里面就只有 TLS 节点带得上,
+        #   而上下行分离最常见的用法恰恰是 REALITY (见 node_build 的说明)。
+        q.update(split_params(n, meta))
         qs = "&".join(f"{k}={_qval(v)}" for k, v in q.items() if v not in (None, ""))
         return f"vless://{n.get('id') or ''}@{_q(host)}:{port}?{qs}#{_q(name)}"
 

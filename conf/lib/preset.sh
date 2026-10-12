@@ -88,10 +88,11 @@ X_PRESETS=(
     "vless|raw|none|③ 最轻 · 后量子裸 TCP|裸 TCP + ML-KEM-768 会话加密, 不套 TLS/REALITY。延迟最低, 但没有 REALITY 的握手伪装|mlkem"
     "vless|xhttp|tls|④ CDN 友好 · XHTTP + TLS|★ 官方主推传输, 也是**新的 CDN 推荐档**: 没有 WS 那种 \"ALPN 是 http/1.1\" 的显著特征, 上下行分离可走 Cloudflare 橙云. 官方称其出现后其它基于 HTTP 的传输层都黯然失色|none|none"
     "vless|xhttp|tls|⑤ CDN + ECH + 后量子|XHTTP + TLS + ECH (ClientHello 加密, 真实 SNI 不外泄) + ML-KEM-768; 走 Cloudflare 橙云时防止域名字面被探测到, 需要一张可信证书|mlkem"
-    "vless|ws|tls|⑥ WS + TLS（官方已弃用）|⚠ 官方文档顶部已挂 danger: \"推荐换用 XHTTP\". 迁移目标 XHTTP H2 & H3 — 只有在服务端/CDN 明确只吃 WS 时才选它"
-    "vless|grpc|tls|⑦ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ④"
-    "vless|httpupgrade|tls|⑧ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ④"
-    "vless|tcp|tls|⑨ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用"
+    "vless|xhttp|reality|⑥ REALITY + XHTTP 上下行分离|★ **上下行真正分开**: 下行走独立 GET、上行走独立 POST —— 不是一条连接上双工。内核里 mode=stream-up。注意 REALITY 下 auto 会退化成 stream-one (合流), 要分离**必须显式选这一档**。不加 Vision (XTLS 只支持裸 TCP 直连)|none|none"
+    "vless|ws|tls|⑦ WS + TLS（官方已弃用）|⚠ 官方文档顶部已挂 danger: \"推荐换用 XHTTP\". 迁移目标 XHTTP H2 & H3 — 只有在服务端/CDN 明确只吃 WS 时才选它"
+    "vless|grpc|tls|⑧ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ④"
+    "vless|httpupgrade|tls|⑨ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ④"
+    "vless|tcp|tls|⑩ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用"
 
     # ---------- Trojan ----------
     "trojan|tcp|reality|① 隐匿优先 · REALITY + Vision|裸 TCP + REALITY; Trojan 侧最抗 DPI 的组合"

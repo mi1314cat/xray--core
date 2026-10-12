@@ -153,6 +153,24 @@ def prefix() -> str:
     return DEFAULT_PREFIX
 
 
+def default_server_name() -> str:
+    """没存过名字时的默认值 —— **旗帜 + hostname** (对齐 SB 的 sb_ask_server_name)。
+
+    ★ 为什么不是光一个 "X":
+      默认值的作用是"用户什么都不填"时也能得到一个**认得出是哪台机器**的名字。
+      同一个 Xray 面板开在两台 VPS 上, 前缀都是 "X", 于是两个订阅在客户端里
+      一模一样 —— 而用户什么都没做,是默认值让他分不出来。
+      hostname 至少能区分机器 (RN 上是 racknerd-75e0e8), 加上旗帜还能一眼看出地区。
+
+      拿不到 hostname 时才退回 "X" —— 那总比空串强 (空 fragment 会让客户端
+      退化成用域名当名字, 同一域名下所有节点在列表里全叫一个名)。
+    """
+    h = _hostname()
+    if not h:
+        return DEFAULT_PREFIX
+    return (flag_emoji() + " " + h).strip()
+
+
 def server_id() -> str:
     """给人看的完整服务器标识：旗帜 + 前缀。"""
     flag = flag_emoji()
@@ -304,6 +322,9 @@ def main(argv) -> int:
         print(display_name(argv[2] if len(argv) > 2 else ""))
     elif cmd == "ensure":
         print(ensure_flag(argv[2] if len(argv) > 2 else ""))
+    elif cmd == "default":
+        # 默认值 (旗帜 + hostname) —— 只读, 不落盘
+        print(default_server_name())
     elif cmd == "set":
         print(set_server_name(argv[2] if len(argv) > 2 else ""))
     elif cmd == "refresh":

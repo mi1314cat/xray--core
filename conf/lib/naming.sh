@@ -158,7 +158,12 @@ x_ask_server_name() {
     [[ -t 0 ]] || return 0
     local cur def v
     cur=$(_x_naming server)
-    def="${cur:-X}"
+    # 默认值 = 已存的 > **旗帜 + hostname** > X。
+    # ★ 原来只有 `cur:-X`, 于是两台机器的默认前缀都是 "X", 而用户什么都没做 ——
+    #   是默认值让他分不出哪个节点属于哪台机器。hostname 至少能区分机器,
+    #   旗帜能一眼看出地区 (对齐 SB 的 sb_ask_server_name)。
+    def="${cur:-$(_x_naming default)}"
+    def="${def:-X}"
     printf '\n  服务器标识（节点名前缀，多台服务器用它区分，避免客户端互相覆盖）\n' >&2
     printf '  直接回车即用默认值。当前: %s\n' "$def" >&2
     printf '  服务器标识 (默认: %s): ' "$def" >&2

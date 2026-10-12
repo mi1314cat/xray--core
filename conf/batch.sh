@@ -206,24 +206,43 @@ fi
 #   不问的后果: 同一个人两台服务器各跑一次批量, 产出的 tag 完全一样
 #   (x-vless01-tls), 两个订阅导进同一个客户端会互相覆盖, 面板还报 [OK]。
 _bt_server_name() {
+    # 读取顺序: 环境变量 → 上次答过的 → conf/lib/naming.py 的默认值 (旗帜+hostname)
     local n="${X_SERVER_NAME:-}"
     if [[ -z "$n" && -r "$XRAY_BASE/.server-name" ]]; then
         n=$(head -1 "$XRAY_BASE/.server-name" 2>/dev/null | tr -d '[:space:]')
     fi
+    if [[ -z "$n" ]]; then
+        n=$(XRAY_BASE="${XRAY_BASE}" python3 "$CONF_DIR/lib/naming.py" default 2>/dev/null) || n=""
+        [[ -z "$n" ]] && n=$(hostname 2>/dev/null || echo "")
+    fi
     printf '%s' "$n"
 }
 
+# ★ 一律问, 回车即默认 (对齐 SB 的 sb_ask_server_name)。
+#
+#   原来这里只在 batch.sh 自己问一次, 而命名权威在 conf/lib/naming.py ——
+#   于是同一个"服务器标识"有两套落盘位置 (本函数的 .server-name 与
+#   naming.py 的 NAME_CACHE), 两边可能答得不一样, 单协议建的节点用 A、
+#   批量建的用 B, 同一个客户端里前缀忽有忽无。
+#   现在两边都以 naming.py 为准。
 ask_server_name() {
-    local cur; cur=$(_bt_server_name)
-    local def="${cur:-$(hostname 2>/dev/null || echo server)}"
+    local cur def n
+    cur=$(_bt_server_name)
+    def="${cur:-server}"
     echo >&2
-    printf "${CYAN}服务器标识: 会写进每个节点的 tag 与分享链接名。${RESET}\n" >&2
-    printf "${DIM}  同一个人在多台服务器上跑批量时, 它能防止两个订阅在同一个客户端里互相覆盖。${RESET}\n" >&2
-    local n
+    printf "${CYAN}服务器标识 (节点名前缀)。${RESET}\n" >&2
+    printf "${DIM}  同一个人在多台服务器上各跑一份, 客户端里靠它区分; 默认值是 旗帜+主机名。${RESET}\n" >&2
+    printf "${DIM}  只影响分享链接里给人看的名字, 节点 tag 不变 —— 所以改它随时可以。${RESET}\n" >&2
     read -r -p "  服务器标识 [回车=$def]: " n || n=""
     n=$(clean_input "${n:-}")
     n="${n:-$def}"
+    # 走 naming.py 落盘, 与单协议建节点共用同一份缓存 (含"补旗帜"逻辑:
+    # 用户只输入短名字时, 旗帜是**服务器的属性**, 不该由改名这个动作弄丢)
+    local via_py
+    via_py=$(XRAY_BASE="${XRAY_BASE}" python3 "$CONF_DIR/lib/naming.py" set "$n" 2>/dev/null) || via_py=""
+    [[ -n "$via_py" ]] && n="$via_py"
     X_SERVER_NAME="$n"
+    export X_SERVER_NAME XRAY_SERVER_NAME="$n"
     mkdir -p "$XRAY_BASE" 2>/dev/null || true
     printf '%s\n' "$n" > "$XRAY_BASE/.server-name" 2>/dev/null || true
     print_ok "服务器标识: $n"
@@ -425,6 +444,74 @@ batch_summary() {
 #      手写的东西"。只说"将删除 8 个节点"是不够的。
 #   2) 明说**保留什么** —— 否则用户会怕连基础配置一起没了而不敢确认。
 #   3) 必须输入 yes, 提示语自带"其它任何输入=取消"。
+# ---------- 清空/重建时的 nginx 连带清理 ----------
+#
+# ★ 用户明确要求: 删节点或「清空全部」都要把 nginx 上对应的配置一起摘掉
+#   (对齐 sing-box-core 的做法: 先删节点产物, 再清理指向已删端口的
+#   反代段, 最后 reload nginx)。
+#
+# 为什么不能只靠"事后孤儿巡检": 孤儿巡检只**报**不**删**。用户清空全部
+# 之后, 站点里还留着一堆指向已删端口的 location —— 它们不报任何错, 但
+# Cloudflare 回源会一直打到不存在的后端, 表现为 502。
+#
+# 做法是**删除前先把 (域名, path) 记下来**, 删完再逐个精确摘除 —— 比事后
+# 按"端口是否存活"反推更可靠, 也不会误伤站点自有的 location。
+
+_collect_nginx_targets() {   # → 打印 "域名<TAB>路径" 每行一个
+    local share_dir="${XRAY_BASE:-/root/catmi/xray}/share"
+    [[ -d "$share_dir" ]] || return 0
+    SHARE_DIR="$share_dir" LIB="$LIB_DIR" py -c "
+import os, sys
+sys.path.insert(0, os.environ['LIB'])
+try:
+    import share_meta
+except Exception:
+    raise SystemExit(0)
+d = os.environ['SHARE_DIR']
+out = []
+try:
+    names = os.listdir(d)
+except OSError:
+    raise SystemExit(0)
+seen = set()
+for n in names:
+    m = share_meta.load(d, n)
+    if not m or m.get('tier') != 'nginx':
+        continue
+    dom = m.get('host') or ''
+    if not dom:
+        continue
+    p = m.get('path') or '/'
+    # 双域名 (上下行分离): 上行域名与下行域名各自有一段, **两段都要摘**;
+    # 两个域名可能各自在不同站点文件里, 所以按域名逐个摘。
+    for x in (dom, m.get('dl_domain') or m.get('dl_host') or ''):
+        if x and x not in seen:
+            seen.add(x)
+            print('%s\t%s' % (x, p))
+" 2>/dev/null
+}
+
+prune_nginx_after_wipe() {   # <"域名<TAB>路径" 清单>
+    local pyf line dom path n=0
+    local -a targets=("$@")
+    (( ${#targets[@]} )) || return 0
+    pyf="$LIB_DIR/nginx_apply.py"
+    [[ -f "$pyf" ]] || { print_warn "拿不到 nginx_apply.py, 请手工清理 nginx 片段"; return 0; }
+    for line in "${targets[@]}"; do
+        dom="${line%%$'	'*}"
+        path="${line#*$'	'}"
+        [[ -n "$dom" ]] || continue
+        py "$pyf" --domain "$dom" --path "$path" --remove >/dev/null 2>&1 || true
+        # 老版本可能按 / 插入的, 带 path 摘不到再按 / 试一次
+        if [[ "$path" != "/" ]]; then
+            py "$pyf" --domain "$dom" --path / --remove >/dev/null 2>&1 || true
+        fi
+        n=$(( n + 1 ))
+    done
+    (( n )) && print_ok "nginx 片段已摘除 $n 段 (对应节点已删除)"
+    return 0
+}
+
 clear_all_nodes() {
     print_title "清空全部节点"
     local n; n=$(list_will_wipe | wc -l)
@@ -445,10 +532,15 @@ clear_all_nodes() {
         print_warn "已取消, 未做任何改动"
         return 0
     fi
+    # ★ 先记住要摘哪些 nginx 片段 —— 删完就再也读不出域名了
+    local -a ng_targets=()
+    while IFS= read -r _l; do [[ -n "$_l" ]] && ng_targets+=("$_l"); done < <(_collect_nginx_targets)
+
     local p del=0
     for p in "${BATCH_PROTOS[@]}"; do
         del=$(( del + $(wipe_proto "$p") ))
     done
+    prune_nginx_after_wipe "${ng_targets[@]}"
     print_ok "已删除 $del 个节点碎片 (conf/out 已备份, 分享令牌需手动重建)"
     return 0
 }
@@ -470,6 +562,9 @@ rebuild_all() {
     read -r -p "确认重建? 输入 yes (其它任何输入=取消): " w || { echo; return 1; }
     [[ "$(clean_input "$w")" == "yes" ]] || { print_warn "已取消"; return 1; }
     local p
+    local -a ng_targets=()
+    while IFS= read -r _l; do [[ -n "$_l" ]] && ng_targets+=("$_l"); done < <(_collect_nginx_targets)
+    prune_nginx_after_wipe "${ng_targets[@]}"
     for p in "${BATCH_PROTOS[@]}"; do wipe_proto "$p" >/dev/null; done
     print_ok "已清掉旧节点, 开始重新生成"
     return 0

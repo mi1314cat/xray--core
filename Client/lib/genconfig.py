@@ -497,6 +497,9 @@ def build_stream(node: dict, mode: str) -> dict:
                     xh["extra"] = parsed
             except (ValueError, TypeError):
                 pass
+        dl = _xhttp_download_settings(node, stream, xh)
+        if dl:
+            xh["downloadSettings"] = dl
         stream["xhttpSettings"] = xh
     elif transport == "websocket":
         ws: dict = {"path": node.get("path") or "/"}
@@ -1105,6 +1108,58 @@ def load_nodes(nodes_dir: str, current_file: str) -> tuple:
         if name == cur_name:
             current = node
     return nodes, current
+
+
+def _xhttp_download_settings(node, stream, xh):
+    """把节点的上下行分离设置落进客户端产物。
+
+    ★ 这里原来**完全没有** downloadSettings —— 于是服务端配了上下行分离,
+      客户端拿到的还是 `mode=auto`, 而 REALITY 下 auto 解析成 stream-one,
+      也就是**合流**。上下行分离在客户端侧等于没生效, 而且没有任何报错。
+
+    形状与内核要求一致: 它是一份完整的 StreamConfig, 带自己的 address/port。
+    """
+    addr = (node.get("dl_address") or "").strip()
+    if not addr:
+        return None
+
+    dl = {"address": addr, "network": "xhttp",
+          "port": int(node.get("dl_port") or 0) or None}
+
+    # 下行加密层: 客户端这侧要的是**客户端**参数 (公钥/证书校验), 与服务端相反
+    dsec = node.get("dl_security") or (stream.get("security") or "none")
+    if dsec == "reality":
+        dl["security"] = "reality"
+        dl["realitySettings"] = {
+            "serverName": node.get("dl_sni") or node.get("sni") or "",
+            "fingerprint": node.get("fingerprint") or "chrome",
+            "publicKey": node.get("dl_public_key") or node.get("reality_public_key") or "",
+            "shortId": node.get("dl_short_id") or node.get("reality_short_id") or "",
+            "spiderX": node.get("spider_x") or "/",
+        }
+    elif dsec == "tls":
+        dl["security"] = "tls"
+        t2 = {"serverName": node.get("dl_sni") or node.get("sni") or ""}
+        if node.get("dl_pinned_cert_sha256") or node.get("pinned_cert_sha256"):
+            # allowInsecure 已被本内核移除, 只剩钉扎
+            t2["pinnedPeerCertSha256"] = (node.get("dl_pinned_cert_sha256")
+                                          or node.get("pinned_cert_sha256"))
+        dl["tlsSettings"] = t2
+    else:
+        dl["security"] = "none"
+
+    if dl.get("port") is None:
+        del dl["port"]
+    xh2 = {"path": node.get("dl_path") or xh.get("path") or "/",
+           "mode": node.get("dl_mode") or xh.get("mode") or "auto"}
+    # ★ 不用 extra: 内核里 extra 非空会整体替换整个 xhttpSettings
+    dl["xhttpSettings"] = xh2
+
+    if dl.get("security") == "reality" and not dl["realitySettings"]["publicKey"]:
+        print("genconfig: 节点声明了下行 REALITY 但没有公钥 —— 下行会连不上",
+              file=sys.stderr)
+        return None
+    return dl
 
 
 def main() -> int:
