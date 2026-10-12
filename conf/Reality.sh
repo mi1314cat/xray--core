@@ -413,7 +413,27 @@ EOF
     echo "vless://${UUID}@${link_ip}:${lport}?flow=${flow}&security=reality&sni=${DEST}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${short_id}&type=tcp${link_enc}#Reality-${next}" \
         > "$OUT_DIR/$PROTO-share-$next.txt"
 
-    print_ok "新增 Reality 配置成功（最高配置）"
+    
+    # ---- 12. 补发布: 分享元数据 + (CDN 档位) nginx ----
+    #
+    # ★ 这个脚本是自己拿 heredoc 拼片段的, 所以一直**绕过了** plan()/
+    #   apply_plan()。后果是建出来的节点:
+    #     · 没有分享元数据 → **没有分享链接、不进订阅**
+    #     · 没有 nginx 段  → CDN 档位下回源直接 502, 而面板上一片正常
+    # 这里在写完片段之后补上这一步, 让菜单 7 出来的节点和新预置
+    # 体系的节点**待遇一致**。不动它建节点的逻辑 —— 那是它自己的交互流程,
+    # 重写风险大得多。
+    _ad="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/deploy.py"
+    if [[ -r "$_ad" ]]; then
+        if ! python3 "$_ad" --adopt ""$file"" --domain ""$DEST"" >&2; then
+            print_warn "  分享元数据没补上 —— 这个节点暂时没有分享链接"
+            print_warn "  面板的其它功能正常; 需要链接时用菜单 13 (预置档位) 重建一个"
+        fi
+    else
+        print_warn "  找不到 lib/deploy.py, 跳过补发布 (本节点无分享链接)"
+    fi
+
+print_ok "新增 Reality 配置成功（最高配置）"
     echo -e "编号: $next\n监听: 0.0.0.0:$lport\nUUID: $UUID\nflow: $flow\n加密: $([ "$encryption_mode" = "mldsa" ] && echo 'ML-KEM-768 (PQ 量子抗性)' || echo '纯 X25519 (无 PQ)')\nSNI/target: ${DEST}:443\nmaxTimeDiff: 40000\nTag: $tag_name\n入站碎片: $file\n客户端文件(X内核): $OUT_DIR/$PROTO-$next.json\n客户端文件(M内核YAML): $OUT_DIR/$PROTO-client-$next.yaml\n分享链接: $OUT_DIR/$PROTO-share-$next.txt" >&2
 }
 

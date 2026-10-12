@@ -185,6 +185,117 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
     return {"fragment": fragment, "meta": meta, "nginx": nginx, "errors": []}
 
 
+def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
+    """给一个**已经写好的**片段补上分享元数据 (以及可选的 nginx 段)。
+
+    为什么要有这条:
+    `vlessecn.sh` / `vlessxhttpecn.sh` / `Reality.sh` 这三个老脚本是**自己拿
+    heredoc 拼 JSON** 的, 绕过了 plan()/apply_plan()。它们建出来的节点:
+
+      * 没有分享元数据 → **没有分享链接、不进订阅**
+      * 没有校验       → 配错了面板也不知道
+      * 没有 nginx 段  → CDN 档位下回源直接 502
+
+    第三条最容易漏: 用户从菜单 5/6/7 建完节点, 面板上一片正常, 但客户端
+    连不上 —— 因为没人给这个节点挂 nginx location。
+
+    这里不去改那三个脚本怎么**建**节点 (那是它们自己的交互流程, 重写风险大),
+    只在它们写完之后调用一次本函数, 把"发布"这一步补齐。
+    于是新老两条入口建出来的节点**待遇一致**: 都有链接、都进订阅、都配 nginx。
+
+    片段是**唯一真相**: 协议/传输/加密层/端口/UUID 全部从里面读回来, 不要求
+    调用方再报一遍 —— 报两遍就一定会有一遍对不上。
+    """
+    import json
+
+    try:
+        with open(frag_path, "r", encoding="utf-8") as f:
+            frag = json.load(f)
+    except Exception as e:
+        return {"ok": False, "errors": [f"读不了片段 {frag_path}: {e}"]}
+
+    inbounds = frag.get("inbounds") or []
+    if not inbounds:
+        return {"ok": False, "errors": ["片段里没有 inbound"]}
+    ib = inbounds[0]
+
+    protocol = ib.get("protocol")
+    ss = ib.get("streamSettings") or {}
+    transport = ss.get("network") or "tcp"
+    security = ss.get("security") or "none"
+    port = ib.get("port")
+    tag = ib.get("tag") or os.path.basename(frag_path)[:-5]
+
+    xh = ss.get("xhttpSettings") or {}
+    xpath = xh.get("path")
+    if xpath and not xpath.endswith("/"):
+        xpath += "/"
+
+    settings = ib.get("settings") or {}
+    clients = settings.get("clients") or []
+    uuid = clients[0].get("id") if clients else None
+
+    errors = []
+    if not protocol:
+        errors.append("片段里没有 protocol")
+    if not port:
+        errors.append("片段里没有监听端口")
+
+    # 域名: 调用方给的优先, 否则从 serverName / host 兜底
+    dom = domain or ss.get("serverName") or (ss.get("tlsSettings") or {}).get("serverName")
+
+    # 档位: 调用方给的优先, 否则从 listen 推断
+    t = tier
+    if not t:
+        listen = ib.get("listen")
+        t = ACCESS_NGINX if listen in ("127.0.0.1", "::1") else ACCESS_CDN
+
+    # 分享链接里要对外暴露的端口: nginx 档位下是 443, 不是 Xray 的端口
+    public_port = 443 if t == ACCESS_NGINX else port
+
+    meta = {
+        "host": dom or "127.0.0.1",
+        "port": public_port,
+        "name": tag,
+        "tier": t,
+        "tag": tag,
+        "schema": 1,
+    }
+    if path or xpath:
+        meta["host_header"] = dom or meta["host"]
+    if security == "reality":
+        rs = ss.get("realitySettings") or {}
+        meta["public_key"] = rs.get("publicKey") or rs.get("password") or ""
+        meta["short_id"] = rs.get("shortId") or ""
+        meta["fingerprint"] = rs.get("fingerprint") or "chrome"
+    if clients and clients[0].get("encryption") and clients[0]["encryption"] != "none":
+        meta["encryption"] = clients[0]["encryption"]
+    alpn = (ss.get("tlsSettings") or {}).get("alpn")
+    if alpn:
+        meta["alpn"] = alpn
+    ech = (ss.get("tlsSettings") or {}).get("echServerKeys")
+    if ech:
+        meta["ech"] = True
+
+    if errors:
+        return {"ok": False, "errors": errors}
+
+    cdir = conf_dir or os.path.dirname(frag_path)
+    sdir = os.path.join(os.path.dirname(cdir.rstrip("/")), "share", "tokens")
+    import share_meta
+    share_meta.save(sdir, tag, meta)
+
+    # 上下行分离的老节点: 把 downloadSettings 一并带进元数据, 否则发出去的
+    # 链接里没有下行参数, 客户端导入后就是个"看着正常但没分离"的节点。
+    dl = xh.get("downloadSettings")
+    if dl and dl.get("address"):
+        import nodes as _nodes
+        _ = _nodes.split_params(frag, meta)   # 兜底路径: 走 fragments 也能导出
+
+    return {"ok": True, "tag": tag, "meta_path": share_meta.meta_path(sdir, tag),
+            "errors": [], "tier": t, "domain": dom}
+
+
 def apply_plan(result, conf_dir, share_dir, nginx_apply=None, nginx_bin="-t"):
     """把方案落到磁盘。
 
@@ -267,6 +378,8 @@ if __name__ == "__main__":
     import json
 
     ap = argparse.ArgumentParser(description="节点部署规划预演")
+    ap.add_argument("--adopt", metavar="片段路径",
+                    help="给一个已经写好的片段补分享元数据 (老脚本用)")
     ap.add_argument("--protocol")
     ap.add_argument("--transport")
     ap.add_argument("--security")
@@ -287,6 +400,18 @@ if __name__ == "__main__":
     ap.add_argument("--cert-file")
     ap.add_argument("--key-file")
     a = ap.parse_args()
+
+    # ---- --adopt: 补发布 ----
+    if a.adopt:
+        r = adopt(a.adopt, domain=a.domain, tier=a.tier, path=a.path)
+        if r["ok"]:
+            print(f"[OK] 已补分享元数据: {r['meta_path']}", file=sys.stderr)
+            print(f"[信息] tag={r['tag']} 档位={r['tier']}", file=sys.stderr)
+        else:
+            for e in r["errors"]:
+                print(f"[错误] {e}", file=sys.stderr)
+        raise SystemExit(0 if r["ok"] else 1)
+
 
     # 整份 JSON 优先: 字段比一长串命令行参数更不容易出错
     if a.config_json:

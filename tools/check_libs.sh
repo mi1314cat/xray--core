@@ -5718,6 +5718,54 @@ rm -rf "$PORTT"
 #   直连 xray 端口            → 200
 #   经 Cloudflare → nginx     → invalid Read on closed Body
 # 写进工具是为了让用户自己分清, 而不是照着"重装一遍"乱试。
+# 老脚本 (菜单 5/6/7) 是自己 heredoc 拼片段的, 一直**没有分享元数据** ——
+# 建出来的节点没有分享链接、不进订阅, 而且 CDN 档位下没人给它挂 nginx。
+group "老脚本建出来的节点也要能分享 (菜单 5/6/7)"
+AD=$(mktemp -d); mkdir -p "$AD/conf" "$AD/share/tokens"
+python3 - "$AD" <<'PYX'
+import json,sys,os
+d=sys.argv[1]
+frag={"inbounds":[{"tag":"vless-xhttp01","listen":"0.0.0.0","port":39314,
+  "protocol":"vless","settings":{"clients":[{"id":"749021fe-aa92-4bbd-91c5-33b4e8123cef"}],"decryption":"none"},
+  "streamSettings":{"network":"xhttp","security":"tls",
+    "tlsSettings":{"serverName":"d.example.com","minVersion":"1.3"},
+    "xhttpSettings":{"path":"/abc/","mode":"auto"}}}]}
+json.dump(frag,open(os.path.join(d,"conf","vless-xhttp01.json"),"w"),indent=1)
+PYX
+AD_OUT=$(cd "$ROOT" && python3 conf/lib/deploy.py --adopt "$AD/conf/vless-xhttp01.json" --domain d.example.com 2>&1)
+if [[ -f "$AD/share/tokens/vless-xhttp01.json" ]]; then
+    ok "--adopt 给老片段补上了分享元数据"
+else
+    bad "--adopt 没补元数据 → 老脚本建的节点仍然没有分享链接"; fi
+# 元数据里的域名/端口必须来自片段本身, 不能要调用方再报一遍
+AD_META="$AD/share/tokens/vless-xhttp01.json"
+grep -qF '"host": "d.example.com"' "$AD_META" && ok "域名取对了" || bad "域名错了"
+grep -qF '"port": 39314' "$AD_META" && ok "端口取自片段" || bad "端口错了"
+# 片段里的 tag 才是唯一真相 —— 文件名可能和它对不上
+grep -qF '"tag": "vless-xhttp01"' "$AD_META" && ok "tag 以片段为准" || bad "tag 取错了"
+# 老节点也必须能出链接
+AD_LINK=$(cd "$ROOT" && python3 -c "
+import sys; sys.path.insert(0,'conf/lib')
+import nodes as N, share_meta
+nl,bad=N.collect('$AD/conf')
+for n in nl:
+    m=share_meta.load('$AD/share/tokens', n['tag']) or {}
+    l=N.build_share_link(n,m)
+    if l and l.startswith('vless://'): print('OK')
+" 2>/dev/null)
+grep -qF 'OK' <<<"$AD_LINK" && ok "老节点现在能出分享链接" || bad "老节点仍出不了链接"
+rm -rf "$AD"
+# 三个老脚本都要接上这一刀, 少一个就漏一条入口
+_missing=0
+for _f in conf/vlessecn.sh conf/vlessxhttpecn.sh conf/Reality.sh; do
+    grep -q 'lib/deploy.py' "$ROOT/$_f" 2>/dev/null || { _missing=$((_missing+1)); }
+done
+if [[ "$_missing" -eq 0 ]]; then
+    ok "三个老脚本都接上了补发布"
+else
+    bad "$_missing 个老脚本没接补发布 → 那条入口建的节点仍然不可分享"
+fi
+
 group "分离节点自检工具 (把实测结论交给用户)"
 grep -qF 'invalid Read on closed Body' "$ROOT/tools/xhttp_doctor.sh" \
     && ok "认得那句唯一的线索" || bad "认不出 invalid Read on closed Body"

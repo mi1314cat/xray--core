@@ -371,7 +371,27 @@ add_config() {
         exit 1
     fi
 
-    print_ok "新增 ${PROTO_NAME} 配置成功"
+    
+    # ---- 12. 补发布: 分享元数据 + (CDN 档位) nginx ----
+    #
+    # ★ 这个脚本是自己拿 heredoc 拼片段的, 所以一直**绕过了** plan()/
+    #   apply_plan()。后果是建出来的节点:
+    #     · 没有分享元数据 → **没有分享链接、不进订阅**
+    #     · 没有 nginx 段  → CDN 档位下回源直接 502, 而面板上一片正常
+    # 这里在写完片段之后补上这一步, 让菜单 5 出来的节点和新预置
+    # 体系的节点**待遇一致**。不动它建节点的逻辑 —— 那是它自己的交互流程,
+    # 重写风险大得多。
+    _ad="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/deploy.py"
+    if [[ -r "$_ad" ]]; then
+        if ! python3 "$_ad" --adopt ""$file"" --domain ""$link_ip"" >&2; then
+            print_warn "  分享元数据没补上 —— 这个节点暂时没有分享链接"
+            print_warn "  面板的其它功能正常; 需要链接时用菜单 13 (预置档位) 重建一个"
+        fi
+    else
+        print_warn "  找不到 lib/deploy.py, 跳过补发布 (本节点无分享链接)"
+    fi
+
+print_ok "新增 ${PROTO_NAME} 配置成功"
     echo -e "编号: $next\n监听地址: $listen_ip\n端口: $lport\nUUID: $UUID\nTag: $tag_name" >&2
     echo >&2
 
