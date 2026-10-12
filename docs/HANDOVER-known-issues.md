@@ -17,52 +17,57 @@
 
 ---
 
-## 二、`reality-cdn` 下行不通 (未结)
+## 二、`reality-cdn` 上行 REALITY 握手不成立 (未结)
 
 ### 现象
 
-上行 REALITY 握手**是成功的** —— 客户端日志:
+上行 REALITY 握手**从不完成**。把网络全部排掉之后 (环回, 同一台机器, 同一对密钥,
+两��都是 `Xray 26.3.27 d2758a0`) 仍然复现, 所以与 CDN、GFW、防火墙都无关。
 
-    proxy/vless/outbound: tunneling request to tcp:www.baidu.com:443 via 107.173.154.178:24301
+最小复现: **裸 REALITY + 裸 tcp, 不带 xHTTP**, 连 xHTTP 都不涉及:
 
-但下行取不到数据, 紧接着 `failed to process outbound traffic`。
+    服务端: REALITY: processed invalid connection from 127.0.0.1:42006:
+            handshake did not complete successfully
 
-服务端日志在 `Xray started` 之后**一行 inbound 都没有**。
+换一个可达的 target (`www.cloudflare.com:443`, RN 到它 TLS1.3 正常) 后,
+服务端的日志变了, 客户端给出了决定性的一句:
 
-### 试过两条路, 都一样
+    [Error] transport/internet/reality: REALITY: received real certificate
+            (potential MITM or redirection)
 
-1. **下行走 CDN** (产品生成的那种): nginx 收到了请求, 但 **404**。
-   nginx access log:
+### 这句话说明什么
 
-       "GET /rc-cdn/29df6158-... HTTP/2.0" 404 9
+**服务端把这次连接当成了未授权的客户端, 直接转给了真实 target** ——
+所以客户端拿到的是 cloudflare 真的那张证书, 而不是 REALITY 现算出来的那张。
+客户端拿公钥去对, 对不上, 于是报 "potential MITM"。
 
-2. **下行直连同一个端口** (绕过 CDN): 服务端**仍然一行日志都没有**。
+即: **REALITY 的鉴权在服务端侧就没通过**, 与证书、CDN、路径都无关。
 
-所以**不是 CDN 那一跳的问题** —— 绕开它也一样不通。
+### 排除了什么
 
-### 为什么 404 那条值得单独看
+| 猜测 | 怎么排除的 |
+|---|---|
+| `flow: xtls-rprx-vision` 与 xHTTP 冲突 | 客户端报错原文就是这个, 但**去掉 flow 后依然失败**。而且 `node_build.build()` **本来就会拦**这个组合 (实测报错信息一模一样), 所以产品不会生成这种配置 —— 是我的夹具自己写了 flow |
+| 字段名写错 (`dest` vs `target`) | 对照 `node_build` 第 197 行, 服务端确实用 `target`。我的夹具写的是 `dest`, 是错的; 但**改成 target 之后仍然失败** |
+| 配置形状不对 | 用**产品自己的** `deploy.py --config-json` 生成一份, 产出的 `target / serverNames / privateKey / shortIds` 与手写夹具**逐字相同**, 一样失败 |
+| 版本不一致 | 两端都是 `26.3.27 d2758a0` |
+| target 不可达 | RN 到 microsoft / cloudflare / apple 的 TLS1.3 都正常 |
 
-nginx 的段是对的 (`proxy_pass https://127.0.0.1:24301` + `proxy_ssl_name`),
-而 24301 上那个 inbound 是 **REALITY** 的, nginx 用普通 HTTPS 代理过去, 对不上。
-按本仓库自己的硬约束:
+### 一个值得记的不对称
 
-> xHTTP 的会话表挂在**每个 inbound 自己**上, 上行 POST 建好的会话, 下行 GET 到另一个
-> 端口就找不到, 连接直接断。CDN 与直连的差别只能体现在**网络路径**上 —— 两段 nginx
-> 都要 proxy_pass 到同一个 xray 端口。
+`cdn-reality` 的**下行**也是 REALITY, 而且它是**客户端**角色 (用 `password`),
+那个**是通的** (环回全程跑通, 22 项验收里它过了)。
 
-也就是说 `reality-cdn` 的上行与下行必须落在**同一个 REALITY inbound** 上,
-而"下行经 CDN"要求那一端能被 nginx 以普通 TLS 代理 —— 这两条要求互相冲突。
+所以问题不在 REALITY 本身, 而在 **REALITY 的服务端侧**: 同一个内核版本,
+当客户端能成, 当服务端就握不上。
 
 ### 下一步该查什么
 
-还没定位到根因, 但线索是明确的:
-
-- 服务端完全收不到下行请求 → 要看 xHTTP 服务端对 **REALITY 入站的 GET 请求**
-  是怎么路由的, 是不是只在 POST 建好会话后才认。
-- 建议先在**环回**上把 uplink+downlink 都设成 REALITY 直连同一端口, 看最小复现
-  能不能成 —— 排掉 CDN 和网络因素。
-
----
+- 让服务端 `show: true`, 看它到底为什么把这次连接判成未授权 —— 现在的
+  `show: false` 会把失败完全吞掉, 只留一行 "invalid connection"。
+- 重点查 **shortId 的取值/编码**: 两端都是 `0123abcd`, 但 REALITY 对短 ID 的
+  长度与字符集有硬要求, 写对了不代表被接受。
+- 也可以拿一份**已知能用的** REALITY 配置做对照 (别的面板产的), 逐字段比。
 
 ## 三、Cloudflare 会打断 xHTTP 的上下行分离
 

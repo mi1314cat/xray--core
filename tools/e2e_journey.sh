@@ -443,15 +443,17 @@ if ds:
 json.dump(c, open(f, "w"), indent=1)
 FIXDL
 
-    # ★ 上行 REALITY 的握手**没法在环回上验**。
-    #   REALITY 的服务端要连 dest (伪装站点) 去"借"它的证书, 客户端那一次
-    #   ClientHello 要对着真站点验签。拨 127.0.0.1 时没有这一段, 握手必然
-    #   停在半路 —— 那是**测法的限制, 不是产品的毛病**。
+    # ★ 上行 REALITY 的握手**在本环境根本不成立**。
+    #   注意: 这不是"环回验不了"的测法限制 —— 我用**裸 REALITY + 裸 tcp**
+    #   (完全不涉及 xHTTP) 在环回上复现过, 一样握不上; 客户端报的是
+    #       REALITY: received real certificate (potential MITM or redirection)
+    #   即服务端把这次连接判成未授权、直接转给了真实 target。
+    #   排除了 flow/xHTTP/字段名/版本/target 可达性, 详见交接文档第二节。
     #   所以这里明说跳过, 而不是打一个红叉: 红叉会被当成"reality-cdn 坏了",
     #   而实际上它的片段/元数据/两个投影在上面都已经验过了。
     if [[ "$up_sec" == "reality" ]]; then
-        skip "上行 REALITY 的握手需要真实 dest, 环回验不了 (片段/元数据/投影已验)"
-        skip "真实连通性靠 RN↔CC 实测那条路 —— 见交接文档"
+        skip "上行 REALITY 握手在本环境从不完成 —— 已用裸 tcp 最小复现, 与 xHTTP/网络无关"
+        skip "详情与下一步见 docs/HANDOVER-known-issues.md 第二节"
         return
     fi
 
