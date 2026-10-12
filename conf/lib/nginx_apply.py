@@ -1341,6 +1341,17 @@ def _run_insert(args):
         flag = "--" + k.replace("_", "-")
         if v is True:
             argv.append(flag)
+        elif str(v).startswith("-"):
+            # ★ 值本身以 - 开头时必须用 --flag=value 写法。
+            #
+            #   --nginx 的默认值就是 "-t" (校验命令)。写成 ["--nginx", "-t"] 时
+            #   argparse 把 -t 当成**另一个选项**, 于是报
+            #       error: argument --nginx: expected one argument
+            #   双域名 (上下行分离的"两个域名") 恰好走 _run_insert 这条路 ——
+            #   insert_dual → _insert_one → _run_insert —— 所以**只有双域名会炸**,
+            #   单域名不走这里, 一直好好的。报错还指向 --nginx, 没有半个字提
+            #   双域名, 排查时极难联想到。
+            argv.append("%s=%s" % (flag, v))
         else:
             argv += [flag, str(v)]
     sys.argv = ["nginx_apply.py"] + argv

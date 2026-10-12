@@ -21,6 +21,9 @@ _e() { printf '\033[31m%s\033[0m\n' "$*"; }
 
 _XD="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
+# 仓库里 conf/ 的位置。cdn_auto.sh 用它定位 nginx_apply.py
+_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/conf"
+
 _lib() {
   local n="$1" f="$_XD/conf/lib/$1"
   [[ -r "$f" ]] && { printf '%s' "$f"; return; }
@@ -32,6 +35,21 @@ _lib() {
 
 PRESET_SH="$(_lib preset.sh)" || exit 1
 DEPLOY_PY="$(_lib deploy.py)" || exit 1
+# CDN 自动配 nginx + 端口账本 (借鉴 sing-box-core 的 cdn_autosetup / batch_next_port)
+# ★ cdn_auto.sh 与本脚本**同目录** (tools/)。我原来写 $_lib_dir/cdn_auto.sh,
+#   而 _lib_dir 指的是 conf/ —— 于是 [[ -r ]] 判断一直为假, 文件从没被
+#   source, 端口账本和 nginx 自动配置两个功能**都静默没生效**, 而屏幕上
+#   一切正常。加载失败必须看得见。
+CD_AUTO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/cdn_auto.sh"
+if [[ ! -r "$CD_AUTO" ]]; then
+    _y "  找不到 cdn_auto.sh, nginx 自动配置与端口账本不生效"
+else
+    # shellcheck source=/dev/null
+    source "$CD_AUTO"
+    declare -F x_cdn_autosetup >/dev/null \
+        || _y "  cdn_auto.sh 加载了但函数不在 (版本不匹配?)"
+fi
+
 PORTS_SH="$(_lib ports.sh)" || exit 1
 # shellcheck source=/dev/null
 source "$PRESET_SH"
@@ -156,8 +174,18 @@ for spec in "${SPECS[@]}"; do
     _e "  $spec: $sec 不支持 $tr (预置表有误)"; fail=$((fail+1)); continue
   fi
 
-  # 端口: 连续分配, 跳过已占
-  while x_port_taken "$port" 2>/dev/null; do port=$((port+1)); done
+  # 端口: 走 .batch-used 账本 (借鉴 SB 的 batch_next_port)。
+  #
+  # 原来这里是 `while x_port_taken; do port=$((port+1)); done`, 而 $port 每次
+  # 进来都重置成 START_PORT —— 于是同形态的两个预置 (vless:4 与 vless:5 都是
+  # xhttp+tls) 领到同一个端口、写出**同一个文件名**, 后者覆盖前者, 而日志
+  # 两行都写"成功"。现在领过的端口记进 $XRAY_BASE/.batch-used, 换一次调用
+  # 也不会重发同一个端口。
+  if declare -F cd_batch_take_port >/dev/null 2>&1; then
+    port=$(cd_batch_take_port) || port=$START_PORT
+  else
+    while x_port_taken "$port" 2>/dev/null; do port=$((port+1)); done
+  fi
   use_port=$port; port=$((port+1))
 
   node_no=$((node_no+1))
@@ -263,6 +291,21 @@ PY
 done
 
 echo
+
+# ★ 建完顺手把 CDN 站点配好 (借鉴 SB: 建完 CDN 节点自动插 nginx)。
+#   放在"完成"汇总**之前**: 汇总要如实反映 nginx 到底配没配上, 放在后面
+#   就成了"先报成功、再报失败"。
+if [[ "$ok" -gt 0 ]] && declare -F x_cdn_autosetup >/dev/null 2>&1; then
+    shopt -s nullglob
+    _all=("$CONF_DIR"/*.json)
+    shopt -u nullglob
+    if [[ ${#_all[@]} -gt 0 ]]; then
+        x_cdn_autosetup --domain "${X_BATCH_DOMAIN:-${X_BATCH_DOMAIN_BASE:-}}" "${_all[@]}" \
+            || _y "  nginx 有站点没配上, 节点本身已生成"
+    fi
+    echo
+fi
+
 _o "════════ 完成: $ok 成功, $fail 失败 ════════"
 (( ok > 0 )) && _y "  片段与分享元数据已写入 $CONF_DIR 与 $SHARE_DIR"
 _y "  重启服务后生效: 菜单 6, 或 systemctl restart xrayls"

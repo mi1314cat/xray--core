@@ -5461,6 +5461,87 @@ case "$SBX_OUT" in
 esac
 rm -rf /tmp/sbx-probe
 
+# ---------------------------------------------------------------- CDN 自动配
+# 借鉴 sing-box-core 的 cdn_autosetup / batch_next_port。三个 bug 值得钉住,
+# 它们的共同点是**静默失败**: 屏幕上一切正常, 功能从来没发生过。
+group "CDN 自动配 nginx (三个静默失败)"
+NGT=$(mktemp -d); mkdir -p "$NGT/nginx" "$NGT/conf"
+cat > "$NGT/nginx/a.example.com.conf" <<'NGEOF'
+server {
+    listen 443 ssl;
+    server_name a.example.com;
+    ssl_certificate /tmp/x.pem;
+    ssl_certificate_key /tmp/y.key;
+}
+NGEOF
+cat > "$NGT/nginx/b.example.com.conf" <<'NGEOF'
+server {
+    listen 443 ssl;
+    server_name b.example.com;
+    ssl_certificate /tmp/x.pem;
+    ssl_certificate_key /tmp/y.key;
+}
+NGEOF
+cat > "$NGT/conf/v-xhttp.json" <<'NGEOF'
+{"inbounds":[{"port":24888,"protocol":"vless",
+ "streamSettings":{"network":"xhttp","security":"tls",
+  "xhttpSettings":{"path":"/t"}}}]}
+NGEOF
+# ① --nginx 默认值是 "-t", 以 - 开头。只在双域名那条路上 (_run_insert
+#    重建 argv) 暴露, 单域名不走 —— 所以历史上一直没人碰到。
+if python3 - "$ROOT/conf/lib/nginx_apply.py" <<'PYEOF'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"def _run_insert\(args\):(.*?)\n\ndef ", src, re.S)
+body = m.group(1) if m else ""
+sys.exit(0 if ('flag, str(v)' in body and 'startswith("-")' in body) else 1)
+PYEOF
+then ok "argv 重建时处理了以 - 开头的值 (--nginx=-t), 双域名不再炸"
+else bad "argv 重建没处理以 - 开头的值 → 双域名报 argument --nginx: expected one argument"
+fi
+
+# ② 片段里**没有** _domain 字段 (域名是生成时入参)。扫描器还去找它的话,
+#    永远扫不到东西, 自动配置就永远静默跳过。
+if python3 - "$ROOT/tools/cdn_auto.sh" <<'PYEOF'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+sys.exit(0 if 'i.get("_domain")' not in s else 1)
+PYEOF
+then ok "扫描器不再指望片段里有 _domain (本来就没有)"
+else bad "扫描器还在找 _domain → 永远扫不到 → 自动配置静默跳过"
+fi
+
+# ③ --dry-run 不能写死在参数里: 写了就只是预演, 磁盘上一个字没改,
+#    还会打印完整的 server 块, 看着像成功了。
+if grep -q 'local -a a=(--domain "$dom_arg" --port "$port" --transport "$tr")' "$ROOT/tools/cdn_auto.sh" \
+   && ! grep -q 'a=(--domain "$dom_arg" --port "$port" --transport "$tr" --dry-run)' "$ROOT/tools/cdn_auto.sh"
+then ok "--dry-run 不再写死 (否则自动配置只是预演, 看着成功其实没写)"
+else bad "--dry-run 写死在参数里 → 自动配置从不落盘"
+fi
+
+# ④ 片段一个都没有时 prune 也要动手 —— 那正是"节点全删了"的时候。
+# 用 grep -F 固定串: 正则里那一堆 [ ] { } $ 转义后基本没法维护,
+# 而断言本身只要看"有没有这一句"就够了。
+if grep -qF '[[ ${#frags[@]} -gt 0 ]] && live=' "$ROOT/tools/cdn_auto.sh"
+then ok "conf/ 空时 prune 不会早退 (节点全删正是最该收拾的时刻)"
+else bad "conf/ 空时 prune 直接返回 → 站点 location 留着反代到不存在的端口"
+fi
+
+# ⑤ 端到端: 单域名与双域名都要真的写进站点文件
+CDOUT=$(cd "$ROOT" && XRAY_BASE="$NGT" NGINX_CONF_ROOTS="$NGT/nginx" bash -c '
+  source tools/cdn_auto.sh >/dev/null 2>&1
+  _e(){ printf "%s\n" "$1" >&2; }
+  x_cdn_autosetup --domain a.example.com --downlink-domain b.example.com '"$NGT"'/conf/v-xhttp.json >/dev/null 2>&1
+  echo "a=$(grep -c location '"$NGT"'/nginx/a.example.com.conf)"
+  echo "sn=$(grep -c "server_name a.example.com" '"$NGT"'/nginx/a.example.com.conf)"' 2>/dev/null)
+CE_A=$(printf '%s' "$CDOUT" | sed -n 's/^a=//p')
+CE_SN=$(printf '%s' "$CDOUT" | sed -n 's/^sn=//p')
+[[ "${CE_A:-0}" -ge 1 ]] && ok "双域名真的写进了站点文件 (a 域名 location 数=$CE_A)" \
+                         || bad "双域名没写进站点文件 (location 数=${CE_A:-无})"
+[[ "${CE_SN:-0}" -ge 1 ]] && ok "插入 location 没有动整站的 server_name" \
+                         || bad "插入把 server_name 也弄没了 —— 会把整个站点搞坏"
+rm -rf "$NGT"
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
