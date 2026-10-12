@@ -5615,6 +5615,104 @@ if printf '%s' "$SPT_OUT" | grep '"port": 20001' >/dev/null; then
 else bad "下行端口与 inbound 不一致 → 下行会话查不到"; fi
 rm -rf "$SPT"
 
+# --------------------------------------------------------- 端口不会被重复领走
+# 两种分配路径都要守住, 因为各自防的是不同场景:
+#   preset_batch.sh 的 cd_batch_take_port  → 同一批/多次调用的**顺序**分配
+#   mknode.sh 的 x_random_free_port         → 向导单建节点的**随机**分配
+#
+# 判错的后果特别难查: 同协议+同传输+同安全层的两个节点会领到同一个端口、
+# 写出**同一个文件名**, 后者覆盖前者 —— 而两边日志都写"成功"。
+# --------------------------------------------------------- 证书自愈
+# 这台机器上证书会**突然只剩私钥**, 证书文件没了。而 nginx 启动时只要有一个
+# ssl_certificate 读不到就 [emerg] 退出 → 容器重启循环 → Cloudflare 回源 521
+# → 所有 CDN 节点一起挂。已在 RN 上实测复现 (CC 侧确认 521)。
+group "证书自愈 (nginx 起不来 = 全部 CDN 节点挂)"
+CG=$(mktemp -d); mkdir -p "$CG/certs" "$CG/conf.d"
+# 夹具自己必须先站住: 上一版 openssl 失败没检查, 结果后面拿一个**不存在的**
+# 私钥去自签, 报的是 openssl 的错 —— 而套件被那个 stderr 带走, 整轮判失败。
+mk_crt() {
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3 \
+        -keyout "$1" -out "$2" -subj "/CN=t" >/dev/null 2>&1
+}
+mk_crt "$CG/certs/a.key" "$CG/certs/a.crt"
+mk_crt "$CG/certs/default_server.key" "$CG/certs/default_server.crt"
+printf 'server {\n listen 443 ssl;\n ssl_certificate /etc/nginx/certs/a.crt;\n ssl_certificate_key /etc/nginx/certs/a.key;\n}\n' > "$CG/conf.d/a.conf"
+printf 'server {\n listen 443 ssl;\n ssl_certificate /etc/nginx/certs/default_server.crt;\n ssl_certificate_key /etc/nginx/certs/default_server.key;\n}\n' > "$CG/conf.d/d.conf"
+if [[ ! -f "$CG/certs/a.key" || ! -f "$CG/certs/default_server.key" ]]; then
+    bad "夹具没生成出来 (openssl 不可用?), 跳过证书自愈测试"
+else
+    KEY_MD5=$(openssl rsa -noout -modulus -in "$CG/certs/a.key" 2>/dev/null | openssl md5)
+    # 复现现场: 证书没了, 私钥还在 —— 与线上观察到的现象一致
+    rm -f "$CG/certs/a.crt" "$CG/certs/default_server.crt"
+    X_CERT_DIR="$CG/certs" X_NGINX_CONF_DIR="$CG/conf.d" X_NGINX_CTR=nonexistent-ctr \
+        bash "$ROOT/tools/cert_guard.sh" >/dev/null 2>&1
+    [[ -f "$CG/certs/a.crt" ]] \
+        && ok "缺签发记录的证书能自签补上" \
+        || bad "有 letsencrypt 也没有的证书补不回来 → nginx 永远起不来"
+    [[ -f "$CG/certs/default_server.crt" ]] \
+        && ok "兜底站点 (server_name _) 的证书也补上了" \
+        || bad "兜底站点证书补不上 → default.conf 一直 [emerg]"
+    # ★ 必须用**现有私钥**签: 换私钥等于动了用户的东西, 而且会 key values mismatch
+    NEW_MD5=$(openssl x509 -noout -modulus -in "$CG/certs/a.crt" 2>/dev/null | openssl md5)
+    [[ -n "$KEY_MD5" && "$KEY_MD5" == "$NEW_MD5" ]] \
+        && ok "补出来的证书与**原来的私钥**配套 (没换用户的私钥)" \
+        || bad "补出来的证书与现有私钥不配套 → nginx 报 key values mismatch"
+    # 干跑不许改东西
+    rm -f "$CG/certs/a.crt"
+    CG_DRY=$(X_CERT_DIR="$CG/certs" X_NGINX_CONF_DIR="$CG/conf.d" X_NGINX_CTR=nonexistent-ctr \
+        bash "$ROOT/tools/cert_guard.sh" --dry-run 2>&1)
+    # ★ 不要 `... | grep -q`: grep -q 命中就立刻退出, 另一头收到 SIGPIPE,
+    #   而套件开着 `set -o pipefail` —— "匹配成功"会被判成"整条命令失败"。
+    if grep -qF '缺证书' <<<"$CG_DRY"; then
+        ok "干跑只报不补"
+    else
+        bad "干跑连缺什么都不报"
+    fi
+    [[ ! -f "$CG/certs/a.crt" ]] \
+        && ok "干跑之后文件确实没动" || bad "干跑却写了证书"
+fi
+rm -rf "$CG"
+
+group "端口分配 (同名覆盖是最难查的一种)"
+PORTT=$(mktemp -d); mkdir -p "$PORTT/conf"
+PT_OUT=$(CONF_DIR="$PORTT/conf" XRAY_BASE="$PORTT" bash -c '
+  source "'"$ROOT"'/conf/lib/ports.sh" 2>/dev/null
+  x_port_taken(){ [[ -f "'"$PORTT"'/conf/.taken" ]] && grep -qx "$1" "'"$PORTT"'/conf/.taken"; }
+  for i in 1 2 3 4 5 6; do p=$(x_random_free_port); echo "$p"; done
+' 2>/dev/null)
+PT_N=$(printf '%s' "$PT_OUT" | grep -c '[0-9]')
+PT_U=$(printf '%s' "$PT_OUT" | grep '[0-9]' | sort -u | grep -c '[0-9]')
+if [[ "${PT_N:-0}" -ge 6 && "${PT_N:-0}" == "${PT_U:-x}" ]]; then
+    ok "向导的随机分配连领 6 次都不同 (领了 $PT_N 个, 不重复 $PT_U 个)"
+else
+    bad "随机分配重复了: 领 $PT_N 次但只有 $PT_U 个不同端口"
+fi
+
+# 账本: 领过的端口要被记下, 换个进程再领不该重复
+PB_OUT=$(cd "$ROOT" && XRAY_BASE="$PORTT" bash -c '
+  source conf/lib/ports.sh 2>/dev/null
+  source tools/cdn_auto.sh 2>/dev/null
+  x_port_taken(){ [[ -f "'"$PORTT"'/conf/.taken" ]] && grep -qx "$1" "'"$PORTT"'/conf/.taken"; }
+  cd_batch_take_port; echo
+  cd_batch_take_port; echo
+  cd_batch_take_port; echo
+' 2>/dev/null)
+PB_N=$(printf '%s' "$PB_OUT" | grep -c '[0-9]')
+PB_U=$(printf '%s' "$PB_OUT" | grep '[0-9]' | sort -u | grep -c '[0-9]')
+if [[ "${PB_N:-0}" -ge 3 && "${PB_N:-0}" == "${PB_U:-x}" ]]; then
+    ok "批量账本连领 3 次都不同 (跨调用也记着)"
+else
+    bad "批量账本重复了: 领 $PB_N 次只有 $PB_U 个不同端口 → 同名覆盖"
+fi
+
+# 账本文件确实落盘了 —— 不落盘就等于没记
+if [[ -s "$PORTT/.batch-used" ]] || grep -qF 'printf .%s.\n. "$n" >> "$used"' "$ROOT/tools/cdn_auto.sh"; then
+    ok "账本落在 \$XRAY_BASE/.batch-used (换一次调用也不重发)"
+else
+    bad "账本没落盘 → 换个终端再跑一次就重发同样的端口"
+fi
+rm -rf "$PORTT"
+
 group "CDN 自动配 nginx (三个静默失败)"
 NGT=$(mktemp -d); mkdir -p "$NGT/nginx" "$NGT/conf"
 cat > "$NGT/nginx/a.example.com.conf" <<'NGEOF'

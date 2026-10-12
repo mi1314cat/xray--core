@@ -522,23 +522,54 @@ def split_params(n, meta=None):
 
     没有下行地址时返回空 dict —— 链接与原来**逐字节相同**, 不给存量链接添噪声。
     """
-    addr = (n.get("dl_address") or (meta or {}).get("dl_address") or "").strip()
+    # ★ 兜底: 直接从服务端的 downloadSettings 里读。
+    #   元数据是**写**的时候带上的, 而历史节点是在加 dl_* 之前生成的 ——
+    #   那些节点的元数据里根本没有这些字段, 于是链接发出来没有下行参数,
+    #   而用户看不出任何区别 (导入正常、能连、只是没分离)。
+    #   downloadSettings 一直都在片段里, 所以拿它兜底, 老节点也能正确导出。
+    dls = {}
+    try:
+        for _in in (n.get("inbounds") or []):
+            _ss = _in.get("streamSettings") or {}
+            _xh = _ss.get("xhttpSettings") or {}
+            if _xh.get("downloadSettings"):
+                dls = _xh["downloadSettings"]
+                nport = _in.get("port")
+                break
+    except Exception:
+        dls = {}
+
+    addr = (n.get("dl_address") or (meta or {}).get("dl_address")
+            or dls.get("address") or "").strip()
     if not addr:
         return {}
     out = {"dlad": addr}
-    port = n.get("dl_port") or (meta or {}).get("dl_port")
+    port = n.get("dl_port") or (meta or {}).get("dl_port") or dls.get("port")
     if port:
         out["dlport"] = port
-    sec = n.get("dl_security") or (meta or {}).get("dl_security") or n.get("security") or "none"
+    sec = (n.get("dl_security") or (meta or {}).get("dl_security")
+           or dls.get("security") or n.get("security") or "none")
     out["dlsec"] = sec
-    sni = n.get("dl_sni") or (meta or {}).get("dl_sni") or n.get("sni") or (meta or {}).get("sni")
+    # mode 必须发: 客户端侧 auto 在 REALITY 下会退化成合流, 就没分离了
+    out["dlmode"] = ((n.get("dl_mode") or (meta or {}).get("dl_mode")
+                      or (dls.get("xhttpSettings") or {}).get("mode") or "stream-up"))
+    sni = (n.get("dl_sni") or (meta or {}).get("dl_sni")
+           or (dls.get("realitySettings") or {}).get("serverName")
+           or (dls.get("tlsSettings") or {}).get("serverName")
+           or n.get("sni") or (meta or {}).get("sni"))
     if sni:
         out["dlsni"] = sni
     if sec == "reality":
-        pbk = n.get("dl_public_key") or (meta or {}).get("dl_public_key") \
-              or (meta or {}).get("public_key")
-        sid = n.get("dl_short_id") or (meta or {}).get("dl_short_id") \
-              or (meta or {}).get("short_id")
+        # ★ 字段名: 服务端 downloadSettings 里写的是 password (客户端角色),
+        #   而**分享链接**这头要用 publicKey —— 客户端导入后自己填进它的
+        #   客户端配置。取哪个都兜一遍, 免得只发一半。
+        pbk = (n.get("dl_public_key") or (meta or {}).get("dl_public_key")
+               or (dls.get("realitySettings") or {}).get("password")
+               or (dls.get("realitySettings") or {}).get("publicKey")
+               or (meta or {}).get("public_key"))
+        sid = (n.get("dl_short_id") or (meta or {}).get("dl_short_id")
+               or (dls.get("realitySettings") or {}).get("shortId")
+               or (meta or {}).get("short_id"))
         if pbk:
             out["dlpbk"] = pbk
         if sid:

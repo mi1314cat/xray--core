@@ -253,12 +253,38 @@ x_cert_referenced_by() {
 # 只删真正没人用的证书, 有引用的跳过并告警。
 #
 # 不静默删: 用户以为自己清理干净了, 第二天节点全挂, 而证书已经在垃圾桶里。
+# ★ 最后一道闸: nginx 站点里有没有提到这个文件。
+#
+#   x_cert_in_use 只认 X 内核自己那套 (片段 / 进程 / XRAY_BASE), 而 nginx
+#   站点里的 ssl_certificate 是**另一批引用** —— 而且nginx 跑在容器里时,
+#   里面写的是 /etc/nginx/certs/xxx, 宿主上却是 /home/web/certs/xxx,
+#   两边路径根本对不上。于是"没被 X 用到" → 当垃圾删掉。
+#
+#   后果不是难看: nginx 启动时只要有一个 ssl_certificate 读不到就 [emerg]
+#   退出 → 容器进重启循环 → Cloudflare 回源 521 → **所有 CDN 节点一起挂**。
+#   实测在 RN 上被这套逻辑清空了整个 /home/web/certs/。
+#
+#   所以这里按 **basename** 再查一遍站点文件 —— 路径写法不同没关系,
+#   同名就是同一张证书。宁可多留一个文件, 也不能删掉还在用的。
+x_cert_referenced_by_nginx() {
+    local f="$1" base d
+    base=$(basename "$f")
+    for d in /home/web/conf.d /etc/nginx/conf.d /etc/nginx/sites-enabled "$XRAY_BASE"/nginx; do
+        [[ -d "$d" ]] || continue
+        grep -rlF "$base" "$d"/*.conf 2>/dev/null | grep -q . && return 0
+    done
+    return 1
+}
+
 x_cert_gc() {
     local c base removed=0 kept=0
     for c in "$@"; do
         [[ -e "$c" ]] || continue
         base=$(basename "$c")
-        if x_cert_in_use "$c"; then
+        if x_cert_referenced_by_nginx "$c"; then
+            printf '  %s%s%s 被 nginx 站点引用, 跳过\n' "$_CERT_YEL" "$base" "$_CERT_RST" >&2
+            kept=$((kept + 1))
+        elif x_cert_in_use "$c"; then
             printf '  %s%s%s 仍在使用, 跳过\n' "$_CERT_YEL" "$base" "$_CERT_RST" >&2
             x_cert_referenced_by "$c" >&2
             kept=$((kept+1))

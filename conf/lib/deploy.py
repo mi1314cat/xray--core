@@ -126,6 +126,33 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
     if opts.get("path"):
         meta["host_header"] = opts.get("host") or domain
 
+    # ---- 上下行分离 ----
+    #
+    # ★ 这里原来**完全没写** dl_* —— 于是 share_meta 里查无此项, 分享链接
+    #   也就发不出下行参数。客户端导入后拿到的是一个"看着普通"的节点:
+    #   连得上、能跑, 只是**没有下行分离**, 而这正是这个节点存在的理由。
+    #   症状是完全静默的 —— 用户不会收到任何报错, 只是下行没走预期那条路。
+    #
+    #   写全: 地址/加密层/模式/path 一律要。下行 REALITY 还要它自己的
+    #   serverName 与公钥短 id (上下行是两套凭据, 不能默认复用上行那套 ——
+    #   上行可能是 TLS, 压根没有 REALITY 参数可复用)。
+    dl_addr = (opts.get("dl_address") or "").strip()
+    if dl_addr:
+        meta["dl_address"] = dl_addr
+        meta["dl_port"] = int(opts.get("dl_port") or port)   # 会话表 per-inbound, 必须同端口
+        meta["dl_security"] = opts.get("dl_security") or security
+        meta["dl_mode"] = opts.get("dl_mode") or "stream-up"
+        meta["dl_path"] = opts.get("path") or "/"
+        # 回源 SNI 用下行自己的; 没有就沿用上行 (共用域名是正常用法)
+        meta["dl_sni"] = (opts.get("dl_sni") or opts.get("sni") or domain)
+        if meta["dl_security"] == "reality":
+            meta["dl_public_key"] = opts.get("dl_public_key") or ""
+            meta["dl_short_id"] = opts.get("dl_short_id") or ""
+        # 客户端拿哪个地址连下行: 域名走 CDN, IP/其他是直连
+        meta["dl_domain"] = opts.get("dl_domain") or dl_addr
+    if opts.get("dl_ech"):
+        meta["dl_ech"] = True
+
     # ---- nginx ----
     #
     # ★ location 用**节点自己的 path**, 不再一律写 `location /`:

@@ -699,6 +699,7 @@ add_node_menu() {
         ui_menu 12 "全协议一键生成    自动分配端口，统一校验，只重载一次"
         ui_menu 13 "预置档位建节点    25 个预置（协议 × TLS × 传输）任选"
         ui_menu 14 "预置批量生成      一次生成多个（支持 vless:2 trojan:3）"
+        ui_menu 15 "上下行分离        xHTTP 三组合（上行CDN+下行CDN 等）"
         ui_menu 0 "返回主菜单"
         echo >&2
         printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
@@ -772,6 +773,7 @@ add_node_menu() {
 
         13) xray_run conf/mknode.sh ;;
         14) xray_run tools/preset_batch.sh --help ;;
+        15) xray_run tools/split_menu.sh ;;
         *)
             ui_invalid "$nchoice"
             ;;
