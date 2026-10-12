@@ -327,6 +327,76 @@ batch_main() {
         fi
     done
 
+    # ---------------------------------------------------- 上下行分离 (xHTTP)
+    #
+    # ★ 用户要求: "全协议脚本里面一定要有这个"。
+    #
+    #   全协议 = 全**传输与加密形态**, 少了上下行分离这一类就名不副实 ——
+    #   它是 X 内核这代最有价值的能力之一, 而且是三个内核里我们独有的
+    #   (SB/M 那边没有 xHTTP 上下行分离这个形态)。
+    #
+    #   三个组合 (用户点的):
+    #     split:cdn-cdn      上行 CDN + 下行 CDN      (ECH 默认开)
+    #     split:cdn-reality  上行 CDN + 下行 REALITY  (ECH 默认开)
+    #     split:reality-cdn  上行 REALITY + 下行 CDN
+    #
+    #   走 preset_batch.sh 而不是各协议脚本: 分离模式要 dl_* 一整套参数,
+    #   各协议脚本的 add 入口接不住, 而 preset_batch.sh 已经是它们的统一
+    #   入口 (借鉴 SB: 批量走统一入口, 别每处自己拼一遍)。
+    #
+    #   域名: 上下行共用 X_BATCH_DOMAIN 是**正常用法**, 不是缺配置 ——
+    #   上下行照样分开, 只是同一个入口。两个域名由 X_BATCH_DL_DOMAIN 给。
+    # preset.sh 里有分离模式表, 而 batch.sh **没加载它** —— 被面板 source
+    # 时可能碰巧已经在了, 单独 `bash conf/batch.sh --auto` 时一定不在。
+    # 跟下面 cert.sh 一样的处理: 按需补载, 加载不了就**说清楚**, 不静默跳过
+    # (静默跳过的话"全协议"里就悄悄少了三个组合, 而汇总照样显示成功)。
+    if [[ "${X_BATCH_SPLIT:-1}" == "1" ]] && ! declare -F x_split_modes >/dev/null 2>&1; then
+        local _sdir _sf
+        _sdir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+        for _sf in "$_sdir/lib/preset.sh" "$_sdir/preset.sh"; do
+            [[ -r "$_sf" ]] && { source "$_sf"; break; }
+        done
+        if ! declare -F x_split_modes >/dev/null 2>&1; then
+            print_warn "读不到分离模式表 (lib/preset.sh), 跳过 xHTTP 上下行分离"
+            print_warn "  用 X_BATCH_SPLIT=0 可以确定性地关掉这一段"
+        fi
+    fi
+    if [[ "${X_BATCH_SPLIT:-1}" == "1" ]] && declare -F x_split_modes >/dev/null 2>&1; then
+        local -a _split_specs=()
+        local _sp
+        for _sp in cdn-cdn cdn-reality reality-cdn; do
+            # reality-cdn 的上行是 REALITY, 需要密钥对; 没给就跳过这一个,
+            # 而不是让整批失败 —— 另外两个组合不需要。
+            if [[ "$_sp" == reality-cdn && -z "${X_BATCH_REALITY_PRIVATE_KEY:-}" ]]; then
+                print_warn "跳过 $_sp (需要 REALITY 密钥对; 设 X_BATCH_REALITY_PRIVATE_KEY 与 X_BATCH_REALITY_PUBLIC_KEY)"
+                continue
+            fi
+            # 有 CDN 段的才需要域名; 两个域名都由 X_BATCH_DOMAIN / _DL_DOMAIN 给
+            _split_specs+=("vless:4:split:$_sp")
+        done
+
+        if [[ ${#_split_specs[@]} -gt 0 ]]; then
+            echo >&2
+            print_title "xHTTP 上下行分离 (三个组合)"
+            print_info "  域名: ${X_BATCH_DOMAIN:-未设置}${X_BATCH_DL_DOMAIN:+ / 下行 ${X_BATCH_DL_DOMAIN}}"
+            print_info "  直连下行地址: ${X_BATCH_DL_ADDRESS:-未设置}"
+            printf "${CYAN}• %-12s${RESET} %s\n" "xhttp-split" "${_split_specs[*]}" >&2
+            X_BATCH_NO_RELOAD=1 X_NO_RELOAD=1 \
+                timeout "$BATCH_PROTO_TIMEOUT" bash "$SCRIPT_DIR/../tools/preset_batch.sh" \
+                    "${_split_specs[@]}" </dev/null \
+                    >"$LOG_DIR/x-batch-split.log" 2>&1
+            local src=$?
+            sed 's/^/    /' "$LOG_DIR/x-batch-split.log" >&2 || true
+            if [[ $src -eq 0 ]]; then
+                printf "${GREEN}[OK]${RESET} 三个组合已生成\n" >&2
+                BATCH_OK+=("xhttp-split")
+            else
+                printf "${RED}[失败]${RESET} (详见 $LOG_DIR/x-batch-split.log)\n" >&2
+                BATCH_FAIL+=("xhttp-split")
+            fi
+        fi
+    fi
+
     # 本批新生成的服务端碎片(收尾失败清理用)
     local -a new_files=() f
     for f in "$CONF_DIR"/*.json; do
