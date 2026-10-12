@@ -167,7 +167,7 @@ _P_TIERS_DEFAULT="core cdn"
 #      请求 (hub.go:461), 入站那份 downloadSettings 不参与校验。差异要
 #      体现在域名上, 不是路径上。
 #
-_P_SPLIT_MODES="cdn-cdn cdn-reality reality-cdn"
+_P_SPLIT_MODES="cdn-cdn cdn-reality reality-reality reality-cdn"
 
 _p_split_field() { # <模式> <第几列>
     case "$1:$2" in
@@ -181,6 +181,11 @@ _p_split_field() { # <模式> <第几列>
         cdn-reality:3)  echo "no"      ;;   # 下行直连, 不挂 nginx
         cdn-reality:4)  echo "yes"     ;;
         cdn-reality:5)  echo "cdn"     ;;   # 下行直连 → 必须 0.0.0.0
+        reality-reality:1) echo "reality" ;;
+        reality-reality:2) echo "reality" ;;
+        reality-reality:3) echo "no"      ;;   # 上下行都直连, 不挂 nginx
+        reality-reality:4) echo "no"      ;;   # REALITY 无 TLS, 没 ECH 可开
+        reality-reality:5) echo "cdn"     ;;   # 直连 → 必须 0.0.0.0
         reality-cdn:1)  echo "reality" ;;
         reality-cdn:2)  echo "tls"     ;;
         reality-cdn:3)  echo "yes"     ;;   # 只有上行不挂, 下行走 CDN
@@ -202,6 +207,7 @@ x_split_title() {
     case "$1" in
         cdn-cdn)     printf '上行 CDN + 下行 CDN' ;;
         cdn-reality) printf '上行 CDN + 下行 REALITY' ;;
+        reality-reality) printf '上行 REALITY + 下行 REALITY' ;;
         reality-cdn) printf '上行 REALITY + 下行 CDN' ;;
         *) printf '%s' "$1" ;;
     esac
@@ -213,8 +219,10 @@ x_split_desc() {
             printf '两段都走 Cloudflare 橙云, 默认开 ECH。藏得最深, 域名字面不外泄; 代价是多一跳 + 受 CF 限制。' ;;
         cdn-reality)
             printf '上行藏进 CDN, 下行直连并用 REALITY 握手伪装。上行被打时下行可能仍通 (反过来不行: CF 挂了两段一起废)。' ;;
+        reality-reality)
+            printf '两段都用 REALITY 直连, 不经任何第三方。抗 DPI 最强, 也不受 Cloudflare 限制; 代价是完全没有 CDN 掩护, 客户端必须能直连服务器。' ;;
         reality-cdn)
-            printf '上行用 REALITY 直连伪装, 下行走 CDN。最常见的折中: 上行不经过第三方。' ;;
+            printf '上行用 REALITY 直连伪装, 下行走 CDN。⚠ 实测不通 —— 见交接文档第二节。' ;;
         *) printf '' ;;
     esac
 }

@@ -340,7 +340,7 @@ if dlsec == "reality":
     # 这对凭据 —— 少一个内核就会明确报错, 但报错里说的字段名是 dl_public_key/
     # dl_short_id, 而内核实际要的是 password 语义, 所以这里按 preset_batch.sh
     # 的同一组键名给。
-    o["dl_sni"] = "www.microsoft.com"
+    o["dl_sni"] = "www.cloudflare.com"
     o["dl_public_key"] = os.environ.get("JOURNEY_PUBKEY", "")
     o["dl_short_id"] = os.environ.get("JOURNEY_SHORTID", "0123abcd")
 if usec == "reality":
@@ -350,8 +350,8 @@ if usec == "reality":
     o["private_key"] = os.environ.get("JOURNEY_PRIVKEY", "")
     o["public_key"] = os.environ.get("JOURNEY_PUBKEY", "")
     o["short_id"] = os.environ.get("JOURNEY_SHORTID", "0123abcd")
-    o["dest"] = "www.microsoft.com:443"
-    o["serverNames"] = ["www.microsoft.com"]
+    o["dest"] = "www.cloudflare.com:443"
+    o["serverNames"] = ["www.cloudflare.com"]
 print(json.dumps(o))
 OPTS
 )
@@ -443,17 +443,20 @@ if ds:
 json.dump(c, open(f, "w"), indent=1)
 FIXDL
 
-    # ★ 上行 REALITY 的握手**在本环境根本不成立**。
-    #   注意: 这不是"环回验不了"的测法限制 —— 我用**裸 REALITY + 裸 tcp**
-    #   (完全不涉及 xHTTP) 在环回上复现过, 一样握不上; 客户端报的是
-    #       REALITY: received real certificate (potential MITM or redirection)
-    #   即服务端把这次连接判成未授权、直接转给了真实 target。
-    #   排除了 flow/xHTTP/字段名/版本/target 可达性, 详见交接文档第二节。
-    #   所以这里明说跳过, 而不是打一个红叉: 红叉会被当成"reality-cdn 坏了",
-    #   而实际上它的片段/元数据/两个投影在上面都已经验过了。
-    if [[ "$up_sec" == "reality" ]]; then
-        skip "上行 REALITY 握手在本环境从不完成 —— 已用裸 tcp 最小复现, 与 xHTTP/网络无关"
-        skip "详情与下一步见 docs/HANDOVER-known-issues.md 第二节"
+    # 只有 reality-cdn 跳过 —— 而且理由跟"上行 REALITY"无关。
+    #
+    #   reality-cdn = 上行 REALITY + 下行走 CDN, 两条要求互相冲突:
+    #     · 上下行必须同一个 inbound 同端口 (会话表 h.sessions per-inbound)
+    #     · 而下行要走 Cloudflare/nginx, 那是**普通 TLS**
+    #   那个 inbound 是 REALITY 的, 只认 REALITY 握手, nginx 对不上。
+    #   实测: nginx 侧 404, 服务端启动后一行 inbound 都没有。
+    #   详见 docs/HANDOVER-known-issues.md 第二节。
+    #
+    # ★ 上下行都 REALITY 直连 (reality-reality) **不在此列**, 它是通的 ——
+    #   环回 200, RN↔CC 连打 5 次全 200。别再笼统地说"REALITY 验不了"。
+    if [[ "$name" == reality-cdn ]]; then
+        skip "reality-cdn 下行走不通: 同端口要求 vs CDN 的普通 TLS, 设计冲突"
+        skip "可靠的是 cdn-cdn / cdn-reality / reality-reality (后者实测 200)"
         return
     fi
 
@@ -481,10 +484,11 @@ run_journey "cdn"   cdn   xhttp
 run_journey "nginx" nginx ws
 
 echo
-echo "════ 上下行分离三个组合 ════"
+echo "════ 上下行分离四个组合 ════"
 run_split "cdn-cdn"     tls      tls
 run_split "cdn-reality" tls      reality
-run_split "reality-cdn" reality  tls
+run_split "reality-reality" reality reality
+run_split "reality-cdn"     reality  tls
 
 echo
 echo "════ 结果: $PASS 通过, $FAIL 失败, $SKIP 跳过(测法限制, 非故障) ════"

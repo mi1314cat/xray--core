@@ -10,8 +10,13 @@
 | 组合 | 片段/元数据/投影 | 真实连通性 | 备注 |
 |---|---|---|---|
 | `cdn-cdn` | ✅ | ✅ **200** | RN↔CC 双端实测 |
-| `cdn-reality` | ✅ | ✅ **200** | 环回全程跑通 |
-| `reality-cdn` | ✅ | ❌ **未通** | 见下 |
+| `cdn-reality` | ✅ | ✅ **200** | 环回 + RN↔CC |
+| `reality-reality` | ✅ | ✅ **200** | **上下行都 REALITY 直连**; 环回跑通, RN↔CC 连打 5 次全 200 |
+| `reality-cdn` | ✅ | ❌ **不通** | 设计冲突, 见第二节 |
+
+`reality-reality` 是第四个组合, 实测通: 上行下行都用 REALITY 直连同一个端口,
+不经任何第三方。它和 `cdn-reality` 对称 —— 一个上行藏进 CDN, 一个下行藏进
+REALITY; 也有各自的代价 (`cdn-reality` 依赖 CF, `reality-reality` 完全不依赖)。
 
 验收脚本: `tools/e2e_journey.sh` (22 通过 / 0 失败 / 2 跳过)。
 
@@ -72,7 +77,18 @@ REALITY 端口, `CONNECTED` 且握手完成 (返回的是真实证书, 因为未
 2. **给下行单开一个 TLS inbound** —— 但这违反"同端口同 inbound"的硬约束,
    除非内核允许按会话路由。这条我没验。
 
-**在改之前, 菜单里应该先提示用户 `reality-cdn` 已知不通**, 别让人建完才发现。
+**这个已经做了**: 菜单里选到 `reality-cdn` 会先把原因和替代组合摆出来再问要不要
+继续; 同时新增了实测可用的 `reality-reality` 作为替代。
+
+### 还有一个副产品发现
+
+REALITY 的伪装站点 (`target`) **不能随便选**。同一份配置:
+
+* `target: www.cloudflare.com:443` → 环回 200, RN↔CC 200
+* `target: www.microsoft.com:443`  → 握手不完成 (`rc=56` 连接重置)
+
+两者从 RN 都能正常握 TLS1.3, 但只有前者能让 REALITY 借到证书。所以
+`tools/e2e_journey.sh` 里的伪装站点已从 microsoft 换成 cloudflare。
 
 ---
 

@@ -5845,6 +5845,35 @@ fi
 # reality-cdn 走不通是**实测**出来的 (裸 REALITY+tcp 环回 200、REALITY+xhttp
 # 环回 200, 唯独"上行 REALITY + 下行普通 TLS"不通), 不是猜测。菜单必须在生成
 # 之前说出来 —— 否则用户建完、分享出去、客户端导入了才发现连不上。
+# reality-reality 是**实测通**的第四个组合: 上下行都 REALITY 直连同一端口。
+# 环回跑通, RN↔CC 连打 5 次全 200。它不在此列, 别再笼统跳过后所有 REALITY。
+group "四个分离组合都在, 且 reality-reality 各项正确"
+PS="$ROOT/conf/lib/preset.sh"
+bash -c 'source "'"$PS"'"; x_split_modes' >/tmp/_sm.$$ 2>/dev/null
+if grep -qF 'reality-reality' /tmp/_sm.$$ >/dev/null 2>&1; then
+    ok "reality-reality 在模式表里"
+else
+    bad "缺少 reality-reality —— 只剩三个组合, 其中一个还已知不通"
+fi
+rm -f /tmp/_sm.$$
+for pair in "reality-reality:reality:reality" "cdn-cdn:tls:tls" "cdn-reality:tls:reality"; do
+    m=${pair%%:*}; rest=${pair#*:}; ul=${rest%%:*}; dl=${rest##*:}
+    _u=$(bash -c 'source "'"$PS"'"; x_split_ul_sec '"$m" 2>/dev/null)
+    _d=$(bash -c 'source "'"$PS"'"; x_split_dl_sec '"$m" 2>/dev/null)
+    if [ "$_u" = "$ul" ] && [ "$_d" = "$dl" ]; then
+        ok "$m 上下行安全层 = $_u / $_d"
+    else
+        bad "$m 上下行安全层不对 (期望 $ul/$dl, 实得 $_u/$_d)"
+    fi
+done
+# reality-reality 上下行都直连 → 不能挂 nginx, 且没有 ECH 可开
+_c=$(bash -c 'source "'"$PS"'"; x_split_dl_cdn reality-reality' 2>/dev/null)
+_e=$(bash -c 'source "'"$PS"'"; x_split_ech reality-reality' 2>/dev/null)
+_t=$(bash -c 'source "'"$PS"'"; x_split_tier reality-reality' 2>/dev/null)
+[ "$_c" = no ] && ok "reality-reality 不挂 nginx (上下行都直连)" || bad "reality-reality 挂CDN=$_c, 应为 no"
+[ "$_e" = no ] && ok "reality-reality 不开 ECH (REALITY 无 TLS)" || bad "reality-reality ECH=$_e, 应为 no"
+[ "$_t" = cdn ] && ok "reality-reality 档位=cdn (直连 → 必须 0.0.0.0)" || bad "reality-reality 档位=$_t, 应为 cdn"
+
 group "已知不通的组合要提前说 (reality-cdn)"
 SM="$ROOT/tools/split_menu.sh"
 warn_line=$(awk '/SPLIT. = reality-cdn/{print NR; exit}' "$SM")
