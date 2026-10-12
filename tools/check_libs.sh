@@ -5723,6 +5723,39 @@ rm -rf "$PORTT"
 # 三个节点脚本以前各抄了一份共用函数, 而且**已经漂移**: Reality.sh 的
 # safe_read 带 batch 守卫, 另外两个不带。今天不出事只因为那两个只从菜单进;
 # 一旦有人非交互地调用, 它就永远卡在 read 上 —— 前面的日志全正常, 只是不动。
+# 这两条是被"用户旅程验收" (tools/e2e_journey.sh) 逮到的, 都不是理论问题:
+#
+#  1) --apply 只在 `if a.config_json:` 里面被认。走 CLI 参数那条路时它被**静默
+#     忽略**: 传了 --apply, 什么都不写, 而且一句错都不报。调用方以为建好了。
+#  2) nginx 档位把证书清掉了, 却没把 security 一起置空, 产出"要 TLS 却没证书"
+#     的入站 —— 过得了 xray -test, 面板也正常, 只有真连才炸。而 nginx 是 WS 类
+#     节点的默认档位, 等于菜单 13/14 建出来的 nginx 节点一个都连不上。
+#     根因更深一层: security 是 build() 的**位置参数**, opts["security"] 它不看,
+#     所以原来那句赋值从头到尾没起过作用。
+group "建节点 (菜单 13/14 走的那条路)"
+J="$ROOT/tools/e2e_journey.sh"
+if [[ -r "$J" ]]; then ok "用户旅程验收脚本在"
+else bad "缺 e2e_journey.sh —— 用户那条路就没人在测了"; fi
+
+# --apply 必须在**两条**路上都认。少一条就是"传了参数什么也没发生, 且不报错"。
+_dp="$ROOT/conf/lib/deploy.py"
+_apply=$(grep -c "_write_plan(r, a.conf_dir, a.share_dir)" "$_dp" 2>/dev/null || echo 0)
+if [[ "${_apply:-0}" -ge 2 ]]; then
+    ok "--apply 在 JSON 路径和 CLI 参数路径都落盘"
+else
+    bad "--apply 只在一条路上生效 (另一条静默什么都不做) —— 实测 ${_apply:-0} 处"
+fi
+
+# nginx 档位必须把 security 一起置空: 证书被 nginx 拿走了, xray 再要 TLS 就没证书
+grep -qE 'eff_security = "none" if \(tier == ACCESS_NGINX and security == "tls"\)' "$_dp" \
+    && ok "nginx 档位 + tls 会把 security 置空 (不会生成无证书的 TLS 入站)" \
+    || bad "nginx 档位仍保留 security=tls 而证书已被清掉 → tls: no certificates configured"
+
+# 而且必须**按位置**传给 build —— 放进 opts 是不生效的 (build 不看它)
+grep -qE 'node_build\.build\(protocol, transport, eff_security, nopts\)' "$_dp" \
+    && ok "解析后的 security 按位置传给 build (放进 opts 是不生效的)" \
+    || bad "security 没按位置传给 build —— 改动会静默失效"
+
 group "节点脚本收敛 (共用层只有一份)"
 [[ -r "$ROOT/conf/lib/proto_ui.sh" ]] \
     && ok "conf/lib/proto_ui.sh 在" || bad "共用层不存在"

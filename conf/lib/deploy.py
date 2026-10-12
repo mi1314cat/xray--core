@@ -96,11 +96,24 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
     nopts["listen"] = listen
     nopts["tag"] = tag
 
-    # nginx 模式下 Xray 只听本机, 不需要自己终结 TLS
-    if tier == ACCESS_NGINX:
-        nopts["security"] = None if security == "none" else security
+    # nginx 模式下 Xray 只听本机, 不需要自己终结 TLS —— 证书在 nginx 手里。
+    #
+    # ★ 这里以前写的是 `None if security == "none" else security`, 也就是
+    #   security 本来就是 none 时才置空, 而 tls 档位原样保留。配上上面刚被清掉的
+    #   cert_file/key_file, 就得到一个**有 TLS 但没有证书**的入站:
+    #       http: TLS handshake error: tls: no certificates configured
+    #   片段还过得了 `xray -test` (它不校验证书在不在), 面板也一切正常, 只有真连
+    #   的时候才炸 —— 而 nginx 档位是所有 WS 类节点的默认档位, 等于菜单 13/14
+    #   建出来的 nginx 节点一个都连不上。
+    #   现在按注释里原本的意图执行: 证书谁终结, 谁用 security。
+    #   只动 tls: REALITY 的握手是 xray 自己做的, 不在这个结论覆盖范围内, 不动它。
+    eff_security = "none" if (tier == ACCESS_NGINX and security == "tls") else security
 
-    fragment = node_build.build(protocol, transport, security, nopts)
+    # ★ 必须把解析后的 security **按位置**传进去。
+    #   build() 的第三个参数才是它真正用的加密层, opts 里的 "security" 它不看 ——
+    #   所以以前那句 `nopts["security"] = ...` 从来没起过任何作用, 等于没写。
+    #   配合上面被清掉的证书, 产出就是一个"要 TLS 却没证书"的入站。
+    fragment = node_build.build(protocol, transport, eff_security, nopts)
 
     # ---- 分享元数据 ----
     #
@@ -372,6 +385,30 @@ def describe(protocol, transport, security, tier):
     return f"{node_build.describe(protocol, transport, security)} · {t}"
 
 
+def _write_plan(r, conf_dir, share_dir):
+    """把 plan() 的结果落盘。config_json 路径和 CLI 参数路径共用这一份。
+
+    单独抽出来是因为以前只有 config_json 那条路会落盘 —— CLI 参数那条路带着
+    --apply 也只做预演。见调用处的注释。
+    """
+    import share_meta
+    conf_dir = conf_dir or os.environ.get("XRAY_CONF_DIR", "/root/catmi/xray/configs")
+    share_dir = share_dir or os.environ.get("XRAY_SHARE_DIR", "/root/catmi/xray/share/tokens")
+    os.makedirs(conf_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(share_dir) or share_dir, exist_ok=True)
+    tag = r["fragment"]["inbounds"][0]["tag"]
+    node_build.write(os.path.join(conf_dir, f"{tag}.json"), r["fragment"])
+    share_meta.save(share_dir, tag, r["meta"])
+    ib = r["fragment"]["inbounds"][0]
+    print(f"已写入片段: {conf_dir}/{tag}.json", file=sys.stderr)
+    print(f"已写入分享元数据: {share_dir}/{tag}.json", file=sys.stderr)
+    print(f"监听: {ib['listen']}:{ib['port']}", file=sys.stderr)
+    print(f"对外: {r['meta']['host']}:{r['meta']['port']}  ({r['meta']['tier']})", file=sys.stderr)
+    if r["nginx"]:
+        print(f"提示: nginx 档位还需配置反代 "
+              f"{r['nginx']['domain']} → 127.0.0.1:{r['nginx']['port']}", file=sys.stderr)
+
+
 if __name__ == "__main__":
     # 规划预演: 不写盘, 只看方案是否可行
     import argparse
@@ -432,21 +469,7 @@ if __name__ == "__main__":
                 print("  - " + e, file=sys.stderr)
             sys.exit(1)
         if a.apply:
-            conf_dir = a.conf_dir or os.environ.get("XRAY_CONF_DIR", "/root/catmi/xray/configs")
-            share_dir = a.share_dir or os.environ.get("XRAY_SHARE_DIR", "/root/catmi/xray/share/tokens")
-            os.makedirs(conf_dir, exist_ok=True)
-            os.makedirs(os.path.dirname(share_dir) or share_dir, exist_ok=True)
-            tag = r["fragment"]["inbounds"][0]["tag"]
-            node_build.write(os.path.join(conf_dir, f"{tag}.json"), r["fragment"])
-            import share_meta
-            share_meta.save(share_dir, tag, r["meta"])
-            print(f"已写入片段: {conf_dir}/{tag}.json")
-            print(f"已写入分享元数据: {share_dir}/{tag}.json")
-            print(f"监听: {r['fragment']['inbounds'][0]['listen']}:{r['fragment']['inbounds'][0]['port']}")
-            print(f"对外: {r['meta']['host']}:{r['meta']['port']}  ({r['meta']['tier']})")
-            if r["nginx"]:
-                print(f"提示: nginx 档位还需配置反代 "
-                      f"{r['nginx']['domain']} → 127.0.0.1:{r['nginx']['port']}")
+            _write_plan(r, a.conf_dir, a.share_dir)
             sys.exit(0)
         _print_plan(r, protocol, transport, security, tier)
         sys.exit(0)
@@ -471,4 +494,11 @@ if __name__ == "__main__":
         for e in r["errors"]:
             print("  - " + e, file=sys.stderr)
         sys.exit(1)
+    # ★ 这条路以前**忽略** --apply, 直接掉进预演: 传了 --apply 却什么都不写,
+    #   而且一句错都不报。调用方 (包括我自己写的验收测试) 于是以为建好了,
+    #   下一句去读文件才发现根本没有 —— 错位很远, 极难往回想。
+    #   成因是 --apply 那段被写在了 `if a.config_json:` 里面, 只有 JSON 路径够得着。
+    if a.apply:
+        _write_plan(r, a.conf_dir, a.share_dir)
+        sys.exit(0)
     _print_plan(r, a.protocol, a.transport, a.security, a.tier)
