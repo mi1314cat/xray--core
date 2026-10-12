@@ -47,18 +47,30 @@ SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/share/tokens}"
 SPECS=()
 TIER_DEFAULT="cdn"
 
+# ★ 这里用**带引号的** heredoc (<<'EOF'), 不是 <<EOF。
+#
+#   原来是 <<EOF (不引用) + 一行 `$( "${0##*/}" )/vless:3`。不引用的 heredoc
+#   会做命令替换 —— 于是**打印帮助的那一下, 真的去执行了 preset_batch.sh**:
+#       tools/preset_batch.sh: line 51: preset_batch.sh: command not found
+#   那行本来是想写 "bash tools/preset_batch.sh vless:3", 被搜索替换成了
+#   `$( "${0##*/}" )/` —— 结果既不是路径, 又会被 shell 执行。
+#
+#   帮助文本里**永远不要留 $(...)**: 要么照原样输出, 要么引号 heredoc。
+#   引号 heredoc 里只有 $0 和协议列表需要展开, 那就单独取出来再拼。
 usage() {
+  local progs
+  progs=$(x_preset_protocols 2>/dev/null | tr '\n' ' ')
   cat >&2 <<EOF
-用法: $0 <协议:预置序号[:档位]> ...
+用法: bash <本脚本> <协议:预置序号[:档位]> ...
 
 例:
-  $0 vless:1 trojan:2                 # VLESS REALITY + Trojan WS (均 CDN)
-  $0 vless:2 trojan:2:nginx           # 走 nginx 转发
-  $0 $( "${0##*/}" )/vless:3          # VLESS XHTTP+TLS
+  bash $(basename "$0") vless:1 trojan:2          # VLESS REALITY + Trojan WS (均 CDN)
+  bash $(basename "$0") vless:2 trojan:2:nginx    # 走 nginx 转发
+  bash $(basename "$0") vless:3                   # VLESS XHTTP+TLS
 
 可选档位: cdn (默认) | nginx
-可用协议: $(x_preset_protocols | tr '\n' ' ')
-每个协议的预置: 用 $0 --list 查看
+可用协议: ${progs:-（读不到 preset.sh）}
+每个协议的预置: 用 bash $(basename "$0") --list 查看
 EOF
 }
 

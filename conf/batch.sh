@@ -19,6 +19,12 @@
 set -u
 
 RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; MAGENTA="\e[35m"; CYAN="\e[36m"; BOLD="\e[1m"; RESET="\e[0m"
+# DIM 之前漏在这里定义, 而下面 "${DIM}逐项确认…" 用到它。
+# 后果不是"颜色没上" —— 脚本带 set -u, 未定义变量会直接终止:
+#   batch.sh: line 585: DIM: unbound variable
+# 于是用户点进「全协议一键生成」**当场报错**, 菜单都还没画出来。
+# 这正是"一进去就报错"最典型的一种: 逻辑没走错, 是变量名对不上。
+DIM="\e[2m"
 print_info()  { printf "${CYAN}[Info]${RESET} %s\n" "$1" >&2; }
 print_ok()    { printf "${GREEN}[OK]${RESET}  %s\n" "$1" >&2; }
 print_warn()  { printf "${YELLOW}[Warn]${RESET} %s\n" "$1" >&2; }
@@ -571,6 +577,11 @@ rebuild_all() {
 }
 
 ########## 入口 ##########
+# 回车默认走哪一项。放在这里而不是写死在 case 里, 是为了:
+#   · 批量/自动化 (X_BATCH_DEF=1) 时可以只问最少的问题;
+#   · 交互测试可以把它固定住, 断言"回车会走到哪一步"而不是靠猜。
+BATCH_DEF="${X_BATCH_DEF:-2}"
+
 main() {
     if [[ "${1:-}" == "--auto" ]]; then
         : $(( X_BATCH_PORT_START = 20000 + RANDOM % 20000 ))
@@ -583,19 +594,28 @@ main() {
         print_title "全协议一键生成 (Batch Generator)"
         echo -e "${CYAN}协议:${RESET} Reality / Trojan / SS2022 / Hysteria2"
         echo -e "${CYAN}1)${RESET} 全协议生成      ${DIM}逐项确认 (服务器标识 + 端口范围)${RESET}"
-        echo -e "${CYAN}2)${RESET} 全协议快速生成  ${DIM}只问端口范围${RESET}"
+        echo -e "${CYAN}2)${RESET} 全协议快速生成  ${DIM}只问端口范围${RESET} ${DIM}← 回车默认${RESET}"
         echo -e "${CYAN}3)${RESET} 全协议重建      ${YELLOW}强制覆盖已有节点 (端口/UUID 会换新)${RESET}"
         echo -e "${CYAN}4)${RESET} 清空全部节点    ${RED}(破坏性)${RESET}"
         echo -e "${CYAN}0)${RESET} 返回"
-        read -r -p "请输入选项 [0-4]: " c || { echo; exit 0; }
+        # ★ 每个菜单项的回车都要有意义 —— 这是 sing-box-core 的做法, 也是
+        #   "按回车就能往下走" 的前提。
+        #
+        #   原来直接回车落到 `*)` 打一句 [Error] 无效选项 就重来。用户刚点进来、
+        #   手还在回车上, 先看见的是一句报错 —— 脚本没坏, 但观感上跟坏了没区别。
+        #   这里让回车 = 推荐动作 (2 快速生成), 并且**在提示里写明**,
+        #   免得用户以为脚本自己动了。
+        read -r -p "  ${CYAN}请输入选项 [0-4, 回车=${BATCH_DEF}]:${RESET} " c || { echo; exit 0; }
         c=$(clean_input "$c")
+        c="${c:-$BATCH_DEF}"
         case "$c" in
             1) ask_all && batch_main ;;
             2) X_SERVER_NAME=$(_bt_server_name); ask_port_range && batch_main ;;
             3) if rebuild_all; then X_SERVER_NAME=$(_bt_server_name); ask_port_range && batch_main; fi ;;
             4) clear_all_nodes ;;
-            0) return ;;
-            *) print_error "无效选项" ;;
+            0|q|Q) return ;;
+            # 破坏性操作绝不猜: 只有明确打了 4 才清空, 回车绝不会落到这儿。
+            *) print_error "无效选项 $c —— 回车=${BATCH_DEF} (快速生成), 0 返回" ;;
         esac
         [[ "$c" == "0" ]] || { read -r -p "按回车键返回..." _ || { echo; exit 0; }; }
     done

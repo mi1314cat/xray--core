@@ -186,7 +186,33 @@ else
     warn "找不到 tools/check_libs.sh, 跳过"
 fi
 
-# ---------------------------------------------------------------- 6. 真实内核
+# ---------------------------------------------------------------- 6. 交互验证
+head1 "交互验证 (真 pty, 真按键)"
+#
+# ★ 这一步抓到过两个真 bug, 都不是逻辑错:
+#   1. batch.sh 用了 ${DIM} 却没定义它 (脚本带 set -u) —— 用户点进
+#      「全协议一键生成」**当场** unbound variable 崩掉, 菜单都没画出来;
+#   2. preset_batch.sh 的 usage 用了**不引用**的 heredoc, 帮助文本里的
+#      $( "${0##*/}" ) 被 shell 真的执行了 -> command not found。
+#   两个都是"逻辑对、体验烂"的典型: 单元测试全绿, 用户一进去就报错。
+#
+# 判据分两类:
+#   崩      (unbound variable / command not found / ...)  -> 失败
+#   业务拒绝 (配置校验失败之类)                            -> **不算**失败。
+#            空沙箱里真跑一次批量, 校验失败是正确行为 (它还回滚了);
+#            把这类也算失败, 人就会开始忽略这个检查, 那比没有更糟。
+if [ -f "$TESTED/tools/ui_probe.py" ]; then
+    ( cd "$TESTED" && timeout 600 python3 -u tools/ui_probe.py --repo "$TESTED" ) >/tmp/pp_ui 2>&1
+    rc=$?
+    ui_ok=$(grep -c '✓' /tmp/pp_ui 2>/dev/null || echo 0)
+    ui_bad=$(grep -c '✗' /tmp/pp_ui 2>/dev/null || echo 0)
+    [ $rc -eq 0 ] && ok "交互验证通过 ($ui_ok 项)" \
+                  || { bad "交互验证没过 ($ui_bad 项)"; grep '✗' /tmp/pp_ui | sed -n '1,8{s/^/        /;p}'; }
+else
+    warn "找不到 tools/ui_probe.py, 跳过"
+fi
+
+# ---------------------------------------------------------------- 7. 真实内核
 head1 "真实内核校验 (不是 -test 的全部能力, 但能挡明显坏配置)"
 if command -v xray >/dev/null 2>&1; then
     ok "xray 在 PATH"
