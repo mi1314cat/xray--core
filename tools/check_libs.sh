@@ -5714,6 +5714,23 @@ fi
 rm -rf "$PORTT"
 
 # xHTTP 必须两个方向都关缓冲。只关响应是不够的。
+# 这份诊断结论是**实测**出来的, 不是猜的:
+#   直连 xray 端口            → 200
+#   经 Cloudflare → nginx     → invalid Read on closed Body
+# 写进工具是为了让用户自己分清, 而不是照着"重装一遍"乱试。
+group "分离节点自检工具 (把实测结论交给用户)"
+grep -qF 'invalid Read on closed Body' "$ROOT/tools/xhttp_doctor.sh" \
+    && ok "认得那句唯一的线索" || bad "认不出 invalid Read on closed Body"
+grep -qF 'Origin HTTP Protocol' "$ROOT/tools/xhttp_doctor.sh" \
+    && ok "给出了 Cloudflare 侧要改哪一项" || bad "没告诉用户去 Cloudflare 改哪一项"
+grep -qF 'HTTP/1.1' "$ROOT/tools/xhttp_doctor.sh" \
+    && ok "明确说要改成 HTTP/1.1" || bad "没说清改成什么"
+# 直连 vs 经 CDN 的判据必须在, 否则用户还是分不清
+grep -qF '直连通' "$ROOT/tools/xhttp_doctor.sh" \
+    && ok "给出了怎么分辨是节点坏还是 CDN 坏" || bad "没给判据"
+bash -n "$ROOT/tools/xhttp_doctor.sh" 2>/dev/null \
+    && ok "自检脚本语法正常" || bad "自检脚本语法错"
+
 group "xHTTP 上行缓冲 (只关 proxy_buffering 是不够的)"
 NG=$(mktemp -d); mkdir -p "$NG"
 NG_OUT=$(cd "$ROOT" && python3 -c "
