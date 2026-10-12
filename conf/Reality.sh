@@ -1,5 +1,20 @@
 #!/bin/bash
 
+# ---- 共用那一层 (打印/读输入/编号/端口) ----
+#
+# 这几个函数以前在本文件里各抄了一份, 而且**已经开始漂移**:
+# Reality.sh 的 safe_read 带 batch 守卫, 另外两个不带 —— 只从菜单进时
+# 看不出来, 但只要哪天有人非交互地调用后两个, 它就会永远卡在 read 上。
+# 抽成一份之后就不可能再各走各的了。详见 conf/lib/proto_ui.sh。
+_PUI="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib/proto_ui.sh"
+if [[ -r "$_PUI" ]]; then
+    # shellcheck source=/dev/null
+    source "$_PUI"
+elif [[ "${X_BATCH:-0}" == "1" ]]; then
+    echo "缺少 conf/lib/proto_ui.sh, 且是批处理调用 —— 拒绝继续" >&2
+    exit 1
+fi
+
 # ================================
 # Reality 节点配置管理（X 内核 / xrayls）
 # 输出为 xray--core 碎片式配置：conf/reality-NN.json
@@ -36,18 +51,7 @@ RESET="\e[0m"
 # ================================
 # 打印函数（全部输出到 stderr，避免污染变量）
 # ================================
-print_info()  { echo -e "${CYAN}[Info]${RESET} $1" >&2; }
-print_ok()    { echo -e "${GREEN}[OK]${RESET}  $1" >&2; }
-print_warn()  { echo -e "${YELLOW}[Warn]${RESET} $1" >&2; }
-print_error() { echo -e "${RED}[Error]${RESET} $1" >&2; }
 
-print_title() {
-    echo -e "${MAGENTA}${BOLD}" >&2
-    echo "╔══════════════════════════════════════════════╗" >&2
-    printf "║ %-42s ║\n" "$1" >&2
-    echo "╚══════════════════════════════════════════════╝" >&2
-    echo -e "${RESET}" >&2
-}
 
 # ================================
 # 基础变量
@@ -113,81 +117,12 @@ resolve_public_ip() {
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
-clean_input() {
-    echo "$1" | tr -d '\000-\037'
-}
 
-safe_read() {
-    local prompt="$1"
-    local default="$2"
-    local input
 
-    if [[ "${X_BATCH:-0}" == "1" ]]; then
-        print_info "Batch 模式: ${prompt} = ${default}"
-        echo "$default"
-        return
-    fi
-
-    printf "%s (默认: %s): " "$prompt" "$default" >&2
-    read input
-    input=$(clean_input "$input")
-    echo "${input:-$default}"
-}
-
-safe_read_port() {
-    local default="$1"
-    local input
-
-    if [[ "${X_BATCH:-0}" == "1" ]]; then
-        default=$(batch_alloc_port)
-        if [[ -z "$default" ]]; then
-            print_error "批量端口范围 $X_BATCH_PORT_START-$X_BATCH_PORT_END 已耗尽，回退随机空闲端口"
-            default=$(random_free_port)
-        fi
-        print_info "Batch 模式: 自动分配端口 = $default"
-        echo "$default"
-        return
-    fi
-
-    while true; do
-        printf "请输入监听端口 (默认: %s): " "$default" >&2
-        read input
-        input=$(clean_input "$input")
-        port="${input:-$default}"
-
-        [[ "$port" =~ ^[0-9]+$ ]] || { print_error "端口必须是数字"; continue; }
-        (( port >= 1 && port <= 65535 )) || { print_error "端口范围错误"; continue; }
-        port_in_use "$port" && { print_error "端口已占用"; continue; }
-
-        echo "$port"
-        return
-    done
-}
 
 # ================================
 # 编号系统（reality-NN.json）
 # ================================
-get_next_index() {
-    local used=() i=1
-    shopt -s nullglob
-    for f in "$CONF_DIR"/${PROTO}-*.json; do
-        local base
-        base=$(basename "$f")
-        if [[ "$base" =~ ^${PROTO}-([0-9]+)\.json$ ]]; then
-            used+=("${BASH_REMATCH[1]}")
-        fi
-    done
-    if ((${#used[@]} == 0)); then
-        printf "%02d\n" 1
-        return
-    fi
-    IFS=$'\n' used=($(printf "%s\n" "${used[@]}" | sort -n))
-    for n in "${used[@]}"; do
-        [[ "$n" -ne "$i" ]] && break
-        ((i++))
-    done
-    printf "%02d\n" "$i"
-}
 
 # ================================
 # 环境准备：伪装域名(domains.sh) + 密钥(xrayls/XRevise.sh)

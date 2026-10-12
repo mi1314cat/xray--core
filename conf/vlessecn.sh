@@ -1,5 +1,20 @@
 #!/bin/bash
 
+# ---- 共用那一层 (打印/读输入/编号/端口) ----
+#
+# 这几个函数以前在本文件里各抄了一份, 而且**已经开始漂移**:
+# Reality.sh 的 safe_read 带 batch 守卫, 另外两个不带 —— 只从菜单进时
+# 看不出来, 但只要哪天有人非交互地调用后两个, 它就会永远卡在 read 上。
+# 抽成一份之后就不可能再各走各的了。详见 conf/lib/proto_ui.sh。
+_PUI="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib/proto_ui.sh"
+if [[ -r "$_PUI" ]]; then
+    # shellcheck source=/dev/null
+    source "$_PUI"
+elif [[ "${X_BATCH:-0}" == "1" ]]; then
+    echo "缺少 conf/lib/proto_ui.sh, 且是批处理调用 —— 拒绝继续" >&2
+    exit 1
+fi
+
 # ================================
 # 依赖检查
 # ================================
@@ -24,17 +39,7 @@ RESET="\e[0m"
 # ================================
 # 打印函数（全部输出到 stderr，避免污染变量）
 # ================================
-print_info()  { echo -e "${CYAN}[Info]${RESET} $1" >&2; }
-print_ok()    { echo -e "${GREEN}[OK]${RESET}  $1" >&2; }
-print_error() { echo -e "${RED}[Error]${RESET} $1" >&2; }
 
-print_title() {
-    echo -e "${MAGENTA}${BOLD}" >&2
-    echo "╔══════════════════════════════════════════════╗" >&2
-    printf "║ %-42s ║\n" "$1" >&2
-    echo "╚══════════════════════════════════════════════╝" >&2
-    echo -e "${RESET}" >&2
-}
 
 # ================================
 # 基础变量
@@ -86,68 +91,13 @@ fi
 # ================================
 # 安全输入（过滤控制字符）
 # ================================
-clean_input() { echo "$1" | tr -d '\000-\037'; }
 
-safe_read() {
-    local prompt="$1" default="$2" input
-    printf "%s (默认: %s): " "$prompt" "$default" >&2
-    read input
-    input=$(clean_input "$input")
-    echo "${input:-$default}"
-}
 
-safe_read_port() {
-    local default="$1" input port
-    while true; do
-        printf "请输入监听端口 (1-65535, 默认: %s): " "$default" >&2
-        read input
-        input=$(clean_input "$input")
-        port="${input:-$default}"
 
-        [[ "$port" =~ ^[0-9]+$ ]] || { print_error "端口必须是数字"; continue; }
-        (( port >= 1 && port <= 65535 )) || { print_error "端口范围错误"; continue; }
-        port_in_use "$port" && { print_error "端口已占用"; continue; }
-
-        echo "$port"
-        return
-    done
-}
-
-get_next_index() {
-    local used=() i=1 f base
-    shopt -s nullglob
-    for f in "$CONF_DIR"/${PROTO}-*.json; do
-        base=$(basename "$f")
-        if [[ "$base" =~ ^${PROTO}-([0-9]+)\.json$ ]]; then
-            used+=("${BASH_REMATCH[1]}")
-        fi
-    done
-    if ((${#used[@]} == 0)); then
-        printf "%02d\n" 1
-        return
-    fi
-    IFS=$'\n' used=($(printf "%s\n" "${used[@]}" | sort -n))
-    for n in "${used[@]}"; do
-        [[ "$n" -ne "$i" ]] && break
-        ((i++))
-    done
-    printf "%02d\n" "$i"
-}
 
 # ================================
 # IPv4 / IPv6 自动检测
 # ================================
-detect_listen_ip() {
-    local has_ipv4=false has_ipv6=false
-    ip -4 addr show scope global | grep -q "inet " && has_ipv4=true
-    ip -6 addr show scope global | grep -q "inet6 [2-9a-fA-F]" && has_ipv6=true
-
-    if $has_ipv4 && ! $has_ipv6; then echo "ipv4"
-    elif ! $has_ipv4 && $has_ipv6; then echo "ipv6"
-    elif $has_ipv4 && $has_ipv6; then echo "dual"
-    else echo "none"
-    fi
-}
 
 # ================================
 # 监听地址选择

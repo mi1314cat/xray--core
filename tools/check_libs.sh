@@ -5720,6 +5720,49 @@ rm -rf "$PORTT"
 # 写进工具是为了让用户自己分清, 而不是照着"重装一遍"乱试。
 # 老脚本 (菜单 5/6/7) 是自己 heredoc 拼片段的, 一直**没有分享元数据** ——
 # 建出来的节点没有分享链接、不进订阅, 而且 CDN 档位下没人给它挂 nginx。
+# 三个节点脚本以前各抄了一份共用函数, 而且**已经漂移**: Reality.sh 的
+# safe_read 带 batch 守卫, 另外两个不带。今天不出事只因为那两个只从菜单进;
+# 一旦有人非交互地调用, 它就永远卡在 read 上 —— 前面的日志全正常, 只是不动。
+group "节点脚本收敛 (共用层只有一份)"
+[[ -r "$ROOT/conf/lib/proto_ui.sh" ]] \
+    && ok "conf/lib/proto_ui.sh 在" || bad "共用层不存在"
+# ★ 共用函数绝不能在脚本里再定义一遍 —— 定义了就等于各走各的, 收敛白做
+_dup=0
+for _f in conf/vlessecn.sh conf/vlessxhttpecn.sh conf/Reality.sh; do
+    if grep -qE '^(safe_read|safe_read_port|clean_input|get_next_index|print_(info|ok|warn|error|title))\(\)' "$ROOT/$_f" 2>/dev/null; then
+        _dup=$((_dup+1))
+    fi
+done
+if [[ "$_dup" -eq 0 ]]; then
+    ok "三个脚本里都没有再定义共用函数 (只有一份实现)"
+else
+    bad "$_dup 个脚本还在自己定义共用函数 → 又各走各的了"
+fi
+# batch 守卫必须在那**唯一一份**里
+if grep -qF 'X_BATCH:-0' "$ROOT/conf/lib/proto_ui.sh"; then
+    ok "batch 守卫在共用层里 (三个脚本都受保护)"
+else
+    bad "共用层里没有 batch 守卫 → 非交互调用会卡在 read 上"
+fi
+# 缺库时批处理必须拒绝, 而不是带着未定义函数往下跑
+if grep -qE 'X_BATCH.*==.*1.*\n?.*exit 1' "$ROOT/conf/vlessxhttpecn.sh" || grep -qF '拒绝继续' "$ROOT/conf/vlessxhttpecn.sh"; then
+    ok "缺共用层时批处理会明确拒绝 (而不是 undefined function 一路跑)"
+else
+    bad "缺共用层时没有拒绝逻辑 → set -u 下报一堆 unbound variable"
+fi
+# stdout 是数据通道: 共用层绝不能往 stdout 写
+if grep -E '^[^#]*\}\s*;\s*echo ' "$ROOT/conf/lib/proto_ui.sh" | grep -qvF '>&2'; then
+    _so=$(grep -nE '^(print_info|print_ok|print_warn|print_error|print_title)\(\)' "$ROOT/conf/lib/proto_ui.sh" >/dev/null; grep -A3 -E '^(print_info|print_ok|print_warn|print_error)\(\)' "$ROOT/conf/lib/proto_ui.sh" | grep -cF '>&2')
+    [[ "$_so" -ge 4 ]] && ok "共用层的打印全部 >&2 (stdout 留给分享链接)" || bad "共用层有打印没走 >&2"
+else
+    ok "共用层的打印全部 >&2 (stdout 留给分享链接)"
+fi
+# 语法
+for _f in conf/vlessecn.sh conf/vlessxhttpecn.sh conf/Reality.sh conf/lib/proto_ui.sh; do
+    bash -n "$ROOT/$_f" 2>/dev/null || bad "$_f 语法错"
+done
+ok "四个脚本语法都正常"
+
 group "老脚本建出来的节点也要能分享 (菜单 5/6/7)"
 AD=$(mktemp -d); mkdir -p "$AD/conf" "$AD/share/tokens"
 python3 - "$AD" <<'PYX'

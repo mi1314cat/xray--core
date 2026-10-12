@@ -143,6 +143,12 @@ _XRAY_LIB_FILES=(
     #  每个 .sh/.py 都当成清单项去 conf/lib 下找存在性, 注释里写一个就报
     #  "清单里有不存在的文件"。)
     ui.sh
+    # proto_ui.sh = 三个节点脚本 (vlessecn/vlessxhttpecn/Reality) 共用的那一层:
+    # 打印/读输入/编号/端口。这三个脚本以前各抄了一份, 而且已经漂移 ——
+    # Reality 的 safe_read 带 batch 守卫, 另两个不带, 于是非交互调用后者
+    # 会永远卡在 read 上。漏登记它, 后果是脚本 source 失败后带着未定义函数
+    # 继续跑, 表现是一堆 unbound variable 而不是一句"缺依赖"。
+    proto_ui.sh
     deploy.py dns_edit.py nginx_apply.py naming.py node_build.py nodes.py
     share_meta.py share_payload.py token_store.py
     hy2_products.py
