@@ -5437,6 +5437,30 @@ grep -q 'x_cert_migrate' "$ROOT/conf/cert.sh" \
     || bad "证书菜单没有迁移入口 —— 存量片段会一直指着会被删的目录"
 rm -rf "$CERT_T"
 
+# ---------------------------------------------------------------- 沙箱
+# ★ 这条来自一次真实的翻车。
+#
+#   10-12 我跑 E2E, 设了 XRAY_BASE=/tmp/e2e, 以为在沙箱里, 结果批量生成
+#   直接跑到了 /root/catmi/xray/conf 上 —— 因为脚本认的是 XRAY_BASE_DIR,
+#   XRAY_BASE 会被那一行原样覆盖掉。而屏幕上一切正常: 没有报错, 生成成功,
+#   汇总照打。只因为"节点已存在, 全部跳过"才没写坏东西。
+#
+#   静默忽略环境变量比报错危险得多 —— 它让你以为自己测的是沙箱。
+group "沙箱变量真的生效 (XRAY_BASE 曾被静默丢弃)"
+SBX_OUT=$(XRAY_BASE=/tmp/sbx-probe bash -c "
+  cd '$ROOT'
+  source conf/batch.sh >/dev/null 2>&1
+  printf '%s|%s|%s' \"\${XRAY_BASE:-}\" \"\${CONF_DIR:-}\" \"\${X_IS_SANDBOX:-unset}\"" 2>/dev/null)
+SBX_BASE=${SBX_OUT%%|*}
+[[ "$SBX_BASE" == "/tmp/sbx-probe" ]] && ok "XRAY_BASE 会被采纳 (沙箱名对得上)" \
+    || bad "XRAY_BASE 被静默丢弃 → 测试会跑在生产上 (实际: '${SBX_OUT:-空}')"
+case "$SBX_OUT" in
+    /root/catmi/*) bad "CONF_DIR 仍指向生产目录" ;;
+    *) [[ "$SBX_OUT" == *"|true" ]] && ok "沙箱标志 X_IS_SANDBOX=true, CONF_DIR 不指生产" \
+                                 || ok "CONF_DIR 不指生产" ;;
+esac
+rm -rf /tmp/sbx-probe
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

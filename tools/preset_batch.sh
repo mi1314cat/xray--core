@@ -84,8 +84,25 @@ show_list() {
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then usage; exit 0; fi
 if [[ "${1:-}" == "--list" ]]; then show_list; exit 0; fi
-[[ $# -eq 0 ]] && { usage; exit 1; }
-SPECS=("$@")
+if [[ "${1:-}" == "--recommended" || "${1:-}" == "--default" ]]; then
+    # ★ --recommended: 展开成"默认全协议"那几档 (core + cdn)。
+    #
+    #   这里只认 preset.sh 的档位表, 不在这里另抄一份清单 —— 两处各写一份,
+    #   迟早对不上, 而对不上的后果是"菜单说会带、实际没带", 静默少几个节点。
+    #
+    #   注意别和本脚本原来的 tier 混淆: 原来的 tier 是**接入档**
+    #   (cdn = 走 Cloudflare / nginx = 走 nginx), 这里的 core/cdn 是
+    #   **推荐度**。两个都叫 tier, 所以这里只读不写, 原变量名一个字没动。
+    shift
+    for _p in vless trojan vmess shadowsocks hysteria2; do
+        for _i in $(_p_default_indexes "$_p"); do
+            printf '%s:%s ' "$_p" "$_i"
+        done
+    done
+    echo
+fi
+[[ $# -eq 0 && -z "${SPECS[*]:-}" ]] && { usage; exit 1; }
+[[ $# -gt 0 ]] && SPECS=("$@")
 
 mkdir -p "$CONF_DIR" "$(dirname "$SHARE_DIR")"
 

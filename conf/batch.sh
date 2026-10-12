@@ -44,9 +44,20 @@ GH_RAW="${X_BATCH_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/ma
 BATCH_PROTOS=(Reality Trojan Shadowsocks hysteria2)
 BATCH_FRAG_PREFIX=(reality trojan ss2022 hysteria)
 
-XRAY_BASE="${XRAY_BASE_DIR:-/root/catmi/xray}"
+# ★ 变量名是 XRAY_BASE_DIR, **不是** XRAY_BASE
+#
+#   之前这里只认 XRAY_BASE_DIR —— 于是外面
+#   `XRAY_BASE=/tmp/sandbox bash conf/batch.sh` 会被**这一行原样覆盖掉**,
+#   紧接着的 CONF_DIR 指向生产目录。测试在生产上跑, 而屏幕上一切正常。
+#   我 10-12 那次 E2E 就是这么把批量生成跑到了 /root/catmi/xray/conf 上,
+#   只因为"节点已存在, 全部跳过"才没写坏东西 —— 属于运气, 不是设计。
+#
+#   两个都收, 并且把"设错了却被忽略"这件事**说出来**: 静默忽略最贵, 因为
+#   它让你以为自己测的是沙箱。
+XRAY_BASE="${XRAY_BASE_DIR:-${XRAY_BASE:-/root/catmi/xray}}"
+# 沙箱标志: 两个变量任意一个指离生产就算沙箱
 X_IS_SANDBOX=false
-[[ "${XRAY_BASE_DIR:-/root/catmi/xray}" != "/root/catmi/xray" ]] && X_IS_SANDBOX=true
+[[ "$XRAY_BASE" != /root/catmi/xray ]] && X_IS_SANDBOX=true
 CONF_DIR="$XRAY_BASE/conf"
 OUT_DIR="$XRAY_BASE/out"
 LOG_DIR="${X_BATCH_LOG_DIR:-/tmp}"
