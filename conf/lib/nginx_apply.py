@@ -653,6 +653,18 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
         L.append(f"{inner}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
         L.append(f"{inner}proxy_read_timeout 300s;")
         L.append(f"{inner}proxy_buffering off;")
+        # ★ 上行也必须关缓冲。
+        #   proxy_buffering 管的是**响应**方向; 客户端 POST 上来的一侧是
+        #   **请求**方向, 由 proxy_request_buffering 管, 默认 on。
+        #   开着的后果: nginx 会先把整个请求体收完再转给 xray —— 而 xHTTP
+        #   的上行恰恰是"边发边等下行", 请求体没收完, 下行就永远不开始。
+        #   实测症状: 源站 access log 里 POST/GET 都是 **200**, 看着完全
+        #   正常, 但 xray 侧只留下一行
+        #       connection ends > http: invalid Read on closed Body
+        #   然后客户端就一直等到超时 —— 两头都没有报错, 极难定位。
+        #   只对 xhttp 关: 别的协议本来就要整包, 关了只是白白多几次转发。
+        if transport == "xhttp":
+            L.append(f"{inner}proxy_request_buffering off;")
         if transport == "grpc":
             L.append(f"{inner}proxy_pass http://127.0.0.1:{port};")
         L.append(f"{ind}}}")

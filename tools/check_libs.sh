@@ -5713,6 +5713,36 @@ else
 fi
 rm -rf "$PORTT"
 
+# xHTTP 必须两个方向都关缓冲。只关响应是不够的。
+group "xHTTP 上行缓冲 (只关 proxy_buffering 是不够的)"
+NG=$(mktemp -d); mkdir -p "$NG"
+NG_OUT=$(cd "$ROOT" && python3 -c "
+import sys; sys.path.insert(0,'conf/lib')
+import nginx_apply as N
+b=N.render_block('d.example.com', 24101, None, True, 'xhttp',
+                 origin_tls=True, origin_sni='d.example.com', ind='    ', path='/x')
+print(b)
+" 2>/dev/null)
+if grep -qF 'proxy_request_buffering off' <<<"$NG_OUT"; then
+    ok "xHTTP 关了上行缓冲 (proxy_request_buffering off)"
+else
+    bad "xHTTP 没关上行缓冲 → nginx 先收完整个请求体再转, 上行永远等不到下行"
+fi
+grep -qF 'proxy_buffering off' <<<"$NG_OUT" \
+    && ok "xHTTP 也关了下行缓冲" || bad "xHTTP 没关下行缓冲 → 下行长连接被 nginx 卡住"
+# 别的协议不该跟着关 —— 关了只是白白多几次转发
+NG_WS=$(cd "$ROOT" && python3 -c "
+import sys; sys.path.insert(0,'conf/lib')
+import nginx_apply as N
+print(N.render_block('d.example.com', 80, None, True, 'ws', ind='    ', path='/x'))
+" 2>/dev/null)
+if grep -qF 'proxy_request_buffering off' <<<"$NG_WS"; then
+    bad "ws 也被关了上行缓冲 —— 不该波及别的协议"
+else
+    ok "只影响 xHTTP, 别的协议没被波及"
+fi
+rm -rf "$NG"
+
 group "CDN 自动配 nginx (三个静默失败)"
 NGT=$(mktemp -d); mkdir -p "$NGT/nginx" "$NGT/conf"
 cat > "$NGT/nginx/a.example.com.conf" <<'NGEOF'
