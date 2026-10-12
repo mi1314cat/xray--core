@@ -15,10 +15,21 @@
 #   而现象是"读到了错的列"而不是报错 —— 排查起来最费时间。
 #   cut 逐列取, 字段缺失就是空串, 行为可预测。
 #
-# 字段: 协议|传输|加密|显示名|说明
+# 字段: 协议|传输|加密|显示名|说明[|加密增强]
 #   协议 vless / trojan / vmess / shadowsocks / socks / http / hysteria2
-#   传输 tcp / ws / xhttp / grpc / httpupgrade
+#   传输 raw tcp / ws / xhttp / grpc / httpupgrade / hysteria
 #   加密 none / tls / reality
+#   第 6 列 (可选, 可留空) = VLESS 会话加密增强。
+#     留空 或 "none" → 普通 VLESS (settings.decryption = "none")
+#     "mlkem"        → 建节点时现调 `xray vlessenc` 生成 ML-KEM-768 后量子配对
+#                       (xray 独有; sing-box 没有这层)
+#     "mldsa65"      → REALITY 握手签名换 ML-DSA-65 后量子 (xray 独有)
+#
+# ★ 为什么第 6 列写标记而不直接写密钥:
+#   密钥**不能预置**。密钥必须成对且每台机器独一无二, 预置进表里等于
+#   把一把所有人的服务器共用的私钥写进公开仓库。(conf/vlessecn.sh 原来有
+#   一个硬编码 FALLBACK_ENC 兜底, 那把密钥会跟着仓库发到每一台机器上。)
+#   这里只写"要哪一档", 真正的值由调用方在建节点那一刻生成。
 # =============================================================
 
 # 传输与加密的合法组合在这里先拦一道, 不让非法组合进到生成环节。
@@ -42,6 +53,14 @@
 #
 # hysteria 是 Hysteria2 自己的传输名 (UDP), 不是 Xray 的标准 network 值,
 # 但 hysteria2.sh 一直在用, 所以留在白名单里。
+# ★ kcp 已从白名单删除 (2026-10-12)。
+#   内核 26.3.27 实测: `kcpSettings: {header, seed}` 直接被拒, 原文
+#     "The feature mkcp header & seed has been removed and migrated to
+#      finalmask/udp header-* & mkcp-original & mkcp-aes128gcm."
+#   只有**空对象** `kcpSettings: {}` 能过配置校验 —— 而那样建出来的节点
+#   运行期一样连不通。`xray run -test` 会放行, 所以这种节点会安静地死在
+#   服务器上: 面板显示一切正常, 用户连不上却查不出原因。
+#   白名单里留着它 = 允许用户造出这种死节点。
 _P_TRANSPORTS="raw tcp ws xhttp grpc httpupgrade hysteria"
 _P_SECURITY="none tls reality"
 
@@ -64,12 +83,15 @@ _preset_security_allows() {
 X_PRESETS=(
     # ---------- VLESS ----------
     # REALITY 预设挂在本段。抗 DPI 最强, 不需要域名和证书。
-    "vless|tcp|reality|① 隐匿优先 · REALITY + Vision|裸 TCP + XTLS Vision; 不需要域名和证书, 抗 DPI 最强, 新装首选"
-    "vless|xhttp|tls|② CDN 友好 · XHTTP + TLS|★ 官方主推传输, 也是**新的 CDN 推荐档**: 没有 WS 那种 \"ALPN 是 http/1.1\" 的显著特征, 上下行分离可走 Cloudflare 橙云. 官方称其出现后其它基于 HTTP 的传输层都黯然失色"
-    "vless|ws|tls|③ WS + TLS（官方已弃用）|⚠ 官方文档顶部已挂 danger: \"推荐换用 XHTTP\". 迁移目标 XHTTP H2 & H3 — 只有在服务端/CDN 明确只吃 WS 时才选它"
-    "vless|grpc|tls|④ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ②"
-    "vless|httpupgrade|tls|⑤ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ②"
-    "vless|tcp|tls|⑥ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用"
+    "vless|raw|reality|① 隐匿优先 · REALITY + Vision + 后量子|裸 TCP + XTLS Vision + ML-KEM-768 会话加密 + ML-DSA-65 握手签名; 全套后量子, 不需要域名和证书, 抗 DPI 最强, 新装首选|mlkem,mldsa65"
+    "vless|tcp|reality|② 隐匿优先 · REALITY + Vision|裸 TCP + XTLS Vision; 不需要域名和证书。tcp 是 raw 的别名, 与 ① 等价|none|none"
+    "vless|raw|none|③ 最轻 · 后量子裸 TCP|裸 TCP + ML-KEM-768 会话加密, 不套 TLS/REALITY。延迟最低, 但没有 REALITY 的握手伪装|mlkem"
+    "vless|xhttp|tls|④ CDN 友好 · XHTTP + TLS|★ 官方主推传输, 也是**新的 CDN 推荐档**: 没有 WS 那种 \"ALPN 是 http/1.1\" 的显著特征, 上下行分离可走 Cloudflare 橙云. 官方称其出现后其它基于 HTTP 的传输层都黯然失色|none|none"
+    "vless|xhttp|tls|⑤ CDN + ECH + 后量子|XHTTP + TLS + ECH (ClientHello 加密, 真实 SNI 不外泄) + ML-KEM-768; 走 Cloudflare 橙云时防止域名字面被探测到, 需要一张可信证书|mlkem"
+    "vless|ws|tls|⑥ WS + TLS（官方已弃用）|⚠ 官方文档顶部已挂 danger: \"推荐换用 XHTTP\". 迁移目标 XHTTP H2 & H3 — 只有在服务端/CDN 明确只吃 WS 时才选它"
+    "vless|grpc|tls|⑦ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ④"
+    "vless|httpupgrade|tls|⑧ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ④"
+    "vless|tcp|tls|⑨ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用"
 
     # ---------- Trojan ----------
     "trojan|tcp|reality|① 隐匿优先 · REALITY + Vision|裸 TCP + REALITY; Trojan 侧最抗 DPI 的组合"
@@ -130,13 +152,19 @@ x_preset_list() {
     for row in "${X_PRESETS[@]}"; do
         [[ "${row%%|*}" == "$p" ]] || continue
         n=$((n+1))
-        printf '  %s) %s\n' "$n" "$(printf '%s' "$row" | cut -d'|' -f4)"
-        printf '     %s\n'     "$(printf '%s' "$row" | cut -d'|' -f5)"
+        printf '  %s) %s\n' "$n" "$(printf '%s' "$row" | cut -d'|' -f4)" >&2
+        printf '     %s\n'     "$(printf '%s' "$row" | cut -d'|' -f5)" >&2
     done
     return 0
 }
 
 # 挑一个预置, 输出 "传输 加密 显示名 说明" 供调用方用
+#
+# ★ 界面一律 >&2, **只有最后那 4 行值走 stdout**。
+#   调用方是 `picked=$(x_preset_ask "$proto")` —— 命令替换会吃掉 stdout,
+#   所以预置列表和"选择"提示必须走 stderr, 否则用户既看不见列表也看不见提示,
+#   而 read 回来的前 4 行全是菜单文字, 于是 MK_TRANSPORT 变成
+#   "  1) ① 隐匿优先 · REALITY + Vision" 这种垃圾, 直接生成坏配置。
 #
 # 挑完先验组合合法 —— 表是手维护的, 加错一行不该等到生成配置时才炸。
 x_preset_ask() {
@@ -146,7 +174,7 @@ x_preset_ask() {
 
     x_preset_list "$p"
     while :; do
-        printf '  选择 (1-%s, 0=返回): ' "$cnt"
+        printf '  选择 (1-%s, 0=返回): ' "$cnt" >&2
         read -r i
         [[ "$i" == "0" || -z "$i" ]] && return 1
         if [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= cnt )); then break; fi
@@ -157,6 +185,8 @@ x_preset_ask() {
     sec=$(x_preset_field "$p" "$i" 3)
     disp=$(x_preset_field "$p" "$i" 4)
     desc=$(x_preset_field "$p" "$i" 5)
+    # 第 6 列: 可选, 缺省 none (cut 缺列时给空串, 所以兜成 none)
+    enh=$(x_preset_field "$p" "$i" 6); enh=${enh:-none}
 
     # 表里非法组合要在这里就报错, 而不是照传
     if ! _preset_security_allows "$sec" "$tr"; then
@@ -166,7 +196,7 @@ x_preset_ask() {
         return 2
     fi
 
-    printf '%s\n%s\n%s\n%s\n' "$tr" "$sec" "$disp" "$desc"
+    printf '%s\n%s\n%s\n%s\n%s\n' "$tr" "$sec" "$disp" "$desc" "$enh"
     return 0
 }
 

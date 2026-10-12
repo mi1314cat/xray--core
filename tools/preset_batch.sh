@@ -66,7 +66,7 @@ show_list() {
   local p
   for p in $(x_preset_protocols); do
     _o "  [$p]"
-    x_preset_list "$p" | sed 's/^/  /'
+    x_preset_list "$p" 2>&1 | sed 's/^/  /'
   done
 }
 
@@ -115,12 +115,17 @@ for spec in "${SPECS[@]}"; do
   sec=$(x_preset_field "$proto" "$idx" 3)
   disp=$(x_preset_field "$proto" "$idx" 4)
 
-  # 预置表合法性由 x_preset_ask 兜底, 这里再查一次组合
-  case "$sec" in
-    reality) if [[ "$tr" != "tcp" ]]; then
-      _e "  $spec: $sec 不支持 $tr (预置表有误)"; fail=$((fail+1)); continue
-    fi ;;
-  esac
+  # 预置表合法性由 x_preset_ask 兜底, 这里再查一次组合。
+  #
+  # ★ 不在这里重抄一份白名单。原来写死 `[[ "$tr" != "tcp" ]]`, 而内核的
+  #   REALITY 白名单是 {raw, tcp, xhttp, grpc} (tcp 与 raw 是等价别名),
+  #   预置表里 vless 第 ① 档用的正是 raw —— 于是这个脚本会把**自己表里的
+  #   第一档**判成"预置表有误"并跳过, 一条节点都建不出来, 而且报错写着
+  #   "预置表有误", 指向完全错误的方向。
+  #   判据统一走 preset.sh 的 _preset_security_allows, 一处说了算。
+  if ! _preset_security_allows "$sec" "$tr"; then
+    _e "  $spec: $sec 不支持 $tr (预置表有误)"; fail=$((fail+1)); continue
+  fi
 
   # 端口: 连续分配, 跳过已占
   while x_port_taken "$port" 2>/dev/null; do port=$((port+1)); done

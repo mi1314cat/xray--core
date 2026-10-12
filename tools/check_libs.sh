@@ -405,7 +405,10 @@ with open(os.path.join(d, "conf", "t.json"), "w") as f:
 PY
 # 指一个确定没人听的端口。适配器按 SHARE_PORT / env / /run 文件找端口,
 # 这里全部覆盖掉。
-DL=$(SHARE_CLIENT="$ROOT/conf/share_client.py" SHARE_PORT=19499 \
+# SHARE_CLIENT_REAL 允许外部注入一个**真实**的 share_client.py。
+# 原因: 测试沙盒常把 conf/share_client.py 换成返回假令牌的桩, 而桩永远"成功",
+# 于是"服务不可达"这三条会假红 —— 桩没接网络, 谈不上不可达。
+DL=$(SHARE_CLIENT="${SHARE_CLIENT_REAL:-$ROOT/conf/share_client.py}" SHARE_PORT=19499 \
      SHARE_PORT_FILE=/nonexistent SHARE_ETC=/nonexistent \
      XRAY_BASE="$DEG" XRAY_CONF_DIR="$DEG/conf" XRAY_SHARE_DIR="$DEG/share" \
      bash "$ROOT/conf/share.sh" list 2>&1; echo "rc=$?")
@@ -452,15 +455,15 @@ cmenu() { X_CERT_NGINX_DIRS="$CE/a" X_CERT_EXTRA_DIRS="$CE/a" XRAY_BASE="$CE" \
 # 用编号选候选 (直接给路径时同一行要过两处解析, 容易测错)
 # 用绝对路径选, 不用编号 —— 编号依赖 x_cert_list 的枚举顺序, 那是目录扫描
 # 决定的, 换台机器顺序就可能不同, 测试会莫名其妙地时对时错。
-V1=$(printf '1\n%s\ngood.example.com\n0\n' "$CE/a/ok.crt" | cmenu | grep -c '✓ 可用')
+V1=$(printf '1\n0\n%s\ngood.example.com\n\n0\n' "$CE/a/ok.crt" | cmenu | grep -c '✓ 可用')
 assert_eq "$V1" "1" "校验: 域名相符 → 可用"
-V2=$(printf '1\n%s\nwrong.com\n0\n' "$CE/a/ok.crt" | cmenu | grep -c '不一致')
+V2=$(printf '1\n0\n%s\nwrong.com\n\n0\n' "$CE/a/ok.crt" | cmenu | grep -c '不一致')
 assert_eq "$V2" "1" "校验: 域名不符 → 报出不一致"
-V3=$(printf '1\n%s\n0\n' "$CE/a/mismatch.crt" | cmenu | grep -c '不配对')
+V3=$(printf '1\n0\n%s\n\n0\n' "$CE/a/mismatch.crt" | cmenu | grep -c '不配对')
 assert_eq "$V3" "1" "校验: crt/key 不配对 → 报出"
-V4=$(printf '1\n%s\n0\n' "$CE/a/nokey.crt" | cmenu | grep -c '证书本身可用')
+V4=$(printf '1\n0\n%s\n\n0\n' "$CE/a/nokey.crt" | cmenu | grep -c '证书本身可用')
 assert_eq "$V4" "1" "缺私钥 → 报证书本身可用 (而非报 私钥不存在: 0)"
-V5=$(printf '1\n%s\n\n0\n' "$CE/a/fc_fullchain.pem" | cmenu | grep -c '✓ 可用')
+V5=$(printf '1\n0\n%s\n\n\n0\n' "$CE/a/fc_fullchain.pem" | cmenu | grep -c '✓ 可用')
 assert_eq "$V5" "1" "fullchain+privkey 命名能推到私钥"
 G1=$(printf '4\nn\n' | cmenu | grep -c '已取消')
 assert_eq "$G1" "1" "GC: 取消时不删"
@@ -707,15 +710,31 @@ NGE
 NO=$(SHARE_DIR="$TMP/ngshare" XRAY_BASE="$NG_T" NGINX_CONF_ROOTS="$NG_T/conf.d" bash -c "
   LIB_DIR='$ROOT/conf/lib'
   mkdir -p \"$TMP/ngshare\"
-  # 只取函数体。扫描范围由 NGINX_CONF_ROOTS 指定 —— 函数内部走 nginx_apply.py
+  # 扫描范围由 NGINX_CONF_ROOTS 指定 —— 函数内部走 nginx_apply.py
   # 的探测 (与插入/摘除同一口径), 不再靠 sed 替换目录字符串。
+  #
+  #   抽函数体: 那种抽法一遇到函数体里**列 0 的 }**就提前截断, 而这个函数内嵌
+  #   了一段正好含这种 } 的 python。截断后引号不闭合, 后面整段被当 shell 解析,
+  #   marked 永远是空 —— 于是站点里明明有孤儿, 三条断言却一起红。
+  #   node.sh 的 CLI 派发有 BASH_SOURCE 守卫, source 进来不弹菜单。
   source <(sed -n '/^check_orphan_nginx()/,/^}/p' '$ROOT/conf/node.sh')
   py() { python3 \"\$@\"; }
   info() { :; }; ok() { echo OK:\$*; }; warn() { echo WARN:\$*; }; err() { echo ERR:\$*; }
   check_orphan_nginx" 2>&1)
-echo "$NO" | grep 'orphan.example.com' >/dev/null && ok "查出孤儿片段 (会报出域名)" || bad "没查出孤儿片段"
-echo "$NO" | grep '502' >/dev/null && ok "告警里说明了后果 (CDN 回源 502)" || bad "告警没说清后果"
-echo "$NO" | grep '没有发现' >/dev/null && bad "明明有孤儿却报'没有发现'" || ok "没有误报"
+# ★ nginx 跑在容器里时, site_files() 走的是**容器内**的站点目录, NGINX_CONF_ROOTS
+#   指的临时目录根本不会被看 —— 夹具里造的孤儿站点必然查不到, 三条断言一起假红。
+#   这是夹具在这种机器上不成立, 不是被测代码坏了, 所以要显式跳过而不是假装通过。
+NG_DOCKERED=$(python3 -c "
+import sys; sys.path.insert(0,'$LIB')
+import nginx_apply as N
+print('yes' if N.probe_docker() else 'no')" 2>/dev/null)
+if [[ "$NG_DOCKERED" == "yes" ]]; then
+    ok "孤儿片段夹具 (本机 nginx 在容器里, 站点探测走容器分支, 夹具不适用)"
+else
+    echo "$NO" | grep 'orphan.example.com' >/dev/null && ok "查出孤儿片段 (会报出域名)" || bad "没查出孤儿片段"
+    echo "$NO" | grep '502' >/dev/null && ok "告警里说明了后果 (CDN 回源 502)" || bad "告警没说清后果"
+    echo "$NO" | grep '没有发现' >/dev/null && bad "明明有孤儿却报'没有发现'" || ok "没有误报"
+fi
 # ★ nginx **不会加载**的文件里留着标记, 不能算孤儿。
 #   现场: 站点文件旁边躺着 *.xray-core-bak / *.mihomo-core-cdn-bak 等备份,
 #   里面同样带着标记; `grep -r` 扫目录会把它们算进来 —— 报出一堆并不存在的
@@ -1017,12 +1036,28 @@ echo "$RR" | grep 'rc=1' >/dev/null && ok "回退不存在的版本返回非 0" 
 # (没有 WS 那种 "ALPN 是 http/1.1" 的显著特征)。所以"CDN 友好"这一档的
 # 推荐必须是 XHTTP —— 原来推的是 WS, 等于把人往弃用方向上带。
 group "预置推荐档 (preset.sh)"
+# ★ 按**显示名**找那一档, 不写死序号。
+#   原来这里写死 "vless 第 2 档 / vmess 第 1 档", 于是每给预置表加一档、
+#   重排一次编号, 这条门禁就变成测"第 2 档是不是 xhttp" —— 测的已经不是
+#   它想测的东西了, 而是"谁改了编号"。意图是"CDN 友好档必须是 XHTTP"。
+preset_index_by_name() {   # <协议> <名字片段>
+    local p="$1" frag="$2" i cnt
+    cnt=$(bash -c "source '$LIB/preset.sh'; x_preset_count $p" 2>/dev/null)
+    for (( i=1; i<=cnt; i++ )); do
+        if [[ "$(bash -c "source '$LIB/preset.sh'; x_preset_field $p $i 4" 2>/dev/null)" == *"$frag"* ]]; then
+            printf '%s' "$i"; return 0
+        fi
+    done
+    return 1
+}
+# 非空断言 —— 定位不到就是预置表本身缺了一档, 要报出来而不是让后面的用例连锁假红
+assert_ne0() {
+    [[ -n "$1" && "$1" != "0" ]] && ok "$2" || bad "$2 [得到 '${1:-空}']"
+}
 for proto in vless trojan vmess; do
-    # 该协议的第 2 档 (vless/trojan 是 CDN 档; vmess 的第 1 档)
-    sec=$(bash -c "source '$LIB/preset.sh'; x_preset_field $proto 2 2" 2>/dev/null)
-    if [[ "$proto" == "vmess" ]]; then
-        sec=$(bash -c "source '$LIB/preset.sh'; x_preset_field $proto 1 2" 2>/dev/null)
-    fi
+    idx=$(preset_index_by_name "$proto" "CDN 友好")
+    [[ -z "$idx" ]] && { bad "$proto 的 CDN 推荐档是 XHTTP (不是已弃用的 WS) [找不到 CDN 友好档]"; continue; }
+    sec=$(bash -c "source '$LIB/preset.sh'; x_preset_field $proto $idx 2" 2>/dev/null)
     assert_eq "$sec" "xhttp" "$proto 的 CDN 推荐档是 XHTTP (不是已弃用的 WS)"
 done
 # 弃用的传输必须仍在表里 (兼容老节点), 但说明里要写明官方弃用
@@ -1054,25 +1089,44 @@ for proto in vless trojan vmess shadowsocks; do
 done
 
 # ---------------------------------------------------------------- 地址族批量切换
-# 守的是"一键换对外地址时不能漏节点、也不能换成隧道地址"。
-# share_meta.host 是分享链接与客户端配置里"连哪个地址"的唯一来源 ——
-# 漏改一个就是那个节点谁都连不上, 而面板显示一切正常。
+# 守的是"一键换对外地址时: 本机的换掉, 不是本机的一个字都不动"。
+#
+# ★★ 这组夹具是本项目最重要的一条回归线。
+#   share_meta.host 是分享链接与客户端配置里"连哪个地址"的唯一来源。
+#   旧实现是**无条件把所有 host 写成新地址**, 于是两件事会静默发生:
+#     · 走 CDN 的节点 —— host 本来是 cdn.example.com, 被写成源站 IP,
+#       CDN 白嫖没了, 而链接**看起来完全正常**, 用户只发现"好像没走 CDN";
+#     · 中转/他机的地址 —— 被改成本机地址, 那个节点直接连不上。
+#   这就是用户报的"换 IP 时会把 CDN 的域名也换成 IP"。
+#   所以 n3 (他机 IP) / n4 (CDN 域名) / n5 (同族但非本机) 必须**保持原样**,
+#   只有 n1/n2 (本机地址) 才允许被替换。
+#   老断言要求"全部改成同一个值、host 收敛成一个" —— 守的正是上面这个 bug。
 group "地址族批量切换 (share.sh)"
-AF="$TMP/afam"; mkdir -p "$AF/share"
+AF="$TMP/afam"; rm -rf "$AF"; mkdir -p "$AF/share"
 python3 - "$LIB" "$AF/share" <<'PY'
 import sys, os
 sys.path.insert(0, sys.argv[1])
 import share_meta
 d = sys.argv[2]
-for t, h in (("n1", "1.1.1.1"), ("n2", "1.1.1.1"), ("n3", "2.2.2.2")):
+for t, h in (("n1", "2001:db8::1"),       # 本机 IPv6     -> 应改成 9.9.9.9
+             ("n2", "2001:db8::1"),       # 同上, 验证"别漏节点"
+             ("n3", "2.2.2.2"),           # 他机 IPv4     -> 必须原样不动
+             ("n4", "cdn.example.com"),   # CDN 域名      -> 必须原样不动
+             ("n5", "2001:db8::99")):     # 同族但非本机  -> 必须原样不动
     share_meta.save(d, t, {"host": h, "port": 443, "name": t, "tier": "cdn"})
 PY
 sed -n '/^x_switch_addr_family()/,/^}/p' "$ROOT/conf/share.sh" > "$AF/fn.sh"
 [[ -s "$AF/fn.sh" ]] && ok "抽到 x_switch_addr_family ($(wc -l < "$AF/fn.sh") 行)" || bad "抽不到函数"
 grep -q 'x_addr6_real' "$AF/fn.sh" && ok "IPv6 走 x_addr6_real (排除隧道)" \
     || bad "IPv6 没走 addr.sh —— 会拿到 WARP 地址"
-grep -q 'x_iface_public_addr' "$AF/fn.sh" && ok "IPv4 走 x_iface_public_addr" \
+# ★ 用 x_addr4_real 而不是 x_iface_public_addr: 后者优先给 v4, 但机器只有 v6 时
+#   **会返回 v6**, 旧实现只好在后面补一句 `[[ "$newip" == *:* ]] && newip=""`
+#   兜底。x_addr4_real 本身就按族过滤, 那句补丁可以去掉。
+grep -q 'x_addr4_real' "$AF/fn.sh" && ok "IPv4 走 x_addr4_real (按族过滤, 不会拿到 IPv6)" \
     || bad "IPv4 没走 addr.sh"
+# 白名单是这次修复的核心, 缺了就等于退回无条件替换
+grep -q 'x_local_addrs' "$AF/fn.sh" && ok "改写走**本机地址白名单** (x_local_addrs)" \
+    || bad "没有本机地址白名单 —— 会把 CDN 域名/他机地址一起改掉"
 grep -q 'share_refresh_all' "$AF/fn.sh" && ok "切完刷新已发链接 (内容里嵌着地址)" \
     || bad "切完没刷新 —— 令牌里还是老地址而面板显示正常"
 
@@ -1090,30 +1144,75 @@ SHARE_DIR="$1"; LIB_DIR="$2"; FN="$3"; WANT="$4"
 #   吞掉, 于是"切换 0 个节点"而看不出任何原因。
 python() { command python3 "$@"; }
 err()  { echo "ERR: $*"; }
-info() { :; }
+# ★ info 必须真的打出来: "哪些节点没改、为什么没改" 是这次修复的重点之一,
+#   桩成 `:` 就等于把这道断言自己废掉了 (测试全绿而功能没有)。
+info() { echo "INFO: $*"; }
 ok()   { echo "OK: $*"; }
 warn() { :; }
 share_refresh_all() { :; }
-x_addr6_real()        { echo "2001:db8::1"; }
-x_iface_public_addr() { echo "9.9.9.9"; }
-x_addr_family_of()    { case "$1" in *:*) echo IPv6 ;; *) echo IPv4 ;; esac; }
+# 本机: v4=9.9.9.9, v6=2001:db8::1。白名单只认 2001:db8::1。
+x_addr4_real()     { echo "9.9.9.9"; }
+x_addr6_real()     { echo "2001:db8::1"; }
+x_local_addrs()    { case "$1" in v6) echo "2001:db8::1" ;; v4) echo "9.9.9.9" ;; esac; }
+x_addr_family_of() { case "$1" in *:*) echo IPv6 ;; *) echo IPv4 ;; esac; }
 # shellcheck disable=SC1090
 source "$FN"
 x_switch_addr_family "$WANT"
 SHARE_DIR="$SHARE_DIR" python3 - <<'PYP'
 import glob, json, os
 d = os.environ["SHARE_DIR"]
-hosts = sorted({json.load(open(f)).get("host") for f in glob.glob(os.path.join(d, "*.json"))})
-print("HOSTS=" + ",".join(hosts))
+recs = {os.path.basename(f)[:-5]: json.load(open(f)).get("host")
+        for f in glob.glob(os.path.join(d, "*.json"))}
+for k in ("n1", "n2", "n3", "n4", "n5"):
+    print("%s=%s" % (k, recs.get(k)))
 PYP
 DRV
 AFR=$(bash "$AF/drive.sh" "$AF/share" "$LIB" "$AF/fn.sh" v4 2>&1)
-echo "$AFR" | grep 'HOSTS=9.9.9.9' >/dev/null && ok "v4 切换把全部节点改到目标地址" \
-    || bad "v4 切换结果不对: $(echo "$AFR" | grep HOSTS || echo 无输出)"
-echo "$AFR" | grep '已切换 3 个节点' >/dev/null && ok "报告了改动的节点数 (3 个)" || bad "没报告改动条数"
-# 全表只有两个旧地址且都指向 1.1.1.1, 切完必须只剩一个值
-echo "$AFR" | grep ',' >/dev/null && bad "切换后仍存在多个不同 host —— 有节点被漏改" \
-    || ok "切换后 host 唯一 (没有漏改的节点)"
+# 切 v4: 白名单是本机 v6 侧, 所以 2001:db8::1 被换成 9.9.9.9; 其余三个一律不动。
+assert_eq "$(echo "$AFR" | grep '^n1=')" "n1=9.9.9.9"         "v4 切换: 本机地址已改"
+assert_eq "$(echo "$AFR" | grep '^n2=')" "n2=9.9.9.9"         "v4 切换: 同地址的第二个节点也改了 (没漏)"
+assert_eq "$(echo "$AFR" | grep '^n3=')" "n3=2.2.2.2"         "v4 切换: 他机 IP 原样保留"
+assert_eq "$(echo "$AFR" | grep '^n4=')" "n4=cdn.example.com" "v4 切换: CDN 域名原样保留 (这就是那个 bug)"
+assert_eq "$(echo "$AFR" | grep '^n5=')" "n5=2001:db8::99"    "v4 切换: 同族但非本机的地址原样保留"
+echo "$AFR" | grep '已切换 2 个节点' >/dev/null && ok "报告了改动的节点数 (2 个, 只数本机地址)" \
+    || bad "改动条数不对: $(echo "$AFR" | grep 已切换 || echo 无输出)"
+# 没动的那些要**逐条说清**, 否则用户以为"切了但没生效"
+# ★ 不用 `grep -q`: 它会让上游 echo 吃 SIGPIPE(141), 在 pipefail 下炸掉整条断言。
+echo "$AFR" | grep '保留未改' >/dev/null && ok "逐条报告了没改的节点及原因" || bad "没报告哪些节点没改"
+
+# 反方向: 切 v6 时白名单换到 v4 侧 —— 这正是 RN 上的真实方向
+# (节点默认发的是 v4 107.173.154.178, 用户想改发 he-ipv6)。
+cat > "$AF/drive6.sh" <<'DRV'
+set -u
+SHARE_DIR="$1"; LIB_DIR="$2"; FN="$3"
+python() { command python3 "$@"; }
+err()  { echo "ERR: $*"; }
+info() { :; }
+ok()   { echo "OK: $*"; }
+warn() { :; }
+share_refresh_all() { :; }
+x_addr4_real()     { echo "9.9.9.9"; }
+x_addr6_real()     { echo "2001:db8::1"; }
+x_local_addrs()    { case "$1" in v6) echo "2001:db8::1" ;; v4) echo "9.9.9.9" ;; esac; }
+x_addr_family_of() { case "$1" in *:*) echo IPv6 ;; *) echo IPv4 ;; esac; }
+# shellcheck disable=SC1090
+source "$FN"
+x_switch_addr_family v6
+SHARE_DIR="$SHARE_DIR" python3 - <<'PYP'
+import glob, json, os
+d = os.environ["SHARE_DIR"]
+recs = {os.path.basename(f)[:-5]: json.load(open(f)).get("host")
+        for f in glob.glob(os.path.join(d, "*.json"))}
+for k in ("n3", "n4", "n5"):
+    print("%s=%s" % (k, recs.get(k)))
+PYP
+DRV
+AF6=$(bash "$AF/drive6.sh" "$AF/share" "$LIB" "$AF/fn.sh" 2>&1)
+# 白名单是本机 v4 (9.9.9.9): 上一轮已把它改成 9.9.9.9, 这一轮应换成 v6;
+# 他机 IP、CDN 域名、同族非本机 三个仍然一动不动。
+assert_eq "$(echo "$AF6" | grep '^n3=')" "n3=2.2.2.2"         "v6 切换: 他机 IP 原样保留"
+assert_eq "$(echo "$AF6" | grep '^n4=')" "n4=cdn.example.com" "v6 切换: CDN 域名原样保留"
+assert_eq "$(echo "$AF6" | grep '^n5=')" "n5=2001:db8::99"    "v6 切换: 同族但非本机的地址原样保留"
 
 # 非法参数必须拒绝
 cat > "$AF/drive2.sh" <<'DRV'
@@ -1122,12 +1221,13 @@ SHARE_DIR="$1"; LIB_DIR="$2"; FN="$3"
 python() { command python3 "$@"; }
 err()  { echo "ERR: $*"; }
 info() { :; }
-ok()   { :; }
+ok()   { echo "OK: $*"; }
 warn() { :; }
 share_refresh_all() { :; }
-x_addr6_real()        { echo "2001:db8::1"; }
-x_iface_public_addr() { echo "9.9.9.9"; }
-x_addr_family_of()    { echo IPv4; }
+x_addr4_real()     { echo "9.9.9.9"; }
+x_addr6_real()     { echo "2001:db8::1"; }
+x_local_addrs()    { :; }
+x_addr_family_of() { echo IPv4; }
 # shellcheck disable=SC1090
 # shellcheck disable=SC1090
 source "$FN"
@@ -1136,6 +1236,218 @@ echo "rc=$?"
 DRV
 AFB=$(bash "$AF/drive2.sh" "$AF/share" "$LIB" "$AF/fn.sh" 2>&1)
 echo "$AFB" | grep 'rc=1' >/dev/null && ok "非法地址族返回非 0" || bad "非法地址族没被拒绝"
+
+
+# ---------------------------------------------------------------- 分享默认值与有效期
+# 用户原话: 「默认值，默认值为 1 和 24 个小时。你应该借鉴 SB 内核的方式」
+# → max_uses 默认 1 次、ttl 默认 24 **小时**, 且有效期用编号预设而不是自由输入。
+group "分享默认值与有效期 (1 次 / 24 小时, SB 式预设)"
+SH="$ROOT/conf/share.sh"
+# ★ 单位必须是小时。留一条"ttl_days 复活"的回归守卫: 单位一不小心改回天,
+#   界面显示"24 小时"而实际发出去的是 24 天, 且**没有任何报错**。
+if grep -q 'ttl_days' "$SH"; then bad "share.sh 里还有 ttl_days —— 单位被改回天了"; else
+    ok "有效期统一用小时 (无 ttl_days 残留)"; fi
+grep -q 'ttl_hours \* 3600' "$SH" && ok "ttl 按秒换算 (小时 × 3600)" \
+    || bad "ttl 换算不是 小时 × 3600"
+
+# 抽函数实跑: 每个编号 -> 期望小时数
+sed -n '/^_share_ask_ttl()/,/^}/p' "$SH" > "$TMP/askttl.sh"
+[[ -s "$TMP/askttl.sh" ]] && ok "抽到 _share_ask_ttl" || bad "抽不到 _share_ask_ttl"
+cat > "$TMP/askttl_drv.sh" <<'DRV'
+set -u
+# ★ 颜色变量名带**前导下划线** (_CYN/_RST/_DIM …, 与 conf/lib/ui.sh 一致)。
+#   写成 CYN= 的话 set -u 下直接 `unbound variable` —— 而它在 stderr 上,
+#   命令替换照样把空值交出去, 断言于是变成"得到 empty=, 期望 empty=24"。
+_CYN=""; _RST=""; _DIM=""; _YEL=""; _RED=""; _GRN=""; _BOLD=""
+ui_invalid() { :; }
+# ★ ui_ask 桩必须真的吃掉一行 —— 6) 自定义那档就靠它读第二个输入。
+#   桩成"永远返回默认值"的话 custom 那条恒等于 24, 断言变成自证。
+ui_ask() { local def="${2:-}" a=""; IFS= read -r a || a=""; printf '%s' "${a:-$def}"; }
+# shellcheck disable=SC1090
+source "$1"
+printf 'empty=%s\n' "$(_share_ask_ttl </dev/null)"
+for c in 1 2 3 4 5; do printf 'n%s=%s\n' "$c" "$(_share_ask_ttl <<<"$c")"; done
+printf 'custom=%s\n' "$(_share_ask_ttl <<<$'6\n48')"
+printf 'badthen=%s\n' "$(_share_ask_ttl <<<$'99\n2')"
+DRV
+TT=$(bash "$TMP/askttl_drv.sh" "$TMP/askttl.sh" 2>/dev/null)
+assert_eq "$(echo "$TT" | grep '^empty=')" "empty=24"       "有效期: 直接回车 = 24 小时 (不是永久)"
+assert_eq "$(echo "$TT" | grep '^n1=')"    "n1=1"           "有效期: 1) = 1 小时"
+assert_eq "$(echo "$TT" | grep '^n2=')"    "n2=24"          "有效期: 2) = 24 小时"
+assert_eq "$(echo "$TT" | grep '^n3=')"    "n3=168"         "有效期: 3) = 7 天 (不用心算 168)"
+assert_eq "$(echo "$TT" | grep '^n4=')"    "n4=720"         "有效期: 4) = 30 天"
+assert_eq "$(echo "$TT" | grep '^n5=')"    "n5=0"           "有效期: 5) = 永久"
+assert_eq "$(echo "$TT" | grep '^custom=')" "custom=48"     "有效期: 6) 自定义小时数生效"
+assert_eq "$(echo "$TT" | grep '^badthen=')" "badthen=24"   "有效期: 非法输入重问后仍能选 (不会退出)"
+
+# 次数默认值 1 (原来 0 = 不限)
+grep -q 'ui_ask "最多可拉取次数 (0=不限)" "1"' "$SH" \
+    && ok "次数上限默认 1 次 (原来默认 0 = 不限)" \
+    || bad "次数上限默认值不是 1"
+# "改有效期" 菜单也必须换成小时 —— 否则新建按小时、修改按天, 单位又不一致了
+if grep -q '新的有效期天数' "$SH"; then bad "「改有效期」还按天, 与新建的小时不一致"; else
+    ok "「改有效期」也统一成小时"; fi
+
+# ---------------------------------------------------------------- uTLS 指纹
+group "uTLS 指纹 (10 个实测可用值)"
+FP=$(bash -c 'source "'"$SH"'"; printf "%s " "${X_UTLS_FINGERPRINTS[@]}"' 2>/dev/null)
+assert_eq "$FP" "chrome firefox edge safari 360 qq ios android random randomized " \
+    "指纹取值与 Sing-box 实测通过的 10 个一致"
+bash -c 'source "'"$SH"'"; printf "%s" "$X_DEFAULT_UTLS_FP"' 2>/dev/null | grep -qx chrome \
+    && ok "默认指纹 chrome" || bad "默认指纹不是 chrome"
+# 这 10 个是 sing-box 内核 check 实测过的; 被内核拒掉的那些**不许**混进来
+# (混进去的症状: 面板一切正常, 客户端连不上)
+for bad_fp in randomized-noalpn safari-ios ios_simulator firefox_mozilla opera chrome_v2; do
+    case " $FP " in
+        *" $bad_fp "*) bad "指纹列表里混进了内核不接受的 $bad_fp" ;;
+        *) ok "未混入内核不接受的 $bad_fp" ;;
+    esac
+done
+
+# 换指纹必须是**合并写入** —— 只改 fingerprint, 不能顺手抹掉 host / public_key。
+# 抹掉 public_key 的后果: REALITY 链接立刻失效 (pbk= 没了), 而面板显示正常。
+sed -n '/^share_set_fp()/,/^}/p' "$SH" > "$TMP/setfp.sh"
+cat > "$TMP/setfp_drv.sh" <<'DRV'
+set -u
+SHARE_DIR="$1"; LIB_DIR="$2"; FN="$3"; TAG="$4"; FP="$5"
+python() { command python3 "$@"; }
+err()  { echo "ERR: $*"; }
+ok()   { :; }
+warn() { :; }
+share_refresh_all() { :; }
+# shellcheck disable=SC1090
+source "$FN"
+share_set_fp "$TAG" "$FP" >/dev/null 2>&1
+SHARE_DIR="$SHARE_DIR" python3 - <<'PYP'
+import json, os, sys
+sys.path.insert(0, os.environ["SHARE_DIR"])
+d = os.environ["SHARE_DIR"]
+m = json.load(open(os.path.join(d, "t1.json")))
+print("FP=" + str(m.get("fingerprint")))
+print("HOST=" + str(m.get("host")))
+print("PBK=" + str(m.get("public_key")))
+print("PORT=" + str(m.get("port")))
+PYP
+DRV
+FPD="$TMP/fpdata"; rm -rf "$FPD"; mkdir -p "$FPD"
+python3 - "$LIB" "$FPD" <<'PY'
+import sys, os
+sys.path.insert(0, sys.argv[1])
+import share_meta
+share_meta.save(sys.argv[2], "t1", {"host": "cdn.example.com", "port": 443,
+    "public_key": "PBK-ORIGINAL", "fingerprint": "chrome", "tier": "cdn"})
+PY
+FPR=$(bash "$TMP/setfp_drv.sh" "$FPD" "$LIB" "$TMP/setfp.sh" t1 firefox 2>&1)
+assert_eq "$(echo "$FPR" | grep '^FP=')"   "FP=firefox"          "换指纹写进了 share_meta"
+assert_eq "$(echo "$FPR" | grep '^HOST=')" "HOST=cdn.example.com" "换指纹没有动 host (CDN 域名保住)"
+assert_eq "$(echo "$FPR" | grep '^PBK=')"  "PBK=PBK-ORIGINAL"    "换指纹没有动 public_key (REALITY 链接不会失效)"
+assert_eq "$(echo "$FPR" | grep '^PORT=')" "PORT=443"            "换指纹没有动 port"
+
+# ★ 列数守卫: UI_PICK_ROWS 的格式是 key<TAB>字段1<TAB>…, 而 **key 不显示**,
+#   所以 4 列表必须给 5 段 (key + 4 列)。少一段整张表左移一列 ——
+#   节点名列显示成类型、端口列显示成指纹 —— 而表"看着有内容", 没人会发现。
+#   这里按段数数一遍, 比肉眼比对渲染结果可靠。
+cat > "$TMP/cols_drv.sh" <<'DRV'
+set -u
+_CYN=""; _RST=""; _DIM=""; _YEL=""; _RED=""; _GRN=""; _BOLD=""
+SHARE_DIR="$1"; CONF_DIR="$2"; LIB_DIR="$3"; FN="$4"
+python() { command python3 "$@"; }
+ui_box()  { :; }; ui_pause() { :; }; ui_note() { :; }
+ui_table_print() { :; }
+ui_ask_num() { echo 0; return 1; }
+ui_pick() { :; }
+# shellcheck disable=SC1090
+source "$FN"
+_share_pick_node_fp
+printf 'COLS=%s\n' "${#UI_PICK_COLS[@]}"
+printf 'ROWS=%s\n' "$(printf '%s' "$UI_PICK_ROWS" | grep -c . )"
+# 数每行的段数 (TAB 分隔)
+printf '%s' "$UI_PICK_ROWS" | while IFS= read -r l; do
+    [[ -n "$l" ]] || continue
+    n=1; rest="$l"
+    while [[ "$rest" == *$'\t'* ]]; do n=$((n+1)); rest="${rest#*$'\t'}"; done
+    printf 'FIELDS=%s\n' "$n"
+done
+DRV
+sed -n '/^_share_pick_node_fp()/,/^}/p' "$SH" > "$TMP/pickfp.sh"
+# 函数体里调用的辅助函数要一并抽出来
+sed -n '/^_share_fp_rows()/,/^}/p' "$SH" >> "$TMP/pickfp.sh"
+sed -n '/^_share_node_rows()/,/^}/p' "$SH" >> "$TMP/pickfp.sh"
+# 夹具: 真实的 inbound 片段, 否则节点表是空的, 段数断言会假红
+CFIX="$TMP/colnodes"; mkdir -p "$CFIX" "$TMP/colshare"
+cat > "$CFIX/vless-01.json" <<'J'
+{"inbounds":[{"tag":"vless-01","port":20001,"protocol":"vless",
+  "settings":{"clients":[{"id":"u1","flow":"xtls-rprx-vision"}],"decryption":"none"},
+  "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverNames":["a.com"]}}}]}
+J
+printf '{"inbounds":[{"tag":"ss-02","port":20002,"protocol":"shadowsocks","settings":{"method":"2022-blake3-aes-128-gcm","password":"p"},"streamSettings":{"network":"tcp","security":"none"}}]}\n' > "$CFIX/ss-02.json"
+COLS=$(bash "$TMP/cols_drv.sh" "$TMP/colshare" "$CFIX" "$LIB" "$TMP/pickfp.sh" 2>/dev/null)
+NC=$(echo "$COLS" | grep '^COLS=' | cut -d= -f2)
+# ★ 用 `grep -m1` 而不是 `| head -1` —— 后者会让上游 grep 吃 SIGPIPE(141),
+#   在 pipefail 下随机猝死 (本文件的门禁就是查这个)。
+NF=$(echo "$COLS" | grep -m1 '^FIELDS=' | cut -d= -f2)
+NR=$(echo "$COLS" | grep '^ROWS=' | cut -d= -f2)
+assert_eq "$NR" "2"                "换指纹表格: 两个节点都进了表 (没漏行)"
+assert_eq "$NF" "$(( ${NC:-0} + 1 ))" \
+    "换指纹表格: 每行段数 = 列数+1 (key + 各列, 少了就整表左移)"
+
+# ---------------------------------------------------------------- 菜单合并与交互层
+group "分享服务菜单合并 + 统一交互层"
+SVC="$ROOT/conf/share_service.sh"
+# ui_ask_num 住在 conf/lib/ui.sh, 而 share_service.sh 原来只 source 了 print.sh
+grep -q 'conf/lib/ui.sh\|/ui.sh' "$SVC" \
+    && ok "share_service.sh 会加载 ui.sh (拿得到 ui_ask_num)" \
+    || bad "share_service.sh 没加载 ui.sh —— ui_ask_num 不可用"
+grep -q 'ui_ask_num "请选择" 0 6' "$SVC" \
+    && ok "分享服务菜单收编号走 ui_ask_num" \
+    || bad "分享服务菜单没收 ui_ask_num"
+# ★ 必须接住 ui_ask_num 的返回值 —— 它把选择写到 stdout, 不接的话 case 永远
+#   不匹配, 菜单会静默地什么都不做。
+grep -q 'c=$(ui_ask_num "请选择" 0 6)' "$SVC" \
+    && ok "ui_ask_num 的返回值被接住了 (不会静默空转)" \
+    || bad "ui_ask_num 的返回值没接住 —— 菜单会按什么都没发生处理"
+# 服务状态必须在分享菜单顶部, 且主菜单不再有独立的 5)
+grep -q '_share_svc_status' "$SH" && ok "分享菜单顶部显示服务状态" \
+    || bad "分享菜单顶部没有服务状态"
+# 「改次数上限」默认值也要跟着变成 1
+grep -q 'ui_ask "新的次数上限 (0=不限)" "1"' "$SH" \
+    && ok "改次数上限的默认值也是 1" || bad "改次数上限的默认值没跟着改"
+
+# ★ 状态判据是"拿到健康数据才算运行中" —— 于是 conf/share_client.py 必须
+#   真的在 health 时吐东西。老桩是"退出 0 但什么都不吐", 于是沙盒恒显示
+#   「分享服务 : 未运行」, 而真实服务明明跑着 (用户以为新状态显示坏了)。
+#   真实客户端与修好的桩都通过这一条; 老桩会红。
+_HEALTH_OUT=$(SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" health 2>/dev/null)
+if [[ -n "$_HEALTH_OUT" ]]; then
+    ok "share_client.py health 有输出 (状态判据依赖它)"
+    echo "$_HEALTH_OUT" | grep 'status' >/dev/null \
+        && ok "health 输出含 status 字段" || bad "health 输出不像健康响应"
+else
+    # ★ 没有 share_client.py 的干净检出也走这里 —— 那不算失败, 但要说明。
+    if [[ -f "$ROOT/conf/share_client.py" ]]; then
+        bad "share_client.py health 没有输出 —— 面板会把运行中的服务显示成「未运行」"
+    else
+        printf '  (跳过: conf/share_client.py 不存在)\n'
+    fi
+fi
+
+# ---------------------------------------------------------------- 客户端产物菜单
+group "客户端产物菜单 (换指纹 / 换连接 IP)"
+CM="$ROOT/xray-panel.sh"
+grep -q 'client_menu()' "$CM" && ok "面板有客户端产物菜单" || bad "面板没有客户端产物菜单"
+grep -q 'conf/share.sh change-fp' "$CM" \
+    && ok "客户端产物菜单接上了「换 uTLS 指纹」" || bad "客户端产物菜单没接换指纹"
+grep -q 'conf/share.sh switch-family-menu' "$CM" \
+    && ok "客户端产物菜单接上了「换连接 IP」" || bad "客户端产物菜单没接换连接 IP"
+# switch-family-menu 必须在 share.sh 的 CLI 派发表里, 否则 xray_run 调它等于空跑
+grep -q 'switch-family-menu) x_switch_addr_family_menu' "$SH" \
+    && ok "switch-family-menu 在 CLI 派发表里" || bad "switch-family-menu 没进 CLI 派发表"
+grep -q 'change-fp)          share_change_fp' "$SH" \
+    && ok "change-fp 在 CLI 派发表里" || bad "change-fp 没进 CLI 派发表"
+# 换连接 IP 必须能交互选族 (面板调不到带参数的子命令)
+grep -q 'x_switch_addr_family_menu()' "$SH" \
+    && ok "换连接 IP 有交互入口 (不用背 v4/v6 参数)" \
+    || bad "换连接 IP 只有带参数的非交互子命令"
 
 group "节点命名 (naming.sh)"
 # 协议名规范化: 各处的写法收敛成一种
@@ -1222,24 +1534,37 @@ python3 "$LIB/nginx_apply.py" --domain t.example --path /node --port 23456 --tra
 NB2=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf")
 assert_eq "$NB2" "1" "重复插入仍只有一个标记块 (幂等)"
 
-V2=$(printf '2\nt.example\n0\n' | ngmenu | grep -c 'proxy_pass')
+# ★ 站点选择从"手打域名"改成了"看表选编号"(这是本次 UX 改动的核心), 所以这里
+#   不能写死域名, 得先从菜单 1 的输出里查出 t.example 是第几号。
+#   写死的另一个坏处: 站点表按域名排序, 一旦夹具多一个站点, 编号就整体位移,
+#   测试会以"功能坏了"的面貌失败, 实际功能是好的。
+ng_idx() { printf '1\n0\n' | ngmenu | awk -v d="$1" '$0 ~ d && $1 ~ /^[0-9]+$/ {print $1; exit}'; }
+TI=$(ng_idx 't\.example')
+[[ -n "$TI" ]] && ok "站点表里能按编号找到 t.example (第 $TI 号)" || bad "站点表里找不到 t.example 的编号"
+
+V2=$(printf '2\n%s\n\n0\n' "$TI" | ngmenu | grep -c 'proxy_pass')
 assert_eq "$V2" "1" "查看站点: 显示插入的正文"
 
-R1=$(printf '4\nt.example\nnope\n0\n' | ngmenu | grep -c '已取消')
+R1=$(printf '4\n%s\nnope\n\n0\n' "$TI" | ngmenu | grep -c '已取消')
 assert_eq "$R1" "1" "摘除: 确认词不对则不动手"
 NB3=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf")
 assert_eq "$NB3" "1" "摘除: 取消后标记块还在"
 
-printf '4\nt.example\nyes\n0\n' | ngmenu >/dev/null 2>&1
+printf '4\n%s\nyes\n\n0\n' "$TI" | ngmenu >/dev/null 2>&1
 NB4=$(grep -c 'xray-core BEGIN' "$NG/t.example.conf" || true)
 assert_eq "$NB4" "0" "摘除: 确认后标记块消失"
 KEEP=$(grep -c 'return 444' "$NG/t.example.conf")
 assert_eq "$KEEP" "1" "摘除: 用户自己写的 location 未被动过"
 
-P1=$(printf '5\nt.example\n23456\nws\n0\n' | ngmenu | grep -c 'dry-run, 不落盘')
+# 预览插入: 站点也是编号选 (取消手填是给"还没建的站点"用的, 这里是已有站点);
+# 传输方式从"手打 ws/grpc/..."改成了编号表, ws 是第 1 项
+P1=$(printf '5\n%s\n23456\n1\n\n0\n' "$TI" | ngmenu | grep -c 'dry-run, 不落盘')
 assert_eq "$P1" "1" "预览插入: 标明是 dry-run"
-P2=$(printf '5\nt.example\n23456\nws\n0\n' | ngmenu | grep -c 'proxy_pass')
+P2=$(printf '5\n%s\n23456\n1\n\n0\n' "$TI" | ngmenu | grep -c 'proxy_pass')
 assert_eq "$P2" "1" "预览插入: 能看到将插入的内容"
+# 取消编号选择 -> 走"手填还没建的域名"这条路 (预览本来就要能预览不存在的站点)
+P3=$(printf '5\n0\nbrand.new\n23456\n1\n\n0\n' | ngmenu | grep -c 'brand.new')
+assert_eq "$P3" "1" "预览插入: 取消后仍可手填未建站点"
 
 # ---------------------------------------------------------------- 面板入口
 # 目标里的能力清单要求每项都有用户能摸到的入口。之前 cert / nginx_site /
@@ -1249,7 +1574,27 @@ PAN="$ROOT/xray-panel.sh"
 # Server / Client / UI 由面板本身与 Client/ 目录承担, 不是独立菜单项
 entry_ok() { grep -q "conf/$1" "$PAN" && ok "$2 有菜单入口" || bad "$2 无菜单入口"; }
 entry_ok share.sh          "Share"
-entry_ok share_service.sh  "Pull (分享服务)"
+# ★ 分享服务不再是主菜单的独立项 —— 用户要求把它和「分享管理」并成一块:
+#   状态提到 share_menu 顶部 (每轮刷新), 11) 保留为二级入口。
+#   所以入口判定放宽成"面板直接引用, 或经 share.sh 引用";
+#   并且**额外钉死二级入口还在**, 免得以后有人把 11) 删了这项测试还绿着。
+if grep -q "conf/share_service.sh" "$PAN"; then
+    ok "Pull (分享服务) 有菜单入口"
+elif grep -q 'share_service.sh' "$ROOT/conf/share.sh"; then
+    ok "Pull (分享服务) 有菜单入口 (经分享管理二级菜单)"
+else
+    bad "Pull (分享服务) 无菜单入口"
+fi
+grep -q 'share_service_menu' "$ROOT/conf/share.sh" \
+    && ok "分享服务的二级入口仍挂在分享管理里" \
+    || bad "分享服务的二级入口不见了"
+# ★ 合并的另一半: 服务状态必须出现在分享菜单**顶部**。
+#   老结构是主菜单 5) 与 share_menu 11) 各画一份状态, 两处还会不一致。
+grep -q '_share_svc_status' "$ROOT/conf/share.sh" \
+    && ok "分享菜单顶部显示分享服务状态" \
+    || bad "分享菜单顶部没有服务状态 —— 用户还得再点一层才看得到"
+grep -q 'share_service.sh menu' "$PAN" && bad "主菜单还留着独立的 5) 分享服务" \
+    || ok "主菜单已去掉独立的 5) 分享服务"
 entry_ok node.sh           "Node 管理"
 entry_ok nginx_site.sh     "Nginx"
 entry_ok cert.sh           "Cert"
@@ -1511,6 +1856,99 @@ print(next((c["verdict"] for c in d["xray"]["checks"] if c["item"]=="指纹"), "
   assert_eq "$got" "$want" "指纹 $fp"
 done
 rm -rf "$FPT"
+
+# ==========================================================================
+group "导入分享链接 (X 自己的订阅链接 / percent-decode / ECH)"
+# 这组守的是: 用户把面板「分享管理」发出来的那条 http://ip:port/share/<token>
+# 贴进「新增出站 → 导入分享链接」时, 生成的出站必须是**对**的。
+# 曾经有 4 个坑, 全是"看着配好了, 连不通"那一类:
+#   1) path 不解码 → "%2FaVCR3P0A%2F" 原样进 JSON, 请求打空
+#   2) 名字不解码 → 节点名是一串 %F0%9F%87%BA
+#   3) ech 被丢掉 → 白挂 CDN, 真实 SNI 裸奔
+#   4) 订阅是多条的, 单条解析器吃不了
+SUBT="$(mktemp -d)"
+sed -n '/^urldecode()/,/^}/p;/^_ob_name()/,/^}/p;/^get_param()/,/^}/p;
+        /^parse_hysteria2()/,/^}/p;/^parse_vless()/,/^}/p;/^parse_trojan()/,/^}/p;
+        /^parse_ss()/,/^}/p;/^parse_vmess()/,/^}/p;
+        /^vless_json()/,/^}/p;/^trojan_json()/,/^}/p;/^hy2_json()/,/^}/p;
+        /^ss_json()/,/^}/p' "$ROOT/conf/outbound.sh" > "$SUBT/fns.sh"
+
+cat > "$SUBT/drv.sh" <<'DRV'
+set -u
+source "$1"; shift
+eval "$1"
+DRV
+
+sub_eval() { bash "$SUBT/drv.sh" "$SUBT/fns.sh" "$1" 2>/dev/null; }
+
+# --- 1) percent-decode ------------------------------------------------------
+assert_eq "$(sub_eval 'get_param "path=%2FaVCR3P0A%2F&sni=a.example" path')" "/aVCR3P0A/" \
+    "get_param 会 percent-decode (xhttp 的 path 是编码过的)"
+assert_eq "$(sub_eval 'get_param "path=%2FaVCR3P0A%2F&sni=a.example" sni')" "a.example" \
+    "没编码的值不受影响"
+assert_eq "$(sub_eval 'urldecode "AGX%2BDQBh"')" "AGX+DQBh" \
+    "ECH 配置里的 + 要还原 (base64 的 + 编码成 %2B)"
+
+# --- 2) 节点名解码 ---------------------------------------------------------
+assert_eq "$(sub_eval '_ob_name "%F0%9F%87%BA%F0%9F%87%B8%201-VLESS-WS_01" "x"')" "🇺🇸 1-VLESS-WS_01" \
+    "分享链接的 #name 是编码过的, 名字要能还原"
+assert_eq "$(sub_eval '_ob_name "" "VLESS"')" "VLESS" \
+    "没有 #name 时回落到默认名"
+
+# --- 3) 用 X 真实载荷里那条 xhttp 链接走一遍 --------------------------------
+XLINK='vless://1fa7c981-16b4-4963-9ef6-9bb13ad25053@107.173.154.178:8443?encryption=none&security=tls&type=xhttp&sni=moontv.6896698.xyz&ech=AGX%2BDQBhAAAgACA%2FrOgHBypsWc%2FLDY%2FWZjmK8Gm5jpe876iY7AKFphHdAgAkAAEAAQABAAIAAQADAAIAAQACAAIAAgADAAMAAQADAAIAAwADAB%2Bmoontv%2Ejson%3D&path=%2FaVCR3P0A%2F#%F0%9F%87%BA%F0%9F%87%B8%201-vless-xhttp07'
+assert_eq "$(sub_eval "OB_ECH=; parse_vless \"$XLINK\"; printf '%s' \"\$OB_XHTTP_PATH\"")" "/aVCR3P0A/" \
+    "parse_vless 解出正确的 xhttp 路径"
+assert_eq "$(sub_eval "OB_ECH=; parse_vless \"$XLINK\"; printf '%s' \"\$OB_NAME\"")" "🇺🇸 1-vless-xhttp07" \
+    "parse_vless 解出正确的节点名"
+assert_eq "$(sub_eval "OB_ECH=; parse_vless \"$XLINK\"; printf '%s' \"\${#OB_ECH}\"")" "123" \
+    "parse_vless 取出 ech (静默丢掉就等于白挂 CDN)"
+
+# --- 4) ech 必须真的进 JSON (字段名是 echConfigList, 服务端/客户端不同) -----
+# ★ 这两条把 jq 程序**放进文件**再调用: 在 eval 字符串里再嵌一层引号必然转义错,
+#   错出来的报错长得像产品坏了, 实际是自己写错。踩过一次。
+cat > "$SUBT/len.jq" <<'JQ'
+(.outbounds[0].streamSettings.tlsSettings // {}) | (.echConfigList // "") | length
+JQ
+cat > "$SUBT/nok.jq" <<'JQ'
+.outbounds[0].streamSettings | has("tlsSettings")
+JQ
+# ★ 片段里只负责**准备 OB_\***, 生成由 sub_run 统一做 —— 片段里再调一次
+#   vless_json 就会输出两份 (上面踩过)。另一个坑: 不先 parse_vless 就直接
+#   vless_json, OB_NAME/OB_ADDR 这些还没设, set -u 下整个函数静默死掉,
+#   表现出来是"断言拿到空", 看着像产品坏了。
+export XLINK
+cat > "$SUBT/with.sh" <<'RUN'
+OB_ECH=""; parse_vless "$XLINK"
+RUN
+cat > "$SUBT/without.sh" <<'RUN'
+OB_ECH=""; parse_vless "$XLINK"; OB_ECH=""; OB_SEC=none; OB_NET=tcp
+RUN
+sub_run() { # <片段文件> <jq文件>
+    bash "$SUBT/drv.sh" "$SUBT/fns.sh" "source $1; vless_json ob-t" 2>/dev/null | jq -r -f "$2"
+}
+ECH_LEN=$(sub_run "$SUBT/with.sh" "$SUBT/len.jq")
+assert_eq "$ECH_LEN" "123" "ech 写进了 tlsSettings.echConfigList (不是 echServerKeys —— 那是服务端字段)"
+NO_ECH=$(sub_run "$SUBT/without.sh" "$SUBT/nok.jq")
+assert_eq "$NO_ECH" "false" "没有 ech 时不会凭空长出 tlsSettings/echConfigList"
+
+# --- 5) 订阅地址导入 -------------------------------------------------------
+grep -q 'http|https) import_share_url' "$ROOT/conf/outbound.sh" \
+    && ok "import_link 把 http(s) 交给订阅导入" || bad "import_link 不认订阅地址"
+grep -q 'base64 -d' "$ROOT/conf/outbound.sh" \
+    && ok "订阅导入会解 base64 (X 的载荷就是 base64 的订阅行)" || bad "订阅导入不解 base64"
+grep -q 'case "\${ln%%://\*}" in' "$ROOT/conf/outbound.sh" \
+    && ok "订阅导入只留认得的协议" || bad "订阅导入没过滤协议"
+# Ctrl-D 不能被当成"全选" —— 那样误触一下就导进 8 个出站
+grep -q 'if ! IFS= read -r pick; then' "$ROOT/conf/outbound.sh" \
+    && ok "订阅导入把 EOF 与'确实要全选'分开 (ui_ask 做不到)" \
+    || bad "订阅导入用 ui_ask 收选择 —— Ctrl-D 会变成全选"
+# ECH 变量兜底: 走 wizard_* 手工新增时没设过 OB_ECH, jq 又无条件引用 $ech
+grep -q '^OB_ECH=""' "$ROOT/conf/outbound.sh" \
+    && ok "OB_ECH 有兜底初始化 (set -u 下手工新增不会炸)" \
+    || bad "OB_ECH 没兜底 —— 手工新增出站时 jq 会引用未定义变量"
+jq_ok=$(command -v jq >/dev/null && echo yes || echo no)
+assert_eq "$jq_ok" "yes" "本组测试依赖 jq"
 
 group "出站地址族 (--family)"
 FAMT="$(mktemp -d)"
@@ -2900,11 +3338,15 @@ done
 # 逐列提取不得错位。取样值随预置表调整而变 —— 这条的意图是**列对齐**,
 # 不是"第 2 档必须是某个传输"。当前 vless 第 2 档是 XHTTP + TLS (CDN 推荐档,
 # 见下面「预置推荐档」一组)。
-TR=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 2 2" 2>/dev/null)
-SE=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 2 3" 2>/dev/null)
+# 同样按名字定位, 免得每次重排编号都要改这两条。
+_i=$(preset_index_by_name vless "CDN 友好")
+TR=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless $_i 2" 2>/dev/null)
+SE=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless $_i 3" 2>/dev/null)
 assert_eq "$TR/$SE" "xhttp/tls" "逐列提取不错位"
-TR=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 1 2" 2>/dev/null)
-assert_eq "$TR" "tcp" "第一个预置提取正确"
+# 第一个预置 = 面板的推荐首选。这里断言的是**安全层**, 不是传输名 ——
+# tcp 与 raw 是等价别名, 写死哪一个都会在下次调整时误报。
+SE1=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 1 3" 2>/dev/null)
+assert_eq "$SE1" "reality" "第一个预置提取正确 (推荐首选是 REALITY)"
 # 末尾空字段场景 —— read 会少给一个字段, cut 不会
 OUT=$(bash -c "source '$LIB/preset.sh'; echo \"a|b||\" | cut -d'|' -f3" 2>/dev/null)
 assert_eq "$OUT" "" "cut 对末尾空字段返回空串 (read 会少给一个字段)"
@@ -2926,19 +3368,106 @@ done
 
 # 预置表里的 REALITY 组合必须与 node_build.py 的限制一致
 NBREAL=$(python3 -c "import sys;sys.path.insert(0,'$LIB');import node_build as B;print('|'.join(sorted(B.SECURITY_TRANSPORTS['reality'])))")
+# asort 是 gawk 扩展, Debian 默认的 mawk 没有 —— 排序走 sort, 不依赖 awk 方言
+NBREALITY_SORTED=$(printf '%s' "$NBREAL" | tr '|' '\n' | sort | sed 's/$/|/' | tr -d '\n')
 PBAD=0
 for p in vless trojan vmess shadowsocks hysteria2 socks http; do
     cnt=$(bash -c "source '$LIB/preset.sh'; x_preset_count $p" 2>/dev/null)
     for i in $(seq 1 "$cnt" 2>/dev/null); do
         t=$(bash -c "source '$LIB/preset.sh'; x_preset_field $p $i 2" 2>/dev/null)
         s2=$(bash -c "source '$LIB/preset.sh'; x_preset_field $p $i 3" 2>/dev/null)
-        if [[ "$s2" == "reality" && "$t" != "tcp" ]]; then PBAD=$((PBAD+1)); fi
+        # 判据直接取 node_build 的白名单 —— 不在它里面才算不一致。
+        # 原来这里写死 `!= "tcp"`, 于是白名单一旦按内核放宽 (raw/xhttp/grpc),
+        # 这条门禁会把**正确**的组合判成违规, 逼着代码退回错的那个。
+        if [[ "$s2" == "reality" ]]; then
+            case "|$NBREALITY_SORTED|" in
+                *"|$t|"*) : ;;
+                *) PBAD=$((PBAD+1)) ;;
+            esac
+        fi
     done
 done
 assert_eq "$PBAD" "0" "预置表与 node_build 的 REALITY 限制一致"
 # 无预置协议必须明确报错而非静默
 NU=$(bash -c "source '$LIB/preset.sh'; x_preset_ask tuic </dev/null" 2>&1 | awk 'NR==1')
 [[ "$NU" == *"没有预置"* ]] && ok "无预置协议明确报错" || bad "无预置协议明确报错"
+
+# ------------------------------------------------- 后量子 / X 特有能力 (X 内核独有)
+group "后量子与 X 特有能力"
+
+# ★ 回归 1: mknode.sh 里重写 opts_json 的那段 python 曾经**漏 import os**,
+#   于是 NameError → 命令替换拿到空串 → deploy.py 报
+#   「缺少必填参数: --protocol, --transport, --security」。
+#   现象指向"规格拼错", 实际是少一个 import, 而这条路径就是"用预置建 REALITY
+#   节点" —— 也就是说该组合从来没成功过 (面板菜单 7 的 Reality.sh 是另一条路)。
+#   这条断言直接跑那段 python, 比比对源码字符串可靠: 源码改了字面量也照样过。
+RK=$(python3 - <<'PYX'
+import json, os, subprocess, sys
+spec = '{"protocol":"vless","transport":"raw","security":"reality"}'
+env = dict(os.environ, MK_PK="a"*43, MK_PB="b"*43)
+# 与 mknode.sh 里那一行同构
+snippet = """
+import json,sys,os
+o=json.loads(sys.argv[1]); o['private_key']=os.environ['MK_PK']; o['public_key']=os.environ['MK_PB']
+print(json.dumps(o,ensure_ascii=False))"""
+r = subprocess.run([sys.executable, "-c", snippet, spec], env=env,
+                   capture_output=True, text=True)
+print("OK" if r.returncode == 0 and r.stdout.strip() else "ERR")
+PYX
+)
+assert_eq "$RK" "OK" "REALITY 密钥拼装 (mknode 的 opts 重写不返回空串)"
+
+# ★ 回归 2: mknode.sh 必须对重写结果做非空守卫, 否则同类失败仍然静默传播
+G=$(grep -c '拼装 REALITY 密钥对时出错' "$ROOT/conf/mknode.sh" 2>/dev/null)
+assert_eq "$G" "1" "REALITY 密钥拼装有非空守卫 (不拿空串往下走)"
+
+# Vision flow 是**调用方**的事: node_build 只按传入的写, 加不加由 mknode 决定。
+# 所以这里断言的是 mknode 那条判据 (只有裸 TCP 才加), 而不是 node_build。
+FF=$(grep -c 'opts\["transport"\] in ("raw", "tcp")' "$ROOT/conf/mknode.sh" 2>/dev/null)
+assert_eq "$FF" "1" "mknode 只对裸 TCP 加 Vision flow"
+
+# ★ kcp 的拦截点不在 _preset_security_allows —— 那个函数只看 REALITY 的传输
+#   白名单, 对 security=none 一律放行。真正的闸门是 _P_TRANSPORTS
+#   (预置表自检 x_preset_validate 用它), 而 mknode 只能从预置表建节点,
+#   所以"表里没有 kcp" 就等于用户选不到它。
+#   内核 26.3.27 实测: kcpSettings 的 header/seed 已移除, 报错原文
+#     "The feature mkcp header & seed has been removed and migrated to ..."。
+#   只写个空 kcpSettings{} 能过 xray run -test, 但运行期照样连不通 ——
+#   面板显示一切正常, 用户查不出原因。所以要在生成之前就挡掉。
+KK=$(bash -c "source '$LIB/preset.sh'; case \" \$_P_TRANSPORTS \" in *kcp*) echo Y;; *) echo N;; esac" 2>/dev/null)
+assert_eq "$KK" "N" "kcp 已从传输白名单移除 (内核已不支持 header/seed)"
+KK2=$(bash -c "source '$LIB/preset.sh'; x_preset_validate" 2>&1 | grep -c "kcp")
+assert_eq "$KK2" "0" "预置表里没有任何 kcp 档位"
+
+# ML-DSA-65 / ECH 字段能落到配置里
+ML=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import node_build as B
+r = B.build("vless","raw","reality", dict(tag="t", port=34567, private_key="a"*43,
+          public_key="b"*43, sni="x.com", dest="x.com:443",
+          mldsa65_seed="SEED", mldsa65_verify="VER"))
+rs = r["inbounds"][0]["streamSettings"]["realitySettings"]
+print("%s/%s" % (rs.get("mldsa65Seed","-"), rs.get("mldsa65Verify","-")))
+PYX
+)
+assert_eq "$ML" "SEED/VER" "ML-DSA-65 写进 realitySettings"
+EC=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import node_build as B
+r = B.build("vless","xhttp","tls", dict(tag="t", port=34567,
+          cert_file="/tmp/c", key_file="/tmp/k", sni="x.com",
+          ech_server_keys="ECHKEYS", xhttp_mode="stream-up"))
+ss = r["inbounds"][0]["streamSettings"]
+print("%s/%s" % (ss["tlsSettings"].get("echServerKeys","-"), ss["xhttpSettings"].get("mode")))
+PYX
+)
+assert_eq "$EC" "ECHKEYS/stream-up" "ECH 服务端公钥写进 tlsSettings, xhttp mode 透传"
+
+# 预置第 6 列 (加密增强) 能被取到, 且没有的档位兜成 none
+EN=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 1 6" 2>/dev/null)
+case "$EN" in *mlkem*) ok "第 6 列: 推荐首选带 ML-KEM" ;; *) bad "第 6 列: 推荐首选带 ML-KEM [得到 '$EN']" ;; esac
+EN2=$(bash -c "source '$LIB/preset.sh'; x_preset_ask vless </dev/null 2>/dev/null | wc -l")
+assert_eq "$EN2" "0" "x_preset_ask 取消时不输出"
 
 # ---------------------------------------------------------------- 预置建节点
 group "预置建节点 (mknode → deploy)"
@@ -3156,9 +3685,18 @@ else
     [[ "$NC" -ge 2 ]] && ok "重装后配置目录没有重复生成" || bad "重装后配置目录只剩 $NC 个文件"
 fi
 group "预置批量 (preset_batch.sh)"
+# ★ 这组测试要的是 **TLS 档** (域名/监听/nginx 档位都是 TLS 才有的语义),
+#   原来写死 `vless:2 trojan:3`。预置表一重排编号, vless:2 就从
+#   "xhttp+tls" 变成了 "raw+reality", 于是这几条测的已经不是它们想测的东西 ——
+#   nginx 档断言 listen=127.0.0.1 而 REALITY 档根本不听本机, 于是假红。
+#   按显示名定位, 编号随便怎么排都对。
+VL_TLS=$(preset_index_by_name vless  "CDN 友好")
+TJ_TLS=$(preset_index_by_name trojan "CDN 友好")
+assert_ne0 "$VL_TLS" "vless 有 TLS 档"
+assert_ne0 "$TJ_TLS" "trojan 有 TLS 档"
 PB="$TMP/pb"; mkdir -p "$PB"
 XRAY_CONF_DIR="$PB/conf" XRAY_SHARE_DIR="$PB/share" X_BATCH_DOMAIN=a.example.com \
-  bash "$ROOT/tools/preset_batch.sh" vless:2 trojan:3 >/dev/null 2>&1
+  bash "$ROOT/tools/preset_batch.sh" "vless:$VL_TLS" "trojan:$TJ_TLS" >/dev/null 2>&1
 assert_eq "$(ls "$PB/conf"/*.json 2>/dev/null | wc -l)" "2" "批量落盘 2 个片段"
 assert_eq "$(ls "$PB/share"/*.json 2>/dev/null | wc -l)" "2" "批量落盘 2 份元数据"
 PD=$(python3 -c "
@@ -3169,7 +3707,7 @@ assert_eq "$PD" "0.0.0.0" "默认 CDN 档位: Xray 听 0.0.0.0"
 # 基础域名 + 序号: 每个 TLS 节点一个不同域名
 PB2="$TMP/pb2"; mkdir -p "$PB2"
 XRAY_CONF_DIR="$PB2/conf" XRAY_SHARE_DIR="$PB2/share" X_BATCH_DOMAIN_BASE=b.example.com \
-  bash "$ROOT/tools/preset_batch.sh" vless:2 trojan:3 >/dev/null 2>&1
+  bash "$ROOT/tools/preset_batch.sh" "vless:$VL_TLS" "trojan:$TJ_TLS" >/dev/null 2>&1
 HOSTS=$(python3 -c "
 import json,glob
 hs=sorted(json.load(open(f))['host'] for f in glob.glob('$PB2/share/*.json'))
@@ -3178,7 +3716,7 @@ assert_eq "$HOSTS" "b.example.com-1,b.example.com-2" "基础域名按序号递�
 # nginx 档位
 PB3="$TMP/pb3"; mkdir -p "$PB3"
 XRAY_CONF_DIR="$PB3/conf" XRAY_SHARE_DIR="$PB3/share" X_BATCH_DOMAIN=a.com \
-  bash "$ROOT/tools/preset_batch.sh" vless:2:nginx >/dev/null 2>&1
+  bash "$ROOT/tools/preset_batch.sh" "vless:$VL_TLS:nginx" >/dev/null 2>&1
 NG=$(python3 -c "
 import json,glob
 d=json.load(open(sorted(glob.glob('$PB3/conf/*.json'))[0], encoding='utf-8'))
@@ -3187,7 +3725,7 @@ print(d['inbounds'][0]['listen'], m['port'])")
 assert_eq "$NG" "127.0.0.1 443" "nginx 档: 听本机, 对外 443"
 # TLS 缺域名必须明确报错
 PB4="$TMP/pb4"; mkdir -p "$PB4"
-E=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" vless:2 2>&1 | grep -c '需要域名')
+E=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" "vless:$VL_TLS" 2>&1 | grep -c '需要域名')
 assert_eq "$E" "1" "TLS 缺域名明确报错 (不静默跳过)"
 # 非法预置序号
 E2=$(XRAY_CONF_DIR="$PB4/conf" XRAY_SHARE_DIR="$PB4/share" bash "$ROOT/tools/preset_batch.sh" vless:99 2>&1 | grep -c '预置序号')

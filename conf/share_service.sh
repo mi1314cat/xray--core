@@ -67,6 +67,32 @@ else
     fi
 fi
 
+# 统一交互层 (conf/lib/ui.sh) —— 提供 ui_ask_num / ui_pick / ui_invalid。
+#
+# ★ 本脚本原来只有 print.sh, 所以菜单收编号只能 `read -r c` + 提示里手写
+#   "[0-6, 回车=0=返回]" —— 而 ui_ask_num 本来就能把范围和"0=取消"说清楚,
+#   还能在输错时**重画同一行**而不是掉进一层 `*) 无效选择` 的死循环。
+#   查找路径与 print.sh 完全一致 (脚本旁边 → 安装目录 → 现拉)。
+if ! declare -F ui_ask_num >/dev/null; then
+    for _ud in "$(dirname "${BASH_SOURCE[0]:-$0}")/lib" \
+               "$XRAY_BASE/conf/lib" /root/catmi/xray/conf/lib; do
+        if [[ -r "$_ud/ui.sh" ]]; then
+            # shellcheck disable=SC1090
+            source "$_ud/ui.sh" && break
+        fi
+    done
+    if ! declare -F ui_ask_num >/dev/null; then
+        _utmp="$(mktemp -d /tmp/.xui.XXXXXX)" 2>/dev/null || _utmp=""
+        if [[ -n "$_utmp" ]] \
+           && curl -fsSL --max-time 20 "$XRAY_RAW/conf/lib/ui.sh" \
+                  -o "$_utmp/ui.sh" 2>/dev/null; then
+            # shellcheck disable=SC1090
+            source "$_utmp/ui.sh"
+        fi
+    fi
+fi
+unset _ud _utmp
+
 python() { command python3 "$@"; }
 
 xapi() { SHARE_PROVIDER=xray python "$SHARE_CLIENT" "$@"; }
@@ -169,10 +195,19 @@ check_firewall() {
 
 share_service_menu() {
     while :; do
-        printf "\n${_CYN}===== 分享服务 =====${_RST}\n" >&2
-        local port st="未运行"
+        local port st="未运行" h
         port=$(share_port)
-        xapi health >/dev/null 2>&1 && st="运行中"
+        # ★ 判据必须是"**拿到了健康数据**", 不能只看退出码。
+        #   下面 status_share 用的是 `[[ -n "$h" ]]`, 而这一行原来只看
+        #   `xapi health &&`, 于是同一个脚本能给出两个相反的答案:
+        #   菜单说"运行中"、点 3) 查看状态却说"未运行或不可达"。
+        #   适配器在服务不可达时会退出非 0, 但退出 0 却没有数据的情况同样存在
+        #   (被别的适配器版本顶替、或输出被吞)。拿不到数据就不能说它在跑。
+        h=$(xapi health 2>/dev/null)
+        [[ -n "$h" ]] && st="运行中"
+        # ★ 删掉原来紧接其上的 `printf "\n${_CYN}===== 分享服务 =====${_RST}\n"` ——
+        #   紧接着 ui_title 又画一次标题, 等于连续两个标题框 ("===== 分享服务 ====="
+        #   与 "分享服务（公共基础服务）")。留一个空行当呼吸即可。
         printf '\n' >&2
         ui_title "分享服务（公共基础服务）"
         ui_kv "当前状态" "$st"
@@ -187,8 +222,15 @@ share_service_menu() {
         ui_menu 5 "升级服务代码"
         ui_menu 6 "检查防火墙放行"
         ui_menu 0 "返回"
-        printf '\n  请选择: ' >&2
-        read -r c || return 0
+        echo >&2
+        # ★ 原来这里 `printf '\n  请选择 [0-6, 回车=0=返回]: '` + `read -r c`,
+        #   输错一个字母就掉进 `*) 无效选择` 死循环 —— 而 ui_ask_num 在输错时
+        #   **留在同一行重问**, 并把范围与"0=取消"写在提示里。
+        #   (ui_ask_num 的取消语义也是 0/空, 与原来的 case 完全一致。)
+        #   ★ 必须接住返回值: ui_ask_num 把选择写到 **stdout**, 不接的话
+        #     case 永远不匹配, 菜单会静默地什么都不做。
+        local c
+        c=$(ui_ask_num "请选择" 0 6) || return 0
         case "$c" in
             1) ensure_share ;;
             2)
@@ -204,7 +246,6 @@ share_service_menu() {
             5) upgrade_share ;;
             6) check_firewall "$port" ;;
             0|"") return 0 ;;
-            *) warn "无效选择" ;;
         esac
     done
 }

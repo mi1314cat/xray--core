@@ -22,39 +22,118 @@ fi
 # ================================
 
 # ================================
-# 彩色定义
+# 统一 UI 层 —— conf/lib/print.sh + conf/lib/ui.sh
+#
+# ★ 本文件原先**自带一份** RED/GREEN/… 与 print_title / print_* / menu_item /
+#   say。抄一份的代价不是多占十几行，而是"改一处漏两处" —— 而且已经踩中两条：
+#     1) print_title 把标题塞进 `printf "║ %-42s ║"`。%-42s 按**字节**算宽度，
+#        而本文件的标题全是中文（一个字 3 字节）。于是
+#        「双栈智能落地（IPv4站走IPv4 + IPv6站走IPv6）」(55 字节) 与
+#        「落地自检（配置 · 绑定 · 服务 · IPv6出口 · MTU）」(65 字节)
+#        都会把右边框顶出屏幕, 少一列就看不出那是标题还是正文。
+#     2) say() 的 %-18s 同理: 中文标签（源IP / 出口IPv6 / 出口IPv4 / 代理）
+#        与 ASCII 标签（DNS / TCP / TLS）混排, 整列歪 2 格。
+#   现在标题统一走 ui_box（按终端宽度 + 显示宽度算）, 对齐统一走 ui_pad_w。
+#
+# ★ 旧函数名全部保留为**薄包装** —— 下面几百个调用点一行都不用改。
+# ★ 提示一律写 stderr: stdout 是数据通道（分享链接 / 节点数据）。
 # ================================
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-BLUE="\e[34m"
-MAGENTA="\e[35m"
-CYAN="\e[36m"
-WHITE="\e[97m"
-GRAY="\e[90m"
-BOLD="\e[1m"
-RESET="\e[0m"
+if [[ -r "$_x_read_lib_dir/print.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$_x_read_lib_dir/print.sh"
+else
+    source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/print.sh") \
+        || { printf '  [X] 提示库 print.sh 加载失败\n' >&2; exit 1; }
+fi
+
+# 统一交互层（编号选择 / 确认 / 提问 / 方框排版）。
+# ★ 取不到不致命: 退化成"只有排版的老样子" —— 菜单点得动比排版好看重要。
+if [[ -r "$_x_read_lib_dir/ui.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$_x_read_lib_dir/ui.sh"
+else
+    printf '  [!] 交互库 ui.sh 取不到, 降级为无编号选择\n' >&2
+    UI_PICK_KEY=""; UI_PICK_IDX=""; UI_PICK_COLS=(); UI_PICK_ROWS=""
+    ui_box()   { ui_title "$@"; }
+    ui_menu()  { printf '  %2s) %s\n' "$1" "$2" >&2; }
+    ui_note()  { printf '  %s\n' "$1" >&2; }
+    ui_pad_w() { printf '%s' "$1"; }
+    ui_rule2() { printf '  --------------------------------\n' >&2; }
+    ui_pause() { printf '\n' >&2; read -r _ || true; }
+    ui_ask() { # <提示> [默认值]
+        local q="$1" d="${2-}" a
+        if [[ -n "$d" ]]; then
+            printf '  %s (回车=%s): ' "$q" "$d" >&2
+        else
+            printf '  %s: ' "$q" >&2
+        fi
+        read -r a || a=""; [[ -z "$a" ]] && a="$d"; printf '%s' "$a"
+    }
+    ui_confirm() {
+        local q="$1" a
+        printf '  %s\n' "$q" >&2
+        printf '    输入 yes 确认 (回车=取消): ' >&2
+        read -r a || a=""
+        [[ "$a" == "yes" || "$a" == "YES" || "$a" == "y" || "$a" == "Y" ]]
+    }
+    ui_table_print() { # 无库兜底: 退化成逐行 dump
+        local k rest i=0
+        while IFS=$'\t' read -r k rest; do
+            [[ -n "$k" ]] || continue
+            i=$((i + 1)); printf '  %2d) %s  %s\n' "$i" "$k" "$rest" >&2
+        done <<< "${UI_PICK_ROWS:-}"
+        (( i == 0 )) && printf '  (空)\n' >&2
+        printf '\n  %s\n' "${1:-共 $i 项}" >&2
+        return 0
+    }
+    ui_ask_num() {
+        local p="$1" lo="$2" hi="$3" a
+        while :; do
+            read -r -p "  $p [$lo-$hi, 0=取消]: " a || return 1
+            [[ -z "$a" || "$a" == 0 ]] && return 1
+            [[ "$a" =~ ^[0-9]+$ ]] && (( a >= lo && a <= hi )) && { printf '%s' "$a"; return 0; }
+            printf '  无效选项: %s\n' "$a" >&2
+        done
+    }
+    ui_pick() {   # 无库时的兜底: 仍然编号化, 只是没有方框
+        local title="$1" empty="$2" verb="$3" -a keys=() labels=()
+        local k v i
+        while IFS=$'\t' read -r k v; do
+            [[ -n "$k" ]] || continue
+            keys+=("$k"); labels+=("$v")
+        done <<< "${UI_PICK_ROWS:-}"
+        if ((${#keys[@]} == 0)); then printf '  %s\n' "$empty" >&2; return 2; fi
+        ui_title "$title"
+        for (( i = 0; i < ${#keys[@]}; i++ )); do ui_menu $((i+1)) "${labels[$i]}"; done
+        ui_menu 0 "取消"
+        i=$(ui_ask_num "$verb" 1 "${#keys[@]}") || { UI_PICK_KEY=""; return 1; }
+        UI_PICK_KEY="${keys[$((i-1))]}"; return 0
+    }
+fi
+
+# ---------- 颜色: 引用共享层, 不再自己声明一份 ----------
+# ★ 非终端时 print.sh 会把颜色关掉（重定向到日志时不该带 ^[[32m 转义序列）,
+#   这里跟着共享层走, 不再无条件写死转义序列。
+RED="${_RED-}"; GREEN="${_GRN-}"; YELLOW="${_YEL-}"; CYAN="${_CYN-}"
+GRAY="${_DIM-}"; BOLD="${_BOLD-}"; RESET="${_RST-}"
+# 共享层没有这三个（用得少）, 保留字面量免得调用点找不到变量
+BLUE="\e[34m"; MAGENTA="\e[35m"; WHITE="\e[97m"
 
 # ================================
 # 打印函数（全部输出到 stderr，与入站脚本一致）
 # ================================
-print_info()  { printf "${CYAN}[Info]${RESET} %s\n" "$1" >&2; }
-print_ok()    { printf "${GREEN}[OK]${RESET}  %s\n" "$1" >&2; }
-print_warn()  { printf "${YELLOW}[Warn]${RESET} %s\n" "$1" >&2; }
-print_error() { printf "${RED}[Error]${RESET} %s\n" "$1" >&2; }
+print_info()  { info "$*"; }
+print_ok()    { ok "$*"; }
+print_warn()  { warn "$*"; }
+print_error() { err "$*"; }
 
-print_title() {
-    printf "${MAGENTA}${BOLD}" >&2
-    printf "╔══════════════════════════════════════════════╗\n" >&2
-    printf "║ %-42s ║\n" "$1" >&2
-    printf "╚══════════════════════════════════════════════╝\n\n" >&2
-    printf "${RESET}" >&2
-}
+# ★ 标题改走 ui_box: 按终端宽度 + 显示宽度画, `%-42s`（字节）的溢出消失。
+print_title() { ui_box "$1"; }
 
 # ---------- 统一菜单控件 ----------
-menu_item() { printf "  ${WHITE}${BOLD}%2s)${RESET} %s\n" "$1" "$2" >&2; }
-menu_hint() { printf "  ${GRAY}%s${RESET}\n" "$1" >&2; }
-menu_quit() { printf "  ${GRAY}${BOLD} 0)${RESET} ${GRAY}%s${RESET}\n" "${1:-返回上级}" >&2; }
+menu_item() { ui_menu "$1" "$2"; }
+menu_hint() { ui_hint "$1"; }
+menu_quit() { ui_menu 0 "${1:-返回上级}"; }
 # EOF 标志。menu_ask 只能 return —— 它基本都在 $(...) 子 shell 里被调用,
 # 直接 exit 只结束子 shell。标志位让外层的 while 能看到"该退出了"。
 #
@@ -89,6 +168,12 @@ OB_PREFIX="out"
 ROUTING_FILE="$CONF_DIR/out-routing.json"
 DEFAULT_OUTBOUND="direct"
 
+# ★ OB_* 的兜底初始化。走"导入分享链接"的解析器会设 OB_ECH, 但走 wizard_* 手工
+#   新增的不会 —— jq 那边又无条件引用 $ech, 于是 set -u 下整个菜单在选完协议后
+#   才炸。同理, 批量导入时上一条链接的 ech 会漏给下一条 (VLESS 有 ECH、下一条
+#   Trojan 没有 → Trojan 出站凭空长出 echConfigList)。
+OB_ECH=""; OB_POOL=""; OB_SEND=""
+
 # Xray 二进制（配置校验用）
 XRAY_BIN="${XRAY_BIN:-}"
 if [[ -z "$XRAY_BIN" ]]; then
@@ -114,8 +199,10 @@ safe_read_int() {
     local input
 
     while [[ "$XR_EOF" == "0" ]]; do
-        printf "%s (默认: %s): " "$prompt" "$default" >&2
-        xr_read "请输入" "" input || { XR_EOF=1; return; }
+        # ★ 原来这里 `printf "%s (默认: %s): "` 紧跟 `xr_read "请输入"` ——
+        #   屏幕上真的会出现 "端口 (默认: 443): 请输入: "（问题问两遍）。
+        #   xr_read 自己就会带 "(默认: …)"，所以提示只留一份。
+        xr_read "$prompt" "$default" input || { XR_EOF=1; return; }
         input=$(clean_input "$input")
         input="${input:-$default}"
         [[ "$input" =~ ^[0-9]+$ ]] || { print_error "必须是数字"; continue; }
@@ -126,14 +213,26 @@ safe_read_int() {
 }
 
 # 单选输入（默认值直接回车）
-safe_choose() {
-    local prompt="$1"
-    local default="$2"
-    local input
-    printf "%s (默认: %s): " "$prompt" "$default" >&2
-    xr_read "请输入" "" input || { XR_EOF=1; return; }
-    input=$(clean_input "$input")
-    echo "${input:-$default}"
+#
+# ★ 原来这里是 `printf "%s (默认: %s): " "传输: 1)tcp 2)ws 3)grpc"` ——
+#   选项只存在于**提示串里**（用户要自己数第几个）而且**完全不校验**：
+#   敲个 "5" 落进调用方的 `*)` 分支，静默变成 tcp，用户却以为自己选了别的。
+#   现在选项先用 ui_menu 画出来，再收编号；0/EOF = 取消（返回 1）。
+safe_choose() { # <提示> <默认序号> <选项…> -> stdout 选中的序号
+    local prompt="$1" default="${2:-1}"
+    shift 2 || true
+    local -a opts=("$@")
+    ((${#opts[@]} == 0)) && return 1
+    local i
+    for (( i = 0; i < ${#opts[@]}; i++ )); do
+        ui_menu $((i + 1)) "${opts[$i]}"
+    done
+    if [[ "$default" =~ ^[0-9]+$ ]] && (( default >= 1 && default <= ${#opts[@]} )); then
+        ui_hint "默认: ${default}) ${opts[$((default - 1))]}（输入序号，0=取消）"
+    else
+        ui_hint "输入序号，0=取消"
+    fi
+    ui_ask_num "$prompt" 1 "${#opts[@]}"
 }
 
 # 随机 UUID（缺 uuidgen 自动安装，与入站脚本一致）
@@ -206,15 +305,44 @@ inbound_tags() {
 # 分享链接解析（极简导入：只问粘贴，不问字段）
 # ================================
 # 读取 URL 查询参数： get_param "k=v&k2=v2" key
+# ★ 必须做 percent-decode —— 分享链接里的值是**编码过**的, 最常见的是 path:
+#   X 自己的分享载荷里 xhttp 节点写的是 `path=%2FaVCR3P0A%2F`。
+#   不解开就原样丢进 Xray JSON 的 path, 请求会打到一个不存在的路径上,
+#   而面板上这个出站看着配得好好的 —— 连不通却查不出原因。
+#   `+` 还原成空格, 与 Client 的 urllib.parse.parse_qs 保持一致:
+#   同一条链接在服务端和客户端必须解析出同一个值。
 get_param() {
-    local qs="$1" key="$2" pair
+    local qs="$1" key="$2" pair val
     IFS='&' read -ra pairs <<< "$qs"
     for pair in "${pairs[@]}"; do
-        [[ "${pair%%=*}" == "$key" ]] && echo "${pair#*=}" && return
+        if [[ "${pair%%=*}" == "$key" ]]; then
+            val="${pair#*=}"
+            urldecode "$val"
+            return
+        fi
     done
 }
 
-urldecode() { printf '%b' "${1//%/\\x}"; }
+# percent-decode。
+# ★ `printf %b` 对非法转义是**无害**的 (实测): `%zz` 原样输出 `%zz`、
+#   裸 `%` 原样输出 —— 不会把值改坏, 所以用它比逐字符起子 shell 快得多
+#   (ECH 配置有 500+ 字符, 逐字符解要起 500 次进程)。
+#   唯一的副作用是遇到裸 `%` 时 bash 会往 stderr 报一句 missing hex digit,
+#   这里一并丢掉 —— 那不是用户该看见的东西。
+urldecode() {
+    local s="${1//+/ }"
+    [[ "$s" != *%* ]] && { printf '%s' "$s"; return; }
+    printf '%b' "${s//%/\\x}" 2>/dev/null
+}
+
+# 分享链接的 #name 段也是编码过的 (🇺🇸 1-VLESS-WS_01 会变成
+# %F0%9F%87%BA%F0%9F%87%B8%201-VLESS-WS_01)。不解开的话节点名就是一串百分号。
+_ob_name() { # <frag> <默认名>
+    local frag="$1" def="$2" n
+    [[ -n "$frag" ]] || { printf '%s' "$def"; return; }
+    n=$(urldecode "$frag")
+    printf '%s' "${n:-$def}"
+}
 
 # hysteria2://pass@host:port?sni=..&insecure=1&pin=sha256hex#name
 parse_hysteria2() {
@@ -225,7 +353,7 @@ parse_hysteria2() {
     qs=${rest#*\?}; [[ "$qs" == "$rest" ]] && qs=""
     base=${rest%%\?*}
     userinfo=${base%%@*}; hostport=${base##*@}
-    OB_NAME=${frag:-Hysteria2}
+    OB_NAME=$(_ob_name "$frag" "Hysteria2")
     OB_PASS=$userinfo
     # 支持 [IPv6]:port 形式（分享链接里的 v6 节点地址）
     if [[ "${hostport:0:1}" == "[" && "$hostport" == *"]"* ]]; then
@@ -254,6 +382,10 @@ parse_hysteria2() {
         fi
     fi
     [[ -n "$OB_PIN" ]] && ! [[ "$OB_PIN" =~ ^[0-9a-f]{64}$ ]] && OB_PIN=""
+    # ★ ech 是 **ECHConfigList 原文**(base64), 不是开关。
+    #   X 自己的分享载荷里 xhttp 节点带 ech= —— 不取就是静默丢掉,
+    #   出站会绕过 ECH 直连真实 SNI, 等于白挂 CDN。
+    OB_ECH=$(get_param "$qs" ech)
     OB_POOL=""; OB_SEND=""
 }
 
@@ -266,7 +398,7 @@ parse_vless() {
     qs=${rest#*\?}; [[ "$qs" == "$rest" ]] && qs=""
     base=${rest%%\?*}
     userinfo=${base%%@*}; hostport=${base##*@}
-    OB_NAME=${frag:-VLESS}
+    OB_NAME=$(_ob_name "$frag" "VLESS")
     OB_UUID=$userinfo
     OB_ADDR=${hostport%%:*}
     OB_PORT=${hostport##*:}
@@ -285,6 +417,10 @@ parse_vless() {
     OB_XHTTP_PATH=$(get_param "$qs" path); [[ -z "$OB_XHTTP_PATH" ]] && OB_XHTTP_PATH=/
     OB_XHTTP_HOST=$(get_param "$qs" host)
     OB_ALPN=$(get_param "$qs" alpn)
+    # ★ ech 是 **ECHConfigList 原文**(base64), 不是开关。
+    #   X 自己的分享载荷里 xhttp 节点带 ech= —— 不取就是静默丢掉,
+    #   出站会绕过 ECH 直连真实 SNI, 等于白挂 CDN。
+    OB_ECH=$(get_param "$qs" ech)
     OB_POOL=""; OB_SEND=""
 }
 
@@ -297,13 +433,17 @@ parse_trojan() {
     qs=${rest#*\?}; [[ "$qs" == "$rest" ]] && qs=""
     base=${rest%%\?*}
     userinfo=${base%%@*}; hostport=${base##*@}
-    OB_NAME=${frag:-Trojan}
+    OB_NAME=$(_ob_name "$frag" "Trojan")
     OB_PASS=$userinfo
     OB_ADDR=${hostport%%:*}
     OB_PORT=${hostport##*:}
     [[ -z "$OB_PORT" || "$OB_PORT" == "$OB_ADDR" ]] && OB_PORT=443
     OB_SNI=$(get_param "$qs" sni); [[ -z "$OB_SNI" ]] && OB_SNI=$OB_ADDR
     OB_INSECURE=$(get_param "$qs" allowInsecure); [[ -z "$OB_INSECURE" ]] && OB_INSECURE=0
+    # ★ ech 是 **ECHConfigList 原文**(base64), 不是开关。
+    #   X 自己的分享载荷里 xhttp 节点带 ech= —— 不取就是静默丢掉,
+    #   出站会绕过 ECH 直连真实 SNI, 等于白挂 CDN。
+    OB_ECH=$(get_param "$qs" ech)
     OB_POOL=""; OB_SEND=""
 }
 
@@ -315,7 +455,7 @@ parse_ss() {
     rest=${rest%%#*}
     base=${rest%%\?*}
     userinfo=${base%%@*}; hostport=${base##*@}
-    OB_NAME=${frag:-Shadowsocks}
+    OB_NAME=$(_ob_name "$frag" "Shadowsocks")
     if [[ "$userinfo" == *:* ]]; then
         OB_METHOD=${userinfo%%:*}; OB_PASS=${userinfo#*:}
     else
@@ -334,7 +474,8 @@ parse_ss() {
 
 # vmess://BASE64(JSON)#name
 parse_vmess() {
-    local url="$1" b64 json
+    # ★ tls 原来没 local —— 每次导入都会把它泄漏成全局变量。
+    local url="$1" b64 json tls
     b64=${url#vmess://}
     b64=${b64%%#*}
     # 尾部 #name 在截断后丢失，单独取
@@ -356,12 +497,17 @@ parse_vmess() {
 # 统一导入入口
 import_link() {
     print_title "导入分享链接"
-    printf "粘贴链接 (hysteria2:// / vless:// / vmess:// / trojan:// / ss://): " >&2
-    xr_read "请输入地址" "" url || { XR_EOF=1; return; }
+    # ★ url 原来没 local: 泄漏到全局, 还会和后面的同名变量打架。
+    local url proto
+    # ★ 原来 `printf "粘贴链接 …: " ` 紧跟 `xr_read "请输入地址"`，**问了两遍**。
+    # ★ 提示必须印在 ui_ask **之前** —— ui_ask 会阻塞等输入, 印在后面等于
+#   用户已经粘完链接才告诉他支持什么格式 (第一版就写反了, 回放才看出来)。
+printf '    %s单条%s: hysteria2:// vless:// vmess:// trojan:// ss://\n' "$GRAY" "$RESET" >&2
+printf '    %s订阅%s: http://ip:9443/share/<token>   ←「分享管理」发出来的那条\n' "$GRAY" "$RESET" >&2
+url=$(ui_ask "粘贴链接或订阅地址" "")
     url=$(clean_input "$url")
     [[ -z "$url" ]] && { print_error "未输入链接"; return 1; }
 
-    local proto
     proto=${url%%://*}
     case "$proto" in
         hysteria2) parse_hysteria2 "$url" ;;
@@ -369,6 +515,10 @@ import_link() {
         vmess)     parse_vmess "$url" || return 1 ;;
         trojan)    parse_trojan "$url" ;;
         ss)        parse_ss "$url" || return 1 ;;
+        # ★ X 自己的分享链接是**订阅地址** (http://ip:9443/share/<token>),
+        #   内容是 base64 的多行节点 —— 单条链接的解析器吃不了。
+        #   用户提的需求: "增加出站的方式, 能不能也加上我们自己的这种分享链接"
+        http|https) import_share_url "$url"; return $? ;;
         *) print_error "不支持的协议: $proto"; return 1 ;;
     esac
 
@@ -380,6 +530,149 @@ import_link() {
     [[ "$proto" == "ss" ]] && wproto=shadowsocks
     write_outbound "$wproto"
     print_ok "已导入 $proto 出站：$OB_NAME → $OB_ADDR:$OB_PORT"
+}
+
+# ================================
+# 订阅地址 (X 自己的分享链接) 导入
+# ================================
+# X 面板「分享管理」发出去的链接长这样:
+#     http://<服务器IP>:<端口>/share/<token>
+# 服务端返回的是 **base64 的订阅行**, 一行一个节点:
+#     hysteria2://pass@host:port?sni=..&alpn=h3#name
+#     vless://uuid@host:port?..&path=%2Fxxx%2F&ech=..#name
+#     ss://base64(method:pass)@host:port#name
+#     trojan://pass@host:port?security=reality&pbk=..#name
+# 所以是**多条**, 不是一条 —— 必须让用户挑, 不能一股脑全导。
+#
+# ★ 为什么不用 Client/lib/node.py 的 parse_subscription:
+#   那是**客户端**的库, 依赖客户端的状态文件与目录约定; 服务端面板这边
+#   拿不到也不该拿。这里只用本文件已经有的 parse_* —— 同一套解析器,
+#   单条导入和订阅导入行为完全一致, 不会各写一份慢慢漂移。
+
+# 把一条链接解析成 OB_* 并写盘。$2=1 时不再问名字 (订阅里的名字已经够用,
+# 批量导入逐条再问一遍是折磨)。返回 0 成功。
+import_one() {
+    local url="$1" ask="$2" name wproto
+    OB_ECH=""; OB_POOL=""; OB_SEND=""
+    wproto=${url%%://*}
+    case "$wproto" in
+        hysteria2|hy2) parse_hysteria2 "$url" || return 1; wproto=hysteria2 ;;
+        vless)         parse_vless "$url" || return 1 ;;
+        vmess)         parse_vmess "$url" || return 1 ;;
+        trojan)        parse_trojan "$url" || return 1 ;;
+        ss)            parse_ss "$url" || return 1; wproto=shadowsocks ;;
+        *) return 1 ;;
+    esac
+    # 万一解析器自己没清干净 (比如换协议时残留), 这里兜底
+    OB_ECH=${OB_ECH:-}
+
+    if [[ "$ask" == "1" ]]; then
+        name=$(safe_read "显示名称" "$OB_NAME")
+        OB_NAME=${name:-$OB_NAME}
+    fi
+    write_outbound "$wproto"
+    print_ok "已导入 $OB_NAME → $OB_ADDR:$OB_PORT"
+}
+
+import_share_url() {
+    local url="$1" raw text
+    print_title "从订阅地址导入"
+    print_info "地址: $url"
+
+    # ★ 只发一个 GET, 不带任何认证头。
+    #   X 的分享服务是公开订阅 (token 在 URL 里), 这一点与 Client/lib/subs.py 一致。
+    raw=$(curl -fsSL --max-time 25 "$url" 2>/dev/null) || {
+        print_error "取不到订阅内容 —— 地址打不开、令牌失效、或者被防火墙挡了"
+        return 1
+    }
+    [[ -n "${raw//[[:space:]]/}" ]] || { print_error "订阅内容是空的"; return 1; }
+
+    # X 的载荷是 base64。也有客户端直接吐明文多行的 —— 两种都要吃:
+    # 含 "://" 就说明已经是明文, 再解一次只会解出乱码。
+    if [[ "$raw" != *"://"* ]]; then
+        text=$(printf '%s' "$raw" | base64 -d 2>/dev/null)
+        if [[ -z "${text//[[:space:]]/}" || "$text" != *"://"* ]]; then
+            text=$raw   # 不是 base64, 当明文再看一遍
+        fi
+    else
+        text=$raw
+    fi
+
+    # 只留本文件认得的协议; 顺带把 M 的 "# 注释"方言和空行扫掉。
+    local -a links=()
+    local ln
+    while IFS= read -r ln; do
+        ln=${ln%$'\r'}                       # CRLF 订阅很常见
+        ln=$(printf '%s' "$ln" | sed 's/^[[:space:]]*#.*$//')
+        ln=${ln#"${ln%%[![:space:]]*}"}      # 去行首空白
+        [[ "$ln" == *"://"* ]] || continue
+        case "${ln%%://*}" in
+            hysteria2|hy2|vless|vmess|trojan|ss) links+=("$ln") ;;
+        esac
+    done <<< "$text"
+
+    local total=${#links[@]}
+    if (( total == 0 )); then
+        print_error "订阅里没有本面板认得的节点 (只支持 hysteria2 / vless / vmess / trojan / ss)"
+        return 1
+    fi
+
+    # 先把表打出来 —— 用户要能看着名字挑, 而不是回一串编号
+    print_info "取到 $total 个节点："
+    local i=1 p nm
+    for ln in "${links[@]}"; do
+        p=${ln%%://*}
+        case "$p" in ss) p=shadowsocks;; hy2) p=hysteria2;; esac
+        nm=${ln##*#}; [[ "$nm" == "$ln" ]] && nm="(无名字)"
+        nm=$(urldecode "$nm")
+        printf '  %2d) %-12s %s\n' "$i" "$p" "$nm" >&2
+        (( i++ ))
+    done
+    echo >&2
+
+    local pick
+    # ★ 这里**不能**用 ui_ask —— 它把"回车"和"Ctrl-D"都变成空串, 而空串在这里
+    #   的含义是"全选"。于是误触 Ctrl-D 就会一口气导进 8 个出站。
+    #   自己 read 才能把 EOF 和"确实想全选"分开。
+    printf '  %s要导入哪几个%s (编号, 空格/逗号分隔; 回车=全选 %d 个): ' \
+        "$CYAN" "$RESET" "$total" >&2
+    if ! IFS= read -r pick; then
+        print_info "已取消"
+        return 1
+    fi
+    local -a want=()
+    if [[ -z "${pick// /}" ]]; then
+        for (( i = 1; i <= total; i++ )); do want+=("$i"); done
+    else
+        pick=${pick//,/ }
+        for i in $pick; do
+            if [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= total )); then
+                want+=("$i")
+            else
+                print_error "跳过无效编号: $i"
+            fi
+        done
+    fi
+    (( ${#want[@]} == 0 )) && { print_info "没有可导入的节点"; return 0; }
+
+    local ok_n=0 fail_n=0
+    for i in "${want[@]}"; do
+        # ★ 不问名字: 订阅里每个节点都自带名字, 再逐条问一遍纯属折磨。
+        #   想改名去「节点管理」里改。
+        if import_one "${links[$((i-1))]}" 0; then
+            (( ok_n++ ))
+        else
+            (( fail_n++ ))
+        fi
+    done
+
+    echo >&2
+    if (( fail_n == 0 )); then
+        print_ok "已导入 $ok_n 个出站"
+    else
+        print_warn "导入完成: 成功 $ok_n, 失败 $fail_n"
+    fi
+    return 0
 }
 
 # ================================
@@ -396,6 +689,7 @@ vless_json() { # $1=tag
         --arg fp "$OB_FP" --arg pub "$OB_PUB" --arg sid "$OB_SID" --arg spx "$OB_SPX" \
         --arg wsp "$OB_WS_PATH" --arg wsh "$OB_WS_HOST" --arg grpc "$OB_GRPC" \
         --arg xp "$OB_XHTTP_PATH" --arg xh "$OB_XHTTP_HOST" --arg send "$OB_SEND" \
+        --arg ech "$OB_ECH" \
         --arg pool "$OB_POOL" \
         '
         def settings:
@@ -407,8 +701,8 @@ vless_json() { # $1=tag
               + (if $xh != "" then {host: $xh} else {} end))} else {} end)
           + (if $net == "tcp" then {tcpSettings: {}} else {} end)
           + (if $sec == "none" then {security: "none"} else {} end)
-          + (if $sec == "tls" then {security: "tls", tlsSettings: {serverName: $sni, fingerprint: $fp, allowInsecure: false}} else {} end)
-          + (if $sec == "reality" then {security: "reality", realitySettings: {serverName: $sni, fingerprint: $fp, publicKey: $pub, shortId: $sid, spiderX: $spx}} else {} end)
+          + (if $sec == "tls" then {security: "tls", tlsSettings: ({serverName: $sni, fingerprint: $fp, allowInsecure: false} + (if $ech != "" then {echConfigList: $ech} else {} end))} else {} end)
+          + (if $sec == "reality" then {security: "reality", realitySettings: ({serverName: $sni, fingerprint: $fp, publicKey: $pub, shortId: $sid, spiderX: $spx} + (if $ech != "" then {echConfigList: $ech} else {} end))} else {} end)
         ;
         {_meta: ({name:$name, proto:"vless"}
                   + (if $pool != "" then {pool: {prefix:($pool|split("|")[0]), address:($pool|split("|")[1])}} else {} end)),
@@ -427,7 +721,7 @@ vmess_json() { # $1=tag
         --arg port "$OB_PORT" --arg uuid "$OB_UUID" \
         --arg net "$OB_NET" --arg sec "$OB_SEC" --arg sni "$OB_SNI" --arg fp "$OB_FP" \
         --arg wsp "$OB_WS_PATH" --arg wsh "$OB_WS_HOST" --arg grpc "$OB_GRPC" \
-        --arg send "$OB_SEND" --arg pool "$OB_POOL" \
+        --arg send "$OB_SEND" --arg pool "$OB_POOL" --arg ech "$OB_ECH" \
         '
         def settings:
           {network: $net}
@@ -436,7 +730,7 @@ vmess_json() { # $1=tag
           + (if $net == "grpc" then {grpcSettings: {serviceName: $grpc}} else {} end)
           + (if $net == "tcp" then {tcpSettings: {}} else {} end)
           + (if $sec == "none" then {security: "none"} else {} end)
-          + (if $sec == "tls" then {security: "tls", tlsSettings: {serverName: $sni, fingerprint: $fp, allowInsecure: false}} else {} end)
+          + (if $sec == "tls" then {security: "tls", tlsSettings: ({serverName: $sni, fingerprint: $fp, allowInsecure: false} + (if $ech != "" then {echConfigList: $ech} else {} end))} else {} end)
         ;
         {_meta: ({name:$name, proto:"vmess"}
                   + (if $pool != "" then {pool: {prefix:($pool|split("|")[0]), address:($pool|split("|")[1])}} else {} end)),
@@ -455,7 +749,7 @@ trojan_json() { # $1=tag
         --arg port "$OB_PORT" --arg pass "$OB_PASS" \
         --arg net "$OB_NET" --arg sec "$OB_SEC" --arg sni "$OB_SNI" --arg fp "$OB_FP" \
         --arg wsp "$OB_WS_PATH" --arg wsh "$OB_WS_HOST" \
-        --arg send "$OB_SEND" --arg pool "$OB_POOL" \
+        --arg send "$OB_SEND" --arg pool "$OB_POOL" --arg ech "$OB_ECH" \
         '
         def settings:
           {network: $net}
@@ -463,7 +757,7 @@ trojan_json() { # $1=tag
               + (if $wsh != "" then {headers: {Host: $wsh}} else {} end))} else {} end)
           + (if $net == "tcp" then {tcpSettings: {}} else {} end)
           + (if $sec == "none" then {security: "none"} else {} end)
-          + (if $sec == "tls" then {security: "tls", tlsSettings: {serverName: $sni, fingerprint: $fp, allowInsecure: false}} else {} end)
+          + (if $sec == "tls" then {security: "tls", tlsSettings: ({serverName: $sni, fingerprint: $fp, allowInsecure: false} + (if $ech != "" then {echConfigList: $ech} else {} end))} else {} end)
         ;
         {_meta: ({name:$name, proto:"trojan"}
                   + (if $pool != "" then {pool: {prefix:($pool|split("|")[0]), address:($pool|split("|")[1])}} else {} end)),
@@ -639,11 +933,14 @@ PY
             if ((${#ins[@]} > 0)); then
                 echo "自检通过，是否把某个入站绑定到此出站？（直接回车=跳过绑定，沿用当前路由）" >&2
                 local i
-                for i in "${!ins[@]}"; do printf "  %d) %s\n" $((i+1)) "${ins[$i]}" >&2; done
-                printf "输入序号 (回车=跳过): " >&2
-                local sel; read -r sel; sel=$(clean_input "$sel")
-                if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#ins[@]} )); then
-                    bind_inbound_to_tag "${ins[$((sel-1))]}" "$tag"
+                for i in "${!ins[@]}"; do menu_item $((i + 1)) "${ins[$i]}"; done
+                # ★ 原来这里是裸 `read -r sel`：**没有 EOF 保护**。
+                #   被 source 调用 / 管道喂输入 / Ctrl-D 时 read 直接失败，
+                #   sel 保持空串 → 落进 else 分支"跳过绑定" —— 看起来像是用户
+                #   自己选了跳过，其实是没读进来。这里收编号：取消(含 EOF) = 跳过。
+                local sel
+                if sel=$(ui_ask_num "绑定入站（对应上面列表，0=跳过）" 1 "${#ins[@]}"); then
+                    bind_inbound_to_tag "${ins[$((sel - 1))]}" "$tag"
                 else
                     print_info "跳过绑定，请稍后用菜单 7 手工绑定"
                 fi
@@ -982,7 +1279,7 @@ wizard_vless() {
     OB_PORT=$(safe_read_int "端口" 443)
     OB_UUID=$(safe_read "UUID" "$(uuidgen | tr 'A-Z' 'a-z')")
     local net_choice
-    net_choice=$(safe_choose "传输: 1)tcp 2)ws 3)grpc 4)xhttp" 1)
+    net_choice=$(safe_choose "传输" 1 tcp ws grpc xhttp) || { print_info "已取消"; return; }
     case "$net_choice" in
         2) OB_NET=ws ;;
         3) OB_NET=grpc ;;
@@ -990,7 +1287,7 @@ wizard_vless() {
         *) OB_NET=tcp ;;
     esac
     local sec_choice
-    sec_choice=$(safe_choose "安全: 1)none 2)tls 3)reality" 1)
+    sec_choice=$(safe_choose "安全" 1 none tls reality) || { print_info "已取消"; return; }
     case "$sec_choice" in
         2)
             OB_SEC=tls
@@ -1027,14 +1324,14 @@ wizard_vmess() {
     OB_PORT=$(safe_read_int "端口" 443)
     OB_UUID=$(safe_read "UUID" "$(uuidgen | tr 'A-Z' 'a-z')")
     local net_choice
-    net_choice=$(safe_choose "传输: 1)tcp 2)ws 3)grpc" 1)
+    net_choice=$(safe_choose "传输" 1 tcp ws grpc) || { print_info "已取消"; return; }
     case "$net_choice" in
         2) OB_NET=ws ;;
         3) OB_NET=grpc ;;
         *) OB_NET=tcp ;;
     esac
     local sec_choice
-    sec_choice=$(safe_choose "TLS: 1)关闭 2)开启" 1)
+    sec_choice=$(safe_choose "TLS" 1 关闭 开启) || { print_info "已取消"; return; }
     if [[ "$sec_choice" == "2" ]]; then
         OB_SEC=tls
         OB_SNI=$(safe_read "SNI" "$OB_ADDR")
@@ -1058,10 +1355,10 @@ wizard_trojan() {
     OB_PORT=$(safe_read_int "端口" 443)
     OB_PASS=$(safe_read "密码" "")
     local net_choice
-    net_choice=$(safe_choose "传输: 1)tcp 2)ws" 1)
+    net_choice=$(safe_choose "传输" 1 tcp ws) || { print_info "已取消"; return; }
     [[ "$net_choice" == "2" ]] && OB_NET=ws || OB_NET=tcp
     local sec_choice
-    sec_choice=$(safe_choose "TLS: 1)开启 2)关闭" 1)
+    sec_choice=$(safe_choose "TLS" 1 开启 关闭) || { print_info "已取消"; return; }
     if [[ "$sec_choice" == "1" ]]; then
         OB_SEC=tls; OB_SNI=$(safe_read "SNI" "$OB_ADDR"); OB_FP=chrome
     else
@@ -1118,20 +1415,40 @@ wizard_hy2() {
 }
 
 wizard_freedom() {
+    # ★ ftype 原来没 local —— 泄漏到全局。
+    local ftype
     OB_NAME=$(safe_read "显示名称" "$(x_default_name freedom 1)")
     OB_SEND=""; OB_POOL=""
-    echo "直连类型：" >&2
-    echo "  1) 默认直连（无指定源IP）" >&2
-    echo "  2) 指定 IPv4 源IP" >&2
-    echo "  3) 自动分配 IPv6（/64 池）" >&2
-    echo "  4) 双栈智能落地（IPv4站走IPv4 + IPv6站走IPv6）" >&2
-    xr_read "请选择类型" "" ftype || { XR_EOF=1; return; }
-    ftype=$(clean_input "$ftype")
+    # ★ 这里原来用裸 echo 画菜单（与其余菜单不对齐），收号用 xr_read。
+    ui_menu 1 "默认直连（无指定源IP）"
+    ui_menu 2 "指定 IPv4 源IP"
+    ui_menu 3 "自动分配 IPv6（/64 池）"
+    ui_menu 4 "双栈智能落地（IPv4站走IPv4 + IPv6站走IPv6）"
+    ui_menu 0 "返回上级"
+    ftype=$(ui_ask_num "请选择类型" 1 4) || { ui_note "已取消"; return; }
     case "$ftype" in
         2)
-            print_info "本机 IPv4:"
-            ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | sed 's/^/  /' >&2
-            OB_SEND=$(safe_read "源IPv4" "")
+            # ★ 原来把本机 IPv4 一行行 echo 出来，然后让用户**照着抄**一个 ——
+            #   "输入源IPv4" 的值必须和上面列表里的某个**一模一样"。
+            #   列表里有 WARP/HE/docker 的地址时哪一个才是想要的，只能靠猜；
+            #   打错一个字符不报错, 直接写进 sendThrough, 出站静默不通。
+            #   现在一次 `ip -4 -o addr` 扫出全部, **编号 + 网卡 + CIDR** 一起列出来,
+            #   用户选序号, 值由程序取 —— 不存在"抄错"这件事。
+            UI_PICK_COLS=(源IPv4 接口 CIDR)
+            UI_PICK_ROWS=""
+            local _iface _cidr
+            while read -r _iface _cidr; do
+                [[ -z "${_cidr:-}" ]] && continue
+                # ★ UI_PICK_ROWS 的**第一列是 key, 不显示**（与 node.sh 同一个约定）。
+                #   所以地址要出现两次: 一次当 key（选中后直接就是 OB_SEND）,
+                #   一次当显示列, 否则列表里根本看不到选了哪个地址。
+                UI_PICK_ROWS+="${_cidr%%/*}"$'\t'"${_cidr%%/*}"$'\t'"${_iface%%@*}"$'\t'"$_cidr"$'\n'
+            done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
+            if ! ui_pick "指定 IPv4 源IP" "本机没有 scope global 的 IPv4 地址" "选择源IP"; then
+                print_error "未选择源IPv4，已放弃"
+                return 1
+            fi
+            OB_SEND="$UI_PICK_KEY"
             [[ -n "$OB_SEND" ]] || { print_error "源IPv4 不能为空"; return 1; }
             ;;
         3)
@@ -1171,8 +1488,14 @@ wizard_freedom() {
 }
 
 # 节点命名约定 (单一实现) —— 本地优先, 否则从仓库取。
-if [[ -r "$_lib_dir/lib/naming.sh" ]]; then
-    source "$_lib_dir/lib/naming.sh"
+#
+# ★ 这里原来写的是 `$_lib_dir/lib/naming.sh`, 而 `$_lib_dir` 这个变量在整份文件里
+#   **从来没有被赋值** —— 于是 `-r` 恒为假, naming.sh 每次都从 GitHub 现拉。
+#   后果不是"慢一点": 本地 conf/lib/naming.sh 里改的东西(节点命名规则)根本不生效,
+#   跑的是仓库 main 分支的版本; 断网时整个出站管理直接 exit 1。
+#   正确变量是文件顶部 `_x_read_lib_dir`(已经含 lib), 所以后面**不能再加 /lib**。
+if [[ -r "$_x_read_lib_dir/naming.sh" ]]; then
+    source "$_x_read_lib_dir/naming.sh"
 else
     source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/naming.sh") \
         || { print_error "命名库加载失败"; exit 1; }
@@ -1180,8 +1503,9 @@ fi
 
 # 对外地址探测库 (单一实现) —— 本地优先, 否则从仓库取。
 # 见 conf/lib/addr.sh 顶部: 为什么不能问外部"我的 IP"、为什么要排除隧道网卡。
-if [[ -r "$_x_lib_dir/lib/addr.sh" ]]; then
-    source "$_x_lib_dir/lib/addr.sh"
+# ★ 同上: `$_x_lib_dir` 未赋值 + 多了一层 /lib, 一并修正。
+if [[ -r "$_x_read_lib_dir/addr.sh" ]]; then
+    source "$_x_read_lib_dir/addr.sh"
 else
     source <(curl -fsSL "${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}/conf/lib/addr.sh") \
         || { print_error "地址库加载失败"; exit 1; }
@@ -1278,6 +1602,16 @@ wizard_dualstack() {
     return 0
 }
 
+# 把当前 v4 名单填进 UI_PICK_ROWS（key = 完整 domain:xxx）并画出来
+dual_domains_rows() { # $1 = splitRules 下标
+    local idx="$1" d
+    UI_PICK_COLS=(域名)
+    UI_PICK_ROWS=""
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && UI_PICK_ROWS+="$d"$'\t'"${d#domain:}"$'\n'
+    done < <(jq -r "._meta.splitRules[$idx].domain[]?" "$ROUTING_FILE" 2>/dev/null)
+}
+
 # 查看/编辑双栈 v4 域名名单（操作 _meta.splitRules 里的全局规则）
 dual_domains() {
     print_title "双栈 v4 域名名单"
@@ -1286,69 +1620,122 @@ dual_domains() {
         return 0
     fi
     # 找到 v4 站分流的规则（含 browserleaks 的全局规则）
-    local idx tags
+    local idx nd rmd ob
     idx=$(jq -r '._meta.splitRules | to_entries | map(select(.value.domain // [] | index("domain:browserleaks.com"))) | .[0].key // empty' "$ROUTING_FILE" 2>/dev/null)
     if [[ -z "$idx" ]]; then
         print_info "未找到双栈 v4 分流规则（含 browserleaks.com 的那条）"
         return 0
     fi
-    echo "当前 v4 域名名单（这些站走IPv4落地）:" >&2
-    jq -r "._meta.splitRules[$idx].domain[]" "$ROUTING_FILE" 2>/dev/null | sed 's/^/  /' >&2
-    echo "v4出站=$(jq -r "._meta.splitRules[$idx].outboundTag" "$ROUTING_FILE")" >&2
-    printf "新增域名(如 example.com，回车跳过): " >&2
-    local nd
-    xr_read "新增域名(如 example.com，回车跳过)" "" nd || { XR_EOF=1; return; }
+    ob=$(jq -r "._meta.splitRules[$idx].outboundTag" "$ROUTING_FILE")
+    ui_note "以下域名走 IPv4 落地: $ob"
+    # ★ 列表改为**编号**渲染: 原来是一行行 sed 's/^/  /', 没有序号,
+    #   紧接着又要用户"输完整域名" —— 等于凭记忆抄一遍刚打印的东西。
+    dual_domains_rows "$idx"
+    ui_table_print "当前名单"
+
+    # ★ 原来 `printf "新增域名…: " ` 紧跟 `xr_read "新增域名…"`, 同一个问题**问了两遍**。
+    nd=$(ui_ask "新增域名（如 example.com，回车跳过）" "")
     if [[ -n "$nd" ]]; then
         nd=${nd#domain:}
         jq --argjson i "$idx" --arg d "domain:$nd" '._meta.splitRules[$i].domain += [$d] | ._meta.splitRules[$i].domain |= unique' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE"
         write_routing
         print_ok "已加入: $nd"
+        # ★ 刚加过一行, 旧的行号/内容已经不准了 —— 重新编号再让用户选。
+        dual_domains_rows "$idx"
     fi
-    printf "移除域名(输完整域名，回车跳过): " >&2
-    local rm
-    xr_read "移除域名(输完整域名，回车跳过)" "" rm || { XR_EOF=1; return; }
-    if [[ -n "$rm" ]]; then
-        rm=${rm#domain:}
-        jq --argjson i "$idx" --arg d "domain:$rm" '._meta.splitRules[$i].domain |= map(select(. != $d))' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE"
-        write_routing
-        print_ok "已移除: $rm"
+
+    # ★ 移除: 编号选择, 值由 UI_PICK_KEY 给, 不再手打。
+    if ! ui_pick "移除 v4 域名" "名单为空，无需移除" "移除域名"; then
+        return 0
     fi
+    rmd="$UI_PICK_KEY"
+    # ★ 原来**不做任何核对**: 域名是字符串全等匹配, 打错一个字符 → jq 什么都没删,
+    #   却照样打印 "已移除: xxx"。用户以为规则删掉了, 实际那条站还在走 IPv4 落地。
+    #   所以先确认它在名单里, 删完再确认它真的没了, 两头都不通过就明说失败。
+    if [[ -z "$(jq -r --arg d "$rmd" "._meta.splitRules[$idx].domain // [] | index(\$d) // empty" "$ROUTING_FILE" 2>/dev/null)" ]]; then
+        print_error "名单里没有 $rmd —— 未做任何修改"
+        return 0
+    fi
+    jq --argjson i "$idx" --arg d "$rmd" '._meta.splitRules[$i].domain |= map(select(. != $d))' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE"
+    write_routing
+    if [[ -n "$(jq -r --arg d "$rmd" "._meta.splitRules[$idx].domain // [] | index(\$d) // empty" "$ROUTING_FILE" 2>/dev/null)" ]]; then
+        print_error "移除失败: $rmd 仍在名单里（未写入或被占用）"
+    else
+        print_ok "已移除: ${rmd#domain:}"
+    fi
+}
+
+# 出站表: 填 UI_PICK_ROWS / UI_PICK_COLS（key = 文件编号 n）
+# 出站行数 → OB_ROWS_COUNT（list_outbounds 画"共 N 个出站"要用）
+OB_ROWS_COUNT=0
+#
+# ★ 原来每个出站起 6 次 jq, 而且第 7 项"被绑定入站数"还要把 read_bindings
+#   在循环体内重跑一遍（N 个出站 = 7N 次进程）。这里改成**每个文件一次 jq**
+#   拿全部字段, 绑定表在循环外读一次。
+# ★ 顺带解决一个更难受的问题: 原来的编号是**文件号**（03、04…）, 而删除文件
+#   后编号会留空洞, 用户看到的"3"和"03"指的不是同一行。现在序号由渲染器统一
+#   生成（连续 1..N）, 文件号单独成一列 —— 序号和文件号不会再混。
+outbound_rows() {
+    local n f tag name proto addr port src cnt binds
+    OB_ROWS_COUNT=0
+    binds=$(read_bindings)
+    UI_PICK_COLS=(名称 协议 文件 tag 地址 端口 源IP 绑定数)
+    UI_PICK_ROWS=""
+    while IFS= read -r n; do
+        [[ -n "$n" ]] || continue
+        f=$(out_file "$n")
+        # @tsv 一次吐出 6 个字段; 空值统一落成 '-'（渲染器也会兜底）
+        IFS=$'\t' read -r name proto tag addr port src < <(jq -r \
+            '[._meta.name // "-",
+              ._meta.proto // "?",
+              .outbounds[0].tag // "-",
+              (.outbounds[0].settings.vnext[0].address // .outbounds[0].settings.servers[0].address // .outbounds[0].settings.address // "直连"),
+              (((.outbounds[0].settings.vnext[0].port // .outbounds[0].settings.servers[0].port // .outbounds[0].settings.port) // "-") | tostring),
+              (.outbounds[0].sendThrough // "-")] | @tsv' "$f" 2>/dev/null)
+        [[ -n "$tag" ]] || tag="-"
+        cnt=$(grep -c "=${tag}$" <<< "$binds" || true)
+        [[ -n "$cnt" ]] || cnt=0
+        UI_PICK_ROWS+="$n"$'\t'"${name:--}"$'\t'"${proto:-?}"$'\t'"out-$n"$'\t'"$tag"$'\t'"${addr:--}"$'\t'"${port:--}"$'\t'"${src:--}"$'\t'"$cnt"$'\n'
+        OB_ROWS_COUNT=$((OB_ROWS_COUNT + 1))
+    done < <(out_numbers)
 }
 
 list_outbounds() {
     print_title "出站列表"
-    local n f proto name tag addr port src meta cnt
-    local total=0
-    for n in $(out_numbers); do
-        f=$(out_file "$n")
-        proto=$(jq -r '._meta.proto // "?"' "$f")
-        name=$(jq -r '._meta.name // empty' "$f")
-        tag=$(jq -r '.outbounds[0].tag // empty' "$f")
-        addr=$(jq -r '.outbounds[0].settings.vnext[0].address // .outbounds[0].settings.servers[0].address // .outbounds[0].settings.address // empty' "$f")
-        port=$(jq -r '.outbounds[0].settings.vnext[0].port // .outbounds[0].settings.servers[0].port // .outbounds[0].settings.port // empty' "$f")
-        src=$(jq -r '.outbounds[0].sendThrough // empty' "$f")
-        cnt=$(read_bindings | grep -c "=${tag}$" || true)
-        printf "${GREEN}%s${RESET}) ${YELLOW}%s${RESET} [%s] tag=${BLUE}%s${RESET} %s:%s\n" \
-            "$n" "$name" "$proto" "$tag" "${addr:-直连}" "${port:-}" >&2
-        [[ -n "$src" ]] && printf "      源IP: ${CYAN}%s${RESET}  被绑定入站数: %s\n" "$src" "$cnt" >&2
-        total=$((total+1))
-    done
-    [[ $total -eq 0 ]] && print_info "暂无出站，请先新增"
+    outbound_rows
+    if (( OB_ROWS_COUNT == 0 )); then
+        ui_note "暂无出站，请先新增"
+        return 0
+    fi
+    ui_table_print "共 $OB_ROWS_COUNT 个出站"
 }
 
-# 选择一个出站编号
+# 选择一个出站（收的是**列表序号**，不是文件号）
 pick_outbound() {
-    local n
-    printf "输入出站编号: " >&2
-    xr_read "请输入" "" n || { XR_EOF=1; return; }
-    n=$(clean_input "$n")
-    [[ "$n" =~ ^[0-9]+$ ]] || { print_error "编号无效"; return 1; }
+    local -a nums=()
+    local n idx
+    mapfile -t nums < <(out_numbers)
+    if ((${#nums[@]} == 0)); then
+        print_info "暂无出站，请先新增"
+        return 1
+    fi
+    # ★ 原来 `printf "输入出站编号: " ` 紧跟 `xr_read "请输入"` —— 问题**问了两遍**
+    #   （屏幕上真的会是 "输入出站编号: 请输入: "）, 而且问的是"编号"却允许任意
+    #   字符串, 校验失败后只能从头再输一遍。
+    if ! idx=$(ui_ask_num "选择出站（对应上面列表的序号）" 1 "${#nums[@]}"); then
+        print_info "已取消"
+        return 1
+    fi
+    n=${nums[$((idx - 1))]}
     [[ -f "$(out_file "$n")" ]] || { print_error "出站 $n 不存在"; return 1; }
     echo "$n"
 }
 
 show_outbound() {
     local n f
+    # ★ 这里原来直接收编号, 但调用链上没画列表 —— 让用户对着一句"输入出站编号"
+    #   凭空猜。先画一次, 序号才有意义。
+    list_outbounds
     n=$(pick_outbound) || return 1
     f=$(out_file "$n")
     print_title "出站详情 $n"
@@ -1357,16 +1744,16 @@ show_outbound() {
 
 edit_outbound() {
     list_outbounds
-    local n f
+    local n f c
     n=$(pick_outbound) || return 1
     f=$(out_file "$n")
     print_title "修改出站 $n"
-    echo "  1) 向导修改（重新填写核心信息）" >&2
-    echo "  2) 直接编辑原始 JSON（自由定制）" >&2
-    echo "  3) 重新分配 IPv6 源地址" >&2
-    echo "  0) 返回" >&2
-    xr_read "请选择" "" c || { XR_EOF=1; return; }
-    c=$(clean_input "$c")
+    # ★ 原来用裸 echo 画菜单 + xr_read 收号（且 c 没 local, 会泄漏）。
+    ui_menu 1 "向导修改（重新填写核心信息）"
+    ui_menu 2 "直接编辑原始 JSON（自由定制）"
+    ui_menu 3 "重新分配 IPv6 源地址"
+    ui_menu 0 "返回"
+    c=$(ui_ask_num "请选择" 1 3) || { ui_note "已取消"; return; }
     case "$c" in
         1)
             # 向导修改：只更新核心字段，其余（传输/安全等）保留原 JSON 原样，尊重自由定制
@@ -1495,7 +1882,7 @@ copy_outbound() {
 
 delete_outbound() {
     list_outbounds
-    local n f tag deps yn
+    local n f tag deps
     n=$(pick_outbound) || return 1
     f=$(out_file "$n")
     tag=$(out_tag "$n")
@@ -1507,22 +1894,24 @@ delete_outbound() {
     fi
 
     deps=$(read_bindings | grep "=${tag}$" | cut -d= -f1)
+    # ★ 原来这里是 `printf "…是否继续? [y/N]: " ` 紧跟 `xr_read "确认? (y/N)"`,
+    #   同一个确认**问了两遍**; 而且 yn 没 local。统一走 ui_confirm（只问一次）。
     if [[ -n "$deps" ]]; then
         print_error "警告：$tag 当前被以下入站使用："
         echo "$deps" | sed 's/^/  /' >&2
-        printf "删除后这些入站将自动恢复为默认出站(${DEFAULT_OUTBOUND})。是否继续? [y/N]: " >&2
-        xr_read "确认? (y/N)" "" yn || { XR_EOF=1; return; }
-        yn=$(clean_input "$yn")
-        [[ "$yn" == "y" || "$yn" == "Y" ]] || { print_info "已取消"; return; }
+        if ! ui_confirm "删除后这些入站将自动恢复为默认出站(${DEFAULT_OUTBOUND})。是否继续?"; then
+            print_info "已取消"
+            return
+        fi
         # 移除绑定
         if [[ -f "$ROUTING_FILE" ]]; then
             jq --arg t "$tag" '._meta.bindings |= with_entries(select(.value != $t))' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE"
         fi
     else
-        printf "确认删除出站 $n ($tag) ? [y/N]: " >&2
-        xr_read "确认? (y/N)" "" yn || { XR_EOF=1; return; }
-        yn=$(clean_input "$yn")
-        [[ "$yn" == "y" || "$yn" == "Y" ]] || { print_info "已取消"; return; }
+        if ! ui_confirm "确认删除出站 $n ($tag) ?"; then
+            print_info "已取消"
+            return
+        fi
     fi
 
     # 释放 IPv6
@@ -1538,11 +1927,17 @@ delete_outbound() {
 # ================================
 # 出站测试
 # ================================
-say() { printf "${CYAN}%-18s${RESET} %s\n" "$1" "$2" >&2; }
+# ★ 按**显示宽度**补齐, 不用 printf %-18s。
+#   %-18s 按**字节**算: "出口IPv6" 是 10 字节 / 12 列, "DNS" 是 3 列 ——
+#   同一个 %-18s 让中文标签那一整列比 ASCII 标签多占 2 格, 冒号全部对不齐。
+#   这里走共享层的 ui_pad_w（ui_cjk_w 判定，中文记 2 列）。
+say() { printf "${CYAN}%s${RESET} %s\n" "$(ui_pad_w "$1" 18)" "$2" >&2; }
 
 test_outbound() {
     list_outbounds
-    local n f proto addr port sni send v6
+    # ★ out / got / msg 原来没 local —— 跑一次测试就把它们泄漏到全局,
+    #   下一个协议分支（乃至别的脚本 source 进来）会读到上一次的残留。
+    local n f proto addr port sni send v6 out got msg
     n=$(pick_outbound) || return 1
     f=$(out_file "$n")
     proto=$(jq -r '._meta.proto' "$f")
@@ -1629,7 +2024,8 @@ test_outbound() {
 # 单出站方案：生成新IP → 挂载 → 写回 → 释放旧IP → 重启
 # ================================
 rotate_out6() {
-    local n f prefix old tag
+    # ★ sel / c / rr 原来都没 local —— 泄漏到全局。
+    local n f prefix old tag sel addr rr i
     print_title "更换落地 IPv6（手动按需）"
     # 只处理 Freedom 带源IPv6 的出站
     local -a v6n=()
@@ -1646,16 +2042,14 @@ rotate_out6() {
         n=${v6n[0]}
         print_info "将更换 Freedom 出站 $(out_tag "$n")"
     else
-        echo "选择要更换落地IP的出站：" >&2
-        local i
+        # ★ 原来 `printf "请选择: " ` 紧跟 `xr_read "请输入"`, 问题问两遍;
+        #   而且列表用 `echo "  $((i+1))) $ot"`（右括号都多打了一个）。
+        #   现在列表用 ui_menu, 收号用 ui_ask_num —— 取消 = 不换, 回到调用菜单。
         for i in "${!v6n[@]}"; do
-            local num=${v6n[$i]} ot
-            ot=$(out_tag "$num")
-            echo "  $((i+1))) $ot" >&2
+            ui_menu $((i + 1)) "$(out_tag "${v6n[$i]}")"
         done
-        printf "请选择: " >&2; xr_read "请输入" "" sel || { XR_EOF=1; return; }
-        [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#v6n[@]} )) || { print_error "无效选择"; return 1; }
-        n=${v6n[$((sel-1))]}
+        sel=$(ui_ask_num "选择要更换落地IP的出站" 1 "${#v6n[@]}") || { ui_note "已取消"; return 1; }
+        n=${v6n[$((sel - 1))]}
     fi
     f=$(out_file "$n")
     tag=$(out_tag "$n")
@@ -1666,11 +2060,9 @@ rotate_out6() {
     [[ -z "$prefix" ]] && prefix=$(detect_v6_prefix) || true
     [[ -z "$prefix" ]] && { print_error "无法确定 IPv6 池前缀（请先在池菜单设置）"; return 1; }
     print_info "新IP将取自前缀: $prefix"
-    printf "确认更换 ${tag} 的落地IPv6 (当前 $old)？y/N: " >&2
-    xr_read "请选择" "" c || { XR_EOF=1; return; }
-    [[ "$c" == "y" || "$c" == "Y" ]] || { print_info "已取消"; return 1; }
+    # ★ 原来 `printf "确认更换 … y/N: " ` 紧跟 `xr_read "请选择"`, 确认问了两遍。
+    ui_confirm "确认更换 ${tag} 的落地IPv6 (当前 $old)?" || { print_info "已取消"; return 1; }
 
-    local addr
     addr=$(gen_v6_address "$prefix") || return 1
     # 挂载新地址（失败则中止，绝不留假配置）
     assign_v6 "$addr" "$prefix" || return 1
@@ -1686,8 +2078,8 @@ rotate_out6() {
     egress_check "$addr"
     # 提示重启使 live 进程加载
     [[ -n "$1" ]] && return 0
-    printf "重启 xrayls 使新IP生效? [y/N]: " >&2; xr_read "请输入" "" rr || { XR_EOF=1; return; }
-    if [[ "$rr" == "y" || "$rr" == "Y" ]]; then
+    # ★ 同样是 printf + xr_read 的双提示。
+    if ui_confirm "重启 xrayls 使新IP生效?"; then
         restart_xrayls
     else
         print_info "未重启。新IP已挂载并写入配置，但 xrayls 仍用旧出站。请稍后菜单9 重启。"
@@ -1702,7 +2094,10 @@ gen_pool_batch() {
     prefix=$(pool_prefix) || true
     [[ -z "$prefix" ]] && prefix=$(detect_v6_prefix) || true
     [[ -z "$prefix" ]] && { print_error "无法确定前缀（请先在池菜单设置）"; return 1; }
-    printf "前缀 %s；生成数量(默认8): " "$prefix" >&2; xr_read "请输入" "" cnt || { XR_EOF=1; return; }; cnt=${cnt:-8}
+    # ★ 原来 `printf "前缀 %s；生成数量(默认8): " ` 紧跟 `xr_read "请输入"` ——
+    #   同一个问题问两遍, 而且前半句在前半行、后半句在后半行, 读起来像两句话。
+    ui_note "前缀 $prefix"
+    cnt=$(ui_ask "生成数量" 8)
     [[ "$cnt" =~ ^[0-9]+$ ]] || { print_error "数量非法"; return 1; }
     (( cnt > 200 )) && cnt=200
     echo "已生成(已挂载到网卡，可任选一个写进出站):" >&2
@@ -1742,37 +2137,42 @@ bind_menu() {
         return
     fi
 
+    # ★ i / x / y / z 原来都没 local —— 循环变量漏到全局, 外面同名循环会被串味。
+    local i inbound ot otname yk z
     while [[ "$XR_EOF" == "0" ]]; do
-        echo "请选择入站：" >&2
+        # ★ 两个动态列表改成 ui_pick: 原来用 `printf "  %d) %s"` 手画序号,
+        #   紧接着又是 `printf "选择: " ` + `xr_read "请输入"` 的双提示,
+        #   越界只报一句"无效入站"（连列表一起重画都没有）。
+        #   ★「默认出站」那一行原来只是"列表末尾多一个数字", key 和真实 tag 混在
+        #     同一个序号空间里; 现在给它独立 key __default__, 不可能和真 tag 混淆。
+        UI_PICK_COLS=(入站)
+        UI_PICK_ROWS=""
         for i in "${!ins[@]}"; do
-            printf "  %d) %s\n" $((i+1)) "${ins[$i]}" >&2
+            UI_PICK_ROWS+="${ins[$i]}"$'\t'"${ins[$i]}"$'\n'
         done
-        printf "  0) 退出\n" >&2
-        printf "选择: " >&2
-        xr_read "请输入" "" x || { XR_EOF=1; return; }
-        x=$(clean_input "$x")
-        [[ -z "$x" || "$x" == "0" ]] && break
-        if (( x < 1 || x > ${#ins[@]} )); then print_error "无效入站"; continue; fi
-        local inbound="${ins[$((x-1))]}"
+        # 取消（含 0/EOF）= 退出绑定菜单, 与原来的 "0) 退出" 同一层
+        ui_pick "选择入站" "未发现任何入站" "选择入站" || break
+        inbound="$UI_PICK_KEY"
 
-        echo "请选择出站（${inbound} 将绑定到）：" >&2
+        UI_PICK_COLS=(出站 名称)
+        UI_PICK_ROWS=""
         for i in "${!outs[@]}"; do
-            local ot otname
             ot=$(out_tag "${outs[$i]}")
             otname=$(jq -r '._meta.name // empty' "$(out_file "${outs[$i]}")")
-            printf "  %d) %s (%s)\n" $((i+1)) "$ot" "$otname" >&2
+            UI_PICK_ROWS+="$ot"$'\t'"$ot"$'\t'"${otname:--}"$'\n'
         done
-        printf "  %d) 默认出站 (%s)\n" $(( ${#outs[@]}+1 )) "$DEFAULT_OUTBOUND" >&2
-        printf "选择: " >&2
-        xr_read "请输入" "" y || { XR_EOF=1; return; }
-        y=$(clean_input "$y")
-        [[ -z "$y" ]] && continue
-        if (( y == ${#outs[@]}+1 )); then
+        UI_PICK_ROWS+="__default__"$'\t'"默认出站"$'\t'"$DEFAULT_OUTBOUND"$'\n'
+        # 取消 = 这一轮不绑, 回到入站选择（与原来 "回车 → continue" 同一层）
+        ui_pick "选择出站（${inbound} 将绑定到）" "尚无出站" "选择出站" || continue
+        yk="$UI_PICK_KEY"
+
+        if [[ "$yk" == "__default__" ]]; then
             # 绑定到默认 → 移除绑定
             jq --arg k "$inbound" '._meta.bindings |= del(.[$k])' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" 2>/dev/null && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE" 2>/dev/null
             print_ok "$inbound → 默认出站($DEFAULT_OUTBOUND)"
-        elif (( y >= 1 && y <= ${#outs[@]} )); then
-            local ot=$(out_tag "${outs[$((y-1))]}")
+        else
+            ot="$yk"
+            local onum="${ot#out-}"
             if [[ -f "$ROUTING_FILE" ]]; then
                 jq --arg k "$inbound" --arg v "$ot" '._meta.bindings[$k]=$v' "$ROUTING_FILE" > "${ROUTING_FILE}.tmp" && mv "${ROUTING_FILE}.tmp" "$ROUTING_FILE"
             else
@@ -1780,16 +2180,14 @@ bind_menu() {
             fi
             print_ok "$inbound → $ot"
             # v6-only 出站警示：纯IPv6落地打不开纯IPv4网站
-            if is_v6only_outbound "$(out_file "${outs[$((y-1))]}")"; then
+            if is_v6only_outbound "$(out_file "$onum")"; then
                 print_error "⚠ 警告：$ot 是纯IPv6落地（sendThrough=IPv6），纯IPv4网站（browserleaks/matrix/github等）将无法访问！"
                 print_info "建议：用 split.sh 给这些站加分流规则指到 direct/v4 落地；或改用菜单7绑定默认出站(direct，双栈自动)。"
             fi
-        else
-            print_error "无效出站"
         fi
         write_routing
-        printf "继续绑定其它入站？回车继续 / 0 结束: " >&2
-        xr_read "请输入" "" z || { XR_EOF=1; return; }
+        # ★ 同样是 printf + xr_read 的双提示; 空/0 结束, 与原来一致。
+        z=$(ui_ask "继续绑定其它入站（回车继续，0 结束）" "")
         [[ "$z" == "0" ]] && break
     done
     validate_config
@@ -1801,19 +2199,45 @@ bind_menu() {
 view_mapping() {
     print_title "Inbound → Outbound"
     echo "==================================================" >&2
-    printf "${BOLD}%-16s %-14s %s${RESET}\n" "入站" "出站" "类型" >&2
-    echo "--------------------------------------------------" >&2
-    local tag bind
-    for tag in $(inbound_tags); do
-        bind=$(read_bindings | grep "^${tag}=" | cut -d= -f2)
+    # ★ 表头和数据行原来**用两套宽度**：表头是 `%-16s %-14s`（按字节），数据行
+    #   也是 —— 但表头写的是中文"入站/出站/类型"（各 6 字节 / 4 列），数据行的
+    #   $tag 是纯 ASCII。于是"出站"这一列表头在第 17 列起，而数据行的出站名
+    #   （含 `默认(direct)` 这种中文混排）按字节补齐 —— 两列**必然**对不上。
+    #   这里先按显示宽度算出真实列宽，表头和数据行共用 ui_pad_w。
+    local -a tags=() c1=() c2=() c3=()
+    local tag bind bname bproto
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] && tags+=("$tag")
+    done < <(inbound_tags)
+    local binds; binds=$(read_bindings)
+    for tag in "${tags[@]}"; do
+        bind=$(grep "^${tag}=" <<< "$binds" | cut -d= -f2)
         if [[ -n "$bind" ]]; then
-            local bname bproto
-            bname=$(jq -r --arg t "$bind" '._meta.name // empty' "$CONF_DIR/out-$(printf "%02d" ${bind#out-}).json" 2>/dev/null || echo "$bind")
-            bproto=$(jq -r '._meta.proto // "?"' "$CONF_DIR/out-$(printf "%02d" ${bind#out-}).json" 2>/dev/null || echo "?")
-            printf "%-16s %-14s %s\n" "$tag" "${bname:-$bind}" "$bproto" >&2
+            local bf
+            bf="$CONF_DIR/out-$(printf "%02d" "${bind#out-}").json"
+            bname=$(jq -r '._meta.name // empty' "$bf" 2>/dev/null)
+            [[ -z "$bname" ]] && bname="$bind"
+            bproto=$(jq -r '._meta.proto // "?"' "$bf" 2>/dev/null)
+            [[ -z "$bproto" ]] && bproto="?"
         else
-            printf "%-16s %-14s %s\n" "$tag" "默认(${DEFAULT_OUTBOUND})" "freedom" >&2
+            bname="默认(${DEFAULT_OUTBOUND})"
+            bproto="freedom"
         fi
+        c1+=("$tag"); c2+=("$bname"); c3+=("$bproto")
+    done
+    # ★ `默认(...)` 原来被塞进 `%-14s` 里, 中文和括号按字节补齐 → 实际宽度随机
+    #   变化, 每次刷新列都错。现在列宽按 ui_cjk_w 统一算, 表格自然对齐。
+    local w1 w2 i t1 t2
+    w1=$(ui_cjk_w "入站"); w2=$(ui_cjk_w "出站")
+    for (( i = 0; i < ${#c1[@]}; i++ )); do
+        t1=$(ui_cjk_w "${c1[$i]}"); (( t1 > w1 )) && w1=$t1
+        t2=$(ui_cjk_w "${c2[$i]}"); (( t2 > w2 )) && w2=$t2
+    done
+    printf "${BOLD}%s  %s  %s${RESET}\n" \
+        "$(ui_pad_w "入站" "$w1")" "$(ui_pad_w "出站" "$w2")" "类型" >&2
+    for (( i = 0; i < ${#c1[@]}; i++ )); do
+        printf "%s  %s  %s\n" \
+            "$(ui_pad_w "${c1[$i]}" "$w1")" "$(ui_pad_w "${c2[$i]}" "$w2")" "${c3[$i]}" >&2
     done
     echo "--------------------------------------------------" >&2
     echo "带源IP的出站：" >&2
@@ -1835,15 +2259,15 @@ view_mapping() {
 pool_menu() {
     while [[ "$XR_EOF" == "0" ]]; do
         print_title "IPv6 地址池管理"
-        local cur
+        # ★ c 原来没 local; 菜单用裸 echo（与其余菜单不齐平）; 收号走 xr_read。
+        local cur c
         cur=$(pool_prefix)
-        echo "当前池前缀: ${cur:-未设置}" >&2
-        echo "  1) 检测/设置前缀" >&2
-        echo "  2) 查看已分配地址" >&2
-        echo "  3) 分配一个新地址并写入出站" >&2
-        echo "  0) 返回" >&2
-        xr_read "请选择" "" c || { XR_EOF=1; return; }
-        c=$(clean_input "$c")
+        ui_note "当前池前缀: ${cur:-未设置}"
+        ui_menu 1 "检测/设置前缀"
+        ui_menu 2 "查看已分配地址"
+        ui_menu 3 "分配一个新地址并写入出站"
+        ui_menu 0 "返回"
+        c=$(ui_ask_num "请选择" 1 3) || { ui_note "已返回"; return; }
         case "$c" in
             1)
                 local detected=""
@@ -1873,10 +2297,9 @@ pool_menu() {
                 assign_v6 "$addr" "$prefix" || continue
                 print_ok "新地址: $addr（已挂载；可在 修改出站 → 3. 重新分配IPv6 写入某出站）"
                 ;;
-            0) return ;;
-            *) print_error "无效选项" ;;
         esac
-        printf "按回车继续..." >&2; read
+        # ★ 裸 `read` 在 EOF 时立刻返回 —— 管道喂完输入会在这里**空转刷屏**。
+        ui_pause
     done
 }
 
@@ -2116,8 +2539,7 @@ main_menu() {
             9)
                 print_title "校验 / 重启"
                 validate_config
-                local rr; rr=$(menu_ask "重启 xrayls 服务? [y/N]") || { XR_EOF=1; return; }
-                [[ "$rr" == "y" || "$rr" == "Y" ]] && restart_xrayls
+                ui_confirm "重启 xrayls 服务?" && restart_xrayls
                 ;;
             10) pool_menu ;;
             11) diag_landing ;;
@@ -2128,8 +2550,9 @@ main_menu() {
             *) print_error "无效选项" ;;
         esac
 
-        printf "  ${GRAY}(按回车继续)${RESET}\n" >&2
-        read
+        # ★ 原来是 `printf "(按回车继续)"` + 裸 `read`：EOF 时立刻返回，
+        #   while 循环会**空转刷屏**（和 inbound.sh 当年刷 18 万行同一个成因）。
+        ui_pause
     done
 }
 

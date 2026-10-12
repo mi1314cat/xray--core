@@ -136,6 +136,13 @@ xray_fetch() {
 _XRAY_LIB_FILES=(
     addr.sh cert.sh fetch.sh naming.sh ports.sh preset.sh print.sh
     random.sh read.sh service.sh verify.sh
+    # ui.sh = 统一交互层 (编号选择/确认/提问/排版)。漏了它不会报"缺依赖",
+    # 而是节点管理走 ui.sh 的兜底分支 —— 菜单还在, 交互却退回旧的手打
+    # 名字, 而现象是"改了没生效", 极难定位。
+    # (注意: 这段注释里不要写出别的库文件名 —— 清单校验会按正则把块里出现的
+    #  每个 .sh/.py 都当成清单项去 conf/lib 下找存在性, 注释里写一个就报
+    #  "清单里有不存在的文件"。)
+    ui.sh
     deploy.py dns_edit.py nginx_apply.py naming.py node_build.py nodes.py
     share_meta.py share_payload.py token_store.py
     hy2_products.py
@@ -250,13 +257,27 @@ if ! _xray_load_ui || ! declare -F ui_menu >/dev/null 2>&1; then
 fi
 
 # 建节点之前问一次"服务器标识（节点名前缀）"（旗帜由 naming 负责）。
+#
+# ★ 原来整个调用包在 ( ) 子 shell 里, x_ask_server_name export 的
+#   XRAY_SERVER_NAME 随之丢失 —— 于是每进一次「添加节点」或「节点管理」
+#   就把同一个问题重新问一遍, 而它与当前要做的事毫无关系。
+#   子脚本 (xray_run 起的那批) 各自认这个变量, 所以要在**父 shell** 取到值
+#   并 export 出去: 本次会话只问一次, 子菜单也因为认得它而直接跳过。
+_SRV_NAME_ASKED=""
 _srv_ask_name() {
+    [[ -n "$_SRV_NAME_ASKED" ]] && return 0
+    _SRV_NAME_ASKED=1
     xray_cache_dir >/dev/null
     xray_ensure_lib >/dev/null 2>&1
     local lib="$_XRAY_CACHE/lib/naming.sh"
     [[ -f "$lib" ]] || return 0
-    # shellcheck disable=SC1090
-    ( source "$lib" && x_ask_server_name ) || true
+    local v
+    # 只捕获 stdout (取值); **不要重定向 stderr** —— 提示全部写在 stderr,
+    # 压掉它就等于把这个提示整个藏起来了 (踩过一次: 加了 2>/dev/null 之后
+    # 服务器标识再也没问过, 而它本该在本次会话第一次进入时问一次)。
+    v=$( ( source "$lib" && x_ask_server_name; printf '%s' "${XRAY_SERVER_NAME:-}" ) ) || true
+    [[ -n "$v" ]] && { XRAY_SERVER_NAME="$v"; export XRAY_SERVER_NAME; }
+    return 0
 }
 
 # ---------------------------------------------------------------- 状态取值
@@ -267,9 +288,19 @@ xray_panel_version() {   # 内核版本（拿不到就空）
     [[ -x "$bin" ]] || return 0
     "$bin" version 2>/dev/null | head -1 | awk '{print $2}'
 }
-xray_node_count() {      # 节点片段数（含 inbounds 的 JSON）
+xray_node_count() {      # 节点数 (inbound 条数, 与节点管理里那张表同口径)
     local dir="${CONF_DIR:-/root/catmi/xray/conf}"
     [[ -d "$dir" ]] || { printf '0'; return 0; }
+    # ★ 必须数 **inbound 条数**, 不能数文件数 —— 一个片段可以含多个 inbound,
+    #   于是主菜单报 22、点进节点管理报 25, 同一台机器两个数对不上。
+    #   实测 RN: 22 个片段 / 25 个 inbound。
+    #
+    # ★ 用 jq 一次吃全部文件而不是 nodes.py: nodes.py 要 0.30 秒, 每重画一次
+    #   菜单付一次 —— 那正是 Mihomo 被嫌"卡"的同款毛病。jq 实测 0.01 秒。
+    #   没有 jq 时退回数文件, 至少不会让菜单打不开。
+    local n
+    n=$(jq -s '[.[].inbounds[]?] | length' "$dir"/*.json 2>/dev/null)
+    if [[ "$n" =~ ^[0-9]+$ ]]; then printf '%s' "$n"; return 0; fi
     grep -l '"inbounds"' "$dir"/*.json 2>/dev/null | wc -l | tr -d ' '
 }
 
@@ -335,7 +366,7 @@ service_menu() {
         _srv_clear; ui_title "服务与配置"
         ui_menu 1 "查询服务状态    systemctl status xrayls"
         ui_menu 2 "校验配置并重载  合并 → 字段 → 内核三道关，过了才重启"
-        ui_menu 3 "查看客户端配置  当前生效的入站、端口与分享内容"
+        ui_menu 3 "客户端产物      查看内容 / 换指纹 / 换连接 IP"
         ui_menu 0 "返回"
         echo >&2
         printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
@@ -344,7 +375,7 @@ service_menu() {
             0|"") return 0 ;;
             1) systemctl status xrayls --no-pager ;;
             2) xray_run conf/verify.sh ;;
-            3) show_xray_configs ;;
+            3) client_menu ;;
             *) ui_invalid "$c" ;;
         esac
         ui_pause
@@ -411,43 +442,54 @@ show_menu() {
     ui_menu 3 "路由与出站      出站 / 分流规则 / 反向代理"
     echo >&2
     ui_sec "分享"
-    ui_menu 4 "分享管理        生成 / 列表 / 启停 / 改次数 / 改有效期"
-    ui_menu 5 "分享服务        公共基础服务（安装 / 升级 / 状态）"
+    # ★ 原来这里是两项: 4) 分享管理 与 5) 分享服务。
+    #   用户的原话是"点进分享管理时更想看见分享服务的状态，这两个能不能放在一起"
+    #   —— 服务状态已经提到 share_menu 顶部 (每轮刷新), 11) 保留为二级入口,
+    #   所以主菜单的 5) 去掉, 后面的项整体前移一位 (保持编号连续)。
+    ui_menu 4 "分享管理        生成 / 列表 / 启停 / 改次数 / 改有效期 / 服务状态"
     echo >&2
     ui_sec "站点与证书"
-    ui_menu 6 "证书管理        申请 / 续期 / 同步 / 信任链体检"
-    ui_menu 7 "Nginx 站点管理  列出 / 校验 / 摘除 / CDN 回源"
+    ui_menu 5 "证书管理        申请 / 续期 / 同步 / 信任链体检"
+    ui_menu 6 "Nginx 站点管理  列出 / 校验 / 摘除 / CDN 回源"
     echo >&2
     ui_sec "内核与服务"
-    ui_menu 8 "安装 / 更新内核  含回退到旧版本、卸载"
-    ui_menu 9 "服务与配置      查询状态 / 校验并重载 / 查看客户端配置"
+    ui_menu 7 "安装 / 更新内核  含回退到旧版本、卸载"
+    ui_menu 8 "服务与配置      查询状态 / 校验并重载 / 客户端产物"
     echo >&2
     ui_sec "维护"
-    ui_menu 10 "DNS 管理        解析模式 / 加密 DNS / 防泄漏"
-    ui_menu 11 "日志            实时 / 错误 / 清空 / 最近"
-    ui_menu 12 "自检与体检      通用能力自检 / 端口体检"
+    ui_menu 9 "DNS 管理        解析模式 / 加密 DNS / 防泄漏"
+    ui_menu 10 "日志            实时 / 错误 / 清空 / 最近"
+    ui_menu 11 "自检与体检      通用能力自检 / 端口体检"
     ui_menu 0 "退出"
     echo >&2
     ui_hint "回车 = 退出；每一项都能单独跑: bash conf/<名字>.sh"
-    printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
 
-    # 同理: 按键用尽时退出, 不要拿空 choice 反复重画
-    read -r -p "请输入选项 [0-9]: " choice || exit 0
+    # 同理: 按键用尽时退出, 不要拿空 choice 反复重画。
+    # ★ 这里**只能有一个提示** —— 原来上面 printf 一次、read -p 又一次,
+    #   用户看到的是 `请选择: 请输入选项 [0-9]:`, 像坏了两遍。
+    read -r -p "  ${_CYN}请选择 [0-11]${_RST}: " choice || exit 0
 
     case "${choice}" in
         0|"") _srv_clear; exit 0 ;;
-        1) _srv_ask_name; add_node_menu; share_refresh_hook ;;
-        2) _srv_ask_name; xray_run conf/node.sh; share_refresh_hook ;;
+        # ★ 这里**不再**调 _srv_ask_name。
+        #   服务器标识 (节点名前缀) 只影响分享链接里给人看的名字, tag 一个字
+        #   不改 —— 而「节点管理」做的查看/改名/删除, 三个动作一个都用不到它。
+        #   原来两处都挂着 _srv_ask_name, 于是进节点管理先要答一遍与当前操作
+        #   无关的问题, 而且提示里已经写着「当前: 🇺🇸 1」(值早就落盘), 看着
+        #   更像是白问。Sing-box 把这个 hook 挂进每个协议的建节点流程,
+        #   Mihomo 做成独立菜单项「补地区旗帜」, 两边都不在节点管理里拦人。
+        #   现在改成: 节点管理 -> 6) 服务器标识, 想改随时去改。
+        1) add_node_menu; share_refresh_hook ;;
+        2) xray_run conf/node.sh; share_refresh_hook ;;
         3) route_menu ;;
         4) xray_run conf/share.sh ;;
-        5) xray_run conf/share_service.sh menu ;;
-        6) xray_run conf/cert.sh ;;
-        7) xray_run conf/nginx_site.sh ;;
-        8) kernel_menu ;;
-        9) service_menu ;;
-        10) xray_run conf/dns.sh ;;
-        11) xray_run conf/logs.sh ;;
-        12) maint_menu ;;
+        5) xray_run conf/cert.sh ;;
+        6) xray_run conf/nginx_site.sh ;;
+        7) kernel_menu ;;
+        8) service_menu ;;
+        9) xray_run conf/dns.sh ;;
+        10) xray_run conf/logs.sh ;;
+        11) maint_menu ;;
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac
 
@@ -526,27 +568,107 @@ run_xray_install() {
         return 1
     }
 }
+# 客户端产物 —— 「客户端最终拿到的东西」的总入口。
+#
+# ★ 原来这里只有一个 show_xray_configs(), 把 out/ 下的 txt / yaml **直接 cat
+#   出来**: 几十屏 base64, 没有文件名以外的任何结构, 更没有任何"改"的动作。
+#   用户看完既不知道哪些节点没被收进去, 也不知道指纹 / 对外地址是哪来的,
+#   想改只能删了重建 (端口、REALITY 密钥、分享历史全丢)。
+#
+#   现在这里给四个动作: 看内容 / 换指纹 / 换连接 IP / 刷新分享内容。
+#   换指纹与换地址都只改 share_meta 里对应的字段 (nodes.py 的链接就是从那儿
+#   取 fp= 与 host 的), 不碰任何协议脚本, 也不动 Xray 片段本身。
+client_menu() {
+    local c
+    while :; do
+        _srv_clear; ui_title "客户端产物"
+        _client_status
+        echo >&2
+        ui_menu 1 "查看产物内容    out/ 下的订阅文件 (TXT / YAML)"
+        ui_menu 2 "更换 uTLS 指纹  客户端握手伪装，10 种可选"
+        ui_menu 3 "更换连接 IP     IPv4 / IPv6 切换，CDN 域名不动"
+        ui_menu 4 "刷新分享内容    换完指纹/地址后把已发链接更新到最新"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
+            1) show_xray_configs ;;
+            2) xray_run conf/share.sh change-fp ;;
+            3) xray_run conf/share.sh switch-family-menu ;;
+            4) xray_run conf/share.sh refresh; ui_pause ;;
+            0|"") return 0 ;;
+            *) ui_invalid "$c" ;;
+        esac
+        ui_pause
+    done
+}
+
+# 客户端产物顶部状态 —— 三个值都必须是**便宜**的 (菜单每步都重画):
+# 节点数复用 xray_node_count (jq), 产物文件数是 glob, 对外地址走 share_meta。
+_client_status() {
+    local nn nfile dir="${OUT_DIR:-/root/catmi/xray/out}"
+    nn=$(xray_node_count 2>/dev/null || echo 0)
+    nfile=0
+    [[ -d "$dir" ]] && nfile=$(find "$dir" -maxdepth 1 \( -name '*.txt' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | wc -l)
+    ui_kv "节点数量" "$nn"
+    ui_kv "产物文件" "$nfile 个"
+    _client_addr_line
+}
+
+# 当前客户端会连的地址 —— 直接从 share_meta 读, 与链接里那个 host 同源。
+# ★ 不问外部 ipify 服务: 那是**出站出口**, 本机走 WARP/代理时会答出 WARP 的 IP,
+#   而客户端连的是入站地址 —— 面板显示的必须是产物里真实会写的那个值。
+_client_addr_line() {
+    xray_cache_dir >/dev/null
+    xray_ensure_lib >/dev/null 2>&1
+    local lib="$_XRAY_CACHE/lib"
+    [[ -f "$lib/addr.sh" ]] || { ui_kv "对外地址" "读取失败"; return 0; }
+    # ★ 一个子shell 出两个值 —— 分两次 source 是白付两遍解析。
+    #   addr.sh 里只有 ip 命令, 没有网络调用, 所以静默 stderr 是安全的。
+    local v4 v6
+    v4=$( ( source "$lib/addr.sh" 2>/dev/null; x_addr4_real 2>/dev/null ) ) || v4=""
+    v6=$( ( source "$lib/addr.sh" 2>/dev/null; x_addr6_real 2>/dev/null ) ) || v6=""
+    local s=""
+    [[ -n "$v4" ]] && s="$v4"
+    [[ -n "$v6" ]] && s="${s:+$s  }$v6"
+    ui_kv "本机地址" "${s:-无可用公网地址}"
+    if [[ -n "$v4" && -n "$v6" ]]; then
+        ui_hint "两种地址族都可用 —— 用 3) 切产物用哪一族"
+    fi
+}
+
+# 看产物内容。
+#
+# ★ 一律写 stderr: stdout 是数据通道 (分享链接/订阅内容都从那儿出)。
+#   这里原来 echo -e "${GREEN}…${PLAIN}" 全走 stdout —— 标题混进数据流,
+#   下游任何解析都会把 "===== TXT 配置文件 =====" 当成内容的一部分。
 show_xray_configs() {
     local out_dir="/root/catmi/xray/out"
 
     if [[ ! -d "$out_dir" ]]; then
-        echo -e "${RED}目录不存在：$out_dir${PLAIN}"
+        printf '  %s目录不存在：%s%s\n' "$RED" "$out_dir" "$PLAIN" >&2
         return
     fi
 
-    echo -e "${GREEN}===== TXT 配置文件 =====${PLAIN}"
-    for f in "$out_dir"/*.txt; do
-        [[ -e "$f" ]] || { echo "无 TXT 文件"; break; }
-        echo -e "\n===== $f ====="
-        cat "$f"
-    done
+    _show_out_files "$out_dir" "TXT 配置文件" "$GREEN" txt
+    _show_out_files "$out_dir" "YAML 配置文件" "$GREEN" yaml yml
+}
 
-    echo -e "\n${GREEN}===== YAML 配置文件 =====${PLAIN}"
-    for f in "$out_dir"/*.yaml "$out_dir"/*.yml; do
-        [[ -e "$f" ]] || { echo "无 YAML 文件"; break; }
-        echo -e "\n===== $f ====="
-        cat "$f"
+_show_out_files() { # <目录> <标题> <颜色> <扩展名...>
+    local dir="$1" title="$2" color="$3"; shift 3
+    printf '\n%s===== %s =====%s\n' "$color" "$title" "$PLAIN" >&2
+    local ext f found=0
+    for ext in "$@"; do
+        for f in "$dir"/*."$ext"; do
+            [[ -f "$f" ]] || continue
+            found=1
+            printf '\n%s===== %s =====%s\n' "$color" "$f" "$PLAIN" >&2
+            cat "$f" >&2          # ★ 内容也走 stderr
+        done
     done
+    (( found )) || printf '  无%s文件\n' "$title" >&2
+    return 0
 }
 
 add_node_menu() {
@@ -597,12 +719,15 @@ add_node_menu() {
             ;;
 
         4)
-            xray_run conf/vlessecn.sh
+            # ★ 原来这里跑的是 conf/vlessecn.sh —— 与 3) 撞车 (两个菜单项建出
+            #   同一种节点), 而标签写着「HTTP」。用户选 HTTP 拿到 VLESS-ECN,
+            #   面板全程无任何提示。3) 与 4) 是当时加 SOCKS5 时整体错位了一格。
+            xray_run conf/http.sh
             systemctl restart xrayls.service
             ;;
 
         5)
-            xray_run conf/http.sh
+            xray_run conf/vlessecn.sh
             systemctl restart xrayls.service
             ;;
 

@@ -37,13 +37,27 @@ TRANSPORTS = {
 
 # 加密方式 → 可用传输。
 #
-# REALITY 只能跑在裸 TCP 上 —— 它的握手伪装依赖客户端直连目标站点,
-# 中间任何一层协议封装 (WS/gRPC/XHTTP) 都会破坏握手。写成数据而不是注释,
-# 这样拼错组合时会被拒绝, 而不是生成一条连不上的配置。
+# ★ REALITY 的传输白名单照**内核源码**, 不照直觉 (2026-10-12 实测校正):
+#
+#   这里原来写的是 {"tcp","raw"}, 注释还写着"REALITY 只能跑在裸 TCP 上,
+#   任何一层封装 (WS/gRPC/XHTTP) 都会破坏握手"。那是错的, 而且错的方向是
+#   "挡掉合法组合":
+#
+#     内核 infra/conf/transport_internet.go 的报错原文:
+#       "REALITY only supports RAW, XHTTP and gRPC for now."
+#     并实测 `reality + xhttp` 的配置 xray run -test 通过。
+#
+#   官方恰恰主推 REALITY + XHTTP (最强安全层 + 官方主推传输), 把它挡掉等于
+#   挡掉用户最想要的组合。conf/lib/preset.sh 的白名单也是这四个, 两边必须一致
+#   (tools/check_libs.sh 有一条门禁专门盯这个漂移)。
+#
+#   真正非法的是 ws / httpupgrade —— 那两个不在内核白名单里, 建出来必然握手失败。
+#
+#   注: Vision flow 另有限制, 只在裸 TCP 上给 (见 mknode.sh)。
 SECURITY_TRANSPORTS = {
     "none":   None,                  # 不限制
     "tls":    None,
-    "reality": {"tcp", "raw"},
+    "reality": {"raw", "tcp", "xhttp", "grpc"},
 }
 
 
@@ -93,6 +107,14 @@ def _stream_settings(transport, security, opts):
         #   不是跳过校验 —— 跳过校验等于把中间人攻击的门打开。
         if opts.get("pinned_cert_sha256"):
             tls["pinnedPeerCertSha256"] = opts["pinned_cert_sha256"]
+        # ★ ECH 服务端公钥 (X 特有)。
+        #   字段名服务端是 echServerKeys, 客户端才是 echConfigList —— 用错内核
+        #   直接拒收整份配置。值由 `xray tls ech` 生成, **成对**: 一次输出的
+        #   ECH config list 给客户端、ECH server keys 留服务端。
+        #   注意内核**不在加载期校验这个值** (实测塞垃圾串也能过 -test), 所以
+        #   面板必须自己保证它来自 xray tls ech, 不能让用户手打。
+        if opts.get("ech_server_keys"):
+            tls["echServerKeys"] = opts["ech_server_keys"]
         ss["security"] = "tls"
         ss["tlsSettings"] = tls
 
@@ -105,6 +127,17 @@ def _stream_settings(transport, security, opts):
         }
         if opts.get("spider_x"):
             rs["spiderX"] = opts["spider_x"]
+        # ★ ML-DSA-65 后量子签名 (X 特有, sing-box 没有)。
+        #   `xray mldsa65` 输出 Seed / Verify 两个值, 对应下面这两个字段
+        #   (从内核二进制 JSON tag 提取并实测 -test 通过)。
+        #   注意它与 VLESS 的 ML-KEM-768 encryption 是**两个独立机制**:
+        #     · mldsa65*  = REALITY 握手签名的抗量子
+        #     · mlkem*    = VLESS 会话密钥交换的抗量子
+        #   两者可以同时上。
+        if opts.get("mldsa65_seed"):
+            rs["mldsa65Seed"] = opts["mldsa65_seed"]
+        if opts.get("mldsa65_verify"):
+            rs["mldsa65Verify"] = opts["mldsa65_verify"]
         ss["security"] = "reality"
         ss["realitySettings"] = rs
 

@@ -99,15 +99,36 @@ backup_conf_out() {
     [[ -f "$tarball" ]] && print_info "已备份 conf/out → $tarball"
 }
 
-########## 唯一交互: 端口范围 ##########
+########## 交互: 分级, 按需才问 ##########
+# ★ 借鉴 SB 的 batch 设计, 但**不照抄它的项数**:
+#   SB 有 5 组交互。这里只加 2 组 (服务器标识 / 证书思路), 端口范围保留。
+#
+#   加的依据是"不问会后悔"还是"不问无所谓":
+#     · 端口范围 —— 不问就得挨个进协议菜单改十几轮, 值得问 (原来就有)
+#     · 服务器标识 —— 不问会在多台机器上撞 tag, 是真 bug, 值得问
+#     · 监听地址 / 伪装目标 / 每个协议的密码 UUID —— 程序能自己算或用户改起来
+#       不费事, 问了纯粹增加输入负担。SB 把监听地址也不问掉, 正是这个道理:
+#       "没有理由让用户为一个更差的选项做选择。"
+#
+#   开场先把"会问什么、失败了会怎样"说清楚 —— 用户能据此决定是逐项问
+#   还是走快速模式, 而不是被一堆问句淹没。
 ask_port_range() {
     local r
     echo >&2
-    printf "${CYAN}唯一交互: 监听端口分配范围。其余全部沿用各协议默认值（最高配置，自动生成密码/UUID/PSK/Reality 伪装域名）。${RESET}\n" >&2
+    printf "${CYAN}接下来问端口范围。其余全部沿用各协议默认值（最高配置，自动生成密码/UUID/PSK/Reality 伪装域名）。${RESET}\n" >&2
     printf "${CYAN}批内多协议端口自动连续分配，收尾统一 check + 仅 reload 一次。${RESET}\n" >&2
     read -r -p "端口范围 (如 20000-25000, 回车=自动选择): " r >&2
     r=$(clean_input "$r")
     choose_port_range "$r"
+}
+
+# 一次问完 (逐项模式)。顺序与 SB 一致: 标识 → 端口。
+ask_all() {
+    print_title "批量生成 · 逐项确认"
+    printf "${CYAN}交互项: 服务器标识 → 端口范围。其余沿用各协议默认值。${RESET}\n" >&2
+    printf "${CYAN}端口被占用或配置失败会自动跳过该协议并写日志；收尾统一 check + 仅 reload 一次。${RESET}\n" >&2
+    ask_server_name
+    ask_port_range
 }
 
 choose_port_range() {
@@ -147,7 +168,87 @@ choose_port_range() {
     return 0
 }
 
+########## 为什么没生成节点 ##########
+# ★ "有结果但不理想"的时候, 把前置条件讲出来 —— 借鉴 SB 的 CDN 汇总。
+#   只打一行「无节点」的话, 用户只能自己去翻日志猜。
+_no_node_reason() {
+    local proto="$1" frag="$2" pf
+    pf=$(fragment_prefix "$proto")
+    if [[ -n "$frag" ]] || ls "$CONF_DIR"/"$pf"-*.json >/dev/null 2>&1; then
+        return 0        # 其实有碎片, 上面那行只是没匹配到排序, 不用多说
+    fi
+    case "$proto" in
+        Reality)
+            printf "     %s提示%s REALITY 需要一个可连的伪装目标域名, 且服务端要有 X25519/ML-DSA 密钥对。\n" "$CYAN" "$RESET" >&2 ;;
+        hysteria2)
+            printf "     %s提示%s Hysteria2 走 UDP, 需要一张可信证书; 证书缺失或端口被占用都会失败。\n" "$CYAN" "$RESET" >&2 ;;
+        *)
+            printf "     %s提示%s 端口 %s-%s 可能已被占用, 或该协议默认凭据生成失败。\n" \
+                "$CYAN" "$RESET" "${X_BATCH_PORT_START:-?}" "${X_BATCH_PORT_END:-?}" >&2 ;;
+    esac
+}
+
 BATCH_OK=(); BATCH_SKIP=(); BATCH_FAIL=()
+
+# ★ timeout 不是所有精简系统都装 (busybox 有, 但极少见的裁剪镜像没有)。
+#   没有就退化成直接调用, 不能因为缺个 coreutils 工具就让整批跑不了。
+BATCH_PROTO_TIMEOUT="${X_BATCH_PROTO_TIMEOUT:-240}"
+if ! command -v timeout >/dev/null 2>&1; then
+    BATCH_PROTO_TIMEOUT=""
+    print_info "系统没有 timeout, 单协议不再限时 (脚本本身已用 </dev/null 防止等待输入)"
+fi
+
+########## 服务器标识 ##########
+# ★ 为什么单独问一次 (借鉴 SB):
+#   各协议是独立子进程 (`bash conf/<proto>.sh add`), 子进程里问的东西
+#   传不回主进程, 而节点名前缀是要给**所有**协议用的。所以只能在这里问一遍,
+#   再通过环境变量传下去。
+#   不问的后果: 同一个人两台服务器各跑一次批量, 产出的 tag 完全一样
+#   (x-vless01-tls), 两个订阅导进同一个客户端会互相覆盖, 面板还报 [OK]。
+_bt_server_name() {
+    local n="${X_SERVER_NAME:-}"
+    if [[ -z "$n" && -r "$XRAY_BASE/.server-name" ]]; then
+        n=$(head -1 "$XRAY_BASE/.server-name" 2>/dev/null | tr -d '[:space:]')
+    fi
+    printf '%s' "$n"
+}
+
+ask_server_name() {
+    local cur; cur=$(_bt_server_name)
+    local def="${cur:-$(hostname 2>/dev/null || echo server)}"
+    echo >&2
+    printf "${CYAN}服务器标识: 会写进每个节点的 tag 与分享链接名。${RESET}\n" >&2
+    printf "${DIM}  同一个人在多台服务器上跑批量时, 它能防止两个订阅在同一个客户端里互相覆盖。${RESET}\n" >&2
+    local n
+    read -r -p "  服务器标识 [回车=$def]: " n || n=""
+    n=$(clean_input "${n:-}")
+    n="${n:-$def}"
+    X_SERVER_NAME="$n"
+    mkdir -p "$XRAY_BASE" 2>/dev/null || true
+    printf '%s\n' "$n" > "$XRAY_BASE/.server-name" 2>/dev/null || true
+    print_ok "服务器标识: $n"
+}
+
+# 清掉本协议已有的服务端碎片 —— 重建模式用。
+wipe_proto() {
+    local pfx f n=0
+    pfx=$(fragment_prefix "$1")
+    for f in "$CONF_DIR"/"$pfx"-*.json; do
+        [[ -e "$f" ]] || continue
+        rm -f "$f" && n=$((n+1))
+    done
+    printf '%s' "$n"
+}
+
+# 列出将被清掉的节点碎片, 让用户先看见再决定。
+list_will_wipe() {
+    local pfx f
+    for pfx in "${BATCH_FRAG_PREFIX[@]}"; do
+        for f in "$CONF_DIR"/"$pfx"-*.json; do
+            [[ -e "$f" ]] && printf "    %s\n" "$(basename "$f")"
+        done
+    done
+}
 
 ########## 主流程 ##########
 batch_main() {
@@ -173,10 +274,15 @@ batch_main() {
             skip_list+=("$proto") && BATCH_SKIP+=("$proto")
             continue
         fi
+        # ★ 必须加 timeout —— 协议脚本内部有 read, 万一 </dev/null 没生效
+        #   (某些 wrapper 会把 stdin 接回 tty) 就挂死, 一个协议能拖死整批。
+        #   借鉴 SB: 每协议子进程 timeout 240。
         X_BATCH=1 X_NO_RELOAD=1 SB_BATCH=1 \
         X_BATCH_PORT_START="${X_BATCH_PORT_START:-}" X_BATCH_PORT_END="${X_BATCH_PORT_END:-}" \
-            bash "$SCRIPT_DIR/$proto.sh" add </dev/null >"$LOG_DIR/x-batch-$proto.log" 2>&1
-        if [[ $? -eq 0 ]]; then
+            timeout "$BATCH_PROTO_TIMEOUT" bash "$SCRIPT_DIR/$proto.sh" add </dev/null \
+            >"$LOG_DIR/x-batch-$proto.log" 2>&1
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then
             printf "${GREEN}[OK]${RESET} 生成\n" >&2
             ok_list+=("$proto") && BATCH_OK+=("$proto")
         else
@@ -268,12 +374,28 @@ batch_summary() {
         frag=$(latest_fragment "$proto")
         if [[ -z "$frag" ]]; then
             printf " ✗ %-14s (无节点; 失败详情见 $LOG_DIR/x-batch-%s.log)\n" "$proto" "$proto" >&2
+            _no_node_reason "$proto" "$frag"
             continue
         fi
         num=$(basename "$frag" | sed -E "s/^$(fragment_prefix "$proto")-([0-9]+)\.json$/\1/")
         port=$(jq -r '.inbounds[0].port' "$frag" 2>/dev/null)
         tag=$(jq -r '.inbounds[0].tag' "$frag" 2>/dev/null)
-        printf " ✓ %-14s 编号=%-3s 端口=%-6s Tag=%s\n" "$proto" "$num" "$port" "$tag" >&2
+        # ★ 形态**从生成的 JSON 里读回来**, 而不是从"我以为生成了什么"推断 ——
+        #   面板说的 ≠ 实际写进文件的, 是这类面板最难查的一类 bug。
+        local form
+        form=$(jq -r '.inbounds[0].streamSettings.security // "none"' "$frag" 2>/dev/null)
+        local net
+        net=$(jq -r '.inbounds[0].streamSettings.network // "raw"' "$frag" 2>/dev/null)
+        printf " ✓ %-14s 编号=%-3s 端口=%-6s Tag=%-18s %s/%s\n" \
+            "$proto" "$num" "$port" "$tag" "$net" "$form" >&2
+        # REALITY 公钥 / ShortID 是用户配客户端唯一要手抄的东西, 必须打出来;
+        # 密码截断显示, 不全打 (日志里已经有了, 刷屏没意义)。
+        local pk sid pw
+        pk=$(jq -r '.inbounds[0].streamSettings.realitySettings.publicKey // empty' "$frag" 2>/dev/null)
+        sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortId // empty' "$frag" 2>/dev/null)
+        [[ -n "$pk" ]] && printf "     Reality 公钥=%s\n" "${pk:0:12}…  ShortID=${sid:-无}" >&2
+        pw=$(jq -r '.inbounds[0].settings.clients[0].password // empty' "$frag" 2>/dev/null)
+        [[ -n "$pw" ]] && printf "     password=%.24s…\n" "$pw" >&2
         # 分享链接直接读取协议脚本生成的现有文件
         local pre share
         pre="$(fragment_prefix "$proto")"
@@ -297,24 +419,86 @@ batch_summary() {
     [[ "$reloaded" == "true" ]] || print_info "服务未重启/沙箱模式: 配置已校验, reload 需在正式目录执行 batch 或手动 verify"
 }
 
+########## 清空全部节点 (破坏性) ##########
+# ★ 破坏性操作的三段式 (借鉴 SB):
+#   1) 先把**要删什么逐条列出来** —— 用户看着文件名才能判断"里面有没有我
+#      手写的东西"。只说"将删除 8 个节点"是不够的。
+#   2) 明说**保留什么** —— 否则用户会怕连基础配置一起没了而不敢确认。
+#   3) 必须输入 yes, 提示语自带"其它任何输入=取消"。
+clear_all_nodes() {
+    print_title "清空全部节点"
+    local n; n=$(list_will_wipe | wc -l)
+    if [[ "$n" -eq 0 ]]; then
+        print_info "本来就没有节点, 没什么可清"
+        return 0
+    fi
+    printf "${RED}将删除以下 %d 个服务端碎片:${RESET}\n" "$n" >&2
+    list_will_wipe >&2
+    echo >&2
+    printf "${DIM}会保留: 00-base.json 等基础骨架、出站、路由、证书。${RESET}\n" >&2
+    printf "${DIM}会删除: 上面这些节点碎片, 以及它们的分享链接会随之失效。${RESET}\n" >&2
+    printf "${DIM}之后可以随时用 1) 重新一键生成。${RESET}\n\n" >&2
+
+    local w
+    read -r -p "确认清空? 输入 yes (其它任何输入=取消): " w || { echo; return 0; }
+    if [[ "$(clean_input "$w")" != "yes" ]]; then
+        print_warn "已取消, 未做任何改动"
+        return 0
+    fi
+    local p del=0
+    for p in "${BATCH_PROTOS[@]}"; do
+        del=$(( del + $(wipe_proto "$p") ))
+    done
+    print_ok "已删除 $del 个节点碎片 (conf/out 已备份, 分享令牌需手动重建)"
+    return 0
+}
+
+# 重建 = 先确认再删本协议已有碎片, 然后正常跑一遍。
+rebuild_all() {
+    print_title "全协议重建 · 将覆盖已有节点"
+    local n; n=$(list_will_wipe | wc -l)
+    if [[ "$n" -eq 0 ]]; then
+        print_info "没有已有节点, 直接生成即可"
+        return 1
+    fi
+    printf "${YELLOW}将先删除以下 %d 个已有节点碎片, 再重新生成 (端口/UUID/密码都会换新的):${RESET}\n" "$n" >&2
+    list_will_wipe >&2
+    echo >&2
+    printf "${DIM}REALITY 长期密钥对、证书、基础骨架保留不动。${RESET}\n" >&2
+    printf "${DIM}已发出的分享链接会立即失效 —— 重建后需要重新分发。${RESET}\n\n" >&2
+    local w
+    read -r -p "确认重建? 输入 yes (其它任何输入=取消): " w || { echo; return 1; }
+    [[ "$(clean_input "$w")" == "yes" ]] || { print_warn "已取消"; return 1; }
+    local p
+    for p in "${BATCH_PROTOS[@]}"; do wipe_proto "$p" >/dev/null; done
+    print_ok "已清掉旧节点, 开始重新生成"
+    return 0
+}
+
 ########## 入口 ##########
 main() {
     if [[ "${1:-}" == "--auto" ]]; then
         : $(( X_BATCH_PORT_START = 20000 + RANDOM % 20000 ))
         : $(( X_BATCH_PORT_END = X_BATCH_PORT_START + 2000 ))
+        X_SERVER_NAME=$(_bt_server_name)
         batch_main
         return $?
     fi
     while true; do
         print_title "全协议一键生成 (Batch Generator)"
-        echo -e "${CYAN}1)${RESET} 全协议生成：Reality / Trojan / SS2022 / Hysteria2（唯一交互: 端口范围）"
-        echo -e "${CYAN}2)${RESET} 全协议生成（自动端口, 完全无交互）"
+        echo -e "${CYAN}协议:${RESET} Reality / Trojan / SS2022 / Hysteria2"
+        echo -e "${CYAN}1)${RESET} 全协议生成      ${DIM}逐项确认 (服务器标识 + 端口范围)${RESET}"
+        echo -e "${CYAN}2)${RESET} 全协议快速生成  ${DIM}只问端口范围${RESET}"
+        echo -e "${CYAN}3)${RESET} 全协议重建      ${YELLOW}强制覆盖已有节点 (端口/UUID 会换新)${RESET}"
+        echo -e "${CYAN}4)${RESET} 清空全部节点    ${RED}(破坏性)${RESET}"
         echo -e "${CYAN}0)${RESET} 返回"
-        read -r -p "请输入选项 [0-2]: " c || { echo; exit 0; }
+        read -r -p "请输入选项 [0-4]: " c || { echo; exit 0; }
         c=$(clean_input "$c")
         case "$c" in
-            1) ask_port_range && batch_main ;;
-            2) choose_port_range "" && batch_main ;;
+            1) ask_all && batch_main ;;
+            2) X_SERVER_NAME=$(_bt_server_name); ask_port_range && batch_main ;;
+            3) if rebuild_all; then X_SERVER_NAME=$(_bt_server_name); ask_port_range && batch_main; fi ;;
+            4) clear_all_nodes ;;
             0) return ;;
             *) print_error "无效选项" ;;
         esac

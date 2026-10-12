@@ -44,8 +44,20 @@ PROTO_NAME="VLESS-TCP-ML-KEM"
 CONF_DIR="/root/catmi/xray/conf"
 XRAYLS_BIN="/root/catmi/xray/xrayls"   # 必需，用于生成 ML-KEM 密钥
 
-# 备用固定密钥（当 xrayls 不可用时自动使用）
-FALLBACK_ENC="mlkem768x25519plus.native.600s.OEYSQhMul9UVxme8omvFtznEWqQViMIEORBJp0fVKekmjMwzBj1NwCikhruSYboDfvnnCS2XTXjWOv1W7PAw4w"
+# ★ 这里原来有一行备用固定密钥 (FALLBACK_ENC="mlkem768x25519plus...")。
+#   已删除。两个理由, 第二个更要命:
+#
+#   1) 这个文件在**公开仓库**里。等于把服务端的解密密钥印在报纸上 ——
+#      拿到仓库的人就能解所有人的流量, 而 ML-KEM-768 那套后量子加密
+#      提供的机密性正好归零。原注释还写着"功能不受影响", 这句是错的。
+#
+#   2) 更严重: 原来的兜底把 SERVER_DEC 和 CLIENT_ENC **赋成同一个值**。
+#      但这两个是 vlessenc 一次生成的**配对**值, 服务端 decryption 与客户端
+#      encryption 本来就不同。把两者填成同一个字符串, 建出来的节点连不上。
+#      "兜底"本身是坏的, 只是没人走到过那条路 (xrayls 一直在) 所以没暴露。
+#
+#   现在取不到密钥就**明确失败**并说清怎么办 —— 宁可建不出节点,
+#   也不能建出一个密钥公开、且握手就失败的节点。
 
 mkdir -p "$CONF_DIR"
 
@@ -261,33 +273,35 @@ generate_uuid() {
 generate_mlkem() {
     if [ ! -x "$XRAYLS_BIN" ]; then
         print_error "未找到 xrayls 可执行文件: $XRAYLS_BIN"
-        print_info "将使用备用固定加密密钥（功能不受影响）"
-        SERVER_DEC="$FALLBACK_ENC"
-        CLIENT_ENC="$FALLBACK_ENC"
-        return 0
+        print_info "VLESS-ECN 必须用内核现生成 ML-KEM-768 密钥, 没有安全的替代方案"
+        print_info "请先修好内核 (面板: 安装/修复内核), 再建这个节点"
+        return 1
     fi
 
     print_info "正在通过 xrayls 生成 ML-KEM 参数..."
     local output
     output=$("$XRAYLS_BIN" vlessenc 2>/dev/null || true)
     if [ -z "$output" ]; then
-        print_error "xrayls vlessenc 无输出，回退到固定密钥"
-        SERVER_DEC="$FALLBACK_ENC"
-        CLIENT_ENC="$FALLBACK_ENC"
-        return 0
+        print_error "xrayls vlessenc 无输出 (内核需 >= 26.3.27 才有这个子命令)"
+        print_info "请升级内核后重试; 不会用固定密钥兜底 —— 那个密钥是公开的"
+        return 1
     fi
 
     SERVER_DEC=$(echo "$output" | grep -oP '"decryption"\s*:\s*"\K[^"]+' | tail -1)
     CLIENT_ENC=$(echo "$output" | grep -oP '"encryption"\s*:\s*"\K[^"]+' | tail -1)
 
     if [ -z "$SERVER_DEC" ] || [ -z "$CLIENT_ENC" ]; then
-        print_error "解析 ML-KEM 参数失败，回退到固定密钥"
-        SERVER_DEC="$FALLBACK_ENC"
-        CLIENT_ENC="$FALLBACK_ENC"
-    else
-        print_info "服务端 decryption: $SERVER_DEC"
-        print_info "客户端 encryption: $CLIENT_ENC"
+        # 同样不再兜底。另外这两个值必须来自**同一次** vlessenc 输出 ——
+        # 原来若只解析出一个, 另一个会留空, 同样建出连不上的节点。
+        print_error "没能从 xrayls vlessenc 输出里同时解析出 decryption 与 encryption"
+        print_error "请升级内核 (>= 26.3.27) 后重试; 已中止, 未创建任何文件"
+        SERVER_DEC=""; CLIENT_ENC=""
+        return 1
     fi
+
+    print_info "服务端 decryption: $SERVER_DEC"
+    print_info "客户端 encryption: $CLIENT_ENC"
+    return 0
 }
 
 # ================================
@@ -317,7 +331,10 @@ add_config() {
     local UUID=$(generate_uuid)
 
     # 5. ML-KEM 密钥
-    generate_mlkem
+    #   ★ 必须检查返回值。generate_mlkem 现在取不到密钥时返回 1 (不再兜底),
+    #   而原来这里是裸调用 —— 于是失败会被静默吞掉, 接着拿**空**的 SERVER_DEC
+    #   去写配置文件, 产出一个密钥为空、握手必失败的节点, 而且面板显示成功。
+    generate_mlkem || { print_error "没有 ML-KEM 密钥, 已中止 (未创建任何文件)"; return 1; }
 
     # 6. 索引与文件名
     local next=$(get_next_index)

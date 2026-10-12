@@ -30,6 +30,47 @@ else
     exit 1
 fi
 
+# 统一交互层 (编号选择 / 确认 / 提问 / 方框排版)。
+# 拿不到就退化成只有 ui_* 排版的老样子 —— 交互退化不能让菜单点不动。
+if [[ -r "$LIB_DIR/ui.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$LIB_DIR/ui.sh"
+else
+    ui_box() { ui_title "$@"; }
+    UI_PICK_KEY=""
+    ui_pick() {   # 无库时的兜底: 仍然编号化, 只是没有方框
+        local title="$1" empty="$2" verb="$3" -a keys=() labels=()
+        local k v i idx
+        while IFS=$'\t' read -r k v; do
+            [[ -n "$k" ]] || continue; keys+=("$k"); labels+=("$v")
+        done <<< "${UI_PICK_ROWS:-}"
+        if (( ${#keys[@]} == 0 )); then warn "$empty"; return 2; fi
+        while :; do
+            ui_title "$title"
+            for (( i = 0; i < ${#keys[@]}; i++ )); do
+                printf '   %2d) %s\n' "$((i+1))" "${labels[$i]}" >&2
+            done
+            printf '    0) 返回\n\n' >&2
+            read -r -p "  $verb [1-${#keys[@]}, 0=取消]: " idx || return 1
+            [[ -z "$idx" || "$idx" == "0" ]] && return 1
+            [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#keys[@]} )) || { ui_invalid "$idx"; continue; }
+            UI_PICK_KEY="${keys[$((idx-1))]}"; return 0
+        done
+    }
+    ui_ask_num() { local p="$1" lo="$2" hi="$3" a
+        while :; do read -r -p "  $p [$lo-$hi, 0=取消]: " a || return 1
+            [[ -z "$a" || "$a" == 0 ]] && return 1
+            [[ "$a" =~ ^[0-9]+$ ]] && (( a >= lo && a <= hi )) && { printf '%s' "$a"; return 0; }
+            ui_invalid "$a"; done; }
+    ui_confirm() { local q="$1" a
+        read -r -p "  $q 输入 yes 确认: " a || return 1
+        [[ "$a" == "yes" || "$a" == "y" || "$a" == "Y" ]]; }
+    ui_note() { printf '  %s\n' "$1" >&2; }
+    # node_print_table 还要用这两个 —— 漏了会让"库缺失"从交互退化变成菜单直接崩
+    ui_rule2() { printf '  %s\n' "------------------------------------------------" >&2; }
+    ui_pad_w() { printf '%s' "$1"; }
+fi
+
 py() { python3 "$@"; }
 
 # ---------------------------------------------------------------- 辅助
@@ -37,7 +78,81 @@ py_lib() { # 把 lib 目录作为参数传给内嵌脚本, 避免 heredoc 猜 sy
     py -c "import sys; sys.path.insert(0, '$LIB_DIR'); exec(sys.stdin.read())"
 }
 
+# CLI 的 `node.sh list` 保持原样 (裸表, 给脚本/管道用) —— 菜单走
+# node_print_table, 两者分工不同, 不要混。
 node_list() { py "$LIB_DIR/nodes.py" "$CONF_DIR"; }
+
+# ---------------------------------------------------------------- 节点表
+# 一次解析, 供「画表」与「按编号取节点」共用。
+#
+# ★ 必须**一次** python 扫全部片段 (nodes.py 本来就是这个形状, 保持住):
+#   Mihomo 的首屏 node_count() 给每个节点文件各起一个 python 进程,
+#   单是 import yaml 就要 60ms, 20 个文件 = 1.3 秒 —— 那正是用户说的"卡"。
+#   这里只花一次进程, 之后每层菜单都复用这一份结果。
+_NODE_TAGS=(); _NODE_FIELDS=()
+_node_cache=""; _node_loaded=0
+
+_node_load() {
+    _node_loaded=1
+    _NODE_TAGS=(); _NODE_FIELDS=()
+    [[ -n "$_node_cache" ]] || _node_cache=$(py "$LIB_DIR/nodes.py" "$CONF_DIR" json 2>/dev/null)
+    [[ -n "$_node_cache" ]] || return 0
+    local t rest
+    while IFS=$'\t' read -r t rest; do
+        [[ -n "$t" ]] || continue
+        _NODE_TAGS+=("$t"); _NODE_FIELDS+=("$rest")
+    done < <(printf '%s' "$_node_cache" | py -c "
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+rows = [(n.get('tag') or '', [n.get('protocol') or '-', n.get('port') or '-',
+         n.get('network') or '-', n.get('security') or '-'])
+        for n in (d.get('nodes') or []) if n.get('tag')]
+rows.sort(key=lambda r: r[0].lower())
+for tag, f in rows: print(tag + '\t' + '\t'.join(str(x) for x in f))
+" 2>/dev/null)
+}
+
+# 节点表失效 (增/删/改名之后) —— 下一次重画时重新解析
+node_cache_drop() { _node_cache=""; _node_loaded=0; _node_load; }
+
+node_count() { _node_load; printf '%s' "${#_NODE_TAGS[@]}"; }
+
+# 画编号节点表 —— 走 ui.sh 的统一渲染器。
+#
+# ★ 列是按"用户要拿它做什么选"选的, 不是把 nodes.py 的字段一股脑倒出来:
+#   **凭据那列删掉了** —— 截断的 UUID 对选节点毫无帮助, 却占了最宽的一列,
+#   顺带把整张表撑到要换行。凭据属于「查看节点详情」。
+node_print_table() {
+    _node_load
+    if (( ${#_NODE_TAGS[@]} == 0 )); then
+        printf '  %s还没有任何节点 —— 先用「添加节点」建一个%s\n' "$_DIM" "$_RST" >&2
+        return 1
+    fi
+    UI_PICK_COLS=(节点名 类型 端口 传输 安全)
+    UI_PICK_ROWS=""
+    local i
+    for (( i = 0; i < ${#_NODE_TAGS[@]}; i++ )); do
+        # 行格式 key<TAB>显示列… —— 节点名就是 tag 本身, 所以第一列重复一遍。
+        # (证书/站点那些表 key 是完整路径而显示列是 basename, 不重复。)
+        UI_PICK_ROWS+="${_NODE_TAGS[$i]}"$'\t'"${_NODE_TAGS[$i]}"$'\t'"${_NODE_FIELDS[$i]}"$'\n'
+    done
+    ui_table_print "共 ${#_NODE_TAGS[@]} 个节点"
+}
+
+# 按编号取节点。编号与上面那张表**是同一套**, 所以不再重画一遍 ——
+# 用户看到的编号和输入的编号来自同一次解析, 不可能对不上。
+node_pick() { # <动作名>
+    _node_load
+    local n=${#_NODE_TAGS[@]}
+    if (( n == 0 )); then
+        warn "还没有任何节点, 先用「添加节点」建一个"
+        ui_pause; return 2
+    fi
+    ui_pick_from_shown "要$1的" "$n" || { UI_PICK_KEY=""; return 1; }
+    UI_PICK_KEY="${_NODE_TAGS[$((UI_PICK_IDX-1))]}"
+    return 0
+}
 
 node_exists() {
     [[ -n "$1" ]] || return 1
@@ -264,11 +379,17 @@ check_orphan_nginx() {
     #   1. nginx 跑在容器里时 (生产就是这样) 真正生效的站点在容器的挂载目录
     #      (如 /home/web/conf.d), 宿主 /etc/nginx/conf.d 是空的 —— 自己扫宿主
     #      目录会得出"没有发现片段"的**假结论**, 而站点里其实一堆孤儿;
-    #   2. `grep -r` 会把 *.xray-core-bak / *.yaml 这些 nginx **根本不加载**的
+    #   2. grep -r 会把 *.xray-core-bak / *.yaml 这些 nginx **根本不加载**的
     #      文件也算进来 (备份里留着标记) —— 于是报出一堆不存在的孤儿, 白折腾。
     #   nginx_apply.site_files() 只列 nginx 真会读的 *.conf, 且容器/宿主自适应,
     #   与"插入/摘除"用的是同一个口径 (改哪儿就在哪儿查)。
     local marked
+    # ★ 下面这段 python 是用 py -c 配**双引号**裹进来的。bash 在双引号里照样会做
+    #   反引号命令替换, 连以 # 开头的行也不例外 —— 所以这一整块里(包括上面的注释)
+    #   **不能出现反引号, 也不能出现双引号**。两边都会把字符串提前闭合或跑命令:
+    #   反引号 → "域名: command not found"; 双引号 → 后半段被当 shell 解析,
+    #   python 直接收不到完整代码, 结果是 marked 恒空, 明明有孤儿也报"没有发现"。
+    #   要引东西一律用「」。
     marked=$(LIB="$LIB_DIR" py -c "
 import os, re, sys
 sys.path.insert(0, os.environ['LIB'])
@@ -279,7 +400,7 @@ for f in N.site_files(dk):
         raw = N.c_read(f, dk).decode('utf-8', 'replace')
     except Exception:
         continue
-    # tag 可能是 `域名` 或 `域名|/路径` —— 存活判断按**域名**做, 所以这里
+    # tag 可能是「域名」或「域名|/路径」—— 存活判断按**域名**做, 所以这里
     # 只取竖线前面那半截。取整段的话带路径的片段会被永远当成孤儿。
     for m in re.finditer(r'>>>\s*xray-core\s+BEGIN\s+(\S+)', raw):
         print(N.tag_domain(m.group(1)))
@@ -354,9 +475,15 @@ node_delete() {
     # 提前告知会影响哪些分享 —— 事后才知道链接失效就晚了
     local _sh="$LIB_DIR/../share.sh"
     [[ -f "$_sh" ]] && bash "$_sh" affected "$tag" 2>&1 | sed 's/^/  /' >&2 || true
-    printf "  确认删除? 输入节点名确认: " >&2
-    read -r conf || true
-    [[ "$conf" == "$tag" ]] || { info "已取消"; return 1; }
+    # 确认词用 yes, **不再重打节点名**。
+    #
+    # ★ 旧交互要求再输一遍节点名, 理由是"防手滑"。但节点名刚才是**编号选**
+    #   出来的 —— 让用户为了一次编号选择再去手打一遍同样的字符串, 防的是
+    #   手滑, 罚的是记忆。SB / M 两边都用 yes, 行为一致。
+    if ! ui_confirm "删除节点 $tag ?"; then
+        info "已取消"
+        return 1
+    fi
 
     # --- 第 0 步: 摘除为它插入的 nginx 片段 ---
     # 必须放在移走片段**之前**: 端口与传输是从片段里读出来的, 片段没了就读不到。
@@ -467,36 +594,188 @@ share_meta.purge(os.environ['SHARE_DIR'], os.environ['TAG'])
 " 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------- 全部删除
+# 一次清空全部节点 —— 旧交互只能一个个删, 节点多了就是十几轮交互。
+# Sing-box 的客户端面板有独立的一项「全部删除节点」, 这里对齐。
+#
+# ★ 为什么整批做反而比逐个删**更安全**:
+#   逐个删中途失败, 会留下"删了一半"的配置 —— 剩下的节点在、已删的没了,
+#   而用户以为自己还在一个完整的状态里。整批是"要么全成, 要么全还原"。
+node_delete_all() {
+    _node_load
+    local -a tags=("${_NODE_TAGS[@]}")
+
+    if (( ${#tags[@]} == 0 )); then
+        warn "还没有任何节点, 没什么可删"
+        ui_pause; return 0
+    fi
+
+    ui_box "全部删除节点"
+    printf '  %s将删除全部 %s 个节点:%s\n' "$_YEL" "${#tags[@]}" "$_RST" >&2
+    local i
+    for (( i = 0; i < ${#tags[@]}; i++ )); do
+        printf '    %s%2d%s) %s\n' "$_CYN" "$((i+1))" "$_RST" "${tags[$i]}" >&2
+    done
+    printf '\n' >&2
+    ui_note "这一步不可撤销 (节点只能重新添加)"
+    printf '\n' >&2
+
+    if ! ui_confirm "确认删除全部 ${#tags[@]} 个节点?"; then
+        info "已取消"
+        ui_pause; return 0
+    fi
+
+    # --- 第 0 步: 摘除为它们插入的 nginx 片段 (必须在片段移走之前) ---
+    for t in "${tags[@]}"; do cleanup_nginx_for "$t" || true; done
+
+    # --- 第 1 步: 整目录移走, 留一份完整备份以便回滚 ---
+    local bak; bak=$(mktemp -d "${TMPDIR:-/tmp}/xray-delall.XXXXXX") \
+        || { err "建不了临时目录, 已放弃"; return 2; }
+    local moved=0 f
+    for t in "${tags[@]}"; do
+        f="$CONF_DIR/$t.json"
+        [[ -f "$f" ]] || { f=$(node_file "$t" 2>/dev/null) || f=""; }
+        [[ -n "$f" && -f "$f" ]] || continue
+        mv "$f" "$bak/" 2>/dev/null && moved=$((moved + 1))
+    done
+    if (( moved == 0 )); then
+        rmdir "$bak" 2>/dev/null
+        err "一个片段都没移走, 已放弃 (磁盘可能只读)"
+        return 2
+    fi
+
+    # --- 第 2 步: 校验 + 重载 (只做一次) ---
+    local _sh="$LIB_DIR/../share.sh"
+    [[ -f "$_sh" ]] && bash "$_sh" refresh >/dev/null 2>&1 || true
+    if ! validate_and_reload; then
+        err "配置校验或重载失败, 已还原全部节点"
+        for f in "$bak"/*.json; do
+            [[ -f "$f" ]] || continue
+            mv -f "$f" "$CONF_DIR/$(basename "$f")" 2>/dev/null
+        done
+        rmdir "$bak" 2>/dev/null
+        info "分享令牌未做任何改动"
+        return 2
+    fi
+
+    # --- 第 3 步: 重载成功后才吊销分享 (与 node_delete 同一顺序) ---
+    for t in "${tags[@]}"; do revoke_shares_for "$t"; done
+    rm -rf "$bak"
+    node_cache_drop
+    ok "已删除全部节点 (共 $moved 个)"
+    ui_pause
+    return 0
+}
+
+# ---------------------------------------------------------------- 服务器标识
+# 节点在客户端里显示成 "<旗帜> <前缀>-<节点名>", 这个前缀就是服务器标识。
+#
+# ★ 为什么不放在"进节点管理就问"的位置:
+#   conf/lib/naming.sh 的 x_ask_server_name 注释写着"只在真的建节点时问" ——
+#   但 xray-panel.sh 把它挂在了**主菜单的 case 分支**上 (1) 添加节点
+#   (2) 节点管理), 于是进「节点管理」也要答一遍。而查看/改名/删除这三个
+#   动作**一个都不会用到它**: 它只影响分享链接里给人看的名字, tag 一个字不动。
+#   提示里明明写着"当前: 🇺🇸 1"(值早就落盘了)却还要再问一次 —— 所以它看起来
+#   就是纯粹的多余步骤。
+#
+#   Sing-box 把这个 hook 挂进**每个协议的建节点流程** (sb_ask_server_name_hook),
+#   Mihomo 则做成独立菜单项「给已有节点名补地区旗帜」, 两边都不在节点管理
+#   里拦人。这里对齐后者: 想改随时来改, 平时一个字都不多问。
+_naming_py() {
+    local d
+    for d in "$LIB_DIR" "${XRAY_CONF_DIR:-${CONF_DIR:-/root/catmi/xray/conf}}/lib" \
+             /root/catmi/xray/conf/lib; do
+        [[ -f "$d/naming.py" ]] && { printf '%s' "$d/naming.py"; return 0; }
+    done
+    printf '%s' "$LIB_DIR/naming.py"
+}
+_naming() { local p; p=$(_naming_py); [[ -f "$p" ]] || return 1
+            XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}" python3 "$p" "$@" 2>/dev/null; }
+
+node_naming_menu() {
+    ui_box "服务器标识 (节点名前缀)"
+    local cur; cur=$(_naming server)
+    ui_kv "当前标识" "${cur:-🇺🇸 X}"
+    printf '\n' >&2
+    ui_note "它只决定节点在客户端里显示成什么, 例如:"
+    printf '    %s%s-vless01-TLS%s\n' "$_DIM" "${cur:-🇺🇸 X}" "$_RST" >&2
+    ui_note "内部 tag (配置 / 文件名 / 链接) 一个字都不改 —— 改它不会让节点失效。"
+    ui_note "平时不需要动。什么时候值得改: 同一台机器跑多个面板, 或想让它"
+    ui_note "在客户端里一眼看出是哪台服务器。"
+    printf '\n' >&2
+
+    local a
+    printf '  %s要改吗?%s %s[y=改 / 回车=返回]%s: ' \
+        "$_CYN" "$_RST" "$_DIM" "$_RST" >&2
+    IFS= read -r a || return 0
+    [[ "$a" == "y" || "$a" == "Y" ]] || { info "已取消"; return 0; }
+
+    local v
+    v=$(ui_ask "新的服务器标识 (会带上归属地旗帜)" "${cur:-X}")
+    [[ -n "$v" ]] || { info "已取消"; return 0; }
+
+    local saved; saved=$(_naming set "$v")
+    if [[ -z "$saved" ]]; then
+        err "保存失败 —— 标识未改动"
+        return 1
+    fi
+    ok "服务器标识已改为: $saved"
+
+    # 已发出去的链接里还是旧名字, 问要不要顺手刷新 —— 不自动做, 因为
+    # refresh 会重写所有分享的载荷, 是个有后果的动作。
+    printf '\n' >&2
+    if ui_confirm "立刻刷新全部分享链接里的节点名?"; then
+        local _sh="$LIB_DIR/../share.sh"
+        if [[ -f "$_sh" ]]; then
+            bash "$_sh" refresh 2>&1 | sed 's/^/  /' >&2
+            ok "分享链接里的节点名已刷新"
+        else
+            warn "找不到 share.sh —— 请到「分享管理」手动刷新一次"
+        fi
+    else
+        info "分享链接里还是旧名字, 客户端下次拉取才生效 —— 想现在刷: 菜单 4) 分享管理"
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- 菜单
 node_menu() {
+    local c
     while :; do
         printf '\n' >&2
         ui_title "节点管理"
-        node_list >&2
-        ui_menu 1 "查看节点详情"
-        ui_menu 2 "改名           片段 / 文件名 / 分享元数据 / 令牌引用四处同步"
-        ui_menu 3 "删除           先校验再吊销分享，失败则回滚"
-        ui_menu 4 "检查 nginx 孤儿片段（已删节点残留的 location）"
+        node_print_table
+        echo >&2
+        ui_menu 1 "查看节点详情    编号选择"
+        ui_menu 2 "改名            片段 / 文件名 / 分享元数据 / 令牌引用四处同步"
+        ui_menu 3 "删除节点        先校验再吊销分享, 失败则回滚"
+        ui_menu 4 "全部删除节点    清空全部节点 (需输入 yes 确认)"
+        ui_menu 5 "检查 nginx 孤儿片段 (已删节点残留的 location)"
+        ui_menu 6 "服务器标识      改节点在客户端里显示的前缀（平时不用动）"
         ui_menu 0 "返回"
-        printf '\n  请选择: ' >&2
+        printf '\n  %s请选择%s: ' "${_CYN:-}" "${_RST:-}" >&2
         read -r c || return 0
         case "$c" in
-            1)
-                printf "  节点名: " >&2; read -r t || true
-                [[ -n "$t" ]] && node_show "$t"
-                ;;
+            1) node_pick "查看" && { node_show "$UI_PICK_KEY"; ui_pause; } ;;
             2)
-                printf "  节点名: " >&2; read -r t || true
-                printf "  新名字: " >&2; read -r nn || true
-                [[ -n "$t" && -n "$nn" ]] && node_rename "$t" "$nn"
+                if node_pick "改名"; then
+                    node_rename "$UI_PICK_KEY" "$(ui_ask "新名字 (字母数字 . _ -)" "$UI_PICK_KEY")"
+                    node_cache_drop
+                    ui_pause
+                fi
                 ;;
             3)
-                printf "  节点名: " >&2; read -r t || true
-                [[ -n "$t" ]] && node_delete "$t"
+                if node_pick "删除"; then
+                    node_delete "$UI_PICK_KEY"
+                    node_cache_drop
+                    ui_pause
+                fi
                 ;;
-            4) check_orphan_nginx ;;
+            4) node_delete_all ;;
+            5) check_orphan_nginx; ui_pause ;;
+            6) node_naming_menu; ui_pause ;;
             0|"") return 0 ;;
-            *) warn "无效选择" ;;
+            *) warn "无效选择"; ui_pause ;;
         esac
     done
 }
@@ -507,8 +786,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         show)   node_show "${2:?用法: node.sh show <tag>}" ;;
         rename) node_rename "${2:?}" "${3:?}" ;;
         delete) node_delete "${2:?}" ;;
+        delete-all) node_delete_all ;;
         orphans) check_orphan_nginx ;;
         menu)   node_menu ;;
-        *) echo "用法: node.sh [menu|list|show <tag>|rename <tag> <新名>|delete <tag>|orphans]" >&2; exit 1 ;;
+        *) echo "用法: node.sh [menu|list|show <tag>|rename <tag> <新名>|delete <tag>|delete-all|orphans]" >&2; exit 1 ;;
     esac
 fi

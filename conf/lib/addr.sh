@@ -144,6 +144,48 @@ x_iface_public_addr() {
     x_addr4_real 2>/dev/null || x_addr6_real 2>/dev/null
 }
 
+# 本机该地址族的**全部**公网地址, 每行一个, 已去重。
+#
+# ★ 为什么不能只用 x_addr4_real / x_addr6_real:
+#   那两个只取**第一个**。多公网 IP 的机器上, 产物里可能写着本机另一个地址 ——
+#   它同样"指向本机", 换地址族时应该跟着切; 但他机的 IP 一个字都不能碰。
+#   所以"换连接 IP"的白名单必须枚举本机真实地址的全集, 不能只拿一个。
+#
+# 隧道/虚拟网卡 (warp / docker / awg …) 一律排除 —— 那些地址客户端连不上,
+# 出现在产物里本身就是错的, 绝不该被当成"本机地址"而写进白名单。
+x_local_addrs() { # <v4|v6>
+    local fam="${1:-v4}" dev cidr
+    case "$fam" in
+        v4|4|ipv4) fam=4 ;;
+        v6|6|ipv6) fam=6 ;;
+        *) return 1 ;;
+    esac
+    # awk 取字段, 不写 `read -r dev _ _ cidr`: `ip -o` 第一列是**接口索引**
+    # ("6:"), 第二列才是接口名 —— read 会把索引塞进 dev, 隧道过滤永远不中。
+    while read -r dev cidr; do
+        [[ -n "$dev" && -n "$cidr" ]] || continue
+        [[ "$dev" =~ $X_TUNNEL_IFACE_RE ]] && continue
+        x_addr_is_private "$cidr" && continue
+        case "$fam" in
+            4) case "$cidr" in *:*) continue ;; esac ;;
+            6) case "$cidr" in *:*) ;; *) continue ;; esac ;;
+        esac
+        printf '%s\n' "$cidr"
+    done < <(ip -o -"$fam" addr show scope global 2>/dev/null |
+             awk '{print $2, $4}' | sed 's|/[0-9]*$||') | sort -u
+    return 0
+}
+
+# 地址是不是一个字面 IP (不是域名)。判断"能不能拿它做白名单比较"用。
+x_is_ip_literal() {
+    case "${1:-}" in
+        ''|*[!0-9a-fA-F:.]*) return 1 ;;
+        *:*) printf 'v6' ;;        # IPv6 (含压缩写法)
+        *.*) printf 'v4' ;;        # IPv4
+        *)   return 1 ;;
+    esac
+}
+
 # 本机是否有**客户端连得上的** IPv4 / IPv6。
 #
 # ★ 两者必须对称地排除隧道网卡。原来 x_has_v4 是直接
