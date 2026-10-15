@@ -373,6 +373,146 @@ x_cert_list() {
     done < <(x_cert_search_dirs)
 }
 
+# x_cert_find_for_domain <域名> -> stdout "crt<TAB>key", 找不到返回 1
+#
+# ★ 为什么需要它: 建 TLS 节点时用户只给了**域名**, 而 TLS 入站真正需要的是
+#   一对 `certificates`。这两者不是一回事 —— 只写 serverName 不带证书的内核
+#   **启动完全成功**, 但每一次握手都失败:
+#
+#       http: TLS handshake error from …: tls: no certificates configured
+#
+#   实测 (接手审计, RN 真内核): 菜单 13 建出来的 vless+xhttp+tls 节点
+#   `xray run -test` → Configuration OK, 真启动 → "started",
+#   然后 `openssl s_client` → unrecognized name / no peer certificate,
+#   curl https → 000。**每一项检查都过, 节点就是连不上。**
+#   面板里没有任何一处能看出缺证书 —— 只有服务端日志里有。
+x_cert_find_for_domain() { # <域名>
+    local want; want=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+    [[ -n "$want" ]] || return 1
+    local f dom key
+    while read -r f; do
+        [[ -f "$f" ]] || continue
+        dom=$(x_cert_domain "$f" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        [[ -n "$dom" ]] || continue
+        # 完全相等, 或者证书是通配 `*.example.com` 而域名是它的子域。
+        # 只在这两种情况下算命中 —— 不做"包含"匹配, 那会让
+        # `a.example.com` 误配到 `b.example.com` 的证书上。
+        case "$dom" in
+            "$want") ;;
+            "*.$want") ;;
+            *)
+                case "$want" in
+                    *."${dom#\*.}") ;;
+                    *) continue ;;
+                esac ;;
+        esac
+        key=$(x_cert_key_for "$f") || continue
+        printf '%s\t%s\n' "$f" "$key"
+        return 0
+    done < <(x_cert_list)
+    return 1
+}
+
+# ---------------------------------------------------------------- 证书方案
+#
+# 下面这几个是照 sing-box-core 的 cert 那一层设计的 (sb_has_key_for /
+# cert_not_expired / sb_selfgen_cert / pick_trusted_cert_verbose)。
+# 学的是**交互与流程**, 不是配置 —— Xray 与 sing-box 的证书字段完全不同。
+#
+# 为什么值得学: SB 在这一层的核心设计是「**永远有出路**」——
+#   扫描不到 → 手动输入 → 输入无效 → 自签。
+#   每一条失败路径都有下一步, 用户不会被堵在"没有证书"上。
+# X 原来只有"找不到就拒绝", 于是没有证书的机器**根本建不出 TLS 节点**。
+
+# 私钥可能在的方向 —— 各家工具落盘命名不一样, 挨个试。
+#
+# ★ 为什么不是"同名换后缀"一条: acme.sh 落 `x.pem` + `x.key`,
+#   certbot 落 `fullchain.pem` + `privkey.pem`, KPanel 落 `x.crt` + `x.key`,
+#   nginx 常见 `x.crt` + `x_key.pem`。只试一种, 明明有的证书会判成"没有私钥",
+#   用户看到的是"证书存在但用不了"。
+x_cert_key_for() { # <crt> -> stdout 私钥路径
+    local crt="${1:-}" k
+    [[ -f "$crt" ]] || return 1
+    for k in "${crt%.crt}.key" "${crt%.pem}.key" "${crt%.cer}.key" \
+             "${crt%.pem}_key.pem" "${crt%_cert.pem}_key.pem" \
+             "$(dirname "$crt")/privkey.pem" \
+             "$(dirname "$crt")/$(basename "${crt%.crt}").key"; do
+        [[ -f "$k" ]] && { printf '%s' "$k"; return 0; }
+    done
+    return 1
+}
+
+# 证书还有没有效 —— 留 24 小时余量。
+# 用 openssl 的 -checkend 而不是自己解析日期: 后者要处理时区/格式, 而
+# 判断反了的后果是"过期证书被当成好的", 客户端握手全挂且看不出原因。
+x_cert_not_expired() { # <crt>
+    [[ -f "${1:-}" ]] || return 1
+    openssl x509 -in "$1" -noout -checkend 86400 >/dev/null 2>&1
+}
+
+# 自签证书 —— 客户端用 pin (Xray 的 pinnedPeerCertSha256) 锁定。
+#
+# ★ 伪装域名不是随便取的: 自签证书会**明文写在握手**里发给客户端,
+#   用 `localhost` / `example.com` 这种一眼假的 CN, 等于主动暴露。
+#   借用 Reality 的随机大站域名 (取不到才退回随机串)。
+#
+# ★ 有效期 200 天: 与 SB 一致。自签没有续期流程, 太长会让"过期"变成
+#   一颗定时炸弹; 太短又会频繁重建。
+# 伪装域名 —— 优先用项目**自己已经在维护**的那个。
+# install_info.env 里的 dest_server 是 Reality 一直在用的伪装备选域名
+# (由 domains.sh 维护并持久化)。自签证书借它, 与 Reality 档口径一致,
+# 也不会凭空造一个谁都没验证过能握手的域名。
+# 取不到才退回随机串 —— 那只是"不像 example.com 那么一眼假"的兜底。
+x_cert_camo_domain() {
+    local f="${XRAY_BASE:-/root/catmi/xray}/install_info.env" d=""
+    if [[ -r "$f" ]]; then
+        d=$(sed -n 's/^dest_server=["'"'"']*\?\([^"'"'"']*\)["'"'"']*.*/\1/p' "$f" | tail -1)
+        d="${d%%:*}"
+    fi
+    if [[ -z "$d" ]]; then
+        d="$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 8).com"
+    fi
+    printf '%s' "$d"
+}
+
+x_cert_selfgen() { # [伪装域名] -> stdout "crt<TAB>key"
+    local dir="${XRAY_CERT_DIR:-${XRAY_BASE:-/root/catmi/xray}/certs}"
+    mkdir -p "$dir" 2>/dev/null || return 1
+    local d="${1:-}"
+    [[ -z "$d" ]] && d=$(x_cert_camo_domain)
+    local crt="$dir/self-$d.crt" key="$dir/self-$d.key"
+    # EC P-256: 比 RSA 快得多 (握手 CPU), 且体积小。Xray 与客户端都支持。
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "$key" -out "$crt" -days 200 \
+        -subj "/CN=$d" -addext "subjectAltName=DNS:$d" >/dev/null 2>&1
+    [[ -s "$crt" && -s "$key" ]] || return 1
+    printf '%s\t%s' "$crt" "$key"
+}
+
+# 列出证书 —— **按域名去重**。
+#
+# ★ 同一张证书在磁盘上常有两份 (acme.sh 的 certs/x.pem 与 letsencrypt 的
+#   live/x/fullchain.pem), 按路径列会把它们都列出来, 用户看着像两张、
+#   编号也对不上号。SB 为这个专门写了 sb_dedup_certs_by_domain。
+# 输出: 每行 "域名<TAB>crt<TAB>key<TAB>标记"
+x_cert_list_domains() {
+    local f dom key seen=" " mark
+    while read -r f; do
+        [[ -f "$f" ]] || continue
+        dom=$(x_cert_domain "$f" 2>/dev/null)
+        [[ -n "$dom" ]] || dom="未知域名"
+        case "$seen" in *" $dom "*) continue ;; esac
+        seen="$seen$dom "
+        key=$(x_cert_key_for "$f") || key=""
+        mark=""
+        [[ -z "$key" ]] && mark="缺私钥"
+        [[ -n "$key" ]] && { x_cert_not_expired "$f" || mark="已过期"; }
+        [[ -z "$mark" ]] && { x_cert_trusted "$f" || mark="自签"; }
+        printf '%s\t%s\t%s\t%s\n' "$dom" "$f" "$key" "$mark"
+    done < <(x_cert_list)
+}
+
+
 # 列出容器化的 nginx 正在用的证书 —— 宿主页面上看不到的那一批。
 x_cert_container_certs() {
     command -v docker >/dev/null 2>&1 || return 1
