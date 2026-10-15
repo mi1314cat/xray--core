@@ -1531,7 +1531,35 @@ PYEOF
     fi
 
     printf '  %s还没有订阅链接, 自动建一条 (不限次数 / 永久)%s\n' "$_DIM" "$_RST" >&2
-    if SHARE_AUTO=1 share_create --all >/dev/null 2>&1; then
+    # ★ 输出**不能吞掉**: share_create 结尾会把订阅地址打在屏幕上, 而那正是
+    #   用户唯一需要复制的东西。第一版把 stdout/stderr 一起重定向掉了,
+    #   结果屏幕上只有"自动建一条", 地址一个字都没有 —— 等于白建。
+    local out
+    out=$(SHARE_AUTO=1 share_create --all 2>&1)
+    local rc=$?
+    printf '%s\n' "$out" | grep -E '^\s*http' | sed 's/^/  /' >&2
+    if (( rc == 0 )); then
+        # 兜底: 万一上面没抓到, 从服务里把刚建的那条查出来再打一次
+        if ! printf '%s\n' "$out" | grep -qE '^\s*http'; then
+            local tok2
+            tok2=$(LIB="$LIB_DIR" python - <<'PYEOF' 2>/dev/null
+import json, os, subprocess, sys
+sys.path.insert(0, os.environ["LIB"])
+want = json.loads(os.environ["TAGS"])
+try:
+    recs = json.loads(subprocess.run([os.environ["CLIENT"], "list"], capture_output=True,
+                                     text=True, timeout=20,
+                                     env={**os.environ, "SHARE_PROVIDER": "xray"}).stdout or "[]")
+except Exception:
+    recs = []
+for r in (recs if isinstance(recs, list) else []):
+    m = r.get("meta") or {}
+    if (m.get("tags") or []) == want and r.get("enabled", True):
+        print(r.get("token", "")); break
+PYEOF
+)
+            [[ -n "$tok2" ]] && print_ok "订阅地址: $(_share_url "$tok2" 2>/dev/null)"
+        fi
         return 0
     fi
     warn "自动建订阅失败 —— 去 菜单 4) 分享管理 → 2) 全协议分享 手工建一条"
