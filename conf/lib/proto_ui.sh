@@ -66,7 +66,22 @@ safe_read() {
 safe_read_port() {
     local prompt="$1" default="$2" input
     if [[ "${X_BATCH:-0}" == "1" || ! -t 0 ]]; then
-        echo "$default"
+        # ★ 批量模式必须**从批量端口区间里分配**, 不能只把默认值吐回去。
+        #   这里原来是 `echo "$default"`, 而调用方普遍写成
+        #       lport=$(safe_read_port "$default_port")     ← 少传了提示语
+        #   于是 $default 读到的是空串 —— **批量建 Reality 节点时端口变空**,
+        #   生成的 JSON 成了 `"port": ,`, 内核报
+        #       invalid character ',' looking for beginning of value
+        #   而菜单 12 (全协议) 里 Reality 是第一个协议, 直接整条失败。
+        #   (交互模式看不出来: 用户自己敲了端口, 只是"默认值"那一栏是空的。)
+        #
+        #   顺带: 走 batch_alloc_port 才能与其它协议共用同一个端口账本,
+        #   否则批量里两个协议可能分到同一个端口。
+        if declare -F batch_alloc_port >/dev/null 2>&1; then
+            local _p
+            _p=$(batch_alloc_port 2>/dev/null) && [[ -n "$_p" ]] && { echo "$_p"; return; }
+        fi
+        echo "${default:-}"
         return
     fi
     while true; do

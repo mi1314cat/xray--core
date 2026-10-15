@@ -87,6 +87,49 @@ resolve_scripts_dir() {
     return 0
 }
 
+# ---------------------------------------------------------- CDN 自动配置
+# cdn_auto.sh 与 preset_batch.sh 同目录 (tools/)。
+#
+# ★ 这里原来**完全没加载它** —— 于是"建完节点顺手配 nginx"这件事在全协议
+#   一键生成里根本不存在: `declare -F x_cdn_autosetup` 永远为假。
+#   加载失败必须**看得见**(打印告警), 因为"没配上"和"根本没尝试"
+#   在屏幕上一模一样 —— 这正是本项目既往缺陷最常见的形态。
+_BATCH_CDN_AUTO=""
+resolve_cdn_auto() {
+    local here f
+    here="$(dirname "${BASH_SOURCE[0]:-$0}")"
+    for f in "$here/../tools/cdn_auto.sh" "$here/cdn_auto.sh" \
+             "$XRAY_BASE/../tools/cdn_auto.sh"; do
+        [[ -r "$f" ]] && { _BATCH_CDN_AUTO="$f"; return 0; }
+    done
+    local tmp="${X_BATCH_TMP_DIR:-/tmp/x-batch-scripts}/cdn_auto.sh"
+    mkdir -p "$(dirname "$tmp")"
+    curl -fsSL "$GH_RAW/tools/cdn_auto.sh" -o "$tmp" 2>/dev/null \
+        && [[ -s "$tmp" ]] && { _BATCH_CDN_AUTO="$tmp"; return 0; }
+    return 1
+}
+if resolve_cdn_auto; then
+    # shellcheck source=/dev/null
+    source "$_BATCH_CDN_AUTO"
+    declare -F x_cdn_autosetup >/dev/null 2>&1 \
+        || print_warn "cdn_auto.sh 加载了但函数不在 (版本不匹配?) —— nginx 不会自动配置"
+else
+    print_warn "找不到 tools/cdn_auto.sh —— nginx 反代不会自动配置"
+fi
+
+resolve_share_sh() {
+    local here f
+    here="$(dirname "${BASH_SOURCE[0]:-$0}")"
+    for f in "$here/share.sh" "$XRAY_BASE/../conf/share.sh"; do
+        [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    local tmp="${X_BATCH_TMP_DIR:-/tmp/x-batch-scripts}/share.sh"
+    mkdir -p "$(dirname "$tmp")"
+    curl -fsSL "$GH_RAW/conf/share.sh" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]] \
+        && { printf '%s' "$tmp"; return 0; }
+    return 1
+}
+
 resolve_verify_sh() {
     if [[ -f "$XRAY_BASE/verify.sh" ]]; then echo "$XRAY_BASE/verify.sh"; return 0; fi
     local here
@@ -481,7 +524,54 @@ batch_main() {
         print_info "正式 reload: 请在正式环境重新执行 batch (或运行 verify.sh restart)"
     fi
 
+    # ---- 建完顺手把 CDN/nginx 站点配好 (照 sing-box-core 的做法) ----
+    #
+    # ★ 这一段原来**没有**。后果与菜单 13/14/15 是一样的: nginx 档的节点
+    #   监听在 127.0.0.1, 却没人给它配反代 —— 客户端连 域名:443 打不到任何
+    #   东西, 而汇总里一切正常。
+    #   SB 在同一位置是建完就自动配 (batch.sh:739 → sb_cdn_autosetup)。
+    #
+    #   放在 batch_summary **之前**: 汇总要如实反映 nginx 到底配没配上,
+    #   放到后面就成了"先报成功、再报失败"。
+    local _ng_ok=0 _ng_fail=0
+    if declare -F x_cdn_autosetup >/dev/null 2>&1; then
+        shopt -s nullglob
+        local -a _frags=("$CONF_DIR"/*.json)
+        shopt -u nullglob
+        if ((${#_frags[@]} > 0)); then
+            echo >&2
+            if x_cdn_autosetup "${_frags[@]}" >/dev/null 2>&1; then
+                _ng_ok=1
+            else
+                _ng_fail=1
+            fi
+        fi
+    else
+        # cdn_auto.sh 没加载上时**要说出来** —— 静默跳过会让"nginx 没配"
+        # 和"根本没尝试配"在屏幕上长得一模一样。
+        print_warn "cdn_auto.sh 没加载上 —— nginx 反代没有自动配置"
+    fi
+    if (( _ng_ok )); then
+        print_ok "已尝试自动配置 nginx 反代 (见上面的站点明细)"
+    elif (( _ng_fail )); then
+        print_warn "nginx 有站点没配上 —— 节点本身已生成, 去 菜单 8→6 Nginx 站点管理 补"
+    fi
+
     batch_summary "$reloaded"
+
+    # ---- 自动生成/刷新订阅链接 (照 SB: 批量建完直接给一条能用的地址) ----
+    # 在这之前 X 不会自动建订阅 —— 用户得自己去 菜单 4 → 2) 全协议分享 点一遍,
+    # 而"我刚建了 4 个节点, 现在该干什么"在屏幕上没有答案。
+    # 失败一律不阻断: 节点本身已经建好了。
+    if declare -F share_ensure_subscription >/dev/null 2>&1 || [[ -n "${_BATCH_SHARE_SH:-}" ]]; then
+        echo >&2
+        local _shf
+        _shf=$(resolve_share_sh 2>/dev/null || true)
+        if [[ -n "$_shf" ]]; then
+            XRAY_BASE="$XRAY_BASE" XRAY_CONF_DIR="$CONF_DIR" \
+            bash "$_shf" ensure-subscription 2>&1 | sed 's/^/  /' >&2 || true
+        fi
+    fi
     # ★ 失败必须以非零退出码收尾 —— 这是"一键全协议"最重要的一条契约。
     #
     #   原来这里无条件 return 0: SS2022 因为 gen_psk 未定义生成失败, 汇总里

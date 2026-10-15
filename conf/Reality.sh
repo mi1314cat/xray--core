@@ -209,7 +209,7 @@ add_config() {
 
     # ---- 端口（默认：随机高位空闲端口）----
     default_port=$(random_free_port)
-    lport=$(safe_read_port "$default_port")
+    lport=$(safe_read_port "监听端口" "$default_port")
 
     # ---- 伪装域名（默认：domains.sh 优选的 dest_server）----
     DEST=$(safe_read "请输入 Reality 伪装域名 (SNI/dest)" "$dest_server")

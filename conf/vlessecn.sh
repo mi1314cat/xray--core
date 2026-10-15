@@ -266,7 +266,7 @@ add_config() {
 
     # 2. 端口
     local default_port=$(random_free_port)
-    local lport=$(safe_read_port "$default_port")
+    local lport=$(safe_read_port "监听端口" "$default_port")
 
     # 3. 公网 IP
     local PUBLIC_IP=$(get_public_ip)

@@ -384,6 +384,17 @@ share_create() {
     ((${#tags[@]} > 0)) || die "没有选中任何节点"
     printf '  %s已选 %s 个节点%s\n' "$_DIM" "${#tags[@]}" "$_RST" >&2
 
+    # ★ SHARE_AUTO=1 = 批量建完节点后由脚本自己调 (见 share_ensure_subscription)。
+    #   不问名称/次数/有效期 —— 但**默认值不是**交互那套 1 次 / 24 小时:
+    #   交互那套的前提是"发给人、用完即焚"; 而订阅是**要反复拉取**的
+    #   (电脑、手机、路由器各拉一次), 1 次就废等于没建。
+    #   所以自动订阅用 0 次 (不限) / 永久, 并把这句写在屏幕上让用户知道。
+    if [[ "${SHARE_AUTO:-0}" == "1" ]]; then
+        name="全协议订阅"
+        max_uses=0
+        ttl_hours=0
+        printf '  %s自动订阅: 不限次数 / 永久有效 (批量建节点后自动生成)%s\n' "$_DIM" "$_RST" >&2
+    else
     name=$(ui_ask "分享名称" "分享")
 
     # ★ 默认 **1 次 / 24 小时** (对齐 Sing-box)。原来默认 0 次 0 天 = 不限 + 永久:
@@ -392,6 +403,7 @@ share_create() {
     [[ "$max_uses" =~ ^[0-9]+$ ]] || max_uses=1
 
     ttl_hours=$(_share_ask_ttl)
+    fi
 
     # 公共服务不在就装 (幂等; 已有则空操作)
     local port; port=$(x_share_ensure)
@@ -1458,12 +1470,81 @@ share_create_all() {
     share_create --all
 }
 
+# ---------------------------------------------------------------- 自动订阅
+#
+# 批量建完节点之后由脚本调用 (batch.sh / preset_batch.sh):
+#   已有覆盖全部节点的分享 → **刷新它**(链接不变, 内容更新)
+#   一条都没有            → 建一条 (不限次数 / 永久)
+#
+# ★ 为什么需要它: 在这之前 X **不会**自动生成任何订阅链接 —— 协议脚本只写
+#   一个 per-node 的 out/<proto>-share-NN.txt, 而"一条能导进客户端的订阅地址"
+#   必须用户自己去 菜单 4 → 2) 全协议分享 里点一遍。SB 那边是批量生成完
+#   直接给一条链接, 用户复制走就能用 —— 这是实打实的体验差距。
+#
+# ★ 只在"一条都没有"时创建, 之后永远走刷新: 否则每跑一次全协议就多一条
+#   订阅, 用户的客户端里会堆一串内容重复的地址。
+share_ensure_subscription() {
+    local -a tags=()
+    _share_node_rows
+    tags=("${_SH_NODES[@]}")
+    ((${#tags[@]} == 0)) && return 0      # 还没节点, 不吭声 (批量里已报过)
+
+    # 服务不可达就安静退出 —— 批量建节点是主流程, 不能被分享服务拖住。
+    # 但要说一句, 否则"链接没生成"和"没尝试生成"长得一模一样。
+    if ! _x_share_api health >/dev/null 2>&1; then
+        warn "分享服务不可达 —— 订阅链接没有生成/刷新 (节点本身已建好)"
+        return 0
+    fi
+
+    # 找一条已经覆盖全部节点的分享
+    local tok="" pyf
+    pyf=$(mktemp -t share-find.XXXXXX.py)
+    cat > "$pyf" <<'PYEOF'
+import json, os, subprocess, sys
+sys.path.insert(0, os.environ["LIB"])
+want = set(json.loads(os.environ["TAGS"]))
+try:
+    raw = subprocess.run([os.environ["CLIENT"], "list"], capture_output=True,
+                         text=True, timeout=20,
+                         env={**os.environ, "SHARE_PROVIDER": "xray"}).stdout
+    recs = json.loads(raw or "[]")
+except Exception:
+    recs = []
+for r in (recs if isinstance(recs, list) else []):
+    meta = r.get("meta") or {}
+    t = meta.get("tags") or ([meta["name"]] if meta.get("name") else [])
+    if isinstance(t, str):
+        t = [t]
+    if want and want.issubset(set(t)) and r.get("enabled", True):
+        print(r.get("token", ""))
+        break
+PYEOF
+    tok=$(LIB="$LIB_DIR" CLIENT="$SHARE_CLIENT"           TAGS="$(printf '%s
+' "${tags[@]}" | python3 -c 'import json,sys;print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' 2>/dev/null || echo '[]')"           python3 "$pyf" 2>/dev/null)
+    rm -f "$pyf"
+
+    if [[ -n "$tok" ]]; then
+        share_refresh_all >/dev/null 2>&1 || true
+        local url; url=$(_share_url "$tok" 2>/dev/null)
+        print_ok "订阅已刷新 (含全部 ${#tags[@]} 个节点): ${url:-（地址读取失败）}"
+        return 0
+    fi
+
+    printf '  %s还没有订阅链接, 自动建一条 (不限次数 / 永久)%s\n' "$_DIM" "$_RST" >&2
+    if SHARE_AUTO=1 share_create --all >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "自动建订阅失败 —— 去 菜单 4) 分享管理 → 2) 全协议分享 手工建一条"
+    return 0
+}
+
 # ---------------------------------------------------------------- 直跑
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-menu}" in
         create)  share_create ;;
         list)    share_list ;;
         refresh) share_refresh_all ;;
+        ensure-subscription) share_ensure_subscription ;;
         migrate) share_migrate ;;
         switch-family)      x_switch_addr_family "${2:-}" ;;
         switch-family-menu) x_switch_addr_family_menu ;;

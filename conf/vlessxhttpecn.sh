@@ -626,7 +626,7 @@ add_config() {
 
     # 2. 端口
     default_port=$(random_free_port)
-    VLESS_PORT=$(safe_read_port "$default_port")
+    VLESS_PORT=$(safe_read_port "监听端口" "$default_port")
 
     # 3. 公网 IP (分享链接用) — 交互确认
     print_info "检测服务器公网 IP..."
