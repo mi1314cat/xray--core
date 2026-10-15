@@ -53,6 +53,151 @@ def _server(value, default=""):
     return s or default
 
 
+# ================================================================ 片段 → 节点视图
+#
+# ★ 为什么需要这一层 (原来没有, 所以本文件一直没有生产调用方)
+#
+#   proxy() 要的是**客户端视角**的字段; 而服务端手上只有另外两个视角:
+#
+#     inbound 片段     listen / privateKey / xhttpSettings.mode   (服务端视角)
+#     分享元数据 sidecar 对外 host / public_key / fingerprint      (发布视角)
+#
+#   缺了这一层, 谁也没法把片段喂给 proxy() —— 片段里根本没有 `address`,
+#   REALITY 只有 `privateKey` (客户端要的是 publicKey), `mode` 藏在
+#   `xhttpSettings` 里而不是顶层。以前各处只能自己手写 YAML heredoc,
+#   于是 5 个协议脚本各写一份, 而带上下行分离的那一份谁都没写。
+#
+#   nodes.extract() 不能干这个活: 它产出的是**分享链接**要的字段, 没有
+#   address / reality_public_key / fingerprint / mode / pinned_cert_sha256。
+
+def node_from_fragment(frag, meta=None, name=None):
+    """inbound 片段 (+ 分享元数据) → proxy() 认得的节点视图。
+
+    frag 可以是整份 {"inbounds": [...]}, 也可以是单个 inbound。
+    meta 是 share_meta 的内容 (host / port / public_key / short_id / fingerprint)。
+    拼不出来的字段留空 —— proxy() 会对缺关键字段的情况返回 None, 由调用方报出来。
+    """
+    meta = meta or {}
+    meta = dict(meta)
+    ibs = frag.get("inbounds") if isinstance(frag, dict) else None
+    ib = (ibs[0] if ibs else frag) or {}
+    ss = ib.get("streamSettings") or {}
+    settings = ib.get("settings") or {}
+    net = ss.get("network") or "tcp"
+    sec = ss.get("security") or "none"
+
+    def _norm_path(p):
+        p = str(p or "").strip()
+        return p or ""
+
+    node = {
+        "tag": ib.get("tag") or "",
+        "name": name or meta.get("name") or ib.get("tag") or "",
+        "protocol": ib.get("protocol") or "",
+        "network": net,
+        "security": sec,
+        # 对外地址走元数据 —— 片段里的 listen 是 0.0.0.0 / 127.0.0.1, 不是客户端该连的
+        "address": meta.get("host") or "",
+        "port": meta.get("port") or ib.get("port"),
+        "path": _norm_path((ss.get("xhttpSettings") or {}).get("path")
+                           or (ss.get("wsSettings") or {}).get("path")
+                           or (ss.get("httpupgradeSettings") or {}).get("path")
+                           or ""),
+    }
+
+    # ---- 凭据 ----
+    node["id"] = meta.get("uuid") or ""
+    clients = settings.get("clients") or []
+    if ib.get("protocol") == "vless":
+        node["id"] = (clients[0].get("id") if clients else "") or ""
+        # 客户端 encryption 与服务端 decryption 配对; 元数据里那份是客户端要用的
+        enc = meta.get("encryption") or ""
+        if not enc:
+            dec = settings.get("decryption") or ""
+            enc = "" if dec in ("", "none") else dec
+        node["encryption"] = enc or "none"
+        # flow 只在裸 TCP 上成立 (内核: XTLS only supports TLS and REALITY
+        # directly) —— 这里如实带出去, 拦不拦由生成期的护栏决定。
+        node["flow"] = (clients[0].get("flow") if clients else "") or ""
+    elif ib.get("protocol") == "vmess":
+        node["id"] = (clients[0].get("id") if clients else "") or ""
+        node["alter_id"] = (clients[0].get("alterId") if clients else 0) or 0
+    elif ib.get("protocol") == "trojan":
+        node["password"] = (clients[0].get("password") if clients else "") or ""
+    elif ib.get("protocol") in ("hysteria", "hysteria2"):
+        node["password"] = (clients[0].get("auth") if clients else "") or ""
+    elif ib.get("protocol") == "shadowsocks":
+        node["method"] = settings.get("method") or ""
+        node["password"] = settings.get("password") or ""
+    if meta.get("encryption"):
+        node["encryption"] = meta["encryption"]
+
+    # ---- 传输细节 ----
+    xh = ss.get("xhttpSettings") or {}
+    node["mode"] = xh.get("mode") or ""
+    node["host"] = xh.get("host") or (ss.get("wsSettings") or {}).get(
+        "headers", {}).get("Host") or ""
+    node["grpc_service"] = (ss.get("grpcSettings") or {}).get("serviceName") or ""
+    # grpc 的 serviceName 不是 URI 路径, 别让它落进 path —— 那会让
+    # ws/httpupgrade 的分支误以为有 path, 也会让 grpc 的取值来源变模糊。
+    if net == "grpc" and node["grpc_service"]:
+        node["path"] = ""
+    node["alpn"] = (ss.get("tlsSettings") or {}).get("alpn") or []
+    # Hysteria2 的 salamander 混淆在 streamSettings.finalmask.udp 里 (全小写)。
+    _fm = ss.get("finalmask") or {}
+    for _m in (_fm.get("udp") or []):
+        if str(_m.get("type") or "").lower() == "salamander":
+            node["hy2_obfs_password"] = (_m.get("settings") or {}).get("password") or ""
+            break
+
+    # ---- TLS / REALITY ----
+    ts = ss.get("tlsSettings") or {}
+    rs = ss.get("realitySettings") or {}
+    if sec == "reality":
+        names = rs.get("serverNames") or []
+        node["sni"] = meta.get("sni") or (names[0] if names else "")
+        # ★ 片段里是 privateKey (服务端), 客户端要的是 publicKey —— 只能从元数据来。
+        #   缺了就是连不上的节点, proxy() 会返回 None, 不会生成一条假链接。
+        node["reality_public_key"] = meta.get("public_key") or ""
+        node["reality_short_id"] = meta.get("short_id") or ""
+        node["fingerprint"] = meta.get("fingerprint") or "chrome"
+    elif sec == "tls":
+        node["sni"] = meta.get("sni") or ts.get("serverName") or ""
+        node["pinned_cert_sha256"] = (meta.get("pinned_cert_sha256")
+                                      or ts.get("pinnedPeerCertSha256") or "")
+        # 服务端字段是 echServerKeys, 客户端才是 echConfigList —— 库里不能互相顶替。
+        # 元数据里的 `ech` 如果是 True (只声明"开了") 而不是一串配置, 就不能当
+        # config 用: 喂给 mihomo 会得到 config: "True"。
+        node["ech"] = meta.get("ech_config") or ""
+        node["ech_enable"] = bool(meta.get("ech"))
+
+    # ---- 上下行分离 ----
+    dl = xh.get("downloadSettings") or {}
+    if dl.get("address"):
+        node["dl_address"] = dl.get("address") or ""
+        node["dl_port"] = dl.get("port") or ib.get("port")
+        node["dl_security"] = dl.get("security") or sec
+        dlts = dl.get("tlsSettings") or {}
+        dlrs = dl.get("realitySettings") or {}
+        dlxh = dl.get("xhttpSettings") or {}
+        node["dl_sni"] = (dlrs.get("serverName") or dlts.get("serverName")
+                          or node["sni"] or "")
+        # ★ 用 .get() 兜底, 不能直接下标。
+        #   上行是 **TLS** 而下行是 REALITY 时 (就是 cdn-reality 那个组合),
+        #   reality_public_key / reality_short_id 这两个键**根本没被设置** ——
+        #   它们在 `sec == "reality"` 分支里才写。直接下标会 KeyError,
+        #   而报错发生在生成客户端产物的半路, 用户看到的是一串 python 回溯。
+        #   (实测: RN 上拿真实的 cdn-reality 节点喂 node_from_fragment 当场炸。)
+        node["dl_public_key"] = dlrs.get("password") or node.get("reality_public_key") or ""
+        node["dl_short_id"] = dlrs.get("shortId") or node.get("reality_short_id") or ""
+        node["dl_mode"] = dlxh.get("mode") or node["mode"]
+        node["dl_path"] = dlxh.get("path") or node["path"]
+        node["dl_ech"] = meta.get("dl_ech_config") or ""
+        node["dl_ech_enable"] = bool(meta.get("dl_ech"))
+
+    return node
+
+
 def xhttp_download_settings(node):
     """上下行分离在 mihomo 侧的形状; 没配下行就返回 None。
 
@@ -166,26 +311,110 @@ def xhttp_opts(node):
 def proxy(node):
     """一个节点 → mihomo proxies 条目 (dict)。不支持的组合返回 None。"""
     proto = str(node.get("protocol") or "").lower()
-    if proto != "vless":
-        # mihomo 的 xhttp **仅 VLESS 支持** (官方文档明写), 其他协议
-        # 即便 X 内核接受, mihomo 侧也起不来。
-        if str(node.get("network") or node.get("transport") or "").lower() == "xhttp":
+    net0 = str(node.get("network") or node.get("transport") or "tcp").lower()
+
+    # mihomo 的 xhttp **仅 VLESS 支持** —— 官方文档原文:
+    #   "仅 VLESS 支持 xhttp 传输层, 请勿在其他协议上使用"
+    #   (https://wiki.metacubex.one/config/proxies/transport/#xhttp-opts)
+    # 别的协议即便 X 内核接受, mihomo 侧也起不来 —— 生成出来只会让人以为能用。
+    if net0 == "xhttp" and proto != "vless":
+        return None
+
+    if proto == "vmess":
+        uid = (node.get("id") or node.get("uuid") or "").strip()
+        if not uid:
             return None
+        out = {
+            "name": str(node.get("name") or node.get("tag") or "x"),
+            "type": "vmess",
+            "server": _server(node.get("address")),
+            "port": int(node.get("port") or 443),
+            "uuid": uid,
+            "alterId": int(node.get("alter_id") or 0),
+            "cipher": str(node.get("cipher") or "auto"),
+            "udp": True,
+        }
+    elif proto == "trojan":
+        pw = (node.get("password") or "").strip()
+        if not pw:
+            return None
+        out = {
+            "name": str(node.get("name") or node.get("tag") or "x"),
+            "type": "trojan",
+            "server": _server(node.get("address")),
+            "port": int(node.get("port") or 443),
+            "password": pw,
+            "udp": True,
+        }
+    elif proto == "shadowsocks":
+        method = (node.get("method") or "").strip()
+        pw = (node.get("password") or "").strip()
+        if not method or not pw:
+            return None
+        out = {
+            "name": str(node.get("name") or node.get("tag") or "x"),
+            "type": "ss",
+            "server": _server(node.get("address")),
+            "port": int(node.get("port") or 443),
+            "cipher": method,
+            "password": pw,
+            "udp": True,
+        }
+        # ★ mihomo 的 ss 出站既没有 REALITY 层, 也没有 TLS 层 —— 这两个都是
+        #   Xray 对 shadowsocks 的扩展, mihomo 侧没有等价物。
+        #   实测 (CC→RN): 带 tls 的 ss 节点 curl 得 000, 而同机其它协议全 200。
+        #   与其生成一条"看着正常、连不上"的条目, 不如明确拒发让调用方说出原因。
+        #   (别被 mihomo -t 骗了: 它对 ss+tls 是**放行**的, 只有真连才发现不通。)
+        if str(node.get("security") or "none").lower() in ("reality", "tls"):
+            return None
+    elif proto in ("hysteria", "hysteria2"):
+        pw = (node.get("password") or "").strip()
+        if not pw:
+            return None
+        out = {
+            "name": str(node.get("name") or node.get("tag") or "x"),
+            "type": "hysteria2",
+            "server": _server(node.get("address")),
+            "port": int(node.get("port") or 443),
+            "password": pw,
+        }
+        # Hysteria2 混淆 (salamander)。★ 两个字段**必须成对出现** ——
+        # 项目自己在这一条上踩过: 一条 `hysteria2://…&obfs=none` 让 mihomo 报
+        #   initial proxy provider error: proxy 0 error: missing obfs password
+        # 而且是**整批**归零, 不是只丢那一条。所以只在一起写。
+        obfs = str(node.get("hy2_obfs_password") or "").strip()
+        if obfs:
+            out["obfs"] = "salamander"
+            out["obfs-password"] = obfs
+    elif proto == "socks":
+        out = {
+            "name": str(node.get("name") or node.get("tag") or "x"),
+            "type": "socks5",
+            "server": _server(node.get("address")),
+            "port": int(node.get("port") or 1080),
+        }
+    elif proto == "http":
+        out = {
+            "name": str(node.get("name") or node.get("tag") or "x"),
+            "type": "http",
+            "server": _server(node.get("address")),
+            "port": int(node.get("port") or 8080),
+        }
+    elif proto == "vless":
+        uid = (node.get("id") or node.get("uuid") or "").strip()
+        if not uid:
+            return None
+        out = {
+            "name": str(node.get("name") or node.get("tag") or "x"),
+            "type": "vless",
+            "server": _server(node.get("address")),
+            "port": int(node.get("port") or 443),
+            "uuid": uid,
+            "udp": True,
+            "encryption": str(node.get("encryption") or "none"),
+        }
+    else:
         return None
-
-    uid = (node.get("id") or node.get("uuid") or "").strip()
-    if not uid:
-        return None
-
-    out = {
-        "name": str(node.get("name") or node.get("tag") or "x"),
-        "type": "vless",
-        "server": _server(node.get("address")),
-        "port": int(node.get("port") or 443),
-        "uuid": uid,
-        "udp": True,
-        "encryption": str(node.get("encryption") or "none"),
-    }
     if not out["server"]:
         return None
 
@@ -215,8 +444,22 @@ def proxy(node):
         out["ws-opts"] = ws
     elif net in ("grpc",):
         out["network"] = "grpc"
+        # ★ 服务名从哪儿来: 适配层 (node_from_fragment) 把它放在 `grpc_service`,
+        #   而这里原来只读 path / service_name —— 于是生成出
+        #   `grpc-service-name: ''`, 与服务端的 `grpcSettings.serviceName` 对不上,
+        #   连接**必定失败**且没有任何报错。
+        #   实测 (CC→RN): grpc 节点 curl 得 000, 而同机其它协议全 200。
         out["grpc-opts"] = {
-            "grpc-service-name": str(node.get("path") or node.get("service_name") or "")}
+            "grpc-service-name": str(node.get("grpc_service")
+                                     or node.get("service_name")
+                                     or node.get("path") or "")}
+    elif net in ("hysteria", "hysteria2"):
+        # ★ Hysteria2 走的是 QUIC/UDP, mihomo 的 hysteria2 出站**不写 network**
+        #   (类型本身就说明了一切)。这里原来没有这一支, 于是 net="hysteria"
+        #   落到下面的 else —— 而 else 只认 tcp/raw/空, 直接 return None:
+        #   **hysteria2 节点永远生成不出 mihomo YAML**。
+        #   (以前没暴露, 是因为 to_mihomo.py 根本没有生产调用方。)
+        pass
     else:
         out["network"] = "tcp"
         if net not in ("tcp", "raw", ""):
@@ -312,6 +555,70 @@ def _dump(doc):
         # 打开 .yaml 想看的是 YAML。
         import json
         return json.dumps(doc, ensure_ascii=False, indent=2)
+
+
+# ================================================================ 产物落盘
+#
+# ★ 为什么产物必须由**建节点的那一步**生成, 而不是"以后想看再转"
+#
+#   1. 建完节点不产出 YAML, 用户就只能"按文档自己拼" —— 而 xhttp 的
+#      download-settings 是两段式、逐项覆盖语义, 手拼必错;
+#   2. 上下行分离**只存在于服务端配置里**, 时间一长没人记得这个节点是分离的;
+#   3. 定式: SB 在 lib.sh 里记过教训 —— 手写 YAML 漂移过 (trojan 漏指纹、
+#      vless 漏 pin), 所以它有 gen_mihomo_yaml 这一个唯一转换器。
+#      X 这边 5 个协议脚本各写一份 heredoc, 正是那个教训的重演。
+
+def write_products(frag, meta, out_dir, name=None, tag=None):
+    """片段 + 元数据 → out/<tag>.yaml。返回 (路径, 原因)。
+
+    路径为 None 时 `原因` 说明**为什么没生成** —— 不生成必须看得见,
+    静默少一个文件正是这个项目既往缺陷的共同形态。
+
+    只写 mihomo YAML: Xray 客户端的出站 JSON 由各协议脚本自己写 (见
+    conf/vlessxhttpecn.sh 等), 服务端这条路径还没有等价生成器 —— 那是
+    另一件事, 不在这里顺手造一个半成品。
+    """
+    import os
+    node = node_from_fragment(frag, meta, name=name)
+    if tag:
+        node["tag"] = tag
+    if not node.get("tag"):
+        return None, "片段里没有 tag"
+    p = proxy(node)
+    if not p:
+        why = _why_unsupported(node)
+        return None, why
+    os.makedirs(out_dir, exist_ok=True)
+    dest = os.path.join(out_dir, f"{node['tag']}.yaml")
+    doc = {"proxies": [p]}
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write(_dump(doc))
+    return dest, ""
+
+
+def _why_unsupported(node):
+    """proxy() 返回 None 时, 说清是**哪一条**不满足。
+
+    不这么做的后果是屏幕上只有一句"没生成 YAML", 而用户手上那份服务端配置
+    看起来完全正常 —— 排查会从"是不是文件权限"开始, 浪费很久。
+    """
+    proto = str(node.get("protocol") or "").lower()
+    net = str(node.get("network") or "tcp").lower()
+    sec = str(node.get("security") or "none").lower()
+    if net == "xhttp" and proto != "vless":
+        return f"mihomo 的 xhttp 仅 VLESS 支持, 本节点是 {proto} (官方文档 xhttp-opts 节)"
+    if not node.get("address"):
+        return "节点没有对外地址 (分享元数据里缺 host)"
+    if proto == "shadowsocks" and sec in ("reality", "tls"):
+        return (f"mihomo 的 ss 出站没有 {sec.upper()} 层 "
+                f"(那是 Xray 对 shadowsocks 的扩展, mihomo 无等价物)")
+    if sec == "reality" and not node.get("reality_public_key"):
+        return "REALITY 缺公钥 (pbk) —— 分享元数据里没有 public_key"
+    if not (node.get("id") or node.get("password")):
+        return "缺凭据 (uuid / password)"
+    if net not in ("xhttp", "ws", "websocket", "grpc", "tcp", "raw", ""):
+        return f"mihomo 不支持 {net} 传输"
+    return f"不支持的组合: {proto} + {net} + {sec}"
 
 
 if __name__ == "__main__":
