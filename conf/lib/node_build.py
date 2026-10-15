@@ -247,6 +247,27 @@ def _stream_settings(transport, security, opts):
             gs["multiMode"] = True
         ss["grpcSettings"] = gs
 
+    # ---- Hysteria2 混淆 (salamander) ----
+    #
+    # ★ 内核 26.3.27 把混淆搬进了新的 **finalmask** 体系:
+    #     streamSettings.finalmask.udp = [{type:"salamander", settings:{password:"…"}}]
+    #   注意字段名是**全小写** `finalmask` (不是 finalMask) —— 大小写写错
+    #   内核不报错、也不生效, 直接静默失效。
+    #
+    #   HysteriaConfig 里那些 congestion/up/down/udphop 是**旧字段**,
+    #   内核会打一行 "move to finalmask/quicParams" 的告警后继续接受,
+    #   真正的新位置是这里。
+    #
+    #   实测 (RN, 同一份配置只差这一个字段):
+    #     无混淆                  -> http=200
+    #     finalmask.salamander    -> http=200
+    #   两端密码必须一致, 且**必须**一起开 —— 一端开一端不开, 握手直接失败。
+    if transport == "hysteria" and opts.get("hy2_obfs_password"):
+        ss.setdefault("finalmask", {})["udp"] = [{
+            "type": "salamander",
+            "settings": {"password": opts["hy2_obfs_password"]},
+        }]
+
     elif transport == "httpupgrade":
         hu = {}
         if opts.get("path"):
@@ -437,6 +458,56 @@ def _xhttp_download_settings(transport, security, opts):
     return dl
 
 
+# ================================================================ 回落 (fallbacks)
+#
+# 「不是本协议的流量转到哪」。
+#
+#   入站是 VLESS/Trojan + TLS 时, 内核先做 TLS 握手 —— 握手成功的**任何人都
+#   连得上 TLS 层**。接下来:
+#     · 报文长得像 VLESS/Trojan  → 走代理
+#     · 不像 (普通浏览器、扫描器) → 转到 fallbacks.dest
+#
+#   所以它解决的是"**这个端口看起来必须像个真网站**"这件事: 主动探测的人
+#   拿到的是一张真证书 + 一个真网站, 而不是一个连上就断的怪端口。
+#
+# 内核实测 (RN, v26.3.27):
+#   普通 HTTPS 打 VLESS 端口  -> 拿到回落目标的网页 ("I-AM-THE-REAL-WEBSITE")
+#   真 VLESS 客户端           -> http=200 (回落没影响真客户端)
+#
+# ★ 只在 **TLS** 上有意义:
+#   · REALITY 有自己的回落 (realitySettings.target), 两套不要混;
+#   · 无加密的入站连"是不是本协议"都判不了, 没有回落可言。
+#
+# ★ dest 收**端口数字**或 "host:port" 字符串。写数字 = 127.0.0.1:<端口>,
+#   这是最常见的用法 (网站就跑在同一台机器上)。
+#   xver 是 PROXY protocol 版本: 0 = 不发 (普通网站要这个),
+#   1/2 = 发 v1/v2 (目标站要能解析 PROXY protocol 才行, 否则会把
+#   PROXY 头当成 HTTP 请求 → 400)。
+def _fallbacks(opts, security, protocol):
+    port = str(opts.get("fallback_port") or "").strip()
+    if not port:
+        return None
+    if security != "tls":
+        raise ValueError(
+            "回落 (fallbacks) 只在 TLS 入站上有意义。\n"
+            "  · REALITY 有自己的回落机制 (realitySettings.target), 不要两套混用;\n"
+            "  · 无加密入站连'是不是本协议'都判不了。"
+        )
+    if protocol not in ("vless", "trojan"):
+        raise ValueError(f"{protocol} 不支持 fallbacks (内核只对 VLESS/Trojan 实现了它)")
+    if not port.isdigit():
+        # 允许 "host:port", 但必须是合法形态
+        if ":" not in port:
+            raise ValueError(f"回落目标 {port!r} 既不是端口也不是 host:port")
+    try:
+        xver = int(opts.get("fallback_xver") or 0)
+    except (TypeError, ValueError):
+        xver = 0
+    if xver not in (0, 1, 2):
+        raise ValueError(f"fallback xver 只能是 0/1/2, 得到 {xver}")
+    return [{"dest": int(port) if port.isdigit() else port, "xver": xver}]
+
+
 def _settings(protocol, opts):
     """协议级 settings。
 
@@ -448,15 +519,24 @@ def _settings(protocol, opts):
         if opts.get("flow"):
             client["flow"] = opts["flow"]
         if opts.get("encryption"):
-            return {"clients": [client], "decryption": opts["encryption"]}
-        return {"clients": [client], "decryption": "none"}
+            out = {"clients": [client], "decryption": opts["encryption"]}
+        else:
+            out = {"clients": [client], "decryption": "none"}
+        fb = _fallbacks(opts, opts.get("_security") or "none", "vless")
+        if fb:
+            out["fallbacks"] = fb
+        return out
 
     if protocol == "vmess":
         return {"clients": [{"id": opts.get("uuid") or str(_uuid.uuid4()),
                              "alterId": 0}]}
 
     if protocol == "trojan":
-        return {"clients": [{"password": opts["password"]}]}
+        out = {"clients": [{"password": opts["password"]}]}
+        fb = _fallbacks(opts, opts.get("_security") or "none", "trojan")
+        if fb:
+            out["fallbacks"] = fb
+        return out
 
     if protocol == "shadowsocks":
         return {"method": opts["method"], "password": opts["password"]}
@@ -503,12 +583,15 @@ def build(protocol, transport, security, opts=None):
     if protocol == "shadowsocks":
         _check_ss(opts.get("method"), opts.get("password"))
 
+    # settings 里要判"回落能不能用" (只 TLS 上有意义), 所以把 security 也带进去
+    _opts = dict(opts)
+    _opts["_security"] = security
     inbound = {
         "listen": opts["listen"],
         "port": int(opts["port"]),
         # hysteria2 是协议族名, 内核侧的 inbound id 是 "hysteria" + version=2
         "protocol": ("hysteria" if protocol == "hysteria2" else protocol),
-        "settings": _settings(protocol, opts),
+        "settings": _settings(protocol, _opts),
         "streamSettings": _stream_settings(transport, security, opts),
     }
     if opts.get("tag"):

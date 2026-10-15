@@ -267,7 +267,8 @@ trojan:5 special
 vmess:1 cdn
 vmess:2 compat
 vmess:3 compat
-vmess:4 special
+vmess:4 compat
+vmess:5 special
 shadowsocks:1 core
 shadowsocks:2 special
 shadowsocks:3 special
@@ -335,7 +336,8 @@ X_PRESETS=(
     "vmess|xhttp|tls|① CDN 友好 · XHTTP + TLS|★ 官方主推传输 (与 VLESS/Trojan 口径一致)"
     "vmess|ws|tls|② WS + TLS（官方已弃用）|⚠ 官方推荐换用 XHTTP"
     "vmess|grpc|tls|③ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
-    "vmess|tcp|tls|④ 裸 TCP + TLS|改连 TCP 伪装, 需要 VMess 自身配置|"
+    "vmess|httpupgrade|tls|④ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已弃用(非移除), 迁移目标 XHTTP"
+    "vmess|tcp|tls|⑤ 裸 TCP + TLS|改连 TCP 伪装, 需要 VMess 自身配置|"
     # ---------- Shadowsocks ----------
     "shadowsocks|tcp|reality|① 隐匿优先 · REALITY|裸 TCP + REALITY; 协议本身简单, 靠 REALITY 补抗识别"
     "shadowsocks|tcp|tls|② 裸 TCP + TLS|标准用法"
