@@ -240,16 +240,31 @@ _srv_clear() {
 
 # 面板排版用的 ui_* 在 conf/lib/print.sh 里（与子菜单脚本共用一套）。
 # 拿不到就退化成朴素输出 —— 排版失败不该让整个面板打不开。
+#
+# ★ 还要加载 conf/lib/ui.sh —— 编号选择层 (ui_pick / ui_table_print /
+#   ui_ask_num) 只在那里面。面板原来只 source print.sh, 于是面板里一调
+#   ui_pick 就是 "command not found", 而报错出现在**按下菜单项之后**,
+#   表现是"菜单能进、一选就退回来", 完全看不出是缺库。
+#   ui.sh 自带颜色兜底 (用 ${_GRN+x} 守卫), 所以 print.sh 之后再 source 是安全的。
 _xray_load_ui() {
     local self f
     self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
     if [[ -r "$self/conf/lib/print.sh" ]]; then
         # shellcheck source=/dev/null
         source "$self/conf/lib/print.sh"
-        return 0
+    else
+        f=$(xray_fetch "conf/lib/print.sh" 2>/dev/null) && source "$f" || return 1
     fi
-    f=$(xray_fetch "conf/lib/print.sh" 2>/dev/null) && source "$f" && return 0
-    return 1
+    # 选择层: 拿不到不算致命 (面板其余部分照常), 但要说出来 ——
+    # "客户端产物 → 查看内容" 会退化成朴素列表而不是静默失败。
+    if [[ -r "$self/conf/lib/ui.sh" ]]; then
+        # shellcheck source=/dev/null
+        source "$self/conf/lib/ui.sh"
+    else
+        f=$(xray_fetch "conf/lib/ui.sh" 2>/dev/null) && source "$f" || \
+            printf '  [警告] 取不到 conf/lib/ui.sh —— 编号选择层不可用\n' >&2
+    fi
+    return 0
 }
 if ! _xray_load_ui || ! declare -F ui_menu >/dev/null 2>&1; then
     # 兜底：只有最朴素的版本，但菜单不会因此消失
@@ -617,10 +632,15 @@ client_menu() {
 # 客户端产物顶部状态 —— 三个值都必须是**便宜**的 (菜单每步都重画):
 # 节点数复用 xray_node_count (jq), 产物文件数是 glob, 对外地址走 share_meta。
 _client_status() {
-    local nn nfile dir="${OUT_DIR:-/root/catmi/xray/out}"
+    local nn nfile dir="${OUT_DIR:-${XRAY_BASE:-/root/catmi/xray}/out}"
     nn=$(xray_node_count 2>/dev/null || echo 0)
     nfile=0
-    [[ -d "$dir" ]] && nfile=$(find "$dir" -maxdepth 1 \( -name '*.txt' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | wc -l)
+    # ★ 口径必须与实际产物一致: 以前只数 txt/yaml/yml, 而 Xray 客户端那份是
+    #   .json (reality-01.json / hy2_client-01.xray.json / <tag>.json) ——
+    #   顶部计数比"查看内容"里看到的少一截, 用户会以为文件丢了。
+    [[ -d "$dir" ]] && nfile=$(find "$dir" -maxdepth 1 \
+        \( -name '*.txt' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) \
+        2>/dev/null | wc -l)
     ui_kv "节点数量" "$nn"
     ui_kv "产物文件" "$nfile 个"
     _client_addr_line
@@ -653,36 +673,138 @@ _client_addr_line() {
 # ★ 一律写 stderr: stdout 是数据通道 (分享链接/订阅内容都从那儿出)。
 #   这里原来 echo -e "${GREEN}…${PLAIN}" 全走 stdout —— 标题混进数据流,
 #   下游任何解析都会把 "===== TXT 配置文件 =====" 当成内容的一部分。
+#
+# ★ 从"全部 cat 一遍"改成"先列 → 选 → 看一个":
+#   out/ 下每个 xhttp 节点都带一长串 base64 (ECH / ML-KEM), 全打出来是
+#   几十屏, 中间夹着别的节点的内容, 想找某一个得一路翻。而且原来**没有
+#   json 分支** —— Xray 客户端那份 (.json) 根本看不到, 顶部"产物文件"
+#   计数也把它漏了。SB 的做法 (artifacts.sh 的 pick_and_cat) 就是先列再选。
 show_xray_configs() {
-    local out_dir="/root/catmi/xray/out"
+    local out_dir="${OUT_DIR:-${XRAY_BASE:-/root/catmi/xray}/out}"
 
     if [[ ! -d "$out_dir" ]]; then
+        ui_box "客户端产物"
         printf '  %s目录不存在：%s%s\n' "$RED" "$out_dir" "$PLAIN" >&2
-        return
+        return 0
     fi
 
-    _show_out_files "$out_dir" "TXT 配置文件" "$GREEN" txt
-    _show_out_files "$out_dir" "YAML 配置文件" "$GREEN" yaml yml
+    local c
+    while :; do
+        _srv_clear; ui_title "客户端产物 · 查看内容"
+        ui_kv "目录" "$out_dir"
+        echo >&2
+        ui_menu 1 "mihomo YAML    客户端出站 (含上下行分离)"
+        ui_menu 2 "Xray JSON      客户端出站 (vnext 结构)"
+        ui_menu 3 "分享链接 TXT   单节点链接"
+        ui_menu 4 "Nginx 片段     该节点的反代段"
+        ui_menu 5 "全部文件清单   只看名字和大小"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
+            1) _pick_out_file "$out_dir" "mihomo YAML" yaml yml ;;
+            2) _pick_out_file "$out_dir" "Xray JSON" json ;;
+            3) _pick_out_file "$out_dir" "分享链接" txt ;;
+            4) _pick_out_file "$out_dir" "Nginx 片段" conf ;;
+            5) _out_file_index "$out_dir" ;;
+            0|"") return 0 ;;
+            *) ui_invalid "$c"; continue ;;
+        esac
+        ui_pause
+    done
 }
 
-_show_out_files() { # <目录> <标题> <颜色> <扩展名...>
-    local dir="$1" title="$2" color="$3"; shift 3
-    printf '\n%s===== %s =====%s\n' "$color" "$title" "$PLAIN" >&2
-    local ext f found=0
+# 列出某一类产物让用户挑一个看。空则明说"这一类没有"。
+_pick_out_file() { # <目录> <标题> <扩展名...>
+    local dir="$1" title="$2"; shift 2
+    local -a files=()
+    local ext f
     for ext in "$@"; do
         for f in "$dir"/*."$ext"; do
-            [[ -f "$f" ]] || continue
-            found=1
-            printf '\n%s===== %s =====%s\n' "$color" "$f" "$PLAIN" >&2
-            cat "$f" >&2          # ★ 内容也走 stderr
+            [[ -f "$f" ]] && files+=("$f")
         done
     done
-    (( found )) || printf '  无%s文件\n' "$title" >&2
-    return 0
+    # 目录是按 mtime 排的更好找 (刚建的在最后) —— 但稳定排序更重要, 用文件名
+    if ((${#files[@]} == 0)); then
+        ui_box "$title"
+        printf '  %s这一类还没有产物文件%s (%s)\n' "$_YEL" "$_RST" "$dir" >&2
+        return 0
+    fi
+    UI_PICK_COLS=(文件名 大小)
+    UI_PICK_ROWS=""
+    local base size
+    for f in "${files[@]}"; do
+        base=$(basename "$f")
+        size=$(du -h "$f" 2>/dev/null | cut -f1)
+        # ★ 格式是 key<TAB>字段1<TAB>…, key 取回用、不显示 ——
+        #   所以 N 列要给 N+1 段。少一段整张表左移一列 (交接文档 5.8)。
+        UI_PICK_ROWS+="$f"$'\t'"$base"$'\t'"${size:--}"$'\n'
+    done
+    # 选择层拿不到时退化: 直接看第一个, 而不是报 "command not found"
+    if ! declare -F ui_pick >/dev/null 2>&1; then
+        ui_box "$title  (共 ${#files[@]} 个 · 无选择层, 显示第一个)"
+        _cat_out_file "${files[0]}"
+        return 0
+    fi
+    # ui_pick 自己会 ui_box + ui_table_print, 这里不要重复画表
+    ui_pick "查看哪一个 · 共 ${#files[@]} 个" "这一类还没有产物文件" "查看" || return 0
+    _cat_out_file "$UI_PICK_KEY"
 }
 
-add_node_menu() {
-    local c
+# 看一个产物文件。★ 内容也走 stderr —— stdout 是数据通道。
+_cat_out_file() {
+    local f="$1"
+    [[ -f "$f" ]] || { printf '  %s文件已不在了: %s%s\n' "$_RED" "$f" "$_RST" >&2; return 0; }
+    _srv_clear
+    printf '\n%s===== %s =====%s\n\n' "$_GRN" "$f" "$_RST" >&2
+    cat "$f" >&2
+    printf '\n%s===== 完 =====%s\n' "$_GRN" "$_RST" >&2
+}
+
+# 全部文件清单 (名字 + 大小), 不打印内容 —— 几十屏 base64 的替代品
+_out_file_index() {
+    local dir="$1" f n=0
+    _srv_clear; ui_title "客户端产物 · 文件清单"
+    printf '  %s%s%s\n\n' "$_DIM" "$dir" "$_RST" >&2
+    for f in "$dir"/*; do
+        [[ -f "$f" ]] || continue
+        n=$((n + 1))
+        printf '  %-44s %8s\n' "$(basename "$f")" "$(du -h "$f" 2>/dev/null | cut -f1)" >&2
+    done
+    (( n )) || printf '  %s（空）%s\n' "$_YEL" "$_RST" >&2
+    printf '\n  共 %s 个文件\n' "$n" >&2
+}
+
+# 预置档位的总数 —— 菜单文案里的数字必须**算出来**, 不能手写。
+#
+# 手写过: 菜单写着「25 个预置」而表里已经有 27 个。用户按 25 去数怎么都对不上,
+# 只会怀疑自己看错了 —— 而这类对不上的数字在项目里还有第二处来源
+# (档位表 _P_TIERS_table 与 X_PRESETS 是两张表, 谁加了档位另一张不会自动跟)。
+# 缓存进变量: 菜单每重画一次都调它, 不能每次都开子 shell 重读 487 行。
+_XRAY_PRESET_TOTAL=""
+_xray_preset_total() {
+    [[ -n "$_XRAY_PRESET_TOTAL" ]] && { printf '%s' "$_XRAY_PRESET_TOTAL"; return 0; }
+    xray_cache_dir >/dev/null
+    xray_ensure_lib >/dev/null 2>&1
+    local lib="$_XRAY_CACHE/lib/preset.sh" n=""
+    # 子 shell 里 source: 预置表定义了一堆 _P_* / X_PRESETS, 不希望它们
+    # 漏进面板自己的命名空间。
+    if [[ -r "$lib" ]]; then
+        n=$( ( # shellcheck source=/dev/null
+               source "$lib" 2>/dev/null || exit 1
+               tot=0
+               for p in $(x_preset_protocols 2>/dev/null); do
+                   tot=$((tot + $(x_preset_count "$p" 2>/dev/null || echo 0)))
+               done
+               printf '%s' "$tot" ) 2>/dev/null )
+    fi
+    # 取不到就写个占位符, **不要**退回写死一个数字 —— 那正是原来出问题的方式
+    _XRAY_PRESET_TOTAL="${n:-?}"
+    printf '%s' "$_XRAY_PRESET_TOTAL"
+}
+
+add_node_menu() {    local c
     while :; do
         _srv_clear
         ui_title "添加节点"
@@ -703,7 +825,7 @@ add_node_menu() {
         echo >&2
         ui_sec "批量与预置"
         ui_menu 12 "全协议一键生成    自动分配端口，统一校验，只重载一次"
-        ui_menu 13 "预置档位建节点    25 个预置（协议 × TLS × 传输）任选"
+        ui_menu 13 "预置档位建节点    $(_xray_preset_total) 个预置（协议 × TLS × 传输）任选"
         ui_menu 14 "预置批量生成      一次生成多个（支持 vless:2 trojan:3）"
         ui_menu 15 "上下行分离        xHTTP 三组合（上行CDN+下行CDN 等）"
         ui_menu 16 "分离节点自检      连不上时先跑这个（分清是节点坏还是 CDN 坏）"

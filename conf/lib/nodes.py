@@ -202,8 +202,14 @@ def extract(inbound, source_file, frag=None):
         # ---- 服务名 (分享/分发时客户端要显示) ----
         "server_names": reality.get("serverNames") or [],
         "path": ws.get("path") or xhttp.get("path") or "",
-        "sni": None,
-        # TLS 节点的 SNI 候选 (片段 _serverName / serverName / 证书 SAN·CN /
+        # xhttp 的上下行模式。★ 必须在这里抽出来 —— build_share_link 早就有
+        # `if n.get("mode")` 那一段 (注释还写着"以前链接里根本不带 mode"),
+        # 但 extract() 从来没产出过这个键, 于是那个条件**恒假**, 条件本身
+        # 成了摆设: 共享出去的 xhttp 节点一律退回 auto, 而 auto 在 REALITY 下
+        # 解析成 stream-one (合流) —— 导入后"看着正常, 只是没在分离"。
+        # (同类的还有 downloadSettings, 见 split_params 的兜底。)
+        "mode": xhttp.get("mode") or "",
+        "sni": None,        # TLS 节点的 SNI 候选 (片段 _serverName / serverName / 证书 SAN·CN /
         # 证书项 domain)。
         "tls_domains": tls_domains(tls, declared),
         # 片段自己的域名声明 —— 也是"这个节点支持 ECH"的来源标记
@@ -223,6 +229,33 @@ def extract(inbound, source_file, frag=None):
     sni = node["server_names"]
     if sni:
         node["sni"] = sni[0]
+
+    # ---- 上下行分离: 直接从片段里抽 ----
+    #
+    # ★ 片段是**服务端真相** (内核真正在跑的就是它), 元数据只是写的时候抄的
+    #   一份副本 —— 所以这里填进 node 之后, build_share_link 的既有优先级
+    #   (`n.get("dl_x") or meta.get("dl_x")`) 自然就是"片段优先, 元数据补位",
+    #   两边都缺才落空。
+    #
+    #   这同时修掉了 split_params 里那段**永远不会执行**的兜底: 它去遍历
+    #   `n["inbounds"]`, 而分享路径传进来的 n 是 extract() 出来的视图
+    #   (根本没有 inbounds 键), 于是"老节点也能正确导出下行参数"这句注释
+    #   一直没兑现 —— 元数据一旦缺失/写错目录, 所有 dl_* 静默消失,
+    #   而链接看起来完全正常, 只是没在分离。
+    dls = xhttp.get("downloadSettings") or {}
+    if dls.get("address"):
+        node["dl_address"] = dls.get("address") or ""
+        node["dl_port"] = dls.get("port") or inbound.get("port")
+        node["dl_security"] = dls.get("security") or node["security"] or "none"
+        node["dl_sni"] = ((dls.get("realitySettings") or {}).get("serverName")
+                          or (dls.get("tlsSettings") or {}).get("serverName")
+                          or node["sni"])
+        # ★ 下行 REALITY 在片段里存的是 `password` —— 因为那一侧服务端扮演的
+        #   是**客户端**角色, 这个字段其实就是公钥 (见 node_build 的说明)。
+        node["dl_public_key"] = (dls.get("realitySettings") or {}).get("password") or None
+        node["dl_short_id"] = (dls.get("realitySettings") or {}).get("shortId") or None
+        node["dl_mode"] = (dls.get("xhttpSettings") or {}).get("mode") or node["mode"]
+        node["dl_path"] = (dls.get("xhttpSettings") or {}).get("path") or node["path"]
     return node
 
 
