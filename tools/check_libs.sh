@@ -1468,6 +1468,43 @@ grep -q 'conf/share.sh switch-family-menu' "$CM" \
 # switch-family-menu 必须在 share.sh 的 CLI 派发表里, 否则 xray_run 调它等于空跑
 grep -q 'switch-family-menu) x_switch_addr_family_menu' "$SH" \
     && ok "switch-family-menu 在 CLI 派发表里" || bad "switch-family-menu 没进 CLI 派发表"
+
+# ---- 「查看产物内容」的三个真缺陷 (都是"按下去才发现"的那一类) ----
+#
+# ★ 这几条用 `| grep PAT >/dev/null` 而不是 `| grep -q` —— 本文件带 pipefail,
+#   grep -q 命中就早退, 上游 sed 会吃 SIGPIPE(141)。套件的 EARLY 门禁盯这个。
+_SXC=$(sed -n "/^show_xray_configs()/,/^}/p" "$CM")
+_PKF=$(sed -n "/^_pick_out_file()/,/^}/p" "$CM")
+#
+# ① 路径硬编码: show_xray_configs 曾写死 /root/catmi/xray/out, 而同一个文件的
+#    _client_status 用 ${OUT_DIR:-…} —— 两处口径不一致, 换了 XRAY_BASE 的
+#    环境 (沙箱 / 多套配置) 里"顶部说 N 个文件、点进去看的是另一个目录"。
+if printf '%s\n' "$_SXC" | grep 'OUT_DIR' >/dev/null; then
+    ok "查看产物用 OUT_DIR (与顶部计数同一口径)"
+else
+    bad "查看产物把 out 目录写死了 → 与 _client_status 口径不一致"
+fi
+
+# ② 没有 json 分支: Xray 客户端那份出站是 .json, 原来只列 txt/yaml/yml,
+#    于是"自己生成的 Xray 客户端配置"在面板里根本看不到。
+if printf '%s\n' "$_SXC" | grep 'json' >/dev/null; then
+    ok "查看产物认得 Xray JSON (不只有 YAML/TXT)"
+else
+    bad "查看产物没有 json 分支 → Xray 客户端产物看不到"
+fi
+
+# ③ ui_pick 在 conf/lib/ui.sh 里, 而面板原来只 source print.sh ——
+#    于是按下去报 "ui_pick: command not found", 菜单看着能进、一选就退回来。
+if grep 'conf/lib/ui.sh' "$CM" >/dev/null; then
+    ok "面板加载了 conf/lib/ui.sh (编号选择层)"
+else
+    bad "面板没加载 ui.sh → ui_pick 会是 command not found"
+fi
+if printf '%s\n' "$_PKF" | grep 'declare -F ui_pick' >/dev/null; then
+    ok "选择层拿不到时有退化分支 (不是 command not found)"
+else
+    bad "_pick_out_file 没有退化分支"
+fi
 grep -q 'change-fp)          share_change_fp' "$SH" \
     && ok "change-fp 在 CLI 派发表里" || bad "change-fp 没进 CLI 派发表"
 # 换连接 IP 必须能交互选族 (面板调不到带参数的子命令)
@@ -3870,7 +3907,368 @@ PYX
 assert_eq "$MH2" "inherit,override" \
     "mihomo 下行公钥: 缺省沿用上行 (同服务器双域名), 显式给值则覆盖"
 
-# 上传前验证脚本必须在
+# ------------------------------------------------- 预置路径的客户端产物
+group "预置路径 (菜单 13/14/15) 也要产出 mihomo YAML"
+
+# ★ 这一组盯的是"建节点的那一步有没有真的产出客户端产物"。
+#   以前预置路径只写 conf/<tag>.json + 分享元数据 —— 用户建完节点手上没有
+#   任何客户端文件, 得自己按文档拼; 而 xhttp 的 download-settings 是两段式、
+#   逐项覆盖语义, 手拼必错。上下行分离更糟: 它**只存在于服务端配置里**,
+#   不落成产物就没人记得这个节点是分离的。
+PR=$(mktemp -d)
+mkdir -p "$PR/conf"
+KP=$(python3 - <<'PYX'
+import base64, os
+print(base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("="))
+PYX
+)
+python3 - "$PR" "$KP" <<'PYX'
+import json, sys, os
+d, pub = sys.argv[1], sys.argv[2]
+spec = {"protocol": "vless", "transport": "xhttp", "security": "tls",
+        "tag": "x-vless01-TLS", "port": 29601, "tier": "cdn",
+        "domain": "up.example.com", "sni": "up.example.com",
+        "path": "/sp-probe", "uuid": "22222222-2222-2222-2222-222222222222",
+        "dl_address": "203.0.113.9", "dl_security": "reality",
+        "dl_mode": "stream-up", "dl_sni": "www.cloudflare.com",
+        "dl_public_key": pub, "dl_short_id": "abcd1234",
+        "split_mode": "cdn-reality"}
+json.dump(spec, open(os.path.join(d, "spec.json"), "w"))
+PYX
+(cd "$ROOT" && XRAY_BASE="$PR" python3 conf/lib/deploy.py \
+    --config-json "@$PR/spec.json" --conf-dir "$PR/conf" \
+    --share-dir "$PR/out/share" --apply >/dev/null 2>&1)
+if [[ -f "$PR/out/x-vless01-TLS.yaml" ]]; then
+    ok "预置路径建节点时产出了 out/<tag>.yaml"
+else
+    bad "预置路径没产出 mihomo YAML → 用户建完节点手上只有服务端片段"
+fi
+# 分离信息必须**进到产物里**, 不能只留在服务端片段
+if grep -q 'download-settings' "$PR/out/x-vless01-TLS.yaml" 2>/dev/null; then
+    ok "产出的 YAML 带 download-settings (上下行分离进了客户端产物)"
+else
+    bad "产出的 YAML 没有 download-settings → 分离节点在 mihomo 侧退化成合流"
+fi
+if grep -qE '^ *server: 203\.0\.113\.9$' "$PR/out/x-vless01-TLS.yaml" 2>/dev/null \
+   && grep -qE '^ *mode: stream-up$' "$PR/out/x-vless01-TLS.yaml" 2>/dev/null; then
+    ok "下行目的地与 mode 都写进了 download-settings"
+else
+    bad "download-settings 缺下行目的地或 mode"
+fi
+# 片段里的服务端字段不能漏进客户端产物 (privateKey 之类)
+if grep -q 'privateKey' "$PR/out/x-vless01-TLS.yaml" 2>/dev/null; then
+    bad "客户端产物里出现了服务端字段 privateKey"
+else
+    ok "客户端产物没有混入服务端字段"
+fi
+
+# 真内核校验: 有 mihomo 就跑, 没有就**如实跳过** (不假装通过)
+MH_BIN=""
+for _c in "$(command -v mihomo 2>/dev/null)" /root/catmi/mihomo/mihomo; do
+    [[ -n "$_c" && -x "$_c" ]] && { MH_BIN="$_c"; break; }
+done
+if [[ -n "$MH_BIN" ]]; then
+    { echo "mixed-port: 17890"; echo "log-level: warning"; \
+      cat "$PR/out/x-vless01-TLS.yaml"; } > "$PR/mh.yaml"
+    if "$MH_BIN" -t -f "$PR/mh.yaml" -d "$PR" >/dev/null 2>&1; then
+        # ★ 取第一行的方式: 先整段取回再用 ${v%%$'\n'*} 切。
+        #   写成 `... | head -1` 会让上游吃 SIGPIPE —— 套件自己的 EARLY
+        #   门禁就是盯这个的, 写新断言时踩过。
+        _mh_v=$("$MH_BIN" -v 2>/dev/null)
+        _mh_v="${_mh_v%%$'\n'*}"
+        ok "产出物过真 mihomo -t (${_mh_v:0:24})"
+    else
+        _mh_out=$("$MH_BIN" -t -f "$PR/mh.yaml" -d "$PR" 2>&1)
+        _mh_err=$(printf '%s\n' "$_mh_out" | grep -i -m1 'level=error')
+        bad "产出物被真 mihomo 拒绝: ${_mh_err:-未知原因}"
+    fi
+else
+    ok "本机没有 mihomo 二进制, 产物未过真内核校验 (如实跳过, 不是通过)"
+fi
+
+# 生成不出来的时候**必须给出原因**, 不能静默少一个文件
+WU=$(python3 - "$LIB" <<'PYX'
+import sys; sys.path.insert(0, sys.argv[1])
+import to_mihomo as M
+n = M.node_from_fragment({"network": "xhttp", "security": "tls",
+                          "protocol": "trojan"}, {"host": "a.com"})
+print("reason" if M._why_unsupported(n) else "EMPTY")
+PYX
+)
+assert_eq "$WU" "reason" "生成不出 YAML 时给得出原因 (而不是静默少一个文件)"
+rm -rf "$PR"
+
+# ------------------------------------------------- 预置向导: 交互验证抓到的四个
+group "预置向导 (菜单 13): pty 真按键才发现的四个缺陷"
+
+# ★ 这一组全部来自**真按键走一遍** (tools/pty_journey.py), 静态检查抓不到。
+MK="$ROOT/conf/mknode.sh"
+UI="$ROOT/conf/lib/ui.sh"
+
+# ① 不落盘: 调 deploy.py 时漏了 --apply, 于是走 _print_plan 预演分支 ——
+#    屏幕上有完整 JSON、有「完成」、没有报错, 磁盘上一个文件都没有。
+if grep -A3 'python3 "$plan_py" --config-json' "$MK" | grep -- '--apply' >/dev/null; then
+    ok "mknode 调 deploy.py 带 --apply (否则只预演、不落盘)"
+else
+    bad "mknode 没给 --apply → 菜单13 建节点只打印方案, 一个文件都不写, 还说「完成」"
+fi
+# 退出码 0 不等于写成了: 落盘后必须回头 stat 一次
+if sed -n '/--apply/,/^}/p' "$MK" | grep -- '-f "$_frag"' >/dev/null; then
+    ok "落盘后回查片段文件 (不拿退出码当成功)"
+else
+    bad "落盘后没有回查文件 → 「退出码 0 但没写成」会再次瞒过去"
+fi
+
+# ② 回车静默中止: 提示写「回车=<默认>」, 而 ui_ask_num 回车一律 return 1,
+#    调用方 `|| return 0` 让整条流程以**成功**退出 —— 提示与行为相反。
+if grep -E '^ui_ask_num\(\)' "$UI" >/dev/null \
+   && sed -n '/^ui_ask_num()/,/^}/p' "$UI" | grep -- 'def="${4:-}"' >/dev/null; then
+    ok "ui_ask_num 支持可选默认值 (回车取默认, 不再静默取消)"
+else
+    bad "ui_ask_num 没有默认值参数 → 回车仍然会静默中止调用方"
+fi
+# 行为验证: 回车 + 默认值 必须返回 0 且给出默认; 不给默认时仍然取消
+UAD=$(bash -c "
+source '$UI' 2>/dev/null
+a=\$(printf '\n' | ui_ask_num '测试' 1 4 3 2>/dev/null) && echo \"def=\$a\" || echo 'def=RC1'
+printf '0\n' | ui_ask_num '测试' 1 4 3 >/dev/null 2>&1 && echo 'zero=RC0' || echo 'zero=RC1'
+" 2>/dev/null | tr '\n' ',')
+assert_eq "$UAD" "def=3,zero=RC1," \
+    "回车取默认值(3) 且返回 0; 输 0 仍是取消"
+
+# ③ 菜单数字写死: 「25 个预置」而表里已经 27 个
+if grep -E 'ui_menu 13 ' "$ROOT/xray-panel.sh" | grep -E '\$\(_xray_preset_total\)' >/dev/null; then
+    ok "预置总数由 _xray_preset_total 算出来 (不写死)"
+else
+    bad "菜单里的预置总数是写死的 → 表一变就对不上"
+fi
+PT2=$(bash -c "source '$ROOT/conf/lib/preset.sh'; t=0; for p in \$(x_preset_protocols); do t=\$((t+\$(x_preset_count \$p))); done; echo \$t" 2>/dev/null)
+if [[ -n "$PT2" && "$PT2" =~ ^[0-9]+$ ]]; then
+    ok "预置总数算得出来 ($PT2 个)"
+else
+    bad "预置总数算不出来"
+fi
+
+# ④ TLS 入站没有证书: 内核 -test 放行、真启动成功、**每次握手都失败**
+#    (tls: no certificates configured)。建 TLS 节点前必须找到证书或明确拒绝。
+if grep -F 'x_cert_find_for_domain' "$MK" >/dev/null; then
+    ok "建 TLS 节点时会去找匹配的证书"
+else
+    bad "mknode 只收域名不找证书 → 生成的 TLS 入站没有 certificates, 永远连不上"
+fi
+if sed -n '/没找到/,/return 1/p' "$MK" | grep -F 'return 1' >/dev/null; then
+    ok "找不到证书时明确拒绝 (不生成必然连不上的节点)"
+else
+    bad "找不到证书时没有拒绝"
+fi
+# 证书查找函数本身要在, 且能按域名命中
+if grep -E '^x_cert_find_for_domain\(\)' "$ROOT/conf/lib/cert.sh" >/dev/null; then
+    ok "x_cert_find_for_domain 在 conf/lib/cert.sh 里"
+else
+    bad "x_cert_find_for_domain 不存在"
+fi
+CFD=$(CD=$(mktemp -d) bash -c '
+CD=$CD
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  -keyout "$CD/a.example.com.key" -out "$CD/a.example.com.crt" \
+  -subj "/CN=a.example.com" -addext "subjectAltName=DNS:a.example.com" 2>/dev/null
+source "'"$ROOT"'/conf/lib/cert.sh" 2>/dev/null
+X_CERT_EXTRA_DIRS="$CD"
+hit=$(X_CERT_EXTRA_DIRS="$CD" x_cert_find_for_domain a.example.com 2>/dev/null)
+[[ -n "$hit" ]] && echo HIT || echo MISS
+X_CERT_EXTRA_DIRS="$CD" x_cert_find_for_domain other.example.com >/dev/null 2>&1 && echo BAD || echo NOMATCH
+rm -rf "$CD"' 2>/dev/null | tr '\n' ',')
+assert_eq "$CFD" "HIT,NOMATCH," \
+    "证书按域名命中 (a.example.com 命中, other.example.com 不误配)"
+
+# ------------------------------------------------- 证书方案 (对标 sing-box-core)
+group "证书方案: 三条路都通 + CDN 准入 + 自签 pin"
+
+CT="$ROOT/conf/lib/cert.sh"
+DP="$ROOT/conf/lib/deploy.py"
+
+# ① 关键 helper 必须在 —— 少一个就是 "command not found", 而报错出现在
+#    建节点流程的中间, 用户看到的是一句与证书无关的话。
+for _f in x_cert_key_for x_cert_not_expired x_cert_selfgen x_cert_list_domains x_cert_find_for_domain; do
+    grep -E "^${_f}\(\)" "$CT" >/dev/null \
+        && ok "cert.sh 有 $_f" || bad "cert.sh 缺 $_f"
+done
+
+# ② 私钥命名要挨个试 (acme.sh / certbot / KPanel / nginx 落盘命名都不一样)。
+#    只试一种的症状是"明明有证书却判成没有私钥"。
+_NK=$(grep -A 8 '^x_cert_key_for()' "$CT" | grep -c 'privkey.pem\|_key.pem\|\.key')
+[[ "$_NK" -ge 3 ]] && ok "私钥命名候选 >= 3 种 (跨工具兼容)" \
+    || bad "x_cert_key_for 只试 $_NK 种命名 → 别的工具落的证书会判成缺私钥"
+
+# ③ 域名去重 + 状态标记 (重复列同一张证书会让编号对不上号)
+grep -E '^x_cert_list_domains\(\)' "$CT" >/dev/null \
+    && ok "证书列表按域名去重" || bad "没有按域名去重"
+
+# ④ CDN 档 + 自签必须被拦住 —— Cloudflare 不接受自签证书。
+#    不拦的症状是用户配完 nginx 才发现 526, 而我方一句提示都没有。
+MK="$ROOT/conf/mknode.sh"
+if sed -n '/CDN, 但证书是自签/,/return 1/p' "$MK" | grep -F 'return 1' >/dev/null; then
+    ok "CDN 档 + 自签被拦住 (Cloudflare 不接受自签)"
+else
+    bad "CDN 档允许自签证书 → 回源必然失败"
+fi
+
+# ⑤ 自签必须带 pin: 不算 pin 的后果是客户端做正常校验必然失败,
+#    表现是"配置全对、服务在跑、就是连不上"。
+if grep -F 'x_cert_client_pin' "$MK" >/dev/null \
+   && grep -F 'cert_pin' "$DP" >/dev/null; then
+    ok "自签证书带 pin 且进了分享元数据"
+else
+    bad "自签证书没有 pin → 客户端连不上, 而产物看起来完全正常"
+fi
+
+# ⑥ nginx 档建节点必须**顺手配好反代**。
+#    只写片段 + 打印一行"提示: 还需配置反代"的后果: 节点监听 127.0.0.1,
+#    却没人转发流量 —— 客户端连域名:443 打不到任何东西, 面板显示节点已建好。
+# ★ 断言要看**代码**, 不看注释: 注释里为了说明坑, 常常把错误写法原样写出来
+#   (「写成 ["--nginx", "-t"] 会报错」), 直接把源码喂给 grep 会把注释也命中,
+#   于是"修好了"反而报红。这里先把注释行去掉再看。
+_DEP_NG=$(sed -n '/^def _configure_nginx/,/^def _write_plan/p' "$DP" | grep -v '^[[:space:]]*#')
+if printf '%s\n' "$_DEP_NG" | grep -F -- '--origin-tls' >/dev/null; then
+    bad "回源带了 --origin-tls → 对明文端口说 TLS (nginx 档 xray 是 security:none)"
+else
+    ok "nginx 档回源不带 --origin-tls (与 security:none 一致)"
+fi
+# --nginx 必须**不传**: 它的默认值就是 "-t", 而 ["--nginx","-t"] 会被 argparse
+# 当成另一个选项, 报 "expected one argument"。
+if printf '%s\n' "$_DEP_NG" | grep -F -- '--nginx' >/dev/null; then
+    bad "传了 --nginx → argparse 会把 -t 当选项 (nginx_apply.py:1359 记过这个坑)"
+else
+    ok "没有 --nginx 分开写法的坑"
+fi
+# nginx 档建节点必须真的去配反代 (不能只打印一行"还需配置反代")
+if sed -n '/^def _write_plan/,/^def _emit_products/p' "$DP" | grep -F '_configure_nginx(r)' >/dev/null; then
+    ok "nginx 档建节点时自动配反代"
+else
+    bad "nginx 档只写片段不配反代 → 节点监听回环但没人转发"
+fi
+# 配不上时**保留节点**并把原因与出路说清楚 (发布侧会拒发回环节点, 所以安全)
+if sed -n '/^def _configure_nginx/,/^def _write_plan/p' "$DP" | grep -F '返回 (ok, 原因)' >/dev/null \
+   && grep -F '它不会被发到订阅里' "$DP" >/dev/null; then
+    ok "nginx 配不上时保留节点 + 说明出路 (不静默留一个转发不到的节点)"
+else
+    bad "nginx 配不上时的处理没说清楚"
+fi
+
+# ------------------------------------------------- 本轮: 回落 / 混淆 / 路径一致性
+group "回落 (fallbacks) · Hysteria2 混淆 · 两条建节点路径一致"
+
+NB="$ROOT/conf/lib/node_build.py"
+MK="$ROOT/conf/mknode.sh"
+PB="$ROOT/tools/preset_batch.sh"
+
+# ① 回落: 只在 TLS 上有意义, 且内核只对 VLESS/Trojan 实现了它。
+#    内核实测: 普通 HTTPS 打 VLESS 端口拿到回落目标的网页, 真客户端仍 200。
+if grep -F '_fallbacks(opts' "$NB" >/dev/null; then
+    ok "node_build 支持回落 (fallbacks)"
+else
+    bad "node_build 没有回落支持"
+fi
+_FB=$(R="$ROOT" python3 - <<'PYX' 2>/dev/null
+import sys, os
+sys.path.insert(0, os.path.join(os.environ["R"], "conf", "lib"))
+import node_build as NB
+out = []
+# TLS 应该写得出来
+f = NB.build("vless","tcp","tls", {"listen":"0.0.0.0","port":443,"uuid":"u",
+      "cert_file":"/tmp/c","key_file":"/tmp/k","sni":"a.com","fallback_port":"8080"})
+out.append("tls=" + str(f["inbounds"][0]["settings"].get("fallbacks")))
+# REALITY 应该被拒 (它有自己的 target, 两套不混)
+try:
+    NB.build("vless","tcp","reality", {"listen":"0.0.0.0","port":443,"uuid":"u",
+        "private_key":"a"*43,"short_id":"ab","sni":"a.com","public_key":"b"*43,
+        "fallback_port":"8080"})
+    out.append("reality=NOTBLOCKED")
+except Exception:
+    out.append("reality=blocked")
+print(",".join(out))
+PYX
+)
+if [[ "$_FB" == *"tls=[{'dest': 8080, 'xver': 0}]"* && "$_FB" == *"reality=blocked"* ]]; then
+    ok "回落: TLS 写得出来, REALITY 被拒 (不与 target 混用)"
+else
+    bad "回落行为不对: $_FB"
+fi
+# 交互里要问得到, 且默认是不回落
+if grep -F '回落 (fallbacks)' "$MK" >/dev/null; then
+    ok "mknode 交互里有回落这一问"
+else
+    bad "mknode 里问不到回落 → 这个选配用户够不着"
+fi
+
+# ② Hysteria2 salamander 混淆 —— 走内核的 finalmask 体系, 字段名**全小写**。
+#    写错大小写内核不报错、也不生效, 直接静默失效。
+if grep -F 'finalmask' "$NB" >/dev/null && grep -F 'salamander' "$NB" >/dev/null; then
+    ok "node_build 支持 Hysteria2 salamander 混淆 (finalmask)"
+else
+    bad "Hysteria2 混淆没实现"
+fi
+if grep -v '^[[:space:]]*#' "$NB" | grep -F 'finalMask' >/dev/null; then
+    bad "用了 finalMask (大写 M) —— 内核只认全小写的 finalmask, 写错是静默失效"
+else
+    ok "字段名是全小写 finalmask (大写不生效且不报错)"
+fi
+_HY=$(R="$ROOT" python3 - <<'PYX' 2>/dev/null
+import sys, os
+sys.path.insert(0, os.path.join(os.environ["R"], "conf", "lib"))
+import node_build as NB, to_mihomo as M
+f = NB.build("hysteria2","hysteria","tls", {"listen":"0.0.0.0","port":443,"password":"pw",
+      "cert_file":"/tmp/c","key_file":"/tmp/k","sni":"a.com","hy2_obfs_password":"sec"})
+fm = (f["inbounds"][0]["streamSettings"].get("finalmask") or {}).get("udp") or []
+srv = "finalmask-ok" if fm and fm[0]["type"] == "salamander" else "finalmask-BAD"
+n = M.node_from_fragment(f, {"host":"1.2.3.4","port":443}, name="h")
+p = M.proxy(n) or {}
+# ★ obfs 与 obfs-password 必须成对; 只写 obfs 会让 mihomo **整批**报
+#   "missing obfs password" (项目自己踩过)
+pair = "pair-ok" if p.get("obfs") == "salamander" and p.get("obfs-password") == "sec" else "pair-BAD"
+f2 = NB.build("hysteria2","hysteria","tls", {"listen":"0.0.0.0","port":443,"password":"pw",
+      "cert_file":"/tmp/c","key_file":"/tmp/k","sni":"a.com"})
+p2 = M.proxy(M.node_from_fragment(f2, {"host":"1.2.3.4","port":443}, name="h")) or {}
+clean = "clean-ok" if "obfs" not in p2 else "clean-NOISE"
+# hysteria2 以前**永远**生成不出 mihomo YAML (network=hysteria 落到 else 分支被拒)
+was = "hy2-yaml-ok" if p2.get("type") == "hysteria2" else "hy2-yaml-BROKEN"
+print(srv + "," + pair + "," + clean + "," + was)
+PYX
+)
+assert_eq "$_HY" "finalmask-ok,pair-ok,clean-ok,hy2-yaml-ok" \
+    "Hysteria2 混淆: 服务端 finalmask / mihomo 成对字段 / 不开时干净 / hy2 能出 YAML"
+
+# ③ 两条建节点路径必须给**同一个** xhttp mode。
+#    实测过的缺陷: 菜单 13 (mknode) 给 stream-up, 菜单 14/15 (preset_batch)
+#    给 auto —— 而 REALITY 下 auto = stream-one = 合流, 与预置⑥的说明相反。
+if grep -F 'xhttp_mode' "$PB" >/dev/null; then
+    ok "preset_batch 也会设 xhttp mode (不再是 auto)"
+else
+    bad "preset_batch 不设 xhttp mode → 与菜单13 走出不同配置"
+fi
+
+# ④ 全协议 (菜单12) 要像 SB 一样自动配 nginx
+if grep -F 'resolve_cdn_auto' "$ROOT/conf/batch.sh" >/dev/null \
+   && grep -F 'x_cdn_autosetup' "$ROOT/conf/batch.sh" >/dev/null; then
+    ok "全协议一键生成会自动配 nginx 反代 (照 SB)"
+else
+    bad "全协议一键生成不配 nginx → nginx 档节点建完没人转发"
+fi
+# cdn_auto.sh 加载不上时必须出声
+if sed -n '/resolve_cdn_auto/,/^fi/p' "$ROOT/conf/batch.sh" | grep -F 'print_warn' >/dev/null; then
+    ok "cdn_auto.sh 加载不上时会告警 (不静默跳过)"
+else
+    bad "cdn_auto.sh 加载失败是静默的"
+fi
+
+# ⑤ VMess + HTTPUpgrade 预置 (用户问"没有吗")
+if grep -E '^\s*"vmess\|httpupgrade\|' "$ROOT/conf/lib/preset.sh" >/dev/null; then
+    ok "VMess 有 HTTPUpgrade 预置"
+else
+    bad "VMess 没有 HTTPUpgrade 预置"
+fi
+
+# ------------------------------------------------- 上传前验证
 assert_ne0 "$(grep -c '而不是' "$ROOT/tools/prepush_check.sh" 2>/dev/null)" \
     "上传前验证脚本在仓库里 (tools/prepush_check.sh)"
 
@@ -4405,7 +4803,10 @@ fi
 
 # 2) 客户端文档的链接必须指向**本**仓库（换个名字就失效的那种错误）
 if [[ -f "$ROOT/Client/README.md" ]]; then
-    n=$(grep -c 'mi1314cat/xray--core' "$ROOT/Client/README.md" 2>/dev/null || echo 0)
+    # ★ 不能 `$(grep -c … || echo 0)`: 没命中时 grep -c 也会打印 0 并返回非 0,
+    #   `|| echo 0` 再补一个 → 变量成了 "0\n0", 后面的算术比较直接报
+    #   syntax error in expression。拿输出, 只用退出码兜底。
+    n=$(grep -c 'mi1314cat/xray--core' "$ROOT/Client/README.md" 2>/dev/null) || n=0
     [[ "$n" -ge 3 ]] && ok "Client/README.md 的安装链接指向本仓库 ($n 处)" \
                      || bad "Client/README.md 指本仓库的链接只有 $n 处"
 fi
@@ -5739,7 +6140,7 @@ else bad "缺 e2e_journey.sh —— 用户那条路就没人在测了"; fi
 
 # --apply 必须在**两条**路上都认。少一条就是"传了参数什么也没发生, 且不报错"。
 _dp="$ROOT/conf/lib/deploy.py"
-_apply=$(grep -c "_write_plan(r, a.conf_dir, a.share_dir)" "$_dp" 2>/dev/null || echo 0)
+_apply=$(grep -c "_write_plan(r, a.conf_dir, a.share_dir)" "$_dp" 2>/dev/null) || _apply=0
 if [[ "${_apply:-0}" -ge 2 ]]; then
     ok "--apply 在 JSON 路径和 CLI 参数路径都落盘"
 else
@@ -5797,7 +6198,13 @@ done
 ok "四个脚本语法都正常"
 
 group "老脚本建出来的节点也要能分享 (菜单 5/6/7)"
-AD=$(mktemp -d); mkdir -p "$AD/conf" "$AD/share/tokens"
+# ★ 夹具目录必须与**全项目读取方**的口径一致: <root>/conf + <root>/out/share。
+#   这里原先是 "$AD/conf" + "$AD/share/tokens" —— 而 share/tokens 正是
+#   deploy.py 写错的那个目录 (内核读 conf, 分享读 out/share)。
+#   夹具照着错的口径建, 于是这条用例**替 bug 背书**: 它在旧口径上一直绿,
+#   而真机上预置路径建的节点在 out/share 里根本找不到元数据、发不出链接。
+#   现在夹具走正确口径, 并把"元数据落在读取方会看的地方"单独断言一条。
+AD=$(mktemp -d); mkdir -p "$AD/conf" "$AD/out/share"
 python3 - "$AD" <<'PYX'
 import json,sys,os
 d=sys.argv[1]
@@ -5809,12 +6216,20 @@ frag={"inbounds":[{"tag":"vless-xhttp01","listen":"0.0.0.0","port":39314,
 json.dump(frag,open(os.path.join(d,"conf","vless-xhttp01.json"),"w"),indent=1)
 PYX
 AD_OUT=$(cd "$ROOT" && python3 conf/lib/deploy.py --adopt "$AD/conf/vless-xhttp01.json" --domain d.example.com 2>&1)
-if [[ -f "$AD/share/tokens/vless-xhttp01.json" ]]; then
+# ★ 路径口径回归: --adopt 补出来的元数据必须落在**读取方**会看的地方
+#   (share_meta / node.sh / share.sh / share_payload 统一读 <root>/out/share)。
+#   写错目录的症状是"补发布报了 OK、链接还是发不出来", 且没有任何报错。
+if [[ -f "$AD/out/share/vless-xhttp01.json" ]] && [[ ! -f "$AD/share/tokens/vless-xhttp01.json" ]]; then
+    ok "--adopt 落在 out/share (与全项目读取方同一口径)"
+else
+    bad "--adopt 没落在 out/share → 补发布报 OK 但分享仍然读不到 (路径口径又漂了)"
+fi
+if [[ -f "$AD/out/share/vless-xhttp01.json" ]]; then
     ok "--adopt 给老片段补上了分享元数据"
 else
     bad "--adopt 没补元数据 → 老脚本建的节点仍然没有分享链接"; fi
 # 元数据里的域名/端口必须来自片段本身, 不能要调用方再报一遍
-AD_META="$AD/share/tokens/vless-xhttp01.json"
+AD_META="$AD/out/share/vless-xhttp01.json"
 grep -qF '"host": "d.example.com"' "$AD_META" && ok "域名取对了" || bad "域名错了"
 grep -qF '"port": 39314' "$AD_META" && ok "端口取自片段" || bad "端口错了"
 # 片段里的 tag 才是唯一真相 —— 文件名可能和它对不上
@@ -5825,7 +6240,7 @@ import sys; sys.path.insert(0,'conf/lib')
 import nodes as N, share_meta
 nl,bad=N.collect('$AD/conf')
 for n in nl:
-    m=share_meta.load('$AD/share/tokens', n['tag']) or {}
+    m=share_meta.load('$AD/out/share', n['tag']) or {}
     l=N.build_share_link(n,m)
     if l and l.startswith('vless://'): print('OK')
 " 2>/dev/null)
