@@ -124,9 +124,55 @@ if [[ -d "$N_DIR" ]]; then
     fi
 fi
 
+# ---- 3b) nginx access log: CF 回源用了 HTTP/2 吗 ----
+#
+# ★ 这一条是**实测补上的**: 上面那句 `invalid Read on closed Body` 是最常见的
+#   形态, 但还有一种更安静的 —— **请求根本没到 xray**, 客户端直接 000,
+#   而 xray 日志里一个字都没有。这时只看 xray 日志会得出"服务器没问题"的
+#   错觉 (因为确实没记录), 用户会去反复重建节点。
+#
+#   判据在 nginx 的 access log 里: 面板插的那条 xhttp location 上,
+#   如果 CF 回源的请求是 `HTTP/2.0`, 就是同一条根因 (Origin HTTP Protocol
+#   选成了 HTTP/2)。对照: 同一路径用 HTTP/1.1 的请求能到 xray。
+_NGLOG=""
+for _c in /home/web/log/nginx/access.log /var/log/nginx/access.log \
+          /root/catmi/xray/log/access.log; do
+    [[ -r "$_c" ]] && { _NGLOG="$_c"; break; }
+done
+if [[ -n "$_NGLOG" ]]; then
+    # 面板插的 location 有哪些 —— 从**站点文件里读**, 不猜路径。
+    # 与第 3) 条同一个 N_DIR / 同一套 BEGIN-END 标记。
+    _ng_paths=""
+    if [[ -n "${N_DIR:-}" && -d "$N_DIR" ]]; then
+        _ng_paths=$(sed -n '/xray-core BEGIN/,/xray-core END/p' "$N_DIR"/*.conf 2>/dev/null \
+                    | grep -oE 'location[[:space:]]+/[^ {]*' | awk '{print $2}' | sort -u | head -10)
+    fi
+    if [[ -n "$_ng_paths" ]]; then
+        _h2=0
+        while read -r _p; do
+            [[ -n "$_p" ]] || continue
+            _c2=$(grep -c "\"GET ${_p}.*HTTP/2.0" "$_NGLOG" 2>/dev/null) || _c2=0
+            (( _c2 > 0 )) && _h2=$((_h2 + _c2))
+        done <<< "$_ng_paths"
+        if (( _h2 > 0 )); then
+            echo >&2
+            _w "nginx 日志里有 $_h2 次 **HTTP/2.0** 回源到面板插的 xhttp 路径"
+            _i "  这和下面第 4 条是同一个根因的另一种表现: Cloudflare 的源站协议是 HTTP/2"
+            _i "  区别只是这次请求**根本没到 xray** —— xray 日志里不会有一行, 别被它误导"
+            _i "  控制台: SSL/TLS → Origin Server → Origin HTTP Protocol → 改成 **HTTP/1.1**"
+        fi
+    fi
+fi
+
 # ---- 4) 日志里那句话 ----
 if [[ -n "$XRAY_LOG" && -r "$XRAY_LOG" ]]; then
-    N_BADLOG=$(grep -c 'invalid Read on closed Body' "$XRAY_LOG" 2>/dev/null || echo 0)
+    # ★ 不能写 `$(grep -c … || echo 0)`: grep -c 在**没命中时也会打印 0**
+    #   并返回非 0, 于是 `|| echo 0` 又补一个 —— 变量成了 "0\n0",
+    #   下一行 [[ … -gt 0 ]] 直接报
+    #       [[: 0\n0: syntax error in expression (error token is "0")
+    #   而这句话出现在**自检工具自己的输出里** —— 用户会以为自检坏了。
+    #   正确写法: 拿 grep 的输出, 只用退出码决定要不要覆盖。
+    N_BADLOG=$(grep -c 'invalid Read on closed Body' "$XRAY_LOG" 2>/dev/null) || N_BADLOG=0
     if [[ "${N_BADLOG:-0}" -gt 0 ]]; then
         echo >&2
         _e "日志里有 $N_BADLOG 次 invalid Read on closed Body"

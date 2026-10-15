@@ -204,8 +204,8 @@ head1 "交互验证 (真 pty, 真按键)"
 if [ -f "$TESTED/tools/ui_probe.py" ]; then
     ( cd "$TESTED" && timeout 600 python3 -u tools/ui_probe.py --repo "$TESTED" ) >/tmp/pp_ui 2>&1
     rc=$?
-    ui_ok=$(grep -c '✓' /tmp/pp_ui 2>/dev/null || echo 0)
-    ui_bad=$(grep -c '✗' /tmp/pp_ui 2>/dev/null || echo 0)
+    ui_ok=$(grep -c '✓' /tmp/pp_ui 2>/dev/null) || ui_ok=0
+    ui_bad=$(grep -c '✗' /tmp/pp_ui 2>/dev/null) || ui_bad=0
     [ $rc -eq 0 ] && ok "交互验证通过 ($ui_ok 项)" \
                   || { bad "交互验证没过 ($ui_bad 项)"; grep '✗' /tmp/pp_ui | sed -n '1,8{s/^/        /;p}'; }
 else
