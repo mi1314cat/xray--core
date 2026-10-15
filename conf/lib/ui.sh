@@ -112,14 +112,33 @@ ui_ask() { # <提示> [默认值] -> stdout
 }
 
 # 收编号。0 与空 = 取消。越界/非数字 → 重画同一个列表 (不退出)。
-ui_ask_num() { # <提示> <最小> <最大>
-    local prompt="$1" lo="$2" hi="$3" ans
+ui_ask_num() { # <提示> <最小> <最大> [默认值]
+    # ★ 第 4 个参数 (默认值) 是后加的, 且**必须可选** —— 老调用点一个字不用改。
+    #
+    #   为什么要它: 原来回车一律 `return 1` (= 取消), 而调用方普遍写成
+    #       c=$(ui_ask_num "选择" 1 4) || return 0
+    #   于是**回车 = 静默中止整个流程**。
+    #
+    #   实测事故 (接手审计, pty 真按键): mknode 建节点走到 xhttp 模式那一问,
+    #   提示写着「回车=auto」, 用户照做 —— ui_ask_num 返回 1, `|| return 0`
+    #   让 mknode 以**成功**退出, 节点没建成、一句错都不报, 直接回到菜单。
+    #   屏幕上的提示与真实行为**相反**, 这是最坏的一种交互缺陷。
+    #
+    #   现在: 给了默认值 → 回车取默认值并返回 0; 没给 → 保持原语义 (回车取消)。
+    #   提示里的默认值也由这里统一渲染, 避免调用方自己在 prompt 里再拼一遍
+    #   (拼了就会渲染成 "[1-4, 回车=auto] [1-4, 0=取消]" 这种重复)。
+    local prompt="$1" lo="$2" hi="$3" def="${4:-}" ans hint=""
+    [[ -n "$def" ]] && hint=", 回车=$def"
     while :; do
-        printf '  %s%s%s %s[%s-%s, 0=取消]%s: ' \
-            "$_CYN" "$prompt" "$_RST" "$_DIM" "$lo" "$hi" "$_RST" >&2
+        printf '  %s%s%s %s[%s-%s%s, 0=取消]%s: ' \
+            "$_CYN" "$prompt" "$_RST" "$_DIM" "$lo" "$hi" "$hint" "$_RST" >&2
         IFS= read -r ans || ans=""
         ans="${ans// /}"
-        [[ -z "$ans" || "$ans" == "0" ]] && return 1
+        if [[ -z "$ans" ]]; then
+            [[ -n "$def" ]] && { printf '%s' "$def"; return 0; }
+            return 1
+        fi
+        [[ "$ans" == "0" ]] && return 1
         [[ "$ans" =~ ^[0-9]+$ ]] || { ui_invalid "$ans —— 要数字"; continue; }
         if (( ans < lo || ans > hi )); then
             ui_invalid "$ans —— 范围 $lo-$hi"

@@ -24,19 +24,87 @@ _cy() { printf "\e[36m%s\e[0m\n" "$*" >&2; }
 _bo() { printf "\e[1m%s\e[0m\n" "$*" >&2; }
 
 _here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-_repo="$(cd "$_here/.." && pwd)"
-_psh="$_repo/conf/lib/preset.sh"
+_repo="$(cd "$_here/.." 2>/dev/null && pwd)"
 
-if [[ ! -r "$_psh" ]]; then
-    _er "找不到 conf/lib/preset.sh ($_psh)"
+# ---------------------------------------------------------------- 依赖定位
+#
+# ★ 这个脚本会被两种方式启动, 两者看到的目录结构**完全不同**:
+#
+#   仓库检出   bash tools/split_menu.sh
+#              → $_here = <repo>/tools, preset.sh 在 <repo>/conf/lib/,
+#                兄弟脚本在 <repo>/tools/
+#   面板运行   xray_run 把脚本**扁平化**成 $CACHE/tools_split_menu.sh
+#              → $_here = $CACHE。里面只有 lib/ (xray_ensure_lib 铺的),
+#                **既没有 conf/ 也没有 preset_batch.sh**
+#
+#   原来只按 "$_here/.." 找 preset.sh, 于是第二种情况下直接
+#   「找不到 conf/lib/preset.sh (/tmp/conf/lib/preset.sh)」退出 ——
+#   而面板正是用户**唯一**的安装方式。也就是说: 菜单 15 (上下行分离)
+#   对用户全死, 只在 git 检出里活着。沙箱实测复现过。
+#
+#   现在按 仓库 → 缓存 → 现拉 三级找, 与 conf/batch.sh 的
+#   resolve_scripts_dir / conf/mknode.sh 的 _mk_lib 是同一条思路,
+#   不另造机制。
+_RAW_BASE="${XRAY_RAW:-https://github.com/mi1314cat/xray--core/raw/refs/heads/main}"
+_CACHE="$(mktemp -d /tmp/.x-split.XXXXXX 2>/dev/null)" || _CACHE=""
+_cleanup() { [[ -n "$_CACHE" ]] && rm -rf "$_CACHE"; }
+trap _cleanup EXIT
+
+_fetch() { # <仓库相对路径> <目标文件>
+    local rel="$1" dest="$2"
+    curl -fsSL --max-time 30 "$_RAW_BASE/$rel" -o "$dest" 2>/dev/null \
+        && [[ -s "$dest" ]] && return 0
+    rm -f "$dest"; return 1
+}
+
+# 找 <仓库相对路径>: 仓库检出 → 扁平化缓存 → 现拉 (拉到 $_CACHE 后再找一次)
+_resolve() { # <仓库相对路径>
+    # ★ local 的多个赋值是**先全部展开再赋值** —— 写成
+    #   `local rel="$1" base="$(basename "$rel")"` 时 base 读到的是外层
+    #   (未定义的) rel, set -u 下当场 unbound variable。
+    #   这个坑项目里已经踩过一次 (交接文档 5.4), 一行一个 local 才对。
+    local rel="$1"
+    local base
+    base="$(basename "$rel")"
+    local c d
+    for c in "$_repo/$rel" "$_here/$rel" "$_here/$base" "$_here/lib/$base"; do
+        [[ -r "$c" ]] && { printf '%s' "$c"; return 0; }
+    done
+    [[ -n "$_CACHE" ]] || return 1
+    d="$_CACHE/$base"
+    _fetch "$rel" "$d" || return 1
+    printf '%s' "$d"
+}
+
+_psh="$(_resolve conf/lib/preset.sh)" || {
+    _er "取不到 conf/lib/preset.sh —— 仓库检出里没有, 镜像链也下不来"
+    _in "  试过的位置: $_repo/conf/lib/ 与 $_here/lib/"
     exit 1
-fi
+}
 # shellcheck source=/dev/null
 source "$_psh"
 
 if ! declare -F x_split_modes >/dev/null 2>&1; then
     _er "这个版本的 preset.sh 里没有分离模式表, 请更新后再试"
     exit 1
+fi
+
+# preset_batch.sh 及其同目录依赖 cdn_auto.sh —— 一并解析好, 否则面板运行下
+# 会出现"菜单能进、一按生成就说找不到 preset_batch.sh"。
+# ★ 两个文件必须落在**同一个目录**: preset_batch.sh 是按
+#   "$(dirname "$BASH_SOURCE")/cdn_auto.sh" 找它的。
+_PBATCH="$(_resolve tools/preset_batch.sh)" || {
+    _er "取不到 tools/preset_batch.sh"
+    exit 1
+}
+# preset_batch.sh 内部的 _lib() 兜底会按 $_XD/conf/lib/ 找, 扁平化时找不到
+# 就去 curl —— 那条路要 XRAY_RAW 指向一个能通的源, 面板已经把它传下来了。
+export XRAY_RAW="$_RAW_BASE"
+if [[ -n "$_CACHE" && "$(dirname "$_PBATCH")" != "$_CACHE" ]]; then
+    cp -f "$_PBATCH" "$_CACHE/preset_batch.sh" 2>/dev/null && _PBATCH="$_CACHE/preset_batch.sh"
+fi
+if [[ -n "$_CACHE" && ! -r "$_CACHE/cdn_auto.sh" ]]; then
+    _fetch tools/cdn_auto.sh "$_CACHE/cdn_auto.sh" || true
 fi
 
 echo >&2
@@ -165,7 +233,7 @@ export X_BATCH_DL_DOMAIN="$DL_DOM"
 export X_NO_RELOAD=1
 
 echo >&2
-bash "$_here/preset_batch.sh" "vless:4:split:$SPLIT" < /dev/null
+bash "$_PBATCH" "vless:4:split:$SPLIT" < /dev/null
 rc=$?
 echo >&2
 if [[ $rc -eq 0 ]]; then

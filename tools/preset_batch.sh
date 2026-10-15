@@ -58,7 +58,9 @@ source "$PORTS_SH"
 
 XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
 CONF_DIR="${XRAY_CONF_DIR:-$XRAY_BASE/conf}"
-SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/share/tokens}"
+# ★ 同 conf/mknode.sh: 分享元数据目录必须与读取方一致 ($XRAY_BASE/out/share)。
+#   完整说明见 conf/lib/deploy.py 文件头的「路径口径」。
+SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
 
 # 规范 = 协议:预置序号[:档位]   档位省略即 cdn
 # 例:  "vless:1 trojan:2:nginx vless:2" → REALITY/CDN, WS+TLS/nginx, WS+TLS/CDN
@@ -122,7 +124,7 @@ fi
 [[ $# -eq 0 && -z "${SPECS[*]:-}" ]] && { usage; exit 1; }
 [[ $# -gt 0 ]] && SPECS=("$@")
 
-mkdir -p "$CONF_DIR" "$(dirname "$SHARE_DIR")"
+mkdir -p "$CONF_DIR" "$SHARE_DIR"
 
 # 域名: TLS 节点必需 (分享链接与 nginx 配置都要用)。两种给法:
 #   环境变量 X_BATCH_DOMAIN        全部 TLS 节点用同一个域名
@@ -320,10 +322,24 @@ PY
   fi
 
   opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" <<'PY'
-import json, sys
+import json, os, sys
+# ★ import 一定要配齐: 这个 heredoc 原来只有 json, sys, 而下面用了
+#   os.environ —— NameError 被 2>/dev/null 吞掉, 命令替换拿到空串,
+#   表现是'规格拼装失败'或干脆静默不生成。项目在 mknode 上踩过一次
+#   (交接文档 10.3), 这里又踩了一次。
 proto,tr,sec,tag,port,tier,cred,extra,domain,split,dl_dom,ech_on,dlsec,dlsni,dlpub,dlsid,node_path = sys.argv[1:18]
 o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
      "port":int(port),"tier":tier}
+# ★ xhttp 的 mode 必须显式给, 否则内核按 `auto` 解析 —— 而 **REALITY 下 auto
+#   解析成 stream-one (上下行合流)**。这正是预置 ⑥「REALITY + XHTTP 上下行分离」
+#   的说明里写着要避免的那件事: 从菜单 13 (mknode) 建出来是 stream-up,
+#   从菜单 14/15 (本脚本) 建出来却变成 auto ⇒ 与说明相反, 而屏幕上一切正常。
+#   实测: 同一条 vless:6, 菜单 13 给 "stream-up", 本脚本给 "auto"。
+#   默认口径与 mknode.sh 对齐 (REALITY → stream-up; 其余 → auto),
+#   可用 X_BATCH_XHTTP_MODE 覆盖。
+_mode = os.environ.get("X_BATCH_XHTTP_MODE", "").strip()
+if tr == "xhttp":
+    o["xhttp_mode"] = _mode or ("stream-up" if sec == "reality" else "auto")
 if domain: o["domain"] = domain
 o.update(json.loads(cred))
 o.update(json.loads(extra))
@@ -388,5 +404,16 @@ fi
 
 _o "════════ 完成: $ok 成功, $fail 失败 ════════"
 (( ok > 0 )) && _y "  片段与分享元数据已写入 $CONF_DIR 与 $SHARE_DIR"
+
+# ---- 自动生成/刷新订阅链接 (照 SB: 批量建完直接给一条能用的地址) ----
+# 在这之前 X 不会自动建订阅 —— 用户得自己去 菜单 4 → 2) 全协议分享 点一遍。
+# 失败一律不阻断: 节点本身已经建好了。
+_share_sh="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/conf/share.sh"
+if [[ -r "$_share_sh" ]]; then
+    XRAY_BASE="$XRAY_BASE" XRAY_CONF_DIR="$CONF_DIR" XRAY_SHARE_DIR="$SHARE_DIR" \
+        bash "$_share_sh" ensure-subscription 2>&1 | sed 's/^/  /' || true
+else
+    _y "  找不到 conf/share.sh —— 订阅链接没有自动生成"
+fi
 _y "  重启服务后生效: 菜单 6, 或 systemctl restart xrayls"
 [[ "$fail" -eq 0 ]]

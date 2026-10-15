@@ -34,6 +34,39 @@ import node_build  # noqa: E402
 ACCESS_CDN = "cdn"
 ACCESS_NGINX = "nginx"
 
+# ---------------------------------------------------------------- 路径口径
+#
+# ★ 这两个默认值必须与**全项目其余部分**逐字一致, 否则症状是"节点建好了、
+#   面板显示正常、就是没有分享链接 / 就是不生效" —— 最难查的一类。
+#
+#   实测事故 (接手审计, 沙箱复现): 本文件与 conf/mknode.sh、tools/preset_batch.sh
+#   曾经默认成
+#       conf  → $XRAY_BASE/configs          (内核 -confdir 读的是 $XRAY_BASE/conf)
+#       元数据 → $XRAY_BASE/share/tokens     (读的是 $XRAY_BASE/out/share)
+#   后果分两半, 且都不报错:
+#     ① 菜单 13 建的节点落在 configs/, 内核**从来不加载**它;
+#     ② 走预置路径的节点, 分享载荷构建器在 out/share 里找不到元数据 →
+#        链接直接不发 (REALITY 节点尤其: 缺 pbk 就判"未发布"),
+#        上下行分离的 dl_* 参数也一并消失。
+#
+#   为什么是 out/share 而不是 share/tokens: 读的一方有 5 处
+#   (conf/share.sh / conf/node.sh / conf/share_service.sh / conf/lib/cert.sh /
+#    conf/lib/share_payload.py) 早就统一在 out/share, 写的一方只有预置路径
+#   这一处跑偏。改一处对齐五处, 不是反过来。
+#
+#   注意 share_meta 的文件是**直接**放在这个目录下的 (<tag>.json),
+#   没有 tokens 子目录 —— out/share/tokens/ 是另一码事 (旧版订阅令牌存储,
+#   见 conf/share.sh 的 share_migrate)。
+def default_conf_dir():
+    return os.environ.get("XRAY_CONF_DIR") or os.path.join(
+        os.environ.get("XRAY_BASE", "/root/catmi/xray"), "conf")
+
+
+def default_share_dir():
+    return os.environ.get("XRAY_SHARE_DIR") or os.path.join(
+        os.environ.get("XRAY_BASE", "/root/catmi/xray"), "out", "share")
+
+
 # 各档位下 Xray 的监听地址
 LISTEN_FOR = {ACCESS_CDN: "0.0.0.0", ACCESS_NGINX: "127.0.0.1"}
 
@@ -165,6 +198,17 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
         meta["dl_domain"] = opts.get("dl_domain") or dl_addr
     if opts.get("dl_ech"):
         meta["dl_ech"] = True
+    # ---- 自签证书的 pin ----
+    # ★ 必须进 meta: 自签节点的客户端配置要靠它才能连 (Xray 26.x 已移除
+    #   allowInsecure, 只剩 pinnedPeerCertSha256)。meta 是分享链接与 mihomo
+    #   YAML 的共同输入 —— 不写在这里, 链接和产物都拿不到 pin, 用户拿到的
+    #   是一个"证书不匹配"的节点。
+    if opts.get("cert_pin"):
+        meta["pinned_cert_sha256"] = opts["cert_pin"]
+    if opts.get("self_signed"):
+        meta["self_signed"] = True
+    if opts.get("cert_file"):
+        meta["cert_file"] = opts["cert_file"]
 
     # ---- nginx ----
     #
@@ -203,7 +247,7 @@ def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
 
     为什么要有这条:
     `vlessecn.sh` / `vlessxhttpecn.sh` / `Reality.sh` 这三个老脚本是**自己拿
-    heredoc 拼 JSON** 的, 绕过了 plan()/apply_plan()。它们建出来的节点:
+    heredoc 拼 JSON** 的, 绕过了 plan()/_write_plan()。它们建出来的节点:
 
       * 没有分享元数据 → **没有分享链接、不进订阅**
       * 没有校验       → 配错了面板也不知道
@@ -289,12 +333,38 @@ def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
     ech = (ss.get("tlsSettings") or {}).get("echServerKeys")
     if ech:
         meta["ech"] = True
+    # 老脚本建的自签节点: 从片段的 certificates 里反算 pin (adopt 没有 opts,
+    # 拿不到 cert_pin, 只能从证书文件本身算)。
+    _certs = (ss.get("tlsSettings") or {}).get("certificates") or []
+    _cf = (_certs[0] or {}).get("certificateFile") if _certs else None
+    if _cf and os.path.isfile(_cf):
+        import subprocess
+        try:
+            _der = subprocess.run(["openssl", "x509", "-in", _cf, "-outform", "DER"],
+                                  capture_output=True, timeout=15).stdout
+            _pin = subprocess.run(["openssl", "dgst", "-sha256", "-hex"],
+                                  input=_der, capture_output=True, timeout=15) \
+                .stdout.decode().strip().split()[-1]
+            # 自签才需要 pin —— 真证书客户端本来就信, 塞 pin 反而多一层耦合。
+            _subj = subprocess.run(["openssl", "x509", "-in", _cf, "-noout", "-subject"],
+                                   capture_output=True, text=True, timeout=15).stdout
+            _iss = subprocess.run(["openssl", "x509", "-in", _cf, "-noout", "-issuer"],
+                                  capture_output=True, text=True, timeout=15).stdout
+            if _pin and _subj.strip() and _subj == _iss:
+                meta["pinned_cert_sha256"] = _pin
+                meta["self_signed"] = True
+                meta["cert_file"] = _cf
+        except Exception:
+            pass          # 算不出来就不写, 不影响补发布本身
 
     if errors:
         return {"ok": False, "errors": errors}
 
     cdir = conf_dir or os.path.dirname(frag_path)
-    sdir = os.path.join(os.path.dirname(cdir.rstrip("/")), "share", "tokens")
+    # 从片段目录反推节点根目录: <root>/conf → <root>/out/share
+    # (原来写的是 <root>/share/tokens, 与全项目的读取方对不上, 见文件头的路径口径)
+    _root = os.path.dirname(os.path.abspath(cdir.rstrip("/")))
+    sdir = os.environ.get("XRAY_SHARE_DIR") or os.path.join(_root, "out", "share")
     import share_meta
     share_meta.save(sdir, tag, meta)
 
@@ -307,61 +377,6 @@ def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
 
     return {"ok": True, "tag": tag, "meta_path": share_meta.meta_path(sdir, tag),
             "errors": [], "tier": t, "domain": dom}
-
-
-def apply_plan(result, conf_dir, share_dir, nginx_apply=None, nginx_bin="-t"):
-    """把方案落到磁盘。
-
-    nginx 配置放最后, 但它失败时**回滚前两步**。只做"前面失败不动后面"是不够
-    的 —— 反过来的半应用状态更糟: 片段在、分享元数据在、nginx 没配, 于是节点
-    存在但没人转发流量, 用户拿到一个连不上的分享链接, 而面板显示一切正常。
-    """
-    if result["errors"]:
-        return False
-
-    tag = result["fragment"]["inbounds"][0]["tag"]
-    frag_path = os.path.join(conf_dir, f"{tag}.json")
-    import share_meta
-    meta_existed = os.path.exists(share_meta.meta_path(share_dir, tag))
-    meta_before = share_meta.load(share_dir, tag) if meta_existed else None
-
-    node_build.write(frag_path, result["fragment"])
-    share_meta.save(share_dir, tag, result["meta"])
-
-    if not (result["nginx"] and nginx_apply):
-        return True
-
-    import subprocess
-    n = result["nginx"]
-    argv = [sys.executable, nginx_apply,
-            "--domain", n["domain"],
-            "--port", str(n["port"]),
-            "--transport", n["transport"],
-            "--nginx", nginx_bin]
-    # 插入与摘除必须用**同一个 path**, 否则摘的时候按 `域名|/prefix` 找不到
-    # 当初按 `域名` 插进去的那段 —— 删除要精确, 前提就是标识一致。
-    if n.get("path") and n["path"] != "/":
-        argv += ["--path", n["path"]]
-    r = subprocess.run(argv, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stdout, file=sys.stderr)
-        print(r.stderr, file=sys.stderr)
-
-        # 回滚前两步, 不留半应用状态
-        try:
-            os.unlink(frag_path)
-            if meta_existed:
-                if meta_before is not None:
-                    share_meta.save(share_dir, tag, meta_before)
-            else:
-                share_meta.purge(share_dir, tag)
-        except OSError as e:
-            print(f"回滚失败, 请手工清理: {e}", file=sys.stderr)
-        print("[信息] nginx 配置未生效, 已回滚节点与分享元数据", file=sys.stderr)
-        print("      常见原因: 该域名还没有 nginx 站点文件。"
-              "先建站点并配好证书, 再执行本步骤。", file=sys.stderr)
-        return False
-    return True
 
 
 def _print_plan(r, protocol, transport, security, tier):
@@ -385,6 +400,64 @@ def describe(protocol, transport, security, tier):
     return f"{node_build.describe(protocol, transport, security)} · {t}"
 
 
+def _nginx_apply_path():
+    """conf/lib/nginx_apply.py 的路径; 找不到返回 None。"""
+    cand = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nginx_apply.py")
+    return cand if os.path.isfile(cand) else None
+
+
+def _configure_nginx(r):
+    """nginx 档位: 顺手把反代配好。
+
+    ★ 为什么不是"只写片段 + 打印一行提示":
+      菜单 13/15 建出来的 nginx 档节点监听在 127.0.0.1, 如果没人给它配反代,
+      客户端连 域名:443 打不到任何东西 —— 而面板显示节点已建好。
+      sing-box-core 在同一位置是**建完就自动配** (vless.sh:278 / vmess.sh:337)。
+
+    ★ 为什么失败**不回滚节点** (与"一次事务、失败全回滚"的取舍不同):
+      事务式落盘 (一次写片段+元数据+nginx, 失败全回滚) 的顾虑是"节点在、没人转发"的半应用状态。但 X 的发布侧
+      已经有更准的一道闸 —— nodes.share_target() 对
+      「只绑回环 + 没有 nginx」的节点**拒绝发布**并把原因报出来。
+      所以节点留着是安全的: 它不会被发出去, 用户还能去 菜单 8→6 补站点。
+      反过来回滚的代价是"nginx 没配好就完全建不出节点", 那更难用 ——
+      SB 在这一步也是"留着 + 把片段打出来让人手工粘"。
+
+    返回 (ok, 原因)。
+    """
+    n = r.get("nginx")
+    if not n:
+        return True, ""
+    apy = _nginx_apply_path()
+    if not apy:
+        return False, "找不到 conf/lib/nginx_apply.py"
+    import subprocess
+    argv = [sys.executable, apy,
+            "--domain", n["domain"],
+            "--port", str(n["port"]),
+            "--transport", n["transport"]]
+    # ★ 不传 --nginx。它的默认值就是 "-t" (校验命令), 而写成
+    #   ["--nginx", "-t"] 会被 argparse 当成另一个选项, 报
+    #       error: argument --nginx: expected one argument
+    #   —— nginx_apply.py:1359-1363 记过这个坑 (双域名那条路踩的),
+    #   这段代码一直没被调用过, 于是同一个坑又埋了一遍。少传一个参数最稳。
+    #
+    # ★ 也**不传** --origin-tls: nginx 档位下 xray 的入站是 security:none
+    #   (TLS 由 nginx 终结, 见 plan() 的 eff_security), 所以回源是**明文**。
+    #   传了 --origin-tls 就是对一个明文端口说 TLS —— 502。
+    #   (CDN 档位相反: 那边 xray 自己终结 TLS, cdn_auto.sh 才传 --origin-tls。
+    #    同一个 flag 在两个档位含义相反, 不能照抄。)
+    if n.get("path") and n["path"] != "/":
+        argv += ["--path", n["path"]]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except Exception as e:                                  # noqa: BLE001
+        return False, f"调用 nginx_apply.py 失败: {e}"
+    if p.returncode == 0:
+        return True, ""
+    detail = (p.stderr or p.stdout or "").strip().splitlines()
+    return False, (detail[-1] if detail else f"退出码 {p.returncode}")
+
+
 def _write_plan(r, conf_dir, share_dir):
     """把 plan() 的结果落盘。config_json 路径和 CLI 参数路径共用这一份。
 
@@ -392,10 +465,10 @@ def _write_plan(r, conf_dir, share_dir):
     --apply 也只做预演。见调用处的注释。
     """
     import share_meta
-    conf_dir = conf_dir or os.environ.get("XRAY_CONF_DIR", "/root/catmi/xray/configs")
-    share_dir = share_dir or os.environ.get("XRAY_SHARE_DIR", "/root/catmi/xray/share/tokens")
+    conf_dir = conf_dir or default_conf_dir()
+    share_dir = share_dir or default_share_dir()
     os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(share_dir) or share_dir, exist_ok=True)
+    os.makedirs(share_dir, exist_ok=True)
     tag = r["fragment"]["inbounds"][0]["tag"]
     node_build.write(os.path.join(conf_dir, f"{tag}.json"), r["fragment"])
     share_meta.save(share_dir, tag, r["meta"])
@@ -404,9 +477,51 @@ def _write_plan(r, conf_dir, share_dir):
     print(f"已写入分享元数据: {share_dir}/{tag}.json", file=sys.stderr)
     print(f"监听: {ib['listen']}:{ib['port']}", file=sys.stderr)
     print(f"对外: {r['meta']['host']}:{r['meta']['port']}  ({r['meta']['tier']})", file=sys.stderr)
-    if r["nginx"]:
-        print(f"提示: nginx 档位还需配置反代 "
-              f"{r['nginx']['domain']} → 127.0.0.1:{r['nginx']['port']}", file=sys.stderr)
+    _emit_products(r, conf_dir, share_dir, tag)
+
+    if r.get("nginx"):
+        ok, why = _configure_nginx(r)
+        n = r["nginx"]
+        if ok:
+            print(f"已配置 nginx 反代: {n['domain']} → 127.0.0.1:{n['port']}", file=sys.stderr)
+        else:
+            # 节点**保留** —— 见 _configure_nginx 的说明。
+            print("", file=sys.stderr)
+            print(f"[警告] nginx 反代没配上 ({why})", file=sys.stderr)
+            print(f"        这个节点监听 127.0.0.1:{n['port']}, 现在**外部访问不到**。", file=sys.stderr)
+            print(f"        去 菜单 8) 服务与配置 → 6) Nginx 站点管理 给它补一个站点,", file=sys.stderr)
+            print(f"        或先建好 {n['domain']} 的站点与证书再重建本节点。", file=sys.stderr)
+            print("        在配上之前, 它不会被发到订阅里 (发布侧会拒发并说明原因)。", file=sys.stderr)
+    return True
+
+
+def _emit_products(r, conf_dir, share_dir, tag):
+    """客户端产物 + nginx 档位的补齐提示。两条落盘路径共用。"""
+    import os
+    # ---- 客户端产物 ----
+    # ★ 建节点就必须产出 mihomo YAML, 不是"以后想看再转"。
+    #   预置路径 (菜单 13/14/15) 原来一份 out/ 产物都没有 —— 用户建完节点
+    #   手上只有服务端片段, 客户端那份得自己按文档拼, 而 xhttp 的
+    #   download-settings 是两段式、逐项覆盖语义, 手拼必错。
+    #   上下行分离尤其: 它**只存在于服务端配置里**, 不落成产物就没人记得
+    #   这个节点是分离的。
+    #
+    #   生成不出来时**必须说出来** —— 静默少一个文件正是本项目既往缺陷的
+    #   共同形态 (见 conf/lib/to_mihomo.py 的 _why_unsupported)。
+    out_dir = os.environ.get("XRAY_OUT_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(conf_dir.rstrip("/"))), "out")
+    try:
+        import to_mihomo
+        p, why = to_mihomo.write_products(
+            r["fragment"], r["meta"], out_dir, name=r["meta"].get("name"), tag=tag)
+        if p:
+            print(f"已写入客户端产物: {p}", file=sys.stderr)
+        else:
+            print(f"[信息] 没生成 mihomo YAML —— {why}", file=sys.stderr)
+    except Exception as e:                                  # noqa: BLE001
+        # 产物生成失败**不能**让节点创建失败: 服务端片段已经落盘了, 报错退出
+        # 会让用户以为节点没建成, 于是重建一次 —— 结果多出一个节点。
+        print(f"[警告] 生成 mihomo YAML 时出错 (节点本身已建好): {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -431,8 +546,8 @@ if __name__ == "__main__":
     ap.add_argument("--path")
     ap.add_argument("--config-json", help="整份 opts 以 JSON 传入 (给 conf/mknode.sh 用, "
                                           "避免在 bash 里拼 JSON —— 引号地狱)")
-    ap.add_argument("--conf-dir", help="片段输出目录 (默认 /root/catmi/xray/configs)")
-    ap.add_argument("--share-dir", help="分享元数据目录 (默认 .../share/tokens)")
+    ap.add_argument("--conf-dir", help="片段输出目录 (默认 $XRAY_CONF_DIR 或 $XRAY_BASE/conf)")
+    ap.add_argument("--share-dir", help="分享元数据目录 (默认 $XRAY_SHARE_DIR 或 $XRAY_BASE/out/share)")
     ap.add_argument("--apply", action="store_true", help="直接落盘而不只是预演")
     ap.add_argument("--cert-file")
     ap.add_argument("--key-file")

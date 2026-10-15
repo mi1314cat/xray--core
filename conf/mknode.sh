@@ -58,6 +58,179 @@ _mk_source() {
 }
 _MK_TMP=()
 
+# ================================================================ 证书方案
+#
+# 照 sing-box-core 的 sb_ask_cert 的形状设计 (学交互与流程, 不抄配置):
+#
+#     证书方案：
+#       1) 扫描本机已有证书 (certbot/acme/nginx; CA 可信)
+#       2) 手动输入路径
+#       3) 生成自签 (200 天, 客户端经 pin 锁定)
+#
+# 三条路都通往"能建出节点", 且每条都把**代价**写在屏幕上:
+# 真证书=任何客户端都能连; 自签=只有支持 pin 的客户端能连。
+#
+# 为什么必须这样: 原来 X 只有"找到就带、找不到就拒绝", 于是**没有证书的
+# 机器完全建不出 TLS 节点**。SB 的设计是每一条失败路径都有下一步。
+#
+# 输出 (全局): MK_CERT_FILE / MK_CERT_KEY / MK_CERT_DOMAIN / MK_CERT_TRUSTED
+MK_CERT_FILE=""; MK_CERT_KEY=""; MK_CERT_DOMAIN=""; MK_CERT_TRUSTED=""
+
+_mk_ask_cert_scheme() {
+    MK_CERT_FILE=""; MK_CERT_KEY=""; MK_CERT_DOMAIN=""; MK_CERT_TRUSTED=""
+
+    # 环境变量直给 (脚本化 / 复用已有证书)
+    if [[ -n "${XRAY_NODE_CERT:-}" ]]; then
+        local k="${XRAY_NODE_CERT_KEY:-}"
+        [[ -n "$k" ]] || k=$(x_cert_key_for "$XRAY_NODE_CERT" 2>/dev/null) || k=""
+        if [[ -f "$k" ]]; then
+            MK_CERT_FILE="$XRAY_NODE_CERT"; MK_CERT_KEY="$k"
+            MK_CERT_DOMAIN=$(x_cert_domain "$XRAY_NODE_CERT" 2>/dev/null)
+            x_cert_trusted "$XRAY_NODE_CERT" && MK_CERT_TRUSTED="yes" || MK_CERT_TRUSTED="no"
+            _g "  证书 (来自 XRAY_NODE_CERT): $MK_CERT_FILE"
+            return 0
+        fi
+        _e "  XRAY_NODE_CERT 没有可用私钥: ${XRAY_NODE_CERT}"
+        return 1
+    fi
+
+    local ncert=0
+    declare -F x_cert_list_domains >/dev/null 2>&1 && \
+        ncert=$(x_cert_list_domains 2>/dev/null | grep -c . )
+    echo >&2
+    _y "  证书方案 —— 这个节点用什么证书对外服务:"
+    if (( ncert > 0 )); then
+        printf "    %s 1) 扫描本机已有证书%s (检测到 %s 张 CA 可信证书)\n" "$_CYN" "$_RST" "$ncert" >&2
+    else
+        printf "    %s 1) 扫描本机已有证书%s  —— 本机没检测到任何证书\n" "$_CYN" "$_RST" >&2
+    fi
+    printf "    %s 2) 手动输入路径%s (crt / key)\n" "$_CYN" "$_RST" >&2
+    printf "    %s 3) 生成自签证书%s (200 天; 客户端用 pin 锁定)\n" "$_CYN" "$_RST" >&2
+    printf "    真证书 = 任何客户端都能连; 自签 = 只有支持 pin 的客户端能连\n" >&2
+
+    local c=""
+    if [[ "${X_BATCH:-0}" == "1" || ! -t 0 ]]; then
+        c=$(( ncert > 0 )) && c=1 || c=3
+        _o "  非交互: 证书方案 = $c"
+    else
+        read -rp "  选择 [1-3, 回车=1]: " c || c=""
+        c="${c:-1}"
+    fi
+    case "$c" in
+        2) _mk_ask_cert_manual ;;
+        3) _mk_ask_cert_selfgen ;;
+        *) _mk_ask_cert_scan ;;
+    esac
+}
+
+# 方案 1: 扫描并挑选。一项都没有时**自动退到自签**, 不把用户堵在这里。
+_mk_ask_cert_scan() {
+    local rows
+    rows=$(x_cert_list_domains 2>/dev/null)
+    if [[ -z "$rows" ]]; then
+        _y "  本机没检测到任何证书, 改用自签 (客户端用 pin 锁定)"
+        _mk_ask_cert_selfgen
+        return $?
+    fi
+    local -a doms=() crts=() keys=() marks=()
+    local d f k m
+    while IFS=$'\t' read -r d f k m; do
+        doms+=("$d"); crts+=("$f"); keys+=("$k"); marks+=("$m")
+    done <<< "$rows"
+    echo >&2
+    # ★ 逐行打印时**先把数组元素取进普通变量**再用。
+    #   原来写的是 "${marks[$i]:+[$marks[$i]] }" —— ${var:+word} 里的
+    #   `$marks[$i]` 没有花括号, bash 读成"$marks 的值"再接字面量 "[$i]",
+    #   于是屏幕上出现的是 "[[2]]" 这种谁也不认识的东西, 而域名的列宽
+    #   也被它挤歪。实测 (RN): 第三行渲染成 `localhost  [[2]] /home/web/...key`。
+    local i _d _k _m
+    for (( i=0; i<${#doms[@]}; i++ )); do
+        _d="${doms[$i]}"; _k="${keys[$i]}"; _m="${marks[$i]}"
+        [[ -n "$_k" ]] || _m="${_m:-缺私钥}"
+        printf "    %2d) %-34s %s\n" "$((i+1))" "$_d" "${_m:+[$_m]}" >&2
+    done
+    printf "    %2d) 手动输入路径\n" "$(( ${#doms[@]}+1 ))" >&2
+    printf "    %2d) 生成自签\n" "$(( ${#doms[@]}+2 ))" >&2
+    echo >&2
+    local pick=""
+    read -rp "  选择 [1-$((${#doms[@]}+2)), 回车=1]: " pick || pick=""
+    pick="${pick:-1}"
+    if [[ "$pick" == "$(( ${#doms[@]}+1 ))" ]]; then
+        _mk_ask_cert_manual; return $?
+    fi
+    if [[ "$pick" == "$(( ${#doms[@]}+2 ))" ]]; then
+        _mk_ask_cert_selfgen; return $?
+    fi
+    if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#doms[@]} )); then
+        _e "  选择无效"; return 1
+    fi
+    local idx=$((pick-1))
+    if [[ -z "${keys[$idx]}" ]]; then
+        _e "  ${crts[$idx]} 没有对应私钥 —— 换个证书, 或走方案 3 (自签)"
+        return 1
+    fi
+    if ! x_cert_not_expired "${crts[$idx]}"; then
+        _y "  ${crts[$idx]} 已过期 (或 24 小时内到期)"
+        _mk_ask_cert_selfgen; return $?
+    fi
+    MK_CERT_FILE="${crts[$idx]}"; MK_CERT_KEY="${keys[$idx]}"
+    MK_CERT_DOMAIN="${doms[$idx]}"
+    _o "    证书: $MK_CERT_FILE"
+    _o "    私钥: $MK_CERT_KEY"
+    x_cert_trusted "$MK_CERT_FILE" && MK_CERT_TRUSTED="yes" || MK_CERT_TRUSTED="no"
+    _g "  证书: $MK_CERT_DOMAIN ($MK_CERT_FILE)"
+    [[ "$MK_CERT_TRUSTED" == "yes" ]] || _y "  这是自签证书 —— 客户端需要 pin 才能连"
+    return 0
+}
+
+# 方案 2: 手动路径。路径无效时不直接失败, 退到自签 (SB 的做法)。
+_mk_ask_cert_manual() {
+    local f k
+    read -rp "  crt 路径: " f || f=""
+    read -rp "  key 路径: " k || k=""
+    f="${f// /}"; k="${k// /}"
+    if [[ ! -f "$f" ]]; then
+        _y "  证书路径无效, 改用自签"
+        _mk_ask_cert_selfgen; return $?
+    fi
+    [[ -n "$k" && -f "$k" ]] || k=$(x_cert_key_for "$f" 2>/dev/null) || k=""
+    if [[ -z "$k" || ! -f "$k" ]]; then
+        _y "  没找到对应私钥, 改用自签"
+        _mk_ask_cert_selfgen; return $?
+    fi
+    if ! x_cert_not_expired "$f"; then
+        _y "  证书已过期, 改用自签"
+        _mk_ask_cert_selfgen; return $?
+    fi
+    MK_CERT_FILE="$f"; MK_CERT_KEY="$k"
+    MK_CERT_DOMAIN=$(x_cert_domain "$f" 2>/dev/null)
+    [[ -n "$MK_CERT_DOMAIN" ]] || MK_CERT_DOMAIN="$(basename "${f%.crt}")"
+    x_cert_trusted "$f" && MK_CERT_TRUSTED="yes" || MK_CERT_TRUSTED="no"
+    _g "  证书: $MK_CERT_DOMAIN ($MK_CERT_FILE)"
+    return 0
+}
+
+# 方案 3: 自签。伪装域名向用户确认 —— 它会明文出现在握手与分享链接里。
+_mk_ask_cert_selfgen() {
+    local d=""
+    declare -F x_cert_camo_domain >/dev/null 2>&1 && d=$(x_cert_camo_domain 2>/dev/null)
+    [[ -z "$d" ]] && d="$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 8).com"
+    _y "  自签证书的伪装域名: $d"
+    _o "    (它会明文出现在 TLS 握手与分享链接里, 所以借一个真实大站的域名)"
+    local inp=""
+    read -rp "  伪装域名 [回车=$d]: " inp || inp=""
+    [[ -n "${inp// /}" ]] && d="${inp// /}"
+    local pair
+    pair=$(x_cert_selfgen "$d") || { _e "  自签证书生成失败 (openssl 在不在?)"; return 1; }
+    MK_CERT_FILE="${pair%%$'\t'*}"
+    MK_CERT_KEY="${pair#*$'\t'}"
+    MK_CERT_DOMAIN="$d"
+    MK_CERT_TRUSTED="no"
+    _g "  自签证书已生成: $MK_CERT_FILE"
+    _o "    客户端需要 pin (Xray 的 pinnedPeerCertSha256) 才能连 —— 已写进产物"
+    return 0
+}
+
 # ★ 一律 >&2。
 #   下面每个 mk_ask_* 都是 `local p; p=$(mk_ask_xxx)` 这样用的 ——
 #   命令替换会吃掉 stdout, 界面写 stdout 等于**用户什么都看不见**,
@@ -102,8 +275,13 @@ if ! declare -F ui_pick >/dev/null 2>&1; then
 fi
 
 XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
-CONF_DIR="${CONF_DIR:-$XRAY_BASE/configs}"
-SHARE_DIR="${SHARE_DIR:-$XRAY_BASE/share/tokens}"
+# ★ 路径口径必须与全项目一致 —— 这两行曾经是 $XRAY_BASE/configs 与
+#   $XRAY_BASE/share/tokens, 而内核 -confdir 读的是 $XRAY_BASE/conf、
+#   分享载荷读的是 $XRAY_BASE/out/share。后果是**菜单 13 建的节点内核
+#   根本不加载、且拿不到分享链接**, 而屏幕上一路 [OK]。
+#   口径的完整说明见 conf/lib/deploy.py 文件头的「路径口径」。
+CONF_DIR="${XRAY_CONF_DIR:-${CONF_DIR:-$XRAY_BASE/conf}}"
+SHARE_DIR="${XRAY_SHARE_DIR:-${SHARE_DIR:-$XRAY_BASE/out/share}}"
 
 mk_ask_protocol() {
     local p
@@ -208,6 +386,12 @@ mk_run() {
     _mk_source preset.sh || return 1
     _mk_source ports.sh  || return 1
     _mk_source naming.sh 2>/dev/null || true   # 显示名（旗帜 + 前缀）
+    # cert.sh = 证书查找 (x_cert_find_for_domain / x_cert_search_dirs)。
+    # ★ TLS 档必须加载它: 建 TLS 节点时要给入站配一对证书, 否则内核启动成功
+    #   但每次握手都失败 (tls: no certificates configured)。加载不到时
+    #   x_cert_find_for_domain 会是未定义命令 —— 所以下面的调用点必须
+    #   先 declare -F 判存在, 不能直接调。
+    _mk_source cert.sh  2>/dev/null || true
     _mk_source deploy.sh 2>/dev/null || true   # 无 shell 版, 走 python
 
     _o "════════ 用预置创建节点 ════════"
@@ -256,9 +440,11 @@ mk_run() {
     #   用户以为"我用了 XHTTP 所以上下行分开了", 实际上没有。
     local xhttp_mode=""
     if [[ "$tr" == "xhttp" ]]; then
-        local def_m="auto"
+        # 默认档换成**编号** —— ui_ask_num 只认数字, 提示里也就不能再写
+        # "回车=auto" (那是与真实行为相反的说明), 见下面的注释。
+        local def_m="auto" def_i=4
         # REALITY + auto = 合流, 这不是用户以为的那回事 —— 默认改成 stream-up
-        [[ "$sec" == "reality" ]] && def_m="stream-up"
+        [[ "$sec" == "reality" ]] && { def_m="stream-up"; def_i=1; }
         echo
         _y "  XHTTP 的上下行模式:"
         printf "    %s 1) stream-up    上下行分开: 下行独立 GET, 上行独立 POST (推荐)%s\n" "$_CYN" "$_RST"
@@ -268,16 +454,22 @@ mk_run() {
         if [[ "$sec" == "reality" ]]; then
             _y "        注意: REALITY 下 auto 会退化成 stream-one (合流), 所以这里默认不是 auto"
         fi
+        # ★ 这里原来是:
+        #      mc=$(ui_ask_num "上下行模式 [1-4, 回车=$def_m]" 1 4) || return 0
+        #   两个缺陷叠在一起:
+        #   ① 提示写「回车=$def_m」(auto), 而 ui_ask_num 回车一律 return 1
+        #      (= 取消) —— 提示与真实行为**相反**;
+        #   ② `|| return 0` 让 mknode 以**成功**退出, 于是节点没建成、一句错都
+        #      不报就回到菜单。用户只会以为自己点错了。
+        #   现在默认值交给 ui_ask_num 的第 4 个参数, 回车就是真的取默认值。
         local mc
-        mc=$(ui_ask_num "上下行模式 [1-4, 回车=$def_m]" 1 4) || return 0
-        case "${mc:-1}" in
+        mc=$(ui_ask_num "上下行模式" 1 4 "$def_i") || { _y "  已取消, 没有创建任何文件"; return 1; }
+        case "$mc" in
             1) xhttp_mode="stream-up" ;;
             2) xhttp_mode="packet-up" ;;
             3) xhttp_mode="stream-one" ;;
             *) xhttp_mode="auto" ;;
         esac
-        # 回车 = 走默认值: REALITY 下默认分离, 其余默认 auto
-        [[ -z "${mc:-}" ]] && xhttp_mode="$def_m"
         _g "    上下行模式: $xhttp_mode"
     fi
 
@@ -293,11 +485,55 @@ mk_run() {
     #   新约定: x-<协议><两位编号>-<安全>[-CDN]  (x 前缀表明是 Xray 建的)
     local _n; _n=$(x_next_index "$proto" "$CONF_DIR" 2>/dev/null || echo 1)
     local tag; tag=$(x_node_tag "$proto" "$_n" "$sec" "$([[ "$tier" == *cdn* ]] && echo cdn)")
-    local domain=""
+    # 域名与证书 —— 证书方案是一等公民 (照 sing-box-core 的 sb_ask_cert 形状)
+    #
+    # ★ 原来这里只收一个域名, 从不给 cert_file/key_file → 生成的 TLS 入站
+    #   **没有 certificates**。内核的表现最难查:
+    #     xray run -test → Configuration OK; 真启动 → "started";
+    #     而每次握手都失败: tls: no certificates configured
+    #   实测 openssl s_client → no peer certificate available, curl https → 000。
+    #   每一项面板做的检查都过, 节点永远连不上, 而屏幕上看不出缺什么。
+    #
+    # ★ 也不能只是"找不到就拒绝" —— 那会让没有证书的机器完全建不出 TLS 节点。
+    #   SB 在这一层的设计是「永远有出路」: 扫描 → 手动 → 自签。
+    #   三条路都通, 且每条都把**代价**说清楚 (自签=只有支持 pin 的客户端能连)。
+    local domain="" cert_file="" key_file="" cert_trusted="" cert_pin=""
     if [[ "$sec" == "tls" ]]; then
-        read -rp "  申请证书的域名: " domain
-        [[ -z "$domain" ]] && { _e "  TLS 需要域名"; return 1; }
+        _mk_ask_cert_scheme || return 1
+        domain="$MK_CERT_DOMAIN"
+        cert_file="$MK_CERT_FILE"
+        key_file="$MK_CERT_KEY"
+        cert_trusted="$MK_CERT_TRUSTED"
+        # 自签证书必须带 pin —— 否则客户端做正常校验必然失败 (自签不被信任),
+        # 而表现是"配置全对、服务在跑、就是连不上"。
+        if [[ "$cert_trusted" != "yes" ]]; then
+            cert_pin=$(x_cert_client_pin "$cert_file" 1 1 2>/dev/null)
+            if [[ -z "$cert_pin" ]]; then
+                _e "  算不出自签证书的 pin —— 客户端将无法连接, 已中止"
+                return 1
+            fi
+            _g "  客户端 pin (pinnedPeerCertSha256): ${cert_pin:0:16}…"
+        fi
+
+        # ★ CDN 档 + 自签 = 走不通。Cloudflare 回源时校验源站证书,
+        #   自签会被拒 (与 SB 的 cdn_menu.sh 同一条判据)。
+        #   在这里说清楚, 而不是等用户配完 nginx 发现 526。
+        if [[ "$tier" == *cdn* && "$cert_trusted" != "yes" ]]; then
+            echo >&2
+            _e "  接入方式选了 CDN, 但证书是自签的 —— Cloudflare 不接受自签证书"
+            _o "    CDN 回源要求源站证书由受信任 CA 签发 (Let's Encrypt 或 CF Origin)"
+            _o "    可选:"
+            _o "      ① 先在 菜单 5) 证书管理 里申请一张 $domain 的真证书, 再来建"
+            _o "      ② 改用直连档 (自签 + 客户端 pin 是可行的, 只有 CDN 不行)"
+            _o "      ③ 改用 REALITY 档 (不需要证书)"
+            read -rp "  仍要按自签继续 (CDN 回源会失败)? [y/N]: " _go || _go=""
+            case "$_go" in
+                y|Y|yes|YES) _y "  已按你的要求继续 —— 这条节点 CDN 回源大概率不通" ;;
+                *) _o "  已取消, 没有创建任何文件"; return 1 ;;
+            esac
+        fi
     fi
+
 
     # ---- 加密增强: 现调内核生成成对密钥 ----
     #
@@ -334,11 +570,60 @@ mk_run() {
         fi
     fi
 
+    # ---- 回落 (fallbacks) ----
+    #
+    # ★ 只在 **TLS** 入站上有意义, 所以 REALITY 档不问 —— REALITY 有自己的
+    #   回落机制 (realitySettings.target), 两套混用没有意义。
+    #
+    # ★ 屏幕上的说明必须写清"它到底解决什么": 开了回落之后, **任何**能过
+    #   TLS 握手的连接都会被看成一个正常访客 —— 长得像 VLESS 的走代理,
+    #   不像的 (浏览器、扫描器) 转去你的网站。所以那个网站**必须真的在跑**,
+    #   否则探测者会拿到一个 502 的"网站", 比不开还显眼。
+    local fallback_port=""
+    if [[ "$sec" == "tls" && ( "$proto" == "vless" || "$proto" == "trojan" ) ]]; then
+        echo >&2
+        _y "  回落 (fallbacks) —— 不像本协议的流量转到哪?"
+        _o "    效果: 普通浏览器/扫描器打这个端口, 看到的是你的**真实网站**;"
+        _o "          只有真客户端才走代理。抗主动探测最有效的一招。"
+        _o "    前提: 那个网站必须真的在跑, 否则探测者会拿到 502 —— 比不开还显眼。"
+        printf "    %s 1) 不回落%s (默认, 最省事)\n" "$_CYN" "$_RST" >&2
+        printf "    %s 2) 转到一个本机端口%s (例如网站跑在 8080)\n" "$_CYN" "$_RST" >&2
+        local _fbc=""
+        if [[ "${X_BATCH:-0}" == "1" || ! -t 0 ]]; then
+            _fbc="${MK_FALLBACK_PORT:+2}"
+        else
+            read -rp "  选择 [1-2, 回车=1]: " _fbc || _fbc=""
+        fi
+        case "${_fbc:-1}" in
+            2)
+                if [[ -n "${MK_FALLBACK_PORT:-}" ]]; then
+                    fallback_port="$MK_FALLBACK_PORT"
+                else
+                    read -rp "  回落端口 (如 8080): " fallback_port || fallback_port=""
+                    fallback_port="${fallback_port// /}"
+                fi
+                if [[ -n "$fallback_port" ]]; then
+                    if [[ "$fallback_port" =~ ^[0-9]+$ ]] && \
+                       ! ss -lnt 2>/dev/null | grep -qE "[:.]${fallback_port}[[:space:]]"; then
+                        _y "  注意: 本机 127.0.0.1:$fallback_port 上**现在没有服务在听**"
+                        _o "        (如果网站用 systemd/docker 跑在别的命名空间, 这条可能误报)"
+                        read -rp "  仍然使用这个端口? [y/N]: " _go || _go=""
+                        case "$_go" in y|Y|yes|YES) ;; *) fallback_port=""; _o "  已改为不回落";; esac
+                    fi
+                    _g "  回落: 非本协议流量 → 127.0.0.1:$fallback_port"
+                fi
+                ;;
+        esac
+    fi
+
     # python 侧拼 opts, 避免在 bash 里拼 JSON (引号地狱)
     local opts_json
     opts_json=$(MK_PROTOCOL="$proto" MK_TRANSPORT="$tr" MK_SECURITY="$sec" \
                 MK_TAG="$tag" MK_PORT="$port" MK_CRED="$cred" \
                 MK_DOMAIN="$domain" MK_TIER="$tier" \
+                MK_CERT_FILE="$cert_file" MK_KEY_FILE="$key_file" MK_CERT_PIN="$cert_pin" \
+                MK_FALLBACK_PORT="$fallback_port" \
+                MK_CERT_TRUSTED="$cert_trusted" \
                 MK_DECRYPTION="$mk_dec" MK_MLDSA_SEED="$mldsa_seed" MK_MLDSA_VERIFY="$mldsa_verify" \
                 MK_XHTTP_MODE="$xhttp_mode" \
                 python3 - <<'PY'
@@ -349,6 +634,21 @@ opts = {"protocol": proto, "transport": os.environ["MK_TRANSPORT"],
         "port": int(os.environ["MK_PORT"]), "tier": os.environ["MK_TIER"]}
 d = os.environ.get("MK_DOMAIN", "")
 if d: opts["domain"] = d
+# ★ TLS 入站的证书必须一起传下去。只给域名不给证书 = 入站没有 certificates,
+#   内核启动成功但每次握手都失败 (tls: no certificates configured)。
+#   没有这两个字段时 node_build 不会写 tlsSettings.certificates。
+_cf = os.environ.get("MK_CERT_FILE", ""); _kf = os.environ.get("MK_KEY_FILE", "")
+if _cf and _kf:
+    opts["cert_file"] = _cf; opts["key_file"] = _kf
+# 自签: pin 只发给**客户端** (分享链接 / mihomo YAML), 不写进服务端片段的
+# tlsSettings —— 那里没有这个语义, 写了是噪音。
+_fb = os.environ.get("MK_FALLBACK_PORT", "").strip()
+if _fb:
+    opts["fallback_port"] = _fb
+_pin = os.environ.get("MK_CERT_PIN", "")
+if _pin:
+    opts["cert_pin"] = _pin
+    opts["self_signed"] = (os.environ.get("MK_CERT_TRUSTED", "") != "yes")
 # 后量子/签名密钥对 (由 mknode 在建节点那一刻用 xray vlessenc / mldsa65 生成)
 _d = os.environ.get("MK_DECRYPTION", "")
 if _d: opts["encryption"] = _d
@@ -411,16 +711,44 @@ print(json.dumps(o,ensure_ascii=False))" "$opts_json") || _new_opts=""
     fi
 
     # ---- 落盘 ----
+    #
+    # ★ `--apply` 必须给。这一段原来挂着"落盘"的注释, 实际**没有 --apply** ——
+    #   于是 deploy.py 走的是 `_print_plan()` 预演分支: 把片段打印到屏幕上,
+    #   退出码 0, mknode 接着打印「完成。菜单 6 重启服务后生效。」
+    #   **而磁盘上一个文件都没写。**
+    #
+    #   现象最难查: 屏幕上有完整的 JSON、有"完成"、没有任何报错, 用户回到菜单
+    #   却发现节点不存在 —— 只会以为是自己哪一步点错了, 再走一遍。
+    #   (接手审计时用 pty 真按键走到最后一步才发现: 沙箱产物 0 个。)
     local plan_py
     if [[ -r "$_MK_DIR/lib/deploy.py" ]]; then plan_py="$_MK_DIR/lib/deploy.py"
     else plan_py="$(_mk_lib deploy.py)" || return 1
               _MK_TMP+=("$plan_py"); fi
 
     python3 "$plan_py" --config-json "$opts_json" \
-            --conf-dir "$CONF_DIR" --share-dir "$SHARE_DIR" 2>&1 | sed 's/^/  /'
+            --conf-dir "$CONF_DIR" --share-dir "$SHARE_DIR" --apply 2>&1 | sed 's/^/  /'
     local rc=${PIPESTATUS[0]}
-    (( rc == 0 )) && _g "  完成。菜单 6 重启服务后生效。" || _e "  未创建"
-    return "$rc"
+    if (( rc != 0 )); then
+        _e "  未创建"
+        return "$rc"
+    fi
+
+    # ★ 落盘之后**回头看一眼文件在不在** —— 不拿退出码当成功。
+    #   "退出码 0 但什么都没写"正是上面那个缺陷的形态, 而它骗过了所有人。
+    #   片段写没写成, 只有 stat 说了算。
+    local _tag _frag
+    _tag=$(printf '%s' "$opts_json" | python3 -c \
+           'import json,sys; print(json.load(sys.stdin).get("tag",""))' 2>/dev/null)
+    _frag="$CONF_DIR/${_tag:-?}.json"
+    if [[ -n "$_tag" && -f "$_frag" ]]; then
+        _g "  完成。片段: $_frag"
+        _g "  重启服务后生效: 菜单 8) 服务与配置 → 2) 校验配置并重载"
+    else
+        _e "  deploy.py 报了成功, 但片段不在: $_frag"
+        _e "  没有创建成功 —— 请把上面几行完整贴出来"
+        return 1
+    fi
+    return 0
 }
 
 cleanup() { [[ ${#_MK_TMP[@]} -gt 0 ]] && rm -f "${_MK_TMP[@]}"; }
