@@ -7082,6 +7082,63 @@ else
 fi
 rm -rf "$_UNS"
 
+group "全协议: 批量铺共用层 (Reality 曾经永远失败)"
+
+# ★ 实测 (全新安装上跑全协议): Reality 失败, 日志里只有一行
+#     "缺少 conf/lib/proto_ui.sh, 且是批处理调用 —— 拒绝继续"
+#   而 Trojan / SS2022 / Hysteria2 三个都正常 —— 面板上看起来"大部分成功"。
+#
+#   原因: batch.sh 的 resolve_scripts_dir 把协议脚本**平铺**下载到
+#   /tmp/x-batch-scripts/, 却没铺 lib/。而协议脚本按 `dirname $0/lib/` 找
+#   proto_ui.sh —— 找不到, 批处理模式下直接拒绝继续 (守卫本身是对的)。
+#   从**仓库检出目录**跑时走的是另一条分支 (lib/ 就在旁边), 所以开发时看不见。
+
+# ① 静态: 下载那条分支必须铺 lib/
+if sed -n '/^resolve_scripts_dir()/,/^}/p' "$ROOT/conf/batch.sh" \
+     | grep -F '"$tmp/lib"' >/dev/null \
+   && sed -n '/^resolve_scripts_dir()/,/^}/p' "$ROOT/conf/batch.sh" \
+        | grep -F 'proto_ui.sh' >/dev/null; then
+    ok "批量下载协议脚本时会一并铺 lib/ (含 proto_ui.sh)"
+else
+    bad "批量只平铺协议脚本不铺 lib/ → 用到共用层的协议(Reality)必然失败"
+fi
+# ② 共用层要一起验语法 —— 下载损坏的库比没有库更难查
+if sed -n '/^resolve_scripts_dir()/,/^}/p' "$ROOT/conf/batch.sh" \
+     | grep -F 'bash -n "$tmp/lib/$l"' >/dev/null; then
+    ok "铺下来的共用层也过了 bash -n"
+else
+    bad "共用层没验语法 → 下坏了也照跑"
+fi
+
+# ③ 行为: 平铺目录 (只有协议脚本 + lib/) 里跑 Reality.sh,
+#    不许再出现"缺少 conf/lib/proto_ui.sh"
+_FLAT="$TMP/flat-batch"; rm -rf "$_FLAT"; mkdir -p "$_FLAT/lib" "$_FLAT/conf"
+cp "$ROOT/conf/Reality.sh" "$_FLAT/" 2>/dev/null
+for _l in proto_ui.sh ports.sh addr.sh; do cp "$ROOT/conf/lib/$_l" "$_FLAT/lib/" 2>/dev/null; done
+_FLAT_OUT=$(XRAY_CONF_DIR="$_FLAT/conf" X_BATCH=1 X_NO_RELOAD=1 \
+            timeout 40 bash "$_FLAT/Reality.sh" add </dev/null 2>&1 || true)
+if printf '%s' "$_FLAT_OUT" | grep -F '缺少 conf/lib/proto_ui.sh' >/dev/null; then
+    bad "平铺目录下 Reality.sh 仍报缺少共用层"
+else
+    ok "平铺目录下 Reality.sh 能找到共用层 (不再拒绝继续)"
+fi
+rm -rf "$_FLAT"
+
+# ⑬ 装了没有, 不能盯着一个老安装器才会写的文件
+#     实测: 全新装完之后 install.sh 仍报"服务端未安装" —— 因为它判的是
+#     $SRV_ROOT/config.json, 而现在写的是 conf/00-base.json。
+if grep -F '[[ -f "$SRV_ROOT/config.json" ]]' "$ROOT/install.sh" >/dev/null; then
+    bad "install.sh 仍用 config.json 判断装没装 → 刚装完也报未安装"
+else
+    ok "install.sh 按内核/conf 判断装没装 (不再盯 config.json)"
+fi
+# ⑭ 提示要指向**真实存在的**菜单项: 装内核在主菜单 7, 不是 1
+if grep -F '进入面板后选第 1 项' "$ROOT/install.sh" >/dev/null; then
+    bad "install.sh 提示点「第 1 项」→ 那是添加节点, 装内核在 7)"
+else
+    ok "install.sh 的安装提示指向 7) 安装 / 更新内核"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

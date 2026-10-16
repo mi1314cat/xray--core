@@ -180,7 +180,17 @@ _get() { # <仓库相对路径> <目标路径>
 }
 
 # ---------------------------------------------------------------- 状态
-srv_installed() { [[ -d "$SRV_ROOT" && -f "$SRV_ROOT/config.json" ]]; }
+# 装了没有的判据 —— 看**内核在不在**, 而不是看某个具体文件名。
+#
+# ★ 原来判的是 "$SRV_ROOT/config.json"。那是老安装器才会写的文件, 现在的
+#   bin/xray_install.sh 写的是 conf/00-base.json —— 于是**刚装完也报"未安装"**,
+#   用户以为没装上, 又去装一遍。这类"判据盯错了东西"比不判更糟:
+#   它给出的结论是反的, 而且看起来很确定。
+srv_installed() {
+    [[ -x "$SRV_ROOT/xrayls" ]] && return 0
+    [[ -d "$SRV_ROOT/conf" && -n "$(ls -A "$SRV_ROOT/conf" 2>/dev/null)" ]] && return 0
+    return 1
+}
 cli_installed() { [[ -d "$CLI_PREFIX" ]]; }
 srv_service()   { systemctl is-active xrayls 2>/dev/null || echo "inactive"; }
 
@@ -454,7 +464,10 @@ run_server() {
     if srv_installed; then
         say "已安装: $SRV_ROOT (xrayls: $(srv_service))"
     else
-        say "服务端未安装 —— 进入面板后选第 1 项「安装/更新 xray」"
+        # ★ 这里原来写的是"选第 1 项" —— 而面板主菜单 1) 是「添加节点」,
+        #   装内核在 7) 安装/更新内核 → 1)。照着提示点会进建节点向导,
+        #   然后在没有内核的情况下迷路。
+        say "服务端未安装 —— 进入面板后选 7) 安装 / 更新内核 → 1) 安装 / 更新"
     fi
 
     TMP="${TMP:-$(mktemp -d)}"

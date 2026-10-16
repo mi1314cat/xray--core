@@ -87,6 +87,32 @@ resolve_scripts_dir() {
             bash -n "$tmp/$f.sh" || { print_error "conf/$f.sh 语法错误(下载损坏)"; return 1; }
         fi
     done
+
+    # ★ 还要把**共用层**铺到 $tmp/lib/, 否则协议脚本里的
+    #     _PUI="$(dirname $0)/lib/proto_ui.sh"
+    #   必然找不到 —— 而 Reality.sh 在批处理模式下遇到这一条是**直接拒绝继续**的
+    #   (这个守卫本身是对的: 不能带着未定义的 print_* / safe_read 往下跑)。
+    #
+    #   实测症状: 全协议里 Reality **永远 [失败]**, 日志里只有一行
+    #       "缺少 conf/lib/proto_ui.sh, 且是批处理调用 —— 拒绝继续"
+    #   而另外三个协议正常生成 —— 面板上看起来是"大部分成功", 很容易被放过。
+    #
+    #   为什么开发时看不到: 从**仓库检出目录**跑时 `$here/Reality.sh` 就在
+    #   conf/ 下面, 走的是上面那条 `SCRIPT_DIR="$here"` 分支, lib/ 本来就在旁边。
+    #   只有真实安装 (脚本被取到缓存/临时目录) 才会踩到 —— 和之前那个
+    #   "取不到 lib/print.sh" 是同一类: 本地一切正常, 用户那边坏。
+    #
+    #   ports.sh / addr.sh 也有各自的 curl 兜底, 但那要再连一次网,
+    #   在"主站本来就不通"的环境里等于没有兜底, 一并铺上。
+    mkdir -p "$tmp/lib"
+    local l
+    for l in proto_ui.sh ports.sh addr.sh; do
+        if [[ ! -s "$tmp/lib/$l" ]]; then
+            curl -fsSL "$GH_RAW/conf/lib/$l" -o "$tmp/lib/$l" \
+                || { print_error "下载 conf/lib/$l 失败 (协议脚本的共用层)"; return 1; }
+            bash -n "$tmp/lib/$l" || { print_error "conf/lib/$l 语法错误(下载损坏)"; return 1; }
+        fi
+    done
     SCRIPT_DIR="$tmp"
     return 0
 }
