@@ -7119,11 +7119,14 @@ for _need in proto_ui.sh preset.sh preset_batch.sh cdn_auto.sh \
         bad "下载清单缺 $_need → 依赖它的那一段会失败"
     fi
 done
-# ②b 下下来的每个文件都要验语法 —— 损坏的库比没有库更难查
-if printf '%s' "$_RSC" | grep -cE 'bash -n "\$(confdir|tooldir)' | grep -qE '^[2-9]'; then
-    ok "铺下来的脚本与共用层都过了 bash -n"
+# ②b 下下来的每个文件都要验语法, 而且**按类型用对工具** ——
+#     一视同仁 bash -n 会对 .py 报 "syntax error near unexpected token `0,'",
+#     看起来像"下载损坏", 其实是拿错工具验它了。
+if printf '%s' "$_RSC" | grep -F 'ast.parse' >/dev/null \
+   && printf '%s' "$_RSC" | grep -F 'bash -n "$confdir/lib/$l"' >/dev/null; then
+    ok "共用层按类型验语法 (.sh 用 bash -n, .py 用 ast)"
 else
-    bad "下下来的文件没验语法 → 下坏了也照跑"
+    bad "共用层没按类型验语法 → .py 会被 bash -n 误判成损坏"
 fi
 
 # ③ 行为: 平铺目录 (只有协议脚本 + lib/) 里跑 Reality.sh,

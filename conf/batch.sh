@@ -137,6 +137,10 @@ resolve_scripts_dir() {
     #       从仓库检出目录跑不会出现 (conf/lib/ 本来就在一起)。
     #       实测症状: 全协议里「xHTTP 上下行分离」两个组合全失败, 而日志里
     #       是一段 Python traceback, 看起来像代码坏了, 其实是文件没摆在一起。
+    # ★ 校验方式要按**文件类型**分: .sh 用 bash -n, .py 用 python 的 ast。
+    #   一视同仁地 bash -n 会得到
+    #       deploy.py: line 31: syntax error near unexpected token `0,'
+    #   看起来像"下载损坏", 其实是我们拿错工具去验它了 —— 这种报错最误导人。
     local l
     for l in proto_ui.sh ports.sh addr.sh preset.sh \
              deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
@@ -144,7 +148,13 @@ resolve_scripts_dir() {
         if [[ ! -s "$confdir/lib/$l" ]]; then
             curl -fsSL "$GH_RAW/conf/lib/$l" -o "$confdir/lib/$l" \
                 || { print_error "下载 conf/lib/$l 失败 (协议脚本的共用层)"; return 1; }
-            bash -n "$confdir/lib/$l" || { print_error "conf/lib/$l 语法错误(下载损坏)"; return 1; }
+            case "$l" in
+                *.py) python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' \
+                          "$confdir/lib/$l" 2>/dev/null \
+                      || { print_error "conf/lib/$l 语法错误(下载损坏)"; return 1; } ;;
+                *)    bash -n "$confdir/lib/$l" \
+                      || { print_error "conf/lib/$l 语法错误(下载损坏)"; return 1; } ;;
+            esac
         fi
     done
 
