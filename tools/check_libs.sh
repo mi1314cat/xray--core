@@ -7328,6 +7328,18 @@ if grep -F 'rs.get("shortIds")' "$ROOT/conf/lib/deploy.py" >/dev/null; then
 else
     bad "adopt 没处理 shortIds 列表 → shortId 补不出来"
 fi
+# ★ 顺序: 老那句 `meta["short_id"] = rs.get("shortId") or ""` 在服务端片段上
+#   永远是空串, 如果排在"从 shortIds 列表取"之后, 就会把它**覆盖掉** ——
+#   实测就是这样 (public_key 补上了, short_id 仍是空)。
+# 判据: 那句 `= rs.get("shortId") or ""` 必须落在 else 分支里 —— 否则它会
+# 无条件覆盖上面从 shortIds 列表取到的值 (实测就是这样)。
+_sp_block=$(sed -n '/shortId: 服务端存的是/,/meta\["fingerprint"\]/p' "$ROOT/conf/lib/deploy.py")
+if printf '%s' "$_sp_block" | grep -F 'meta["short_id"] = _sids[0]' >/dev/null \
+   && printf '%s' "$_sp_block" | grep -F 'else' >/dev/null; then
+    ok "short_id 的取值顺序对 (列表优先, 空串那句在 else 分支里)"
+else
+    bad "从 shortIds 取到的 short_id 会被后面那句空串无条件覆盖"
+fi
 
 # ⑩ 补发布时的对外地址要按"这个节点怎么被访问"给
 #    现场: 10 个节点只进了 1 个订阅, 两个原因都是地址给错导致的**拒发**:

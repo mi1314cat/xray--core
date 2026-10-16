@@ -516,10 +516,16 @@ def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
         if not _pub:
             _pub = _reality_pubkey_from_private(rs.get("privateKey"))
         meta["public_key"] = _pub
+        # shortId: 服务端存的是**列表** shortIds, 不是单个 shortId。
+        # ★ 顺序很要紧: 下面那句 `meta["short_id"] = rs.get("shortId") or ""`
+        #   在服务端片段上**永远是空串**, 写在后面就会把上面刚取到的值覆盖掉。
+        #   (实测就是这样: public_key 补上了, short_id 仍是空 —— 而 REALITY
+        #    的分享链接 sid 为空时, 客户端要么连不上要么被静默丢弃。)
         _sids = rs.get("shortIds")
         if not rs.get("shortId") and isinstance(_sids, list) and _sids:
             meta["short_id"] = _sids[0]
-        meta["short_id"] = rs.get("shortId") or ""
+        else:
+            meta["short_id"] = rs.get("shortId") or ""
         meta["fingerprint"] = rs.get("fingerprint") or "chrome"
     if clients and clients[0].get("encryption") and clients[0]["encryption"] != "none":
         meta["encryption"] = clients[0]["encryption"]
