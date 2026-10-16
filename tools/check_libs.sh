@@ -7093,21 +7093,28 @@ group "全协议: 批量铺共用层 (Reality 曾经永远失败)"
 #   proto_ui.sh —— 找不到, 批处理模式下直接拒绝继续 (守卫本身是对的)。
 #   从**仓库检出目录**跑时走的是另一条分支 (lib/ 就在旁边), 所以开发时看不见。
 
-# ① 静态: 下载那条分支必须铺 lib/
-if sed -n '/^resolve_scripts_dir()/,/^}/p' "$ROOT/conf/batch.sh" \
-     | grep -F '"$tmp/lib"' >/dev/null \
-   && sed -n '/^resolve_scripts_dir()/,/^}/p' "$ROOT/conf/batch.sh" \
-        | grep -F 'proto_ui.sh' >/dev/null; then
-    ok "批量下载协议脚本时会一并铺 lib/ (含 proto_ui.sh)"
+# ① 静态: 下载那条分支必须**照仓库形状**摆 (conf/ + conf/lib/ + tools/)
+_RSC=$(sed -n '/^resolve_scripts_dir()/,/^}/p' "$ROOT/conf/batch.sh")
+if printf '%s' "$_RSC" | grep -F 'confdir/lib' >/dev/null \
+   && printf '%s' "$_RSC" | grep -F 'tooldir' >/dev/null \
+   && printf '%s' "$_RSC" | grep -F 'SCRIPT_DIR="$confdir"' >/dev/null; then
+    ok "批量下载按仓库形状摆 (conf/ + conf/lib/ + tools/), SCRIPT_DIR 指 conf/"
 else
-    bad "批量只平铺协议脚本不铺 lib/ → 用到共用层的协议(Reality)必然失败"
+    bad "批量把脚本平铺下载 → 相对路径全断 (Reality 与 上下行分离 会一起失败)"
 fi
-# ② 共用层要一起验语法 —— 下载损坏的库比没有库更难查
-if sed -n '/^resolve_scripts_dir()/,/^}/p' "$ROOT/conf/batch.sh" \
-     | grep -F 'bash -n "$tmp/lib/$l"' >/dev/null; then
-    ok "铺下来的共用层也过了 bash -n"
+# ② 两条腿要的同伴文件都必须在下载清单里
+for _need in proto_ui.sh preset.sh preset_batch.sh cdn_auto.sh; do
+    if printf '%s' "$_RSC" | grep -F "$_need" >/dev/null; then
+        ok "下载清单含 $_need"
+    else
+        bad "下载清单缺 $_need → 依赖它的那一段会失败"
+    fi
+done
+# ②b 下下来的每个文件都要验语法 —— 损坏的库比没有库更难查
+if printf '%s' "$_RSC" | grep -cE 'bash -n "\$(confdir|tooldir)' | grep -qE '^[2-9]'; then
+    ok "铺下来的脚本与共用层都过了 bash -n"
 else
-    bad "共用层没验语法 → 下坏了也照跑"
+    bad "下下来的文件没验语法 → 下坏了也照跑"
 fi
 
 # ③ 行为: 平铺目录 (只有协议脚本 + lib/) 里跑 Reality.sh,

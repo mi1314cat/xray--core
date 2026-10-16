@@ -77,43 +77,55 @@ resolve_scripts_dir() {
         SCRIPT_DIR="$here"
         return 0
     fi
+    # ★ 下载之后必须**照着仓库的目录形状**摆, 不能平铺。
+    #
+    #   协议脚本与 tools/ 下的脚本都是按**相对自身**的位置找同伴的:
+    #       Reality.sh     → $(dirname $0)/lib/proto_ui.sh
+    #       preset_batch.sh→ $(dirname $0)/cdn_auto.sh 与 ../conf/lib/*.py
+    #   所以布局必须是
+    #       $tmp/conf/<协议>.sh   $tmp/conf/lib/*   $tmp/tools/<工具>.sh
+    #   而 SCRIPT_DIR 指向 $tmp/conf —— 这样上面那些相对路径才成立。
+    #
+    #   平铺过一版, 结果是**真实安装上两条腿同时瘸**, 而且症状都不像"路径问题":
+    #     · Reality: 日志一行"缺少 conf/lib/proto_ui.sh" → 只有它失败;
+    #     · 上下行分离: "bash: /tmp/x-batch-scripts/../tools/preset_batch.sh:
+    #       No such file or directory" → 三个组合一个都没有。
+    #   从**仓库检出目录**跑永远看不到 (那边 conf/ 与 tools/ 本来就在位),
+    #   所以开发时一路绿灯。
     local tmp="${X_BATCH_TMP_DIR:-/tmp/x-batch-scripts}"
-    mkdir -p "$tmp"
+    local confdir="$tmp/conf" tooldir="$tmp/tools"
+    mkdir -p "$confdir/lib" "$tooldir"
     local f
     for f in "${BATCH_PROTOS[@]}"; do
-        if [[ ! -s "$tmp/$f.sh" ]]; then
-            curl -fsSL "$GH_RAW/conf/$f.sh" -o "$tmp/$f.sh" \
+        if [[ ! -s "$confdir/$f.sh" ]]; then
+            curl -fsSL "$GH_RAW/conf/$f.sh" -o "$confdir/$f.sh" \
                 || { print_error "下载 conf/$f.sh 失败"; return 1; }
-            bash -n "$tmp/$f.sh" || { print_error "conf/$f.sh 语法错误(下载损坏)"; return 1; }
+            bash -n "$confdir/$f.sh" || { print_error "conf/$f.sh 语法错误(下载损坏)"; return 1; }
         fi
     done
 
-    # ★ 还要把**共用层**铺到 $tmp/lib/, 否则协议脚本里的
-    #     _PUI="$(dirname $0)/lib/proto_ui.sh"
-    #   必然找不到 —— 而 Reality.sh 在批处理模式下遇到这一条是**直接拒绝继续**的
-    #   (这个守卫本身是对的: 不能带着未定义的 print_* / safe_read 往下跑)。
-    #
-    #   实测症状: 全协议里 Reality **永远 [失败]**, 日志里只有一行
-    #       "缺少 conf/lib/proto_ui.sh, 且是批处理调用 —— 拒绝继续"
-    #   而另外三个协议正常生成 —— 面板上看起来是"大部分成功", 很容易被放过。
-    #
-    #   为什么开发时看不到: 从**仓库检出目录**跑时 `$here/Reality.sh` 就在
-    #   conf/ 下面, 走的是上面那条 `SCRIPT_DIR="$here"` 分支, lib/ 本来就在旁边。
-    #   只有真实安装 (脚本被取到缓存/临时目录) 才会踩到 —— 和之前那个
-    #   "取不到 lib/print.sh" 是同一类: 本地一切正常, 用户那边坏。
-    #
-    #   ports.sh / addr.sh 也有各自的 curl 兜底, 但那要再连一次网,
-    #   在"主站本来就不通"的环境里等于没有兜底, 一并铺上。
-    mkdir -p "$tmp/lib"
+    # 共用层: 协议脚本按 dirname($0)/lib/ 找它, 找不到时批处理模式直接拒绝继续
     local l
-    for l in proto_ui.sh ports.sh addr.sh; do
-        if [[ ! -s "$tmp/lib/$l" ]]; then
-            curl -fsSL "$GH_RAW/conf/lib/$l" -o "$tmp/lib/$l" \
+    for l in proto_ui.sh ports.sh addr.sh preset.sh; do
+        if [[ ! -s "$confdir/lib/$l" ]]; then
+            curl -fsSL "$GH_RAW/conf/lib/$l" -o "$confdir/lib/$l" \
                 || { print_error "下载 conf/lib/$l 失败 (协议脚本的共用层)"; return 1; }
-            bash -n "$tmp/lib/$l" || { print_error "conf/lib/$l 语法错误(下载损坏)"; return 1; }
+            bash -n "$confdir/lib/$l" || { print_error "conf/lib/$l 语法错误(下载损坏)"; return 1; }
         fi
     done
-    SCRIPT_DIR="$tmp"
+
+    # 上下行分离走 preset_batch.sh; 它又会按 dirname($0)/cdn_auto.sh 找同伴
+    local t
+    for t in preset_batch.sh cdn_auto.sh; do
+        if [[ ! -s "$tooldir/$t" ]]; then
+            curl -fsSL "$GH_RAW/tools/$t" -o "$tooldir/$t" \
+                || { print_error "下载 tools/$t 失败 (上下行分离要用)"; return 1; }
+            bash -n "$tooldir/$t" || { print_error "tools/$t 语法错误(下载损坏)"; return 1; }
+        fi
+    done
+
+    # 组装写的是 SCRIPT_DIR/../tools/... , 所以 SCRIPT_DIR 必须是 conf/ 那一层
+    SCRIPT_DIR="$confdir"
     return 0
 }
 
