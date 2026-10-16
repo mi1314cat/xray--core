@@ -391,6 +391,37 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
     return {"fragment": fragment, "meta": meta, "nginx": nginx, "errors": []}
 
 
+def _reality_pubkey_from_private(private_key):
+    """由 REALITY 私钥推出公钥 (`xray x25519 -i <私钥>`)。推不出来返回 ""。
+
+    服务端片段只存私钥; 而分享链接里必须有公钥 (pbk), 否则客户端连不上、
+    链接也建不出来。内核本来就有这个子命令, 现推一次比要求调用方再传一遍可靠
+    (传两遍就一定有一遍会漏)。
+    """
+    pk = (private_key or "").strip()
+    if not pk:
+        return ""
+    import os as _os
+    import re as _re
+    import shutil
+    import subprocess
+    for cand in (_os.path.join(_os.environ.get("XRAY_BASE", "/root/catmi/xray"), "xrayls"),
+                 "xray"):
+        exe = cand if _os.path.isabs(cand) else shutil.which(cand)
+        if not exe or not _os.path.isfile(exe):
+            continue
+        try:
+            out = subprocess.run([exe, "x25519", "-i", pk], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except Exception:                                   # noqa: BLE001
+            continue
+        m = _re.search(r'^\s*(?:Password \(PublicKey\)|Password|Public key)\s*:\s*(\S+)',
+                       out, re.M)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
     """给一个**已经写好的**片段补上分享元数据 (以及可选的 nginx 段)。
 
@@ -471,7 +502,21 @@ def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
         meta["host_header"] = dom or meta["host"]
     if security == "reality":
         rs = ss.get("realitySettings") or {}
-        meta["public_key"] = rs.get("publicKey") or rs.get("password") or ""
+        # ★ 服务端片段里**没有**公钥 —— 只有 privateKey 与 shortIds(列表)。
+        #   公钥要用 `xray x25519 -i <privateKey>` 现推 (实测推出来的值与
+        #   协议脚本自己写进分享链接的 pbk 逐字节相同)。
+        #   以前这里读的是 publicKey/password —— 服务端片段里都不存在, 于是
+        #   补出来的 public_key 是**空串**; 而 REAILTY 的分享链接必须有 pbk,
+        #   建不出来 → 节点进不了订阅。实测: 全协议 10 个节点里, 两个
+        #   REALITY 系的 (Reality / Trojan) 就是这个原因漏掉的, 而屏幕上
+        #   一切正常 (协议脚本自己写的那份链接是对的, 与订阅无关)。
+        _pub = rs.get("publicKey") or rs.get("password") or ""
+        if not _pub:
+            _pub = _reality_pubkey_from_private(rs.get("privateKey"))
+        meta["public_key"] = _pub
+        _sids = rs.get("shortIds")
+        if not rs.get("shortId") and isinstance(_sids, list) and _sids:
+            meta["short_id"] = _sids[0]
         meta["short_id"] = rs.get("shortId") or ""
         meta["fingerprint"] = rs.get("fingerprint") or "chrome"
     if clients and clients[0].get("encryption") and clients[0]["encryption"] != "none":

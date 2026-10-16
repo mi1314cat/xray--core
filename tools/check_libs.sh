@@ -7312,6 +7312,23 @@ else
     bad "这些脚本调了 py 却没定义 (command not found, 且常被 2>/dev/null 吞掉)" "$_UNDEF2"
 fi
 
+# ⑨ REALITY 的公钥必须能补出来
+#    现场: 服务端片段里只有 privateKey 与 shortIds(列表), **没有公钥**;
+#    而分享链接必须有 pbk。以前 adopt 读的是 publicKey/password —— 都不存在,
+#    补出来是空串 → 那两个 REALITY 系的节点进不了订阅 (实测 10 个里漏 2 个),
+#    而屏幕上一切正常 (协议脚本自己写的链接是对的, 与订阅无关)。
+if grep -F '_reality_pubkey_from_private' "$ROOT/conf/lib/deploy.py" >/dev/null \
+   && grep -F 'x25519' "$ROOT/conf/lib/deploy.py" >/dev/null; then
+    ok "adopt 会用 x25519 由私钥推出 REALITY 公钥"
+else
+    bad "adopt 补不出 REALITY 公钥 → 那两个节点永远进不了订阅"
+fi
+if grep -F 'rs.get("shortIds")' "$ROOT/conf/lib/deploy.py" >/dev/null; then
+    ok "adopt 会从 shortIds 列表里取 shortId (服务端存的是列表)"
+else
+    bad "adopt 没处理 shortIds 列表 → shortId 补不出来"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
