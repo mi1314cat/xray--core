@@ -7108,7 +7108,11 @@ else
     bad "批量把脚本平铺下载 → 相对路径全断 (Reality 与 上下行分离 会一起失败)"
 fi
 # ② 两条腿要的同伴文件都必须在下载清单里
-for _need in proto_ui.sh preset.sh preset_batch.sh cdn_auto.sh; do
+#    .py 那几个尤其重要: deploy.py 里是 `import node_build` / `import to_mihomo`,
+#    逐个下到临时文件就 import 不到兄弟模块 (实测报 No module named 'node_build',
+#    症状是全协议的上下行分离两个组合全失败, 而日志里是一段 Python traceback)。
+for _need in proto_ui.sh preset.sh preset_batch.sh cdn_auto.sh \
+             deploy.py node_build.py to_mihomo.py nodes.py share_meta.py; do
     if printf '%s' "$_RSC" | grep -F "$_need" >/dev/null; then
         ok "下载清单含 $_need"
     else

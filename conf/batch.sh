@@ -122,9 +122,22 @@ resolve_scripts_dir() {
         fi
     done
 
-    # 共用层: 协议脚本按 dirname($0)/lib/ 找它, 找不到时批处理模式直接拒绝继续
+    # 共用层。两类都在这里:
+    #   · 协议脚本按 dirname($0)/lib/ 找的 .sh (找不到时批处理模式直接拒绝继续);
+    #   · preset_batch.sh → deploy.py 这条链要的 .py。
+    #     ★ .py 必须**整组一起下到同一个目录**: deploy.py 里是
+    #       `import node_build` / `import to_mihomo` / `import nodes`,
+    #       而 preset_batch.sh 的 _lib 是**逐个下到临时文件**的
+    #       (/tmp/deploy.py.XXXXXX) —— 那样 sys.path[0] 是 /tmp,
+    #       兄弟模块一个都 import 不到, 报的是
+    #           ModuleNotFoundError: No module named 'node_build'
+    #       从仓库检出目录跑不会出现 (conf/lib/ 本来就在一起)。
+    #       实测症状: 全协议里「xHTTP 上下行分离」两个组合全失败, 而日志里
+    #       是一段 Python traceback, 看起来像代码坏了, 其实是文件没摆在一起。
     local l
-    for l in proto_ui.sh ports.sh addr.sh preset.sh; do
+    for l in proto_ui.sh ports.sh addr.sh preset.sh \
+             deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
+             naming.py nginx_apply.py; do
         if [[ ! -s "$confdir/lib/$l" ]]; then
             curl -fsSL "$GH_RAW/conf/lib/$l" -o "$confdir/lib/$l" \
                 || { print_error "下载 conf/lib/$l 失败 (协议脚本的共用层)"; return 1; }
