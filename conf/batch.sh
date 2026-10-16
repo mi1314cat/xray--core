@@ -144,7 +144,7 @@ resolve_scripts_dir() {
     local l
     for l in proto_ui.sh ports.sh addr.sh preset.sh \
              deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
-             naming.py nginx_apply.py; do
+             naming.py nginx_apply.py share_payload.py token_store.py; do
         if [[ ! -s "$confdir/lib/$l" ]]; then
             curl -fsSL "$GH_RAW/conf/lib/$l" -o "$confdir/lib/$l" \
                 || { print_error "下载 conf/lib/$l 失败 (协议脚本的共用层)"; return 1; }
@@ -206,11 +206,16 @@ fi
 resolve_share_sh() {
     local here f
     here="$(dirname "${BASH_SOURCE[0]:-$0}")"
-    for f in "$here/share.sh" "$XRAY_BASE/../conf/share.sh"; do
+    # ★ 下载目标必须是 **conf/ 那一层**: share.sh 自己按 `dirname($0)/lib/`
+    #   找它的依赖 (share_meta.py 等)。以前下到 $tmp/share.sh —— 那里没有 lib/,
+    #   于是"订阅链接没有自动生成"永远是那句含糊的提示, 而真正的原因没人看得见。
+    #   实测: 全协议跑完提示"找不到 conf/share.sh", 而 curl 是通的。
+    local confdir="${X_BATCH_TMP_DIR:-/tmp/x-batch-scripts}/conf"
+    mkdir -p "$confdir"
+    for f in "$here/share.sh" "$confdir/share.sh" "$XRAY_BASE/conf/share.sh"; do
         [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
     done
-    local tmp="${X_BATCH_TMP_DIR:-/tmp/x-batch-scripts}/share.sh"
-    mkdir -p "$(dirname "$tmp")"
+    local tmp="$confdir/share.sh"
     curl -fsSL "$GH_RAW/conf/share.sh" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]] \
         && { printf '%s' "$tmp"; return 0; }
     return 1
@@ -491,6 +496,33 @@ batch_main() {
         fi
     fi
     if [[ "${X_BATCH_SPLIT:-1}" == "1" ]] && declare -F x_split_modes >/dev/null 2>&1; then
+        # ★ REALITY 密钥对: **有内核就自己生成**, 不要逼用户去手抄。
+        #   全协议的意义就是"一次把形态配齐", 而三个组合里有两个用到 REALITY。
+        #   以前不设 X_BATCH_REALITY_* 就跳过 reality-cdn、而 cdn-reality 直接
+        #   失败 (下行 REALITY 缺 password/shortId) —— 用户看到的是一半能成,
+        #   还得自己去翻文档找该设哪两个变量。
+        #   内核的 x25519 子命令本来就在手边 (面板装的 xrayls 就有)。
+        if [[ -z "${X_BATCH_REALITY_PRIVATE_KEY:-}" || -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
+            local _xb _kp _pk _pub
+            _xb="$(command -v xray 2>/dev/null || true)"
+            [[ -x "$_xb" ]] || _xb="$XRAY_BASE/xrayls"
+            if [[ -x "$_xb" ]]; then
+                _kp=$("$_xb" x25519 2>/dev/null || true)
+                # 不用 `| head -1`: 管道里 head 会让产出方吃 SIGPIPE
+                _pk=$(printf '%s\n' "$_kp" | awk -F': *' '/^PrivateKey:/{print $2; exit}')
+                _pub=$(printf '%s\n' "$_kp" | awk -F': *' '/^Password:/{print $2; exit}')
+                if [[ -n "$_pk" && -n "$_pub" ]]; then
+                    export X_BATCH_REALITY_PRIVATE_KEY="$_pk"
+                    export X_BATCH_REALITY_PUBLIC_KEY="$_pub"
+                    print_info "  已用内核现生成 REALITY 密钥对 (分离组合要用)"
+                fi
+            fi
+        fi
+        # 下行 REALITY 还要一个 shortId: 十六进制, 长度 <= 16 且偶数位
+        if [[ -z "${X_BATCH_REALITY_SHORT_ID:-}" ]]; then
+            export X_BATCH_REALITY_SHORT_ID="$(openssl rand -hex 4 2>/dev/null || printf 'a1b2c3d4')"
+        fi
+
         local -a _split_specs=()
         local _sp
         for _sp in cdn-cdn cdn-reality reality-cdn; do

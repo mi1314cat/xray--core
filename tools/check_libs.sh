@@ -7112,13 +7112,31 @@ fi
 #    逐个下到临时文件就 import 不到兄弟模块 (实测报 No module named 'node_build',
 #    症状是全协议的上下行分离两个组合全失败, 而日志里是一段 Python traceback)。
 for _need in proto_ui.sh preset.sh preset_batch.sh cdn_auto.sh \
-             deploy.py node_build.py to_mihomo.py nodes.py share_meta.py; do
+             deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
+             share_payload.py token_store.py; do
     if printf '%s' "$_RSC" | grep -F "$_need" >/dev/null; then
         ok "下载清单含 $_need"
     else
         bad "下载清单缺 $_need → 依赖它的那一段会失败"
     fi
 done
+# ②a2 share.sh 必须下到 conf/ 那一层 —— 它按 dirname($0)/lib/ 找依赖,
+#     下到 $tmp/share.sh 的话那边没有 lib/, 症状是"订阅链接没有自动生成"
+#     而 curl 明明是通的 (实测)。
+if sed -n '/^resolve_share_sh()/,/^}/p' "$ROOT/conf/batch.sh" | grep -F 'confdir/share.sh' >/dev/null; then
+    ok "share.sh 下到 conf/ 那一层 (它自己的 lib/ 才找得到)"
+else
+    bad "share.sh 下到没有 lib/ 的地方 → 订阅链接永远生成不出来"
+fi
+
+# ②a3 分离那一段要用 REALITY 密钥对; 有内核就该自己生成, 不逼用户手填
+if sed -n '/REALITY 密钥对: \*\*有内核就自己生成/,/^        fi$/p' "$ROOT/conf/batch.sh" \
+     | grep -F 'x25519' >/dev/null; then
+    ok "全协议会自己生成 REALITY 密钥对 (三个分离组合都跑得起来)"
+else
+    bad "分离组合要靠手设 X_BATCH_REALITY_*, 否则 cdn-reality 必失败"
+fi
+
 # ②b 下下来的每个文件都要验语法, 而且**按类型用对工具** ——
 #     一视同仁 bash -n 会对 .py 报 "syntax error near unexpected token `0,'",
 #     看起来像"下载损坏", 其实是拿错工具验它了。
