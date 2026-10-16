@@ -6913,31 +6913,59 @@ else
     bad "ECH 发现行为不对: $_ECHG"
 fi
 
-# ⑥ VLESS 会话加密 (Xray 独有) 必须挡在产物之前
-#    实测 mihomo v1.19.32: `invaild vless encryption value` → **整份配置**不加载,
-#    不是"这个节点不可用", 是所有节点一起起不来。
-if grep -F 'def enc_unsupported' "$ROOT/conf/lib/to_mihomo.py" >/dev/null \
-   && sed -n '/^def proxy/,/^def /p' "$ROOT/conf/lib/to_mihomo.py" \
-        | grep -F 'if enc_unsupported(node):' >/dev/null; then
-    ok "Xray 独有会话加密的节点不会产出 mihomo YAML (带原因)"
-else
-    bad "会产出 mihomo 加载不了的 YAML → 用户整份配置起不来"
-fi
+# ⑥ VLESS 会话加密: 服务端用 decryption, 客户端用 encryption, **一对, 不能混**
+#
+#    ★ 这一条纠正的是我上一版写错的判据。当时看到 mihomo 报
+#        proxy 0: invaild vless encryption value: mlkem768x25519plus.native.600s.…
+#      就下结论"mihomo 不支持 Xray 的后量子会话加密", 于是让产物一律拒绝。
+#      实测追问下去才发现: mihomo **支持**, 它只认客户端那一种形态
+#          mlkem768x25519plus.native.0rtt.<客户端公钥>   → 接受
+#          mlkem768x25519plus.native.600s.<服务端私钥>   → 拒绝
+#      而面板把**服务端那一半**写进了客户端产物 —— 真正该修的是这个。
+#      错误判据的代价是把本来能用的节点拒之门外。
 _ENCG=$(XRAY_ROOT="$ROOT" python3 - <<'PYX'
 import os, sys
 sys.path.insert(0, os.path.join(os.environ["XRAY_ROOT"], "conf", "lib"))
 import to_mihomo as M
-bad = M.enc_unsupported({"protocol": "vless",
-                         "encryption": "mlkem768x25519plus.native.600s.AAAA"})
-ok1 = M.enc_unsupported({"protocol": "vless", "encryption": "none"})
-ok2 = M.enc_unsupported({"protocol": "trojan", "encryption": "whatever"})
-print("bad=%s,none=%s,trojan=%s" % ("caught" if bad else "MISS",
-                                    "pass" if not ok1 else "FALSE",
-                                    "pass" if not ok2 else "FALSE"))
+def u(**kw):
+    kw.setdefault("protocol", "vless")
+    return bool(M.enc_unsupported(kw))
+cases = [
+    ("none",            u(encryption="none"), False),
+    ("0rtt(客户端形态)",  u(encryption="mlkem768x25519plus.native.0rtt.CLIENT"), False),
+    ("600s(服务端形态)",  u(encryption="mlkem768x25519plus.native.600s.SERVER"), True),
+    ("其它形态",         u(encryption="xorpub"), True),
+    ("服务端要/客户端无",  u(encryption="none", vless_srv_decryption="mlkem768x25519plus.native.600s.X"), True),
+    ("非 vless",         u(protocol="trojan", encryption="whatever"), False),
+]
+bad = [n for n, got, want in cases if got != want]
+print("bad=%s" % (",".join(bad) if bad else "none"))
 PYX
 )
-assert_eq "$_ENCG" "bad=caught,none=pass,trojan=pass" \
-    "会话加密判据: 挡住 Xray 独有串, 放过 none 与非 VLESS"
+assert_eq "$_ENCG" "bad=none" \
+    "会话加密判据: 放过 0rtt 客户端形态, 挡住 600s 服务端形态与'服务端要、客户端无'"
+
+# ⑥b 客户端那一半只能来自元数据 —— 不能拿服务端 decryption 顶上
+if grep -F 'node["encryption"] = (meta.get("encryption") or "").strip() or "none"' \
+     "$ROOT/conf/lib/to_mihomo.py" >/dev/null; then
+    ok "客户端 encryption 只取自元数据 (不再回落到服务端 decryption)"
+else
+    bad "客户端 encryption 仍会回落到服务端 decryption → 拿服务端私钥去握手"
+fi
+# ⑥c 一次 vlessenc 要同时取到两半
+if grep -F '"encryption"[[:space:]]*:[[:space:]]*"[^"]*"' "$ROOT/conf/mknode.sh" >/dev/null \
+   && grep -F '"decryption"[[:space:]]*:[[:space:]]*"[^"]*"' "$ROOT/conf/mknode.sh" >/dev/null; then
+    ok "菜单 13 一次 vlessenc 同时取 decryption 与 encryption"
+else
+    bad "菜单 13 只取了服务端那一半 → 客户端产物拿不到可用的密钥"
+fi
+# ⑥d 服务端片段里的 decryption 仍必须是服务端那一半
+if grep -F 'out = {"clients": [client], "decryption": opts["encryption"]}' \
+     "$ROOT/conf/lib/node_build.py" >/dev/null; then
+    ok "服务端片段写的是 decryption (服务端那一半)"
+else
+    bad "服务端片段的 decryption 取值被改动了 —— 那会让服务端自己握手失败"
+fi
 
 # ⑦ 菜单 13 要能**独立**选 ECH (不绑在后量子预置上)
 if sed -n '/ECH (加密 ClientHello/,/ECH: 不开/p' "$ROOT/conf/mknode.sh" | grep -c . >/dev/null \

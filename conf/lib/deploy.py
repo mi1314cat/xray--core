@@ -237,8 +237,30 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
         meta["public_key"] = opts.get("public_key")
         meta["short_id"] = opts.get("short_id", "")
         meta["fingerprint"] = opts.get("fingerprint", "chrome")
-    if opts.get("encryption"):
-        meta["encryption"] = opts["encryption"]
+    # ★ 客户端产物里这一项必须是**客户端**的 encryption, 不是服务端的 decryption。
+    #
+    #   实测 (2026-10-16): 这两个串长得像、作用相反 ——
+    #       decryption: mlkem768x25519plus.native.600s.<服务端私钥>
+    #       encryption: mlkem768x25519plus.native.0rtt.<客户端公钥>
+    #   以前这里写的是 opts["encryption"], 而那个值是**服务端的 decryption**
+    #   (mknode 只取了那一行)。于是客户端拿着服务端私钥去握手:
+    #       mihomo → proxy 0: invaild vless encryption value: …600s.…
+    #       Xray   → 握手失败
+    #   服务端片段完全正确, 面板上一切正常, 只有真连的时候炸。
+    _cli_enc = (opts.get("client_encryption") or "").strip()
+    if _cli_enc:
+        meta["encryption"] = _cli_enc
+    elif opts.get("encryption"):
+        # 只有服务端那半 (老片段 / adopt 这类拿不到客户端密钥的路径) ——
+        # **宁可不写**, 也不能把服务端私钥当客户端公钥发出去。
+        print("[警告] 这个节点用了 VLESS 会话加密, 但只有服务端密钥、取不到客户端那一半 ——"
+              "\n"
+              "       客户端产物里**不会**写 encryption。写服务端的 decryption 出去,"
+              "客户端会拿着\n"
+              "       服务端私钥去握手, 表现是「配置全对、就是连不上」。\n"
+              "       补救: 用 菜单 13 重建这条节点 (它会在生成时同时取到两半),"
+              "或手工填客户端密钥。",
+              file=sys.stderr)
 
     # ---- ECH: 客户端产物必须拿到 ECHConfigList ----
     #

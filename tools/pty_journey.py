@@ -134,6 +134,9 @@ def main():
     ap.add_argument("--screen", type=int, default=0, help="每屏只显示最后 N 行 (0=全部)")
     ap.add_argument("--budget", type=float, default=180.0, help="整场总时长上限")
     ap.add_argument("--script", default="xray-panel.sh", help="入口脚本 (相对仓库)")
+    # 有的入口脚本靠**参数**决定走哪条路 (install.sh server / client / ...),
+    # 不支持参数就只能测到主菜单那条路, 而用户日常敲的恰恰是带参数那条。
+    ap.add_argument("--args", default="", help='传给入口脚本的参数, 如 "server"')
     ap.add_argument("--keep", action="store_true", help="保留沙箱")
     a = ap.parse_args()
 
@@ -159,6 +162,8 @@ def main():
     })
 
     argv = ["bash", os.path.join(repo, a.script)]
+    if a.args:
+        argv += a.args.split()
     keys = split_keys(a.keys)
     steps = [("wait", 2.5)] + keys
 

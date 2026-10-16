@@ -118,12 +118,19 @@ def node_from_fragment(frag, meta=None, name=None):
     clients = settings.get("clients") or []
     if ib.get("protocol") == "vless":
         node["id"] = (clients[0].get("id") if clients else "") or ""
-        # 客户端 encryption 与服务端 decryption 配对; 元数据里那份是客户端要用的
-        enc = meta.get("encryption") or ""
-        if not enc:
-            dec = settings.get("decryption") or ""
-            enc = "" if dec in ("", "none") else dec
-        node["encryption"] = enc or "none"
+        # ★ 客户端那一半**只能**来自元数据 (它由 xray vlessenc 与本节点的服务端
+        #   密钥**成对**生成, 客户端和服务端各拿一半, 不能互推)。
+        #
+        #   这里以前有个"取不到就用服务端 decryption 顶上"的兜底 —— 那是错的,
+        #   而且错得很隐蔽: 服务端片段完全正确, 面板一路绿灯, 客户端产物看起来
+        #   也像那么回事, 只有真连的时候炸。实测两种客户端的表现:
+        #       mihomo → proxy 0: invaild vless encryption value: …600s.…
+        #       Xray   → 握手失败
+        #   所以取不到就如实留空, 由 enc_unsupported 拒绝出产物并把原因讲清楚。
+        node["encryption"] = (meta.get("encryption") or "").strip() or "none"
+        # 服务端那一半带着走: 判断"这个节点到底要不要会话加密"要用它 ——
+        # 服务端要、客户端没有, 等于这条节点怎么配都连不上。
+        node["vless_srv_decryption"] = str(settings.get("decryption") or "")
         # flow 只在裸 TCP 上成立 (内核: XTLS only supports TLS and REALITY
         # directly) —— 这里如实带出去, 拦不拦由生成期的护栏决定。
         node["flow"] = (clients[0].get("flow") if clients else "") or ""
@@ -630,16 +637,38 @@ _MIHOMO_VLESS_ENC_OK = ("", "none")
 
 
 def enc_unsupported(node):
-    """这个节点的 VLESS encryption mihomo 吃不吃得下。吃得下返回 ""。"""
+    """这个节点的 VLESS encryption mihomo 吃不吃得下。吃得下返回 ""。
+
+    ★ 结论来自实测 (mihomo v1.19.32), 不是猜的:
+        mlkem768x25519plus.native.0rtt.<客户端公钥>   → 接受
+        mlkem768x25519plus.native.600s.<服务端私钥>   → 拒绝
+            proxy 0: invaild vless encryption value: …
+      也就是说 mihomo **是支持**后量子 VLESS 会话加密的, 它只认客户端那一种形态。
+      所以这里不能一刀切成"不支持" —— 那种判据会把本来能用的节点拒之门外,
+      真正要挡的是"把服务端那一半写进客户端"。
+    """
     proto = str(node.get("protocol") or "").lower()
     if proto != "vless":
         return ""
     enc = str(node.get("encryption") or "").strip()
+    srv = str(node.get("vless_srv_decryption") or "").strip()
     if enc.lower() in _MIHOMO_VLESS_ENC_OK:
+        # 客户端没写, 但**服务端要求**会话加密 —— 那不是"这个节点没加密",
+        # 是"这条节点怎么配都连不上"。必须挡下来, 否则用户拿到一份
+        # 看起来正常、导入也不报错的配置, 然后永远连不上。
+        if srv and srv.lower() != "none" and srv.startswith("mlkem"):
+            return ("服务端要求 VLESS 会话加密, 但这个节点的客户端那一半密钥取不到 "
+                    "(它由 xray vlessenc 与服务端密钥成对生成, 推不出来)。"
+                    "用菜单 13 重建这条节点 —— 重建时会同时取到两半")
         return ""
-    return (f"VLESS 会话加密 {enc.split('.')[0]} 是 Xray 独有的, "
-            f"mihomo 会直接拒绝整个配置 (实测 v1.19.32: invaild vless encryption value)。"
-            f"这条节点请用 Xray 原生客户端, 或改用不带后量子加密的档位")
+    if enc.startswith("mlkem768x25519plus.native.0rtt."):
+        return ""
+    if enc.startswith("mlkem768x25519plus.native.600s."):
+        return ("客户端加密串写成了服务端的 decryption (600s)。"
+                "客户端要用 0rtt 那一半 —— 两个串由 xray vlessenc 成对生成, 不能混用。"
+                "用菜单 13 重建这条节点即可")
+    return (f"VLESS 会话加密 {enc.split('.')[0]} 的形态 mihomo 不认 "
+            f"(实测它只认 mlkem768x25519plus.native.0rtt.<客户端公钥>)")
 
 
 def _why_unsupported(node):

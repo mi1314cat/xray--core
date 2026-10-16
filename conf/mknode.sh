@@ -575,17 +575,34 @@ mk_run() {
     #   每台服务器的密钥必须独一无二; 预置等于把一把所有用户共用的私钥
     #   写进公开仓库。
     local XBIN; XBIN=$(_mk_xray_bin)
-    local mk_dec="" mldsa_seed="" mldsa_verify=""
+    local mk_dec="" mk_cli_enc="" mldsa_seed="" mldsa_verify=""
     if [[ ",$enh," == *",mlkem,"* || "$enh" == "mlkem" ]]; then
-        if [[ -n "$XBIN" ]]; then
-            mk_dec=$("$XBIN" vlessenc 2>/dev/null \
+        local _ve=""
+        [[ -n "$XBIN" ]] && _ve=$("$XBIN" vlessenc 2>/dev/null)
+        # ★ 这两行是**一对**, 必须来自同一次生成, 而且**不能混用**:
+        #
+        #     "decryption": "mlkem768x25519plus.native.600s.<服务端私钥>"  → 服务端用
+        #     "encryption": "mlkem768x25519plus.native.0rtt.<客户端公钥>"  → 客户端用
+        #
+        #   以前只取了 decryption, 然后把**同一个串**写进客户端产物 ——
+        #   客户端拿服务端私钥去握手, 必然连不上。客户端那一侧的两种表现:
+        #       mihomo:  proxy 0: invaild vless encryption value: …600s.…
+        #                (它只认 0rtt 那种客户端形态)
+        #       Xray  :  握手失败
+        #   而服务端片段是对的, 面板上也一片正常 —— 典型"配好了就是连不上"。
+        #   取的时候两个都取, 谁用谁的那一份。
+        if [[ -n "$_ve" ]]; then
+            mk_dec=$(printf '%s\n' "$_ve" \
                      | grep -o '"decryption"[[:space:]]*:[[:space:]]*"[^"]*"' | tail -1 | cut -d'"' -f4)
+            mk_cli_enc=$(printf '%s\n' "$_ve" \
+                     | grep -o '"encryption"[[:space:]]*:[[:space:]]*"[^"]*"' | tail -1 | cut -d'"' -f4)
         fi
-        if [[ -n "$mk_dec" ]]; then
-            _g "  已生成 ML-KEM-768 会话密钥对 (xray vlessenc)"
+        if [[ -n "$mk_dec" && -n "$mk_cli_enc" ]]; then
+            _g "  已生成 ML-KEM-768 会话密钥对 (服务端 decryption + 客户端 encryption, 一次生成)"
         else
             _e "  要 ML-KEM-768 但取不到密钥对 —— 降级为普通 VLESS"
             _y "        vlessenc 需要内核 >= 26.3.27; 面板的 xrayls 太旧就没有这个子命令"
+            mk_dec=""; mk_cli_enc=""
         fi
     fi
     # ★ mldsa65 **只调一次**。它每次都生成一整套新密钥 —— 分两次调 Seed 和
@@ -659,7 +676,8 @@ mk_run() {
                 MK_CERT_FILE="$cert_file" MK_KEY_FILE="$key_file" MK_CERT_PIN="$cert_pin" \
                 MK_FALLBACK_PORT="$fallback_port" \
                 MK_CERT_TRUSTED="$cert_trusted" \
-                MK_DECRYPTION="$mk_dec" MK_MLDSA_SEED="$mldsa_seed" MK_MLDSA_VERIFY="$mldsa_verify" \
+                MK_DECRYPTION="$mk_dec" MK_CLIENT_ENC="$mk_cli_enc" \
+                MK_MLDSA_SEED="$mldsa_seed" MK_MLDSA_VERIFY="$mldsa_verify" \
                 MK_XHTTP_MODE="$xhttp_mode" MK_ECH="$mk_ech" \
                 python3 - <<'PY'
 import json, os
@@ -685,8 +703,11 @@ if _pin:
     opts["cert_pin"] = _pin
     opts["self_signed"] = (os.environ.get("MK_CERT_TRUSTED", "") != "yes")
 # 后量子/签名密钥对 (由 mknode 在建节点那一刻用 xray vlessenc / mldsa65 生成)
+# 服务端用 decryption, 客户端用 encryption —— 一对, 不能混
 _d = os.environ.get("MK_DECRYPTION", "")
 if _d: opts["encryption"] = _d
+_ce = os.environ.get("MK_CLIENT_ENC", "")
+if _ce: opts["client_encryption"] = _ce
 _ms = os.environ.get("MK_MLDSA_SEED", "")
 if _ms: opts["mldsa65_seed"] = _ms
 _mv = os.environ.get("MK_MLDSA_VERIFY", "")
