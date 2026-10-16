@@ -7359,6 +7359,28 @@ else
     bad "--tier 默认写死 cdn → nginx 档节点被补成 cdn, 发布侧拒发"
 fi
 
+# ⑪ 客户端那一半会话加密必须传进 adopt
+#    现场: 订阅里 REALITY 那条链接写的是 encryption=none, 而服务端要求 ML-KEM,
+#    客户端连上去必然失败 ("延时测试失败 tls")。而协议脚本**自己**写的那份
+#    share-NN.txt 带着正确的 encryption —— 两条生成链接的路径又漂了。
+#    这一半推不出来 (由 vlessenc 成对生成), 只能由脚本递给 adopt。
+if grep -F -- '--client-encryption' "$ROOT/conf/lib/deploy.py" >/dev/null \
+   && grep -F 'client_encryption=a.client_encryption' "$ROOT/conf/lib/deploy.py" >/dev/null \
+   && grep -F 'if client_encryption:' "$ROOT/conf/lib/deploy.py" >/dev/null; then
+    ok "adopt 收得下客户端那一半会话加密 (--client-encryption)"
+else
+    bad "adopt 收不下客户端会话加密 → 订阅里的链接会是 encryption=none"
+fi
+_miss=""
+for _f in Reality.sh vlessecn.sh; do
+    grep -F -- '--client-encryption' "$ROOT/conf/$_f" >/dev/null || _miss="$_miss $_f"
+done
+if [[ -z "$_miss" ]]; then
+    ok "Reality / VLESS-ECN 都会把客户端会话加密交给补发布"
+else
+    bad "这些脚本没把客户端会话加密交出去 → 订阅里那条链接连不上" "$_miss"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

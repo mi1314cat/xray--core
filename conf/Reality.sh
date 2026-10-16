@@ -386,7 +386,12 @@ EOF
         #   面板上、在分享链接里都"正常"。实测 (全协议建完之后订阅里只有
         #   预置体系的节点, 协议脚本建的四个一个都没进去) 才查到这一层。
         #   vlessecn.sh 那边给的是 link_ip (对的), 这里跟着它改。
-        if ! python3 "$_ad" --adopt ""$file"" --domain ""$link_ip"" >&2; then
+        # ★ 把**客户端那一半**会话加密也带过去。不带的话订阅里这条链接会写成
+        #   encryption=none, 而服务端要求 ML-KEM —— 客户端连上去必失败,
+        #   而脚本自己写的那份 share-NN.txt 是好的 (两条路径不一致, 实测踩到)。
+        _ce_arg=()
+        [[ "$encryption_mode" == "mldsa" && -n "$CLIENT_ENC" ]] && _ce_arg=(--client-encryption "$CLIENT_ENC")
+        if ! python3 "$_ad" --adopt ""$file"" --domain ""$link_ip"" "${_ce_arg[@]}" >&2; then
             print_warn "  分享元数据没补上 —— 这个节点暂时没有分享链接"
             print_warn "  面板的其它功能正常; 需要链接时用菜单 13 (预置档位) 重建一个"
         fi

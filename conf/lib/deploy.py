@@ -424,7 +424,8 @@ def _reality_pubkey_from_private(private_key):
     return ""
 
 
-def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
+def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None,
+          client_encryption=None):
     """给一个**已经写好的**片段补上分享元数据 (以及可选的 nginx 段)。
 
     为什么要有这条:
@@ -527,7 +528,15 @@ def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
         else:
             meta["short_id"] = rs.get("shortId") or ""
         meta["fingerprint"] = rs.get("fingerprint") or "chrome"
-    if clients and clients[0].get("encryption") and clients[0]["encryption"] != "none":
+    # ★ 客户端那一半的 VLESS 会话加密**推不出来** (它由 xray vlessenc 与服务端
+    #   密钥成对生成), 只能由调用方给。协议脚本手里有它 (Reality.sh 的
+    #   CLIENT_ENC), 以前没往这里传 —— 于是订阅里这条链接写的是
+    #   `encryption=none`, 而服务端要求 ML-KEM: 客户端连上去必然失败
+    #   (实测: REALITY 节点"延时测试失败 tls", 而协议脚本自己写的那份链接
+    #    带着正确的 encryption, 是好的 —— 两条生成链接的路径又漂了)。
+    if client_encryption:
+        meta["encryption"] = client_encryption
+    elif clients and clients[0].get("encryption") and clients[0]["encryption"] != "none":
         meta["encryption"] = clients[0]["encryption"]
     alpn = (ss.get("tlsSettings") or {}).get("alpn")
     if alpn:
@@ -822,13 +831,16 @@ if __name__ == "__main__":
     ap.add_argument("--conf-dir", help="片段输出目录 (默认 $XRAY_CONF_DIR 或 $XRAY_BASE/conf)")
     ap.add_argument("--share-dir", help="分享元数据目录 (默认 $XRAY_SHARE_DIR 或 $XRAY_BASE/out/share)")
     ap.add_argument("--apply", action="store_true", help="直接落盘而不只是预演")
+    ap.add_argument("--client-encryption",
+                    help="客户端那一半的 VLESS 会话加密串 (协议脚本手里有, 推不出来)")
     ap.add_argument("--cert-file")
     ap.add_argument("--key-file")
     a = ap.parse_args()
 
     # ---- --adopt: 补发布 ----
     if a.adopt:
-        r = adopt(a.adopt, domain=a.domain, tier=a.tier, path=a.path)
+        r = adopt(a.adopt, domain=a.domain, tier=a.tier, path=a.path,
+                  client_encryption=a.client_encryption)
         if r["ok"]:
             print(f"[OK] 已补分享元数据: {r['meta_path']}", file=sys.stderr)
             print(f"[信息] tag={r['tag']} 档位={r['tier']}", file=sys.stderr)

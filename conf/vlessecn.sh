@@ -362,7 +362,10 @@ add_config() {
     # 重写风险大得多。
     _ad="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/deploy.py"
     if [[ -r "$_ad" ]]; then
-        if ! python3 "$_ad" --adopt ""$file"" --domain ""$link_ip"" >&2; then
+        # ★ 客户端那一半会话加密也必须传 —— 不然订阅里这条链接会写成
+        #   encryption=none, 而服务端要求 ML-KEM, 客户端必失败 (同 Reality.sh)。
+        if ! python3 "$_ad" --adopt ""$file"" --domain ""$link_ip"" \
+                 ${CLIENT_ENC:+--client-encryption "$CLIENT_ENC"} >&2; then
             print_warn "  分享元数据没补上 —— 这个节点暂时没有分享链接"
             print_warn "  面板的其它功能正常; 需要链接时用菜单 13 (预置档位) 重建一个"
         fi
