@@ -4268,6 +4268,59 @@ else
     bad "VMess 没有 HTTPUpgrade 预置"
 fi
 
+# ------------------------------------------------- nginx 档客户端视角
+group "nginx 档: 客户端加密层 ≠ 片段里的加密层"
+
+# ★ 这一条是"真连才发现"的: 片段里的 security 是 **xray 入站**用的
+#   (nginx 档 = none, 因为 TLS 由 nginx 终结), 而客户端连的是 nginx 的 443,
+#   必须走 TLS。照搬片段里那个, 客户端就用明文去连 HTTPS 端口 ——
+#   实测 mihomo 先发明文 HTTP/2 前言再发 TLS, Cloudflare 直接关连接,
+#   客户端 000 而服务端一个字节都收不到。
+#   本机自测看不出来 (nginx 自己会 400), 所以两处都要有专门断言。
+_NGC=$(R="$ROOT" python3 - <<'PYX' 2>/dev/null
+import sys, os
+sys.path.insert(0, os.path.join(os.environ["R"], "conf", "lib"))
+import nodes as N, to_mihomo as M
+frag = {"inbounds": [{"tag": "t", "port": 443, "protocol": "vless",
+        "settings": {"clients": [{"id": "u"}], "decryption": "none"},
+        "streamSettings": {"network": "xhttp", "security": "none",
+                           "xhttpSettings": {"path": "/p", "mode": "stream-up"}}}]}
+meta_ng = {"host": "a.example.com", "port": 443, "tier": "nginx"}
+meta_cdn = {"host": "a.example.com", "port": 443, "tier": "cdn"}
+out = []
+# nginx 档 → 客户端必须是 tls
+n1 = M.node_from_fragment(frag, meta_ng, name="t")
+p1 = M.proxy(n1) or {}
+out.append("yaml-nginx=" + str(p1.get("tls")))
+# cdn 档 → 片段说 none 就是 none (客户端直连源站)
+n2 = M.node_from_fragment(frag, meta_cdn, name="t")
+p2 = M.proxy(n2) or {}
+out.append("yaml-cdn=" + str(p2.get("tls")))
+# 分享链接同理
+def link(meta):
+    n = N.extract(frag["inbounds"][0], "t.json")
+    return N.build_share_link(n, meta) or ""
+import urllib.parse as U
+q1 = dict(U.parse_qsl(U.urlparse(link(meta_ng)).query))
+q2 = dict(U.parse_qsl(U.urlparse(link(meta_cdn)).query))
+out.append("link-nginx=" + str(q1.get("security")))
+out.append("link-cdn=" + str(q2.get("security")))
+# REALITY 档不能被这条规则改掉
+frag2 = {"inbounds": [{"tag": "t", "port": 443, "protocol": "vless",
+         "settings": {"clients": [{"id": "u"}], "decryption": "none"},
+         "streamSettings": {"network": "xhttp", "security": "reality",
+                            "realitySettings": {"serverNames": ["s.com"]},
+                            "xhttpSettings": {"path": "/p", "mode": "stream-up"}}}]}
+m2 = {"host": "a.example.com", "port": 443, "tier": "nginx",
+      "public_key": "b" * 43, "short_id": "ab"}
+n3 = M.node_from_fragment(frag2, m2, name="t")
+out.append("reality-untouched=" + str((M.proxy(n3) or {}).get("tls")))
+print(",".join(out))
+PYX
+)
+assert_eq "$_NGC" "yaml-nginx=True,yaml-cdn=False,link-nginx=tls,link-cdn=none,reality-untouched=True" \
+    "nginx 档客户端走 tls / cdn 档照搬片段 / REALITY 不受影响 (YAML 与链接两处)"
+
 # ------------------------------------------------- 上传前验证
 assert_ne0 "$(grep -c '而不是' "$ROOT/tools/prepush_check.sh" 2>/dev/null)" \
     "上传前验证脚本在仓库里 (tools/prepush_check.sh)"

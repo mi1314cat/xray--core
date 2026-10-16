@@ -394,6 +394,30 @@ def is_loopback_bound(n) -> bool:
     return listen in LOOPBACK_LISTEN
 
 
+def client_security(n, meta=None):
+    """客户端该用哪一层加密 —— **不是**片段里那个。
+
+    ★ 两者在 nginx 档上恰好相反, 而这是一处会让"配置看着对、就是连不上"的分叉:
+
+        片段里的 security   = xray **入站**用的  (nginx 档 = none, 因为
+                              TLS 由 nginx 终结, nginx→xray 是明文)
+        客户端要的 security = 客户端连出去的   (nginx 档 = tls, 因为
+                              客户端连的是 nginx 的 443, 走 HTTPS)
+
+      直接拿片段里那个当客户端配置, 客户端就会用**明文**去连一个 HTTPS 端口 ——
+      实测: mihomo 先发明文 HTTP/2 前言, 再发 TLS, Cloudflare 直接关连接,
+      客户端 000, 而服务端日志里一个字都没有 (请求根本没到)。
+      本机访问看不到这个问题 (nginx 自己会 400), 所以很容易漏。
+
+    cdn 档不一样: 客户端直连源站端口, 片段里写什么就是什么 (tls / reality / none)。
+    """
+    sec = str(n.get("security") or "none").lower()
+    tier = str((meta or {}).get("tier") or "").strip().lower()
+    if tier == "nginx" and sec == "none":
+        return "tls"
+    return sec
+
+
 def share_target(n, meta=None):
     """决定分享链接里的 host:port, 返回 (host, port, note, refuse)。
 
@@ -667,7 +691,7 @@ def build_share_link(n, meta=None, notes=None):
             return None
         q = {
             "encryption": meta.get("encryption", "none"),
-            "security": n.get("security") or "none",
+            "security": client_security(n, meta),
             "type": n.get("network") or "tcp",
         }
         if n.get("flow"):
@@ -725,7 +749,7 @@ def build_share_link(n, meta=None, notes=None):
             if notes is not None:
                 notes.append(f"{n.get('tag') or '?'}: 未发布 —— REALITY 缺公钥(pbk)")
             return None
-        q = {"security": n.get("security") or "none", "type": n.get("network") or "tcp"}
+        q = {"security": client_security(n, meta), "type": n.get("network") or "tcp"}
         if n.get("security") == "reality":
             sni = reality_sni(n)
             if sni:

@@ -85,6 +85,14 @@ def node_from_fragment(frag, meta=None, name=None):
     settings = ib.get("settings") or {}
     net = ss.get("network") or "tcp"
     sec = ss.get("security") or "none"
+    # ★ nginx 档: 片段里是 security:none (TLS 由 nginx 终结, nginx→xray 明文),
+    #   而客户端连的是 nginx 的 443 —— 必须走 TLS。
+    #   照搬片段里那个的话, 生成的 YAML 会写 `tls: false`, 客户端就用明文
+    #   去连 HTTPS 端口: 实测 mihomo 先发明文 HTTP/2 前言再发 TLS,
+    #   Cloudflare 直接关连接, 客户端 000 而服务端日志一片空白。
+    #   本机自测看不出来 (nginx 自己会 400), 所以这个分叉特别隐蔽。
+    if str(meta.get("tier") or "").strip().lower() == "nginx" and sec == "none":
+        sec = "tls"
 
     def _norm_path(p):
         p = str(p or "").strip()
@@ -162,7 +170,9 @@ def node_from_fragment(frag, meta=None, name=None):
         node["reality_short_id"] = meta.get("short_id") or ""
         node["fingerprint"] = meta.get("fingerprint") or "chrome"
     elif sec == "tls":
-        node["sni"] = meta.get("sni") or ts.get("serverName") or ""
+        node["sni"] = (meta.get("sni") or ts.get("serverName")
+                       or (meta.get("host") if str(meta.get("tier") or "").lower() == "nginx" else "")
+                       or "")
         node["pinned_cert_sha256"] = (meta.get("pinned_cert_sha256")
                                       or ts.get("pinnedPeerCertSha256") or "")
         # 服务端字段是 echServerKeys, 客户端才是 echConfigList —— 库里不能互相顶替。
