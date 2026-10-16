@@ -407,6 +407,90 @@ service_menu() {
     done
 }
 
+# ---------------------------------------------------------------- 面板自身
+#
+# ★ 为什么面板里要有这个东西 (以及为什么实现只有一份, 在 install.sh):
+#
+#   2026-10-15 用户报:"我从 GitHub 进去, 结果点菜单报
+#       [X] 取不到 /tmp/.xray-panel.XXXXXX/lib/print.sh —— 提示函数不可用"
+#   查下来不是网络、也不是仓库: 是他机器上那份 **10-10 的旧面板**被优先采用了
+#   (老的 install.sh 是"本地优先"), 而旧面板里有个已经修掉的缓存 bug。
+#   仓库上明明是好的 —— 所以他第一反应是"我们没更新 GitHub 吧?"。
+#
+#   SB 在进门那一步有 auto_update: 比对 → 备份 → 换新 → 语法检查不过就回滚。
+#   这里对齐, 并且**补充一条 SB 也没有的**: 回退入口要能在面板里直接点到。
+#   自动更新把人救出来一次, 但"新版有问题想退回上一版"必须随时能做,
+#   而不是让用户去 SSH 手抄命令。
+#
+#   落地/备份/语法检查/回滚的实现在 install.sh 里 —— 面板**不能给自己做手术**
+#   (它正跑着), 也不该抄一份逻辑出来 (两份必漂移)。所以这里只是调用它。
+panel_self_ver() {
+    local d f
+    for d in "${XRAY_BASE:-/root/catmi/xray}/.panel" \
+             "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)" \
+             "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"; do
+        [[ -n "$d" ]] || continue
+        f="$d/VERSION"
+        [[ -s "$f" ]] || continue
+        head -1 "$f" 2>/dev/null | tr -d '[:space:]'
+        return 0
+    done
+    return 0
+}
+
+# 显示的版本串: 有版本号就 v3.0.0, 没有就报**文件身份**。
+# ★ 不能无脑拼一个 "v" 前缀 —— 取不到版本时屏幕上会出现一个光秃秃的 "v",
+#   看起来像渲染坏了, 又什么都没告诉你。
+panel_self_label() {
+    local v; v=$(panel_self_ver)
+    if [[ -n "$v" ]]; then printf 'v%s' "$v"; return 0; fi
+    local f="${BASH_SOURCE[0]:-$0}"
+    [[ -s "$f" ]] && { printf '身份 %s' "$(md5sum "$f" 2>/dev/null | cut -c1-12)"; return 0; }
+    printf '未知'
+}
+
+# 跑 install.sh 的一个子命令。**本地那份优先** ——
+# 它和托管副本是同一次更新落下来的, 所以:
+#   · 不依赖网络 (回退/查看版本必须离线也能用: 最需要回退的时刻, 网络往往也不好)
+#   · 版本对得上 (拿远端最新 install.sh 去操作本机旧面板, 行为可能不一致)
+# 本地没有 (第一次更新之前) 才走 xray_run 现取。
+_panel_self_run() {
+    local sub="$1" local_sh
+    local_sh="${XRAY_BASE:-/root/catmi/xray}/.panel/install.sh"
+    if [[ -s "$local_sh" ]]; then
+        XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}" bash "$local_sh" "$sub"
+        return $?
+    fi
+    xray_run install.sh "$sub"
+}
+
+panel_self_menu() {
+    local c
+    while :; do
+        _srv_clear; ui_title "更新面板脚本"
+        # 托管副本是**下次进门**才跑的, 所以这里说清"什么时候生效" ——
+        # 否则用户更新完发现界面没变, 只会以为没生效。
+        ui_kv "当前版本" "$(panel_self_label)"
+        ui_hint "更新在下次进面板时生效（当前这份已经在内存里跑着了）"
+        echo >&2
+        ui_menu 1 "检查并更新     比对 GitHub, 有新版就换（失败也不挡你）"
+        ui_menu 2 "回退到上一版   列出本机备份, 选一份换回去"
+        ui_menu 3 "查看版本与备份 当前版本 / 备份列表 / 托管路径"
+        ui_menu 0 "返回"
+        echo >&2
+        printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
+        read -r c || return 0
+        case "$c" in
+            0|"") return 0 ;;
+            1) _panel_self_run update-panel ;;
+            2) _panel_self_run panel-rollback ;;
+            3) _panel_self_run panel-status ;;
+            *) ui_invalid "$c" ;;
+        esac
+        ui_pause
+    done
+}
+
 maint_menu() {
     local c
     while :; do
@@ -458,6 +542,7 @@ show_menu() {
     ui_title "xrayls 管理脚本"
     ui_kv "服务状态" "$st_txt"
     ui_kv "内核版本" "${xver:-未知}"
+    ui_kv "面板版本" "$(panel_self_label)"
     ui_kv "节点数量" "$nnodes"
     echo >&2
 
@@ -485,6 +570,7 @@ show_menu() {
     ui_menu 9 "DNS 管理        解析模式 / 加密 DNS / 防泄漏"
     ui_menu 10 "日志            实时 / 错误 / 清空 / 最近"
     ui_menu 11 "自检与体检      通用能力自检 / 端口体检"
+    ui_menu 12 "更新面板脚本    检查新版 / 回退到上一版 / 查看面板版本"
     ui_menu 0 "退出"
     echo >&2
     ui_hint "回车 = 退出；每一项都能单独跑: bash conf/<名字>.sh"
@@ -492,7 +578,7 @@ show_menu() {
     # 同理: 按键用尽时退出, 不要拿空 choice 反复重画。
     # ★ 这里**只能有一个提示** —— 原来上面 printf 一次、read -p 又一次,
     #   用户看到的是 `请选择: 请输入选项 [0-9]:`, 像坏了两遍。
-    read -r -p "  ${_CYN}请选择 [0-11]${_RST}: " choice || exit 0
+    read -r -p "  ${_CYN}请选择 [0-12]${_RST}: " choice || exit 0
 
     case "${choice}" in
         0|"") _srv_clear; exit 0 ;;
@@ -515,6 +601,7 @@ show_menu() {
         9) xray_run conf/dns.sh ;;
         10) xray_run conf/logs.sh ;;
         11) maint_menu ;;
+        12) panel_self_menu ;;
         *) echo -e "${RED}无效的选项 ${choice}${PLAIN}" ;;
     esac
 
