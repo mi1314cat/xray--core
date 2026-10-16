@@ -6975,6 +6975,113 @@ else
     bad "ECH 只能靠预置⑤ 带出来 → 不用后量子的用户没法单开 ECH"
 fi
 
+group "卸载脚本 (不能删错)"
+
+# ★ 这一组对应一次实测。仓库里原来那份 uninstall_xray.sh 只有五行, 用诱饵
+#   目录跑过之后的结论是:
+#     · 只删固定路径, 邻居没动 —— 这方面是干净的;
+#     · 但 rm -rf 前面**没有确认、没有备份**;
+#     · 单元文件没删 → 卸完 systemctl 还认得它;
+#     · nginx 里我们插的 location 不摘 → 那些路径继续 502。
+_UN="$ROOT/uninstall_xray.sh"
+
+# ① 不许"看一眼路径就 rm -rf" —— 动手前必须证明这个目录是我们的
+if grep -F 'dir_is_ours' "$_UN" >/dev/null \
+   && grep -F '看不出是 xrayls 的安装目录' "$_UN" >/dev/null; then
+    ok "卸载前会先确认目标目录是本工具的 (不是就拒绝)"
+else
+    bad "卸载脚本不做归属确认 → 路径被别的东西占用时会删错"
+fi
+# ② 符号链接必须拒绝 (rm -rf 一个指向别处的链接, 删的是什么就说不清了)
+if grep -F '是一个符号链接' "$_UN" >/dev/null; then
+    ok "符号链接会被拒绝 (不跟随)"
+else
+    bad "卸载脚本会跟符号链接删 → 可能删到别处"
+fi
+# ③ 要确认 + 有预演
+if grep -F -- '--dry-run' "$_UN" >/dev/null && grep -F '确认请输入 yes' "$_UN" >/dev/null; then
+    ok "要输 yes 才动手, 且有 --dry-run 预演"
+else
+    bad "卸载没有确认/预演 → 一条命令就没了"
+fi
+# ④ 先备份, 而且备份必须落在**被删目录外面**
+if grep -F 'tar czf "$BACKUP"' "$_UN" >/dev/null \
+   && grep -F 'BACKUP="$(dirname "$SRV_ROOT")' "$_UN" >/dev/null; then
+    ok "删除前会备份, 且备份放在被删目录之外"
+else
+    bad "卸载不备份, 或备份放在被删目录里 (会跟着一起没)"
+fi
+# ⑤ 单元文件必须真的删掉 + daemon-reload
+if grep -F 'rm -f "$UNIT"' "$_UN" >/dev/null \
+   && grep -F 'daemon-reload' "$_UN" >/dev/null; then
+    ok "会删除 systemd 单元文件并 daemon-reload"
+else
+    bad "只 stop+disable 不删单元文件 → 卸完 systemctl 还认得它"
+fi
+# ⑥ nginx 里我们插的段要摘掉 (否则站点上留下指向死端口的入口)
+if grep -F 'xray-core BEGIN' "$_UN" >/dev/null \
+   && grep -F 'xray-core END' "$_UN" >/dev/null; then
+    ok "会按标记摘除自己插入的 nginx 段"
+else
+    bad "卸载不摘 nginx 段 → 站点上留一堆 502 的入口"
+fi
+
+# ⑦ 真跑一遍 (沙箱里, 用一个不存在的服务名, 不碰任何真东西)
+_UNS="$TMP/un-install"; rm -rf "$_UNS"; mkdir -p "$_UNS/xray/conf" "$_UNS/xray/out" "$_UNS/xray/.panel" "$_UNS/nginx" "$_UNS/sibling/certs"
+echo '{"inbounds":[{"tag":"n1","port":1}]}' > "$_UNS/xray/conf/n1.json"
+echo meta > "$_UNS/xray/out/n1.json"
+echo '{"k":1}' > "$_UNS/xray/config.json"
+touch "$_UNS/xray/xrayls"; chmod +x "$_UNS/xray/xrayls"
+echo cert > "$_UNS/sibling/certs/keep.pem"
+cat > "$_UNS/nginx/site.conf" <<'NGXEOF'
+server {
+    server_name a.com;
+    location / { root /var/www; }
+    # >>> xray-core BEGIN a.com|/abc >>>
+    location /abc { proxy_pass http://127.0.0.1:31510; }
+    # <<< xray-core END a.com|/abc <<<
+    location /keepme { proxy_pass http://127.0.0.1:8080; }
+}
+NGXEOF
+
+# ⑦a 不是我们的目录 → 必须拒绝, 且一个文件都不动
+mkdir -p "$_UNS/foreign/important"; echo x > "$_UNS/foreign/important/f"
+_out=$(NGINX_CONF_ROOTS="$_UNS/nginx" XRAY_BASE="$_UNS/foreign" XRAY_SERVICE=no-such-svc \
+       bash "$_UN" --yes 2>&1)
+if [[ -f "$_UNS/foreign/important/f" ]] && printf '%s' "$_out" | grep -F '一个文件都没有动' >/dev/null; then
+    ok "拿一个不属于它的目录去卸 → 拒绝且没动文件"
+else
+    bad "卸载脚本会删一个不属于它的目录"
+fi
+
+# ⑦b 符号链接 → 拒绝
+ln -sfn "$_UNS/foreign" "$_UNS/link"
+_out=$(XRAY_BASE="$_UNS/link" XRAY_SERVICE=no-such-svc bash "$_UN" --yes 2>&1)
+if [[ -f "$_UNS/foreign/important/f" ]] && printf '%s' "$_out" | grep -F '符号链接' >/dev/null; then
+    ok "符号链接 → 拒绝"
+else
+    bad "符号链接没被拦住"
+fi
+
+# ⑦c 正常卸载: 备份 / 摘 nginx / 保留邻居
+_out=$(NGINX_CONF_ROOTS="$_UNS/nginx" XRAY_BASE="$_UNS/xray" XRAY_SERVICE=no-such-svc \
+       bash "$_UN" --yes 2>&1)
+_bk=$(ls -1 "$_UNS"/xray-uninstall-backup-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')
+_kept=0
+if grep -F 'location / {' "$_UNS/nginx/site.conf" >/dev/null \
+   && grep -F 'location /keepme' "$_UNS/nginx/site.conf" >/dev/null; then _kept=1; fi
+_marked=$(grep -c 'xray-core BEGIN' "$_UNS/nginx/site.conf" || true)
+_bkin=$(tar tzf "$_UNS"/xray-uninstall-backup-*.tar.gz 2>/dev/null | grep -c 'conf/n1.json' || true)
+assert_eq "$([ -d "$_UNS/xray" ] && echo gone || echo removed)/$_bk/$_kept/$_marked/$_bkin" \
+          "removed/1/1/0/1" \
+          "沙箱卸载: 目录已删 / 有 1 份备份(含 conf) / 站点自有 location 保留 / 标记段摘净"
+if [[ -f "$_UNS/sibling/certs/keep.pem" ]]; then
+    ok "同级的证书目录完好 (没被连坐)"
+else
+    bad "卸载把同级的证书目录也删了"
+fi
+rm -rf "$_UNS"
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
