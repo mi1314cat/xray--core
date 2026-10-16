@@ -7122,7 +7122,7 @@ fi
 #    .py 那几个尤其重要: deploy.py 里是 `import node_build` / `import to_mihomo`,
 #    逐个下到临时文件就 import 不到兄弟模块 (实测报 No module named 'node_build',
 #    症状是全协议的上下行分离两个组合全失败, 而日志里是一段 Python traceback)。
-for _need in proto_ui.sh preset.sh print.sh share.sh preset_batch.sh cdn_auto.sh \
+for _need in proto_ui.sh preset.sh print.sh preset_batch.sh cdn_auto.sh \
              deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
              share_payload.py token_store.py; do
     if printf '%s' "$_RSC" | grep -F "$_need" >/dev/null; then
@@ -7131,6 +7131,15 @@ for _need in proto_ui.sh preset.sh print.sh share.sh preset_batch.sh cdn_auto.sh
         bad "下载清单缺 $_need → 依赖它的那一段会失败"
     fi
 done
+# ②a1 share.sh 在 conf/ 下, 不在 conf/lib/ 下 —— URL 用错会报"下载失败",
+#     而人只会去怀疑网络 (实测踩到)
+if grep -F '"$GH_RAW/conf/share.sh"' "$ROOT/conf/batch.sh" >/dev/null \
+   && ! grep -F 'share.sh \' "$ROOT/conf/batch.sh" >/dev/null; then
+    ok "share.sh 取的是 conf/share.sh (不是 conf/lib/share.sh)"
+else
+    bad "share.sh 的下载 URL 写错了 (会报下载失败, 但其实是路径不对)"
+fi
+
 # ②a2 share.sh 必须下到 conf/ 那一层 —— 它按 dirname($0)/lib/ 找依赖,
 #     下到 $tmp/share.sh 的话那边没有 lib/, 症状是"订阅链接没有自动生成"
 #     而 curl 明明是通的 (实测)。

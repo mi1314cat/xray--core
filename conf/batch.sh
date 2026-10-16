@@ -146,7 +146,7 @@ resolve_scripts_dir() {
     # 不铺的话屏幕上只有一句"找不到 conf/share.sh —— 订阅链接没有自动生成",
     # 而 curl 明明是通的 (实测)。
     local l
-    for l in proto_ui.sh ports.sh addr.sh preset.sh print.sh share.sh \
+    for l in proto_ui.sh ports.sh addr.sh preset.sh print.sh \
              deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
              naming.py nginx_apply.py share_payload.py token_store.py; do
         if [[ ! -s "$confdir/lib/$l" ]]; then
@@ -161,6 +161,18 @@ resolve_scripts_dir() {
             esac
         fi
     done
+
+    # share.sh 单独下: 它在 **conf/ 下, 不在 conf/lib/ 下** ——
+    # 混进上面那个循环会得到 "下载 conf/lib/share.sh 失败", 而人只会去怀疑网络。
+    # 它必须落在 conf/ 那一层: 两个调用者分别按
+    #   batch.sh        → $confdir/share.sh
+    #   preset_batch.sh → dirname($0)/../conf/share.sh
+    # 找它, 而它自己按 dirname($0)/lib/ 找依赖。
+    if [[ ! -s "$confdir/share.sh" ]]; then
+        curl -fsSL "$GH_RAW/conf/share.sh" -o "$confdir/share.sh" \
+            || { print_error "下载 conf/share.sh 失败 (订阅链接要用)"; return 1; }
+        bash -n "$confdir/share.sh" || { print_error "conf/share.sh 语法错误(下载损坏)"; return 1; }
+    fi
 
     # 上下行分离走 preset_batch.sh; 它又会按 dirname($0)/cdn_auto.sh 找同伴
     local t
