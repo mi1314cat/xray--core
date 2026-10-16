@@ -7381,6 +7381,21 @@ else
     bad "这些脚本没把客户端会话加密交出去 → 订阅里那条链接连不上" "$_miss"
 fi
 
+# ⑫ nginx 片段必须给跨源预检放行 (客户端 Browser Dialer 要用)
+#    现场: 客户端切到 xhttp 节点, Xray 在跑、配置全对, 就是上不了网;
+#    Chromium 控制台原文:
+#      Access to fetch at 'https://<域名>/<path>/...' from origin
+#      'http://127.0.0.1:18081' has been blocked by CORS policy:
+#      Response to preflight request doesn't pass access control check:
+#      No 'Access-Control-Allow-Origin' header is present
+#    而**服务端一个请求都没收到** —— 浏览器根本没把请求发出去。
+if grep -F 'Access-Control-Allow-Origin' "$ROOT/conf/lib/nginx_apply.py" >/dev/null \
+   && grep -F 'if ($request_method = OPTIONS)' "$ROOT/conf/lib/nginx_apply.py" >/dev/null; then
+    ok "nginx 片段带 CORS 头与 OPTIONS 就地 204 (Browser Dialer 能跨源)"
+else
+    bad "nginx 片段没有 CORS 处理 → 客户端的浏览器拨号被浏览器自己拦掉"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

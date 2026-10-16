@@ -641,6 +641,26 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
             L.append(f"{inner}proxy_request_buffering off;")
             L.append(f"{inner}proxy_read_timeout 300s;")
             L.append(f"{inner}proxy_send_timeout 300s;")
+        # ★ CORS: 客户端那边的 Browser Dialer 是**跨源**请求 ——
+        #   页面跑在 http://127.0.0.1:18081, 却要去 fetch https://你的域名/path/...
+        #   浏览器先发 OPTIONS 预检, 没有 Access-Control-Allow-Origin 就直接拦掉,
+        #   连请求都发不出去。实测 (Chromium 控制台原文):
+        #     Access to fetch at 'https://<域名>/<path>/...' from origin
+        #     'http://127.0.0.1:18081' has been blocked by CORS policy:
+        #     Response to preflight request doesn't pass access control check:
+        #     No 'Access-Control-Allow-Origin' header is present
+        #   表现是"节点配置全对、Xray 也在跑、就是上不了网", 而服务端**一个请求
+        #   都没收到** (日志里干干净净)。
+        #   OPTIONS 必须**就地 204**, 不能转给 xray —— xray 对这个请求只会 404。
+        L.append(f"{inner}# 跨源预检 (Browser Dialer 从 127.0.0.1 打过来)")
+        L.append(f"{inner}if ($request_method = OPTIONS) {{")
+        L.append(f"{inner}    add_header Access-Control-Allow-Origin  \"*\" always;")
+        L.append(f"{inner}    add_header Access-Control-Allow-Methods \"GET, POST, OPTIONS\" always;")
+        L.append(f"{inner}    add_header Access-Control-Allow-Headers \"*\" always;")
+        L.append(f"{inner}    add_header Access-Control-Max-Age 86400 always;")
+        L.append(f"{inner}    return 204;")
+        L.append(f"{inner}}}")
+        L.append(f"{inner}add_header Access-Control-Allow-Origin \"*\" always;")
         L.append(f"{ind}}}")
     else:
         L.append(f"{ind}location {path} {{")
@@ -649,6 +669,14 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
         L.append(f"{inner}proxy_set_header Host $host;")
         L.append(f"{inner}proxy_set_header Upgrade $http_upgrade;")
         L.append(f"{inner}proxy_set_header Connection $connection_upgrade;")
+        # 同上: Browser Dialer 是跨源请求, 没有这几个头浏览器直接拦掉。
+        L.append(f"{inner}if ($request_method = OPTIONS) {{")
+        L.append(f"{inner}    add_header Access-Control-Allow-Origin  \"*\" always;")
+        L.append(f"{inner}    add_header Access-Control-Allow-Methods \"GET, POST, OPTIONS\" always;")
+        L.append(f"{inner}    add_header Access-Control-Allow-Headers \"*\" always;")
+        L.append(f"{inner}    return 204;")
+        L.append(f"{inner}}}")
+        L.append(f"{inner}add_header Access-Control-Allow-Origin \"*\" always;")
         L.append(f"{inner}proxy_set_header X-Real-IP $remote_addr;")
         L.append(f"{inner}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
         L.append(f"{inner}proxy_read_timeout 300s;")
