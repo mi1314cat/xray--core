@@ -378,7 +378,15 @@ EOF
     # 重写风险大得多。
     _ad="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/deploy.py"
     if [[ -r "$_ad" ]]; then
-        if ! python3 "$_ad" --adopt ""$file"" --domain ""$DEST"" >&2; then
+        # ★ 这里必须给**对外入口地址**, 不能给伪装域名。
+        #   以前写的是 --domain "$DEST" —— DEST 是 REALITY 的伪装目标
+        #   (go.dev 这类), 它只是握手时给对方看的 SNI, **根本不是本机地址**。
+        #   后果: 补出来的分享元数据里 host=go.dev, 于是订阅里这个节点指向
+        #   go.dev:<端口> —— 客户端连过去当然是别人的服务器, 而这个节点在
+        #   面板上、在分享链接里都"正常"。实测 (全协议建完之后订阅里只有
+        #   预置体系的节点, 协议脚本建的四个一个都没进去) 才查到这一层。
+        #   vlessecn.sh 那边给的是 link_ip (对的), 这里跟着它改。
+        if ! python3 "$_ad" --adopt ""$file"" --domain ""$link_ip"" >&2; then
             print_warn "  分享元数据没补上 —— 这个节点暂时没有分享链接"
             print_warn "  面板的其它功能正常; 需要链接时用菜单 13 (预置档位) 重建一个"
         fi

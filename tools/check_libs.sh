@@ -7248,6 +7248,30 @@ else
     bad "vlessxhttpecn.sh 里判据用到了尚未赋值的 CONF_DIR (set -u 下直接退出)"
 fi
 
+# ⑦ 订阅里必须有**协议脚本建的节点**, 不能只有预置体系的
+#    现场: 全协议建完, 汇总里每个节点都有自己的分享链接, 而订阅载荷里
+#    只有预置那条路 (走 deploy 的) 的节点 —— 协议脚本建的一个都没进。
+#    原因: 元数据只认 out/share/, 而协议脚本要么不写、要么把**伪装域名**
+#    当成对外地址写进去 (Reality 原来给的是 --domain "$DEST", DEST=go.dev)。
+if grep -F 'backfill_share_meta' "$ROOT/conf/batch.sh" >/dev/null; then
+    ok "批量收尾会补发布 (缺元数据的片段逐个 adopt)"
+else
+    bad "协议脚本建的节点永远不会进订阅 → 「全协议订阅」名不副实"
+fi
+# 伪装域名不能当对外地址
+if sed -n '/--adopt/,+2p' "$ROOT/conf/Reality.sh" | grep -F 'link_ip' >/dev/null; then
+    ok "Reality 补发布用的是对外入口地址, 不是伪装域名"
+else
+    bad "Reality 把 REALITY 伪装域名当成了节点地址 → 订阅里指向别人的服务器"
+fi
+# 分享元数据目录口径: 只能是 out/share (与 share_meta.py 一致)
+_badshare=$(grep -nE '\$XRAY_BASE\}/share"|XRAY_BASE}/share"' "$ROOT/conf/batch.sh" 2>/dev/null || true)
+if [[ -z "$_badshare" ]]; then
+    ok "batch 里的分享目录口径与读取方一致 (out/share)"
+else
+    bad "batch 里有地方把分享目录写成了 \$XRAY_BASE/share (少一层 out/)" "$_badshare"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

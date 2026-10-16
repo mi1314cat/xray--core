@@ -77,6 +77,13 @@ export XRAY_BASE
 X_IS_SANDBOX=false
 CONF_DIR="${_XRAY_CONF_OVERRIDE:-$XRAY_BASE/conf}"
 OUT_DIR="${_XRAY_OUT_OVERRIDE:-$XRAY_BASE/out}"
+# ★ 分享元数据目录的口径必须与**读取方**一致: share_meta.py 用的是
+#   $XRAY_BASE/out/share。这里以前写过 "$XRAY_BASE/share" —— 少一层 out/,
+#   而那个目录在真实安装上通常是空的 (或根本没有), 于是"清空/重建前先记下
+#   要摘的 (域名, path)"这一步什么也记不到, 事后站点里留下一堆指向死端口的
+#   location, 而屏幕上一切正常。同一个坑同族已经踩过两次 (share/tokens 与
+#   out/share), 所以这里收口成一个变量。
+SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
 # 判定要跟着**真正生效的那个目录**走: 只给 XRAY_CONF_DIR 时 XRAY_BASE
 # 仍是生产值, 但写的已经不是生产目录了 —— 那种情况必须也算沙箱,
 # 否则"配置写到别处、systemd 照样重启生产服务"。
@@ -332,6 +339,40 @@ choose_port_range() {
     # —— 而这段区间后面要写进防火墙规则, 是要能对得上的。
     print_ok "批量端口区间: $X_BATCH_PORT_START - $X_BATCH_PORT_END" \
              "($(( X_BATCH_PORT_END - X_BATCH_PORT_START + 1 )) 个, 每个节点一个)" >&2
+    return 0
+}
+
+########## 补发布: 让协议脚本建的节点也进订阅 ##########
+#
+# ★ 协议脚本 (Reality/Trojan/Shadowsocks/hysteria2) 是**自己拼片段**的, 只在
+#   "建的那一刻"顺手补一次分享元数据 (走 deploy.py --adopt)。于是:
+#     · 早于那次修复建出来的节点, 永远不会有元数据;
+#     · 补的时候给错域名 (Reality 原来给的是伪装域名 go.dev), 补了也等于没补。
+#   而**订阅载荷只认 out/share/** —— 结果就是
+#       "订阅里只有预置体系的节点, 协议脚本建的四个一个都不在",
+#   而面板上、汇总里每个节点的分享链接都打得出来, 一切正常。
+#
+#   所以批量收尾时统一补一次: 缺元数据的片段逐个 adopt, 用的是**对外入口地址**
+#   (域名优先, 否则本机公网地址), 不是任何伪装目标。
+backfill_share_meta() {
+    local host="$1" f tag n=0
+    [[ -n "$host" ]] || return 0
+    local dp=""
+    for dp in "$LIB_DIR/deploy.py" "$(dirname "$LIB_DIR")/lib/deploy.py"; do
+        [[ -r "$dp" ]] && break
+    done
+    [[ -r "$dp" ]] || return 0
+    shopt -s nullglob
+    for f in "$CONF_DIR"/*.json; do
+        shopt -u nullglob
+        tag=$(jq -r '.inbounds[0].tag // empty' "$f" 2>/dev/null)
+        [[ -n "$tag" ]] || continue
+        [[ -f "$SHARE_DIR/$tag.json" ]] && continue
+        if python3 "$dp" --adopt "$f" --domain "$host" >/dev/null 2>&1; then
+            n=$((n + 1))
+        fi
+    done
+    (( n > 0 )) && print_info "  补发布: $n 个节点补上了分享元数据 (订阅里才看得见)"
     return 0
 }
 
@@ -642,6 +683,17 @@ batch_main() {
         return 1
     fi
 
+    # ---- 补发布: 让协议脚本建的节点也进订阅 ----
+    #   对外地址: 域名优先 (CDN/nginx 档连的是域名), 否则本机公网地址。
+    local _pubhost="${X_BATCH_DOMAIN:-${X_BATCH_DOMAIN_BASE:-}}"
+    if [[ -z "$_pubhost" ]]; then
+        _pubhost=$(awk -F'"' '/^(link_ip|PUBLIC_IP)=/{print $2; exit}' \
+                   "$XRAY_BASE/install_info.env" 2>/dev/null || true)
+    fi
+    [[ -n "$_pubhost" ]] || _pubhost=$(XRAY_BASE="$XRAY_BASE" XRAY_RAW="$GH_RAW" \
+        bash -c 'source "$XRAY_BASE/conf/lib/addr.sh" 2>/dev/null; resolve_public_ip 2>/dev/null' 2>/dev/null || true)
+    backfill_share_meta "$_pubhost"
+
     # ---- 仅一次统一 reload (非沙箱 XRAY_BASE_DIR 才操作 systemd) ----
     local reloaded=false
     if [[ "$X_IS_SANDBOX" != "true" && "${X_BATCH_TEST_SKIP_RESTART:-0}" != "1" ]]; then
@@ -798,7 +850,7 @@ batch_summary() {
 # 按"端口是否存活"反推更可靠, 也不会误伤站点自有的 location。
 
 _collect_nginx_targets() {   # → 打印 "域名<TAB>路径" 每行一个
-    local share_dir="${XRAY_BASE:-/root/catmi/xray}/share"
+    local share_dir="$SHARE_DIR"
     [[ -d "$share_dir" ]] || return 0
     SHARE_DIR="$share_dir" LIB="$LIB_DIR" py -c "
 import os, sys
