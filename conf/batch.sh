@@ -75,13 +75,16 @@ _XRAY_OUT_OVERRIDE="${XRAY_OUT_DIR:-}"
 export XRAY_BASE
 # 沙箱标志: 两个变量任意一个指离生产就算沙箱
 X_IS_SANDBOX=false
+CONF_DIR="${_XRAY_CONF_OVERRIDE:-$XRAY_BASE/conf}"
+OUT_DIR="${_XRAY_OUT_OVERRIDE:-$XRAY_BASE/out}"
 # 判定要跟着**真正生效的那个目录**走: 只给 XRAY_CONF_DIR 时 XRAY_BASE
 # 仍是生产值, 但写的已经不是生产目录了 —— 那种情况必须也算沙箱,
 # 否则"配置写到别处、systemd 照样重启生产服务"。
+# ★ 顺序不能颠倒: 判据里用到了 CONF_DIR, 而本脚本 set -u ——
+#   写在赋值之前就是 `CONF_DIR: unbound variable` 直接退出 (实测踩到)。
+X_IS_SANDBOX=false
 [[ "$XRAY_BASE" != /root/catmi/xray || "$CONF_DIR" != /root/catmi/xray/conf ]] \
     && X_IS_SANDBOX=true
-CONF_DIR="${_XRAY_CONF_OVERRIDE:-$XRAY_BASE/conf}"
-OUT_DIR="${_XRAY_OUT_OVERRIDE:-$XRAY_BASE/out}"
 LOG_DIR="${X_BATCH_LOG_DIR:-/tmp}"
 
 ########## 脚本目录解析 ##########

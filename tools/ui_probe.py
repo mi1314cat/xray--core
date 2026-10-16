@@ -241,7 +241,9 @@ def main():
         # 非交互标志关掉: 我们要测的就是交互那条路
         "SB_BATCH": "",
         # 别碰生产的分享服务 —— 见 check_libs.sh 顶部那条注释
-        "X_NO_SHARE_SUBSCRIBE": "1",
+        # 默认关掉自动订阅 (别碰生产分享服务); 但**允许调用方显式覆盖** ——
+        # 要验证"批量建完自动出订阅"这条功能时就必须能打开它。
+        "X_NO_SHARE_SUBSCRIBE": os.environ.get("X_NO_SHARE_SUBSCRIBE", "1"),
     })
     # 让面板不要联网去拉 lib (会掩盖真正的交互问题)
     env["XRAY_RAW"] = env.get("XRAY_RAW", "file://" + repo)

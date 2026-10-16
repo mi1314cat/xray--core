@@ -7179,6 +7179,34 @@ else
 fi
 rm -rf "$_SBX"
 
+# ⑥ 沙箱标志的判据里用到 CONF_DIR, 而脚本是 set -u —— 顺序写反就直接退出
+#    实测: `CONF_DIR: unbound variable` (batch.sh 的判据被挪到赋值之前)。
+#    这条只有**在 set -u 下真的 source 一遍**才看得出来, 静态看字符串是看不出的。
+_ORD=""
+# 只挑**可以直接 source 做这件事**的脚本: vlessxhttpecn.sh 在 source 时会往下
+# 执行到别的地方 (实测 line 473: CERT_FILE: unbound variable), 那是它自己的
+# 顶层级代码, 与这里的顺序问题无关 —— 拿它做这个判据只会假红。它改用静态判。
+for _f in batch.sh Reality.sh Trojan.sh Shadowsocks.sh hysteria2.sh vlessecn.sh; do
+    _o=$(env -u CONF_DIR -u OUT_DIR XRAY_BASE=/tmp/ordprobe bash -c \
+         "set -u; cd '$ROOT' && source conf/$_f >/dev/null 2>&1; printf '%s' \"\$CONF_DIR\"" 2>&1 | tail -1)
+    [[ "$_o" == "/tmp/ordprobe/conf" ]] || _ORD="$_ORD $_f($_o)"
+done
+if [[ -z "$_ORD" ]]; then
+    ok "set -u 下六个脚本都能正常算出 CONF_DIR (判据顺序没写反)"
+else
+    bad "这些脚本在 set -u 下算 CONF_DIR 就挂了" "$_ORD"
+fi
+# vlessxhttpecn.sh: 静态查行号 —— CONF_DIR 的赋值必须早于用到它的那句
+# 用 awk 自己取第一行号, 不接管道 —— `grep | head` 会让 grep 吃 SIGPIPE,
+# 而那正是本套门禁里另一条规则明令禁止的写法。
+_vx_conf=$(awk '/^CONF_DIR=/{print NR; exit}' "$ROOT/conf/vlessxhttpecn.sh")
+_vx_use=$(awk '/\$CONF_DIR" != \/root\/catmi\/xray\/conf/{print NR; exit}' "$ROOT/conf/vlessxhttpecn.sh")
+if [[ -n "$_vx_conf" && -n "$_vx_use" && "$_vx_conf" -lt "$_vx_use" ]]; then
+    ok "vlessxhttpecn.sh 里 CONF_DIR 先赋值后使用"
+else
+    bad "vlessxhttpecn.sh 里判据用到了尚未赋值的 CONF_DIR (set -u 下直接退出)"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
