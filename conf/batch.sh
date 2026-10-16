@@ -375,9 +375,8 @@ choose_port_range() {
 #
 #   所以批量收尾时统一补一次: 缺元数据的片段逐个 adopt, 用的是**对外入口地址**
 #   (域名优先, 否则本机公网地址), 不是任何伪装目标。
-backfill_share_meta() {
-    local host="$1" f tag n=0
-    [[ -n "$host" ]] || return 0
+backfill_share_meta() {   # <直连节点的对外地址> [nginx/CDN 节点的域名]
+    local host="$1" dom="${2:-}" f tag n=0
     local dp=""
     for dp in "$LIB_DIR/deploy.py" "$(dirname "$LIB_DIR")/lib/deploy.py"; do
         [[ -r "$dp" ]] && break
@@ -389,7 +388,21 @@ backfill_share_meta() {
         tag=$(jq -r '.inbounds[0].tag // empty' "$f" 2>/dev/null)
         [[ -n "$tag" ]] || continue
         [[ -f "$SHARE_DIR/$tag.json" ]] && continue
-        if python3 "$dp" --adopt "$f" --domain "$host" >/dev/null 2>&1; then
+        # ★ 对外地址要**按这个节点怎么被访问**来给, 不能一刀切:
+        #   绑 0.0.0.0 的是直连节点 (协议脚本建的那些), 客户端连的是公网地址;
+        #   绑 127.0.0.1 的是 nginx 档, 客户端连的是域名。
+        #   给错的后果不是"链接难看", 而是**发布侧拒发**:
+        #     · 直连节点给域名 → 与协议脚本自己写的产物端点不一致, 被判"不一致"拒发;
+        #     · nginx 档给 IP   → 元数据 tier 不对, 被判"只绑回环外部访问不到"拒发。
+        #   实测: 10 个节点里只有 1 个进了订阅, 而屏幕上一切正常。
+        local _listen _h
+        _listen=$(jq -r '.inbounds[0].listen // ""' "$f" 2>/dev/null)
+        case "$_listen" in
+            127.0.0.1|::1) _h="${dom:-$host}" ;;
+            *)             _h="$host" ;;
+        esac
+        [[ -n "$_h" ]] || continue
+        if python3 "$dp" --adopt "$f" --domain "$_h" >/dev/null 2>&1; then
             n=$((n + 1))
         fi
     done
@@ -547,14 +560,13 @@ batch_main() {
     #   那条订阅就只包含"当时有元数据"的几个节点 —— 实测 9 个节点里只进了 5 个,
     #   而屏幕上一切正常。
     #   对外地址: 域名优先 (CDN/nginx 档连的是域名), 否则本机公网地址。
-    local _pubhost="${X_BATCH_DOMAIN:-${X_BATCH_DOMAIN_BASE:-}}"
-    if [[ -z "$_pubhost" ]]; then
-        _pubhost=$(awk -F'"' '/^(link_ip|PUBLIC_IP)=/{print $2; exit}' \
-                   "$XRAY_BASE/install_info.env" 2>/dev/null || true)
-    fi
-    [[ -n "$_pubhost" ]] || _pubhost=$(XRAY_BASE="$XRAY_BASE" XRAY_RAW="$GH_RAW" \
+    local _pubdom="${X_BATCH_DOMAIN:-${X_BATCH_DOMAIN_BASE:-}}"
+    local _pubip
+    _pubip=$(awk -F'"' '/^(link_ip|PUBLIC_IP)=/{print $2; exit}' \
+             "$XRAY_BASE/install_info.env" 2>/dev/null || true)
+    [[ -n "$_pubip" ]] || _pubip=$(XRAY_BASE="$XRAY_BASE" XRAY_RAW="$GH_RAW" \
         bash -c 'source "$XRAY_BASE/conf/lib/addr.sh" 2>/dev/null; resolve_public_ip 2>/dev/null' 2>/dev/null || true)
-    backfill_share_meta "$_pubhost"
+    backfill_share_meta "$_pubip" "$_pubdom"
 
     # ★ 用户要求: "全协议脚本里面一定要有这个"。
     #

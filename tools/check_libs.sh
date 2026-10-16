@@ -7329,6 +7329,24 @@ else
     bad "adopt 没处理 shortIds 列表 → shortId 补不出来"
 fi
 
+# ⑩ 补发布时的对外地址要按"这个节点怎么被访问"给
+#    现场: 10 个节点只进了 1 个订阅, 两个原因都是地址给错导致的**拒发**:
+#      · 直连节点给了域名 → 与协议脚本自己写的产物端点不一致, 判"不一致"拒发;
+#      · nginx 档给了 IP  → 判"只绑回环外部访问不到"拒发。
+#    屏幕上完全看不出来: 每个节点自己的分享链接都在, 只有订阅里是空的。
+if sed -n '/^backfill_share_meta()/,/^}/p' "$ROOT/conf/batch.sh" \
+     | grep -F '127.0.0.1|::1)' >/dev/null; then
+    ok "补发布会按监听地址选对外地址 (直连给 IP / nginx 档给域名)"
+else
+    bad "补发布一刀切给地址 → 一半节点会被发布侧拒发"
+fi
+# --adopt 的 --tier 默认值不能强行给 cdn, 否则会覆盖 adopt 自己的判断
+if grep -F 'ap.add_argument("--tier", default=None' "$ROOT/conf/lib/deploy.py" >/dev/null; then
+    ok "--adopt 的 --tier 默认是 None (adopt 才能按片段自己判档位)"
+else
+    bad "--tier 默认写死 cdn → nginx 档节点被补成 cdn, 发布侧拒发"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

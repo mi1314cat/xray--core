@@ -74,7 +74,9 @@ LISTEN_FOR = {ACCESS_CDN: "0.0.0.0", ACCESS_NGINX: "127.0.0.1"}
 PUBLIC_HOST_SOURCE = {ACCESS_CDN: "domain", ACCESS_NGINX: "domain"}
 
 
-def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
+def plan(protocol, transport, security, opts=None, tier=None):
+    if not tier:
+        tier = ACCESS_CDN
     """生成完整部署方案。
 
     返回 dict:
@@ -402,7 +404,7 @@ def _reality_pubkey_from_private(private_key):
     if not pk:
         return ""
     import os as _os
-    import re as _re
+    import re
     import shutil
     import subprocess
     for cand in (_os.path.join(_os.environ.get("XRAY_BASE", "/root/catmi/xray"), "xrayls"),
@@ -415,7 +417,7 @@ def _reality_pubkey_from_private(private_key):
                                  text=True, timeout=10).stdout
         except Exception:                                   # noqa: BLE001
             continue
-        m = _re.search(r'^\s*(?:Password \(PublicKey\)|Password|Public key)\s*:\s*(\S+)',
+        m = re.search(r'^\s*(?:Password \(PublicKey\)|Password|Public key)\s*:\s*(\S+)',
                        out, re.M)
         if m:
             return m.group(1)
@@ -799,7 +801,12 @@ if __name__ == "__main__":
     ap.add_argument("--public-port", type=int, help="对外端口, nginx 档位默认 443")
     ap.add_argument("--domain")
     ap.add_argument("--tag")
-    ap.add_argument("--tier", default=ACCESS_CDN, choices=[ACCESS_CDN, ACCESS_NGINX])
+    # ★ 默认必须是 None, 不能是 ACCESS_CDN。
+    #   --adopt 要按片段自己判断档位 (监听 127.0.0.1 就是 nginx 档), 而
+    #   argparse 的 default 会**悄悄覆盖**那个判断: 于是 nginx 档节点被补成
+    #   tier=cdn, 发布侧按"绑回环又没 nginx"拒发 —— 节点在, 却永远进不了订阅。
+    #   plan() 那边收到 None 时自己兜成 cdn, 行为不变。
+    ap.add_argument("--tier", default=None, choices=[ACCESS_CDN, ACCESS_NGINX])
     ap.add_argument("--password")
     ap.add_argument("--uuid")
     ap.add_argument("--method")
