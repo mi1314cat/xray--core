@@ -7272,6 +7272,37 @@ else
     bad "batch 里有地方把分享目录写成了 \$XRAY_BASE/share (少一层 out/)" "$_badshare"
 fi
 
+# ⑧ 脚本里用到的变量/函数必须先有定义
+#    现场: batch.sh 里 LIB_DIR 与 py 被用了多处 (补发布找 deploy.py、摘 nginx
+#    找 nginx_apply.py), 却**从来没有定义过** —— 那几处的路径都是 "/deploy.py"
+#    这类, 判断一律为假, 而且大多在 `|| true` / 2>/dev/null 后面, 报错被吞掉:
+#    功能静默不生效, 屏幕上一切正常。
+#    实测代价: "订阅里只有预置体系的节点" 与 "清空/重建时记不下要摘的 location"。
+_UNDEF=""
+for _f in "$ROOT"/conf/*.sh "$ROOT"/tools/*.sh; do
+    [[ -f "$_f" ]] || continue
+    grep -qE '\bLIB_DIR\b' "$_f" 2>/dev/null || continue
+    grep -qE '^[[:space:]]*(LIB_DIR=|LIB_DIR:)' "$_f" 2>/dev/null && continue
+    grep -qE 'LIB_DIR=' "$_f" 2>/dev/null && continue
+    _UNDEF="$_UNDEF $(basename "$_f")"
+done
+if [[ -z "$_UNDEF" ]]; then
+    ok "用到 LIB_DIR 的脚本都给它赋了值"
+else
+    bad "这些脚本用了 LIB_DIR 却没定义 (路径会变成 /deploy.py 这类)" "$_UNDEF"
+fi
+_UNDEF2=""
+for _f in "$ROOT"/conf/*.sh; do
+    grep -qE '(^|[^a-z_])py (-c|"|\$)' "$_f" 2>/dev/null || continue
+    grep -qE '^[[:space:]]*py\(\)' "$_f" 2>/dev/null && continue
+    _UNDEF2="$_UNDEF2 $(basename "$_f")"
+done
+if [[ -z "$_UNDEF2" ]]; then
+    ok "用到 py 的脚本都定义了它"
+else
+    bad "这些脚本调了 py 却没定义 (command not found, 且常被 2>/dev/null 吞掉)" "$_UNDEF2"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

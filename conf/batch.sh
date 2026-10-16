@@ -84,6 +84,27 @@ OUT_DIR="${_XRAY_OUT_OVERRIDE:-$XRAY_BASE/out}"
 #   location, 而屏幕上一切正常。同一个坑同族已经踩过两次 (share/tokens 与
 #   out/share), 所以这里收口成一个变量。
 SHARE_DIR="${XRAY_SHARE_DIR:-$XRAY_BASE/out/share}"
+
+# ★ 共用库目录。这个变量在本脚本里被用了三处 (补发布找 deploy.py、摘 nginx
+#   找 nginx_apply.py、给 python 助手传 LIB), 却**从来没有被定义过** ——
+#   于是那三处的路径都是 "/deploy.py" "/nginx_apply.py" 这类, 判断一律为假,
+#   相关功能静默不生效, 而屏幕上一切正常:
+#     · 补发布: 协议脚本建的节点进不了订阅 (实测: 订阅里只有预置体系的节点);
+#     · 摘 nginx: 清空/重建时记不下要摘的 (域名, path)。
+#   口径与 xray_run 一致: 面板把 lib/ 铺在脚本旁边的 lib/; 仓库里是 conf/lib/。
+_x_batch_libdir() {
+    local here d
+    here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    for d in "$here/lib" "$here/conf/lib" "$XRAY_BASE/conf/lib"; do
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    done
+    printf '%s' "$here/lib"
+}
+LIB_DIR="${XRAY_LIB_DIR:-$(_x_batch_libdir)}"
+# py 也一样: 本脚本里用 python 的地方统一走它 (与 conf/node.sh 同一写法)。
+# 不定义就是 "py: command not found", 而那几处都在 || true / 2>/dev/null 后面,
+# 报错被吞掉, 功能静默不生效。
+py() { python3 "$@"; }
 # 判定要跟着**真正生效的那个目录**走: 只给 XRAY_CONF_DIR 时 XRAY_BASE
 # 仍是生产值, 但写的已经不是生产目录了 —— 那种情况必须也算沙箱,
 # 否则"配置写到别处、systemd 照样重启生产服务"。
