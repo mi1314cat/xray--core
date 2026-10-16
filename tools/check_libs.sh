@@ -7122,7 +7122,7 @@ fi
 #    .py 那几个尤其重要: deploy.py 里是 `import node_build` / `import to_mihomo`,
 #    逐个下到临时文件就 import 不到兄弟模块 (实测报 No module named 'node_build',
 #    症状是全协议的上下行分离两个组合全失败, 而日志里是一段 Python traceback)。
-for _need in proto_ui.sh preset.sh preset_batch.sh cdn_auto.sh \
+for _need in proto_ui.sh preset.sh print.sh share.sh preset_batch.sh cdn_auto.sh \
              deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
              share_payload.py token_store.py; do
     if printf '%s' "$_RSC" | grep -F "$_need" >/dev/null; then

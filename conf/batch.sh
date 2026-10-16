@@ -141,8 +141,12 @@ resolve_scripts_dir() {
     #   一视同仁地 bash -n 会得到
     #       deploy.py: line 31: syntax error near unexpected token `0,'
     #   看起来像"下载损坏", 其实是我们拿错工具去验它了 —— 这种报错最误导人。
+    # share.sh 也要铺: 批量建完的那一步会调它生成订阅链接, 而它是按
+    # `dirname($0)/../conf/share.sh` 找自己的位置 / 找同目录的 lib 的。
+    # 不铺的话屏幕上只有一句"找不到 conf/share.sh —— 订阅链接没有自动生成",
+    # 而 curl 明明是通的 (实测)。
     local l
-    for l in proto_ui.sh ports.sh addr.sh preset.sh \
+    for l in proto_ui.sh ports.sh addr.sh preset.sh print.sh share.sh \
              deploy.py node_build.py to_mihomo.py nodes.py share_meta.py \
              naming.py nginx_apply.py share_payload.py token_store.py; do
         if [[ ! -s "$confdir/lib/$l" ]]; then
