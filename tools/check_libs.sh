@@ -7395,6 +7395,16 @@ if grep -F 'Access-Control-Allow-Origin' "$ROOT/conf/lib/nginx_apply.py" >/dev/n
 else
     bad "nginx 片段没有 CORS 处理 → 客户端的浏览器拨号被浏览器自己拦掉"
 fi
+# ★ 但**不能**再给被代理的响应补一个 ACAO: xray 自己会回那个头 (它本来就支持
+#   跨源), 补第二个就变成"多值 ACAO", 而浏览器对多值是直接拒绝的
+#   ("contains multiple values"), 比没有还糟。实测过响应里出现两个。
+_cors_uncond=$(grep -c '^        L.append(f"{inner}add_header Access-Control-Allow-Origin' \
+               "$ROOT/conf/lib/nginx_apply.py" 2>/dev/null || echo 0)
+if [[ "${_cors_uncond:-0}" -eq 0 ]]; then
+    ok "没有给被代理的响应重复补 ACAO (避免多值被浏览器拒绝)"
+else
+    bad "被代理的响应上补了第二个 ACAO → 浏览器会以'多值'拒绝"
+fi
 
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then

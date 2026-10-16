@@ -660,7 +660,12 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
         L.append(f"{inner}    add_header Access-Control-Max-Age 86400 always;")
         L.append(f"{inner}    return 204;")
         L.append(f"{inner}}}")
-        L.append(f"{inner}add_header Access-Control-Allow-Origin \"*\" always;")
+        # ★ 这里**不再**无条件补一个 Access-Control-Allow-Origin。
+        #   xray 自己会给带 Origin 的请求回 ACAO (它本来就支持跨源), 我们再补
+        #   一个就变成**两个** ACAO 头 —— 而浏览器对"多值 ACAO"是直接拒绝的
+        #   ("contains multiple values"), 比没有还糟。
+        #   实测: OPTIONS 由 nginx 就地 204; GET/POST 转给 xray 后响应里已经
+        #   带着 access-control-allow-origin。
         L.append(f"{ind}}}")
     else:
         L.append(f"{ind}location {path} {{")
