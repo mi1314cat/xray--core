@@ -25,6 +25,11 @@ RESET="\e[0m"
 print_info()  { printf "${CYAN}[Info]${RESET} %s\n" "$1" >&2; }
 print_ok()    { printf "${GREEN}[OK]${RESET}  %s\n" "$1" >&2; }
 print_error() { printf "${RED}[Error]${RESET} %s\n" "$1" >&2; }
+# ★ 补上漏掉的一个。这个脚本自带一套 print_*, 不 source lib/print.sh,
+#   而下面用到了 print_warn —— 少这一行, 屏幕上就会出现
+#       conf/verify.sh: line 123: print_warn: command not found
+#   偏偏它是在"有端口没绑上"那条最需要说清楚的路径上。
+print_warn()  { printf "${YELLOW}[Warn]${RESET}  %s\n" "$1" >&2; }
 
 print_title() {
     printf "${MAGENTA}${BOLD}" >&2

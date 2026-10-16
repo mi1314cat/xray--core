@@ -1497,7 +1497,7 @@ share_ensure_subscription() {
     #   (XRAY_BASE 是不是生产那样), 而有人本来就把面板装在别处, 那种情况下
     #   他要的就是自动订阅。**显式开关**比猜测可靠。
     if [[ "${X_NO_SHARE_SUBSCRIBE:-0}" == "1" ]]; then
-        print_info "已按 X_NO_SHARE_SUBSCRIBE=1 跳过自动订阅 (节点照常建好)"
+        info "已按 X_NO_SHARE_SUBSCRIBE=1 跳过自动订阅 (节点照常建好)"
         return 0
     fi
 
@@ -1543,7 +1543,7 @@ PYEOF
     if [[ -n "$tok" ]]; then
         share_refresh_all >/dev/null 2>&1 || true
         local url; url=$(_share_url "$tok" 2>/dev/null)
-        print_ok "订阅已刷新 (含全部 ${#tags[@]} 个节点): ${url:-（地址读取失败）}"
+        ok "订阅已刷新 (含全部 ${#tags[@]} 个节点): ${url:-（地址读取失败）}"
         return 0
     fi
 
@@ -1575,7 +1575,7 @@ for r in (recs if isinstance(recs, list) else []):
         print(r.get("token", "")); break
 PYEOF
 )
-            [[ -n "$tok2" ]] && print_ok "订阅地址: $(_share_url "$tok2" 2>/dev/null)"
+            [[ -n "$tok2" ]] && ok "订阅地址: $(_share_url "$tok2" 2>/dev/null)"
         fi
         return 0
     fi

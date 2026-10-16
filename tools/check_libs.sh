@@ -6791,6 +6791,62 @@ else
     bad "share.sh 不认开关 → 测试没法关掉它"
 fi
 
+# ⑤ 调用别处私有定义的输出函数 —— 会打印 "command not found" 而不是报错停下
+#    现场: share.sh 里调了 batch.sh 私有定义的 print_info, 而 share.sh 自己
+#    没定义、也没 source 到任何一个定义了它的库。表现是屏幕上出现一行
+#          conf/share.sh: line 1500: print_info: command not found
+#    而流程照常"成功"结束 —— 它不是 set -e 下的致命错误。
+#    (本地测试看不见: 那条路径要"批量建完节点收尾"才会走到。)
+#
+#    ★ 判据必须算**可见集**, 不能只 grep 一个文件里有没有定义:
+#      print_info 这批名字在 X 里不是全局的, 它由 proto_ui.sh 提供,
+#      谁 source 了才看得见。只查"本文件有没有定义"会把
+#      Reality.sh / vlessecn.sh / vlessxhttpecn.sh (都 source 了 proto_ui.sh)
+#      一起冤枉进去 —— 假红的门禁比没有门禁更糟, 因为没人再看它。
+_BADFN=$(XRAY_ROOT="$ROOT" python3 - <<'PYX'
+import os, re, sys, pathlib
+root = pathlib.Path(os.environ["XRAY_ROOT"])
+libd = root / "conf" / "lib"
+
+def defines(text):
+    return set(re.findall(r'^[ \t]*([A-Za-z_][A-Za-z0-9_]*)\(\)', text, re.M))
+
+lib_defs = {}
+for f in libd.glob("*.sh"):
+    try:
+        lib_defs[f.name] = defines(f.read_text(encoding="utf-8", errors="ignore"))
+    except OSError:
+        pass
+
+bad = []
+for f in sorted((root / "conf").glob("*.sh")):
+    try:
+        t = f.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        continue
+    calls = set(re.findall(r'\b(print_[a-z_]+)\b', t))
+    if not calls:
+        continue
+    visible = defines(t)
+    # 能看见的库: 文本里提到过的 lib/<名>.sh, 以及 proto_ui.sh (常用别名 _PUI)
+    for name, d in lib_defs.items():
+        if name in t:
+            visible |= d
+    if "_PUI" in t or "proto_ui" in t:
+        visible |= lib_defs.get("proto_ui.sh", set())
+    missing = {c for c in calls if c not in visible
+               and not re.search(r'^[ \t]*%s\(\)' % re.escape(c), t, re.M)}
+    if missing:
+        bad.append("%s (%s)" % (f.name, ", ".join(sorted(missing))))
+print(" | ".join(bad))
+PYX
+)
+if [[ -z "$_BADFN" ]]; then
+    ok "没有脚本调用自己看不见的输出函数 (print_* 可见集算过)"
+else
+    bad "这些脚本调用了未定义/取不到的 print_* 函数" "$_BADFN"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
