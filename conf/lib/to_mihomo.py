@@ -268,8 +268,8 @@ def xhttp_download_settings(node):
     ech = str(node.get("dl_ech") or "").strip()
     if ech:
         dl["ech-opts"] = {"enable": True, "config": ech}
-    elif node.get("dl_ech_enable"):
-        dl["ech-opts"] = {"enable": True}
+    # ★ 同上: 没有配置串就不写 `enable: true` —— 那会让 mihomo 自己去查 DNS,
+    #   查不到就把整条下行打成连不上。
 
     # ---- xhttp 部分 ----
     xh = {}
@@ -328,6 +328,11 @@ def proxy(node):
     #   (https://wiki.metacubex.one/config/proxies/transport/#xhttp-opts)
     # 别的协议即便 X 内核接受, mihomo 侧也起不来 —— 生成出来只会让人以为能用。
     if net0 == "xhttp" and proto != "vless":
+        return None
+
+    # VLESS 会话加密 (Xray 独有): mihomo 拿到就直接拒绝加载**整份配置** ——
+    # 不是"这个节点不可用", 是**所有节点一起起不来**。实测见 enc_unsupported。
+    if enc_unsupported(node):
         return None
 
     if proto == "vmess":
@@ -503,8 +508,12 @@ def proxy(node):
     ech = str(node.get("ech") or "").strip()
     if ech:
         out["ech-opts"] = {"enable": True, "config": ech}
-    elif node.get("ech_declared") or node.get("ech_enable"):
-        out["ech-opts"] = {"enable": True}
+    # ★ 这里**故意**没有"没有配置串也写个 enable: true"的分支。
+    #   实测那样做会把整条节点打成不可用: mihomo 会去自己查 DNS, 查不到就
+    #       resolve ECH config error: no ECH config found in DNS records
+    #   直接连不上 (HTTP=000) —— 比不开 ECH 糟得多, 而用户看到的是"节点坏了"。
+    #   取不到配置串时宁可不写这一项: 节点至少是通的, 而"为什么没有 ECH"
+    #   由生成节点那一刻的警告说清楚 (见 deploy.plan)。
 
     if (node.get("flow") or "").strip():
         out["flow"] = str(node["flow"]).strip()
@@ -606,6 +615,33 @@ def write_products(frag, meta, out_dir, name=None, tag=None):
     return dest, ""
 
 
+# mihomo 认的 VLESS encryption 取值。
+#
+# ★ 这条是实测出来的 (mihomo v1.19.32): Xray 的 VLESS Encryption 串
+#   `mlkem768x25519plus.native.600s.<密钥>` 交给 mihomo, 它**整个配置都不加载**:
+#       level=error msg="proxy 0: invaild vless encryption value: mlkem768x25519plus..."
+#       configuration file ... test failed
+#   也就是说产出一份 mihomo YAML 等于产出一份"客户端起不来"的配置 ——
+#   而屏幕上只写着"已写入客户端产物"。宁可不出这份文件, 把原因讲清楚。
+#
+#   注意 mihomo 里确实有 mlkem (它的 ECH/TLS 栈用它), 但那不是同一个东西:
+#   那是 TLS 层, 这是 VLESS 应用层的会话加密。名字像, 不能互推。
+_MIHOMO_VLESS_ENC_OK = ("", "none")
+
+
+def enc_unsupported(node):
+    """这个节点的 VLESS encryption mihomo 吃不吃得下。吃得下返回 ""。"""
+    proto = str(node.get("protocol") or "").lower()
+    if proto != "vless":
+        return ""
+    enc = str(node.get("encryption") or "").strip()
+    if enc.lower() in _MIHOMO_VLESS_ENC_OK:
+        return ""
+    return (f"VLESS 会话加密 {enc.split('.')[0]} 是 Xray 独有的, "
+            f"mihomo 会直接拒绝整个配置 (实测 v1.19.32: invaild vless encryption value)。"
+            f"这条节点请用 Xray 原生客户端, 或改用不带后量子加密的档位")
+
+
 def _why_unsupported(node):
     """proxy() 返回 None 时, 说清是**哪一条**不满足。
 
@@ -626,6 +662,9 @@ def _why_unsupported(node):
         return "REALITY 缺公钥 (pbk) —— 分享元数据里没有 public_key"
     if not (node.get("id") or node.get("password")):
         return "缺凭据 (uuid / password)"
+    _enc_bad = enc_unsupported(node)
+    if _enc_bad:
+        return _enc_bad
     if net not in ("xhttp", "ws", "websocket", "grpc", "tcp", "raw", ""):
         return f"mihomo 不支持 {net} 传输"
     return f"不支持的组合: {proto} + {net} + {sec}"

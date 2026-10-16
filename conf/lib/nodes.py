@@ -520,6 +520,74 @@ def ech_config_list(server_keys):
     return base64.b64encode(rest).decode()
 
 
+def ech_discover(domain, timeout=3):
+    """从域名的 HTTPS RR (type 65) 里取 ECHConfigList。取不到返回 ""。
+
+    ★ 为什么必须有这一条 (2026-10-16 实测):
+      CDN 前置的节点, ECH 是由 **CDN 边缘**终结的 —— 源站手里没有、
+      也不该有那份私钥。客户端要用的 ECHConfigList 只存在于域名的
+      HTTPS RR 里 (Cloudflare 自动发布, 值里 `cloudflare-ech.com` 就是
+      它对外声称的 public name)。
+
+      在那之前, 客户端产物只写了 mihomo 的 `ech-opts: {enable: true}`,
+      以为"让客户端自己去 DNS 查"。**实测那个写法会让整条节点直接不可用**:
+          dial ... error: resolve ECH config error: no ECH config found in DNS records
+      连 curl 都拿不到任何响应 (HTTP=000) —— 不是"ECH 没生效", 是节点坏了。
+      而同一台机器上 `dig TYPE65` 明明查得到。也就是说 **能不能查到取决于
+      客户端自己的 DNS 实现, 不能赌**。
+
+      拿到值直接写进配置 (`ech-opts.config`) 之后实测: SNI 明文变成
+      cloudflare-ech.com, ClientHello 里出现扩展 65037, 隧道照常通。
+
+    两条路都试: 先 dig (快, 且用的是本机 resolver 的策略), 再 DoH (dig 不在
+    或本机 resolver 丢 type 65 时)。都不行就回空 —— 调用方必须把这件事
+    **说出来**, 不能静默降级。
+    """
+    if not domain or is_ip_literal(domain):
+        return ""
+    import json as _json
+    import re as _re
+    import shutil
+    import subprocess
+    import urllib.request
+
+    if os.environ.get("X_NO_ECH_DISCOVER") == "1":
+        return ""
+
+    def _from_rr(text):
+        m = _re.search(r'ech=([A-Za-z0-9+/=]+)', text or "")
+        return m.group(1) if m else ""
+
+    dig = shutil.which("dig")
+    if dig:
+        try:
+            out = subprocess.run([dig, "+short", "+time=2", "+tries=1",
+                                  domain, "TYPE65"],
+                                 capture_output=True, text=True,
+                                 timeout=timeout).stdout
+            v = _from_rr(out)
+            if v:
+                return v
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    for url in ("https://cloudflare-dns.com/dns-query?name=%s&type=HTTPS" % domain,
+                "https://dns.google/resolve?name=%s&type=HTTPS" % domain):
+        try:
+            req = urllib.request.Request(url, headers={
+                "accept": "application/dns-json",
+                "user-agent": "xray-panel/ech-discover"})
+            with urllib.request.urlopen(req, timeout=timeout) as fp:
+                data = _json.load(fp)
+            for ans in data.get("Answer", []):
+                v = _from_rr(ans.get("data", ""))
+                if v:
+                    return v
+        except Exception:                                   # noqa: BLE001
+            continue
+    return ""
+
+
 def ech_param(n, host=None):
     """这个节点的分享链接该不该写 `ech=`, 写什么值。取不到返回 ""。
 

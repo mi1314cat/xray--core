@@ -6847,6 +6847,106 @@ else
     bad "这些脚本调用了未定义/取不到的 print_* 函数" "$_BADFN"
 fi
 
+group "ECH (客户端产物必须带得动它)"
+
+# ★ 这一组对应 2026-10-16 的实测。原来预置⑤「CDN + ECH + 后量子」在 plan()
+#   这条路上**完全没有 ECH**: 说明里写着, 产物里没有, 屏幕上看不出来。
+#   而界面上另外那条路 (`ech-opts: {enable: true}` 不给配置) 更糟 ——
+#   实测 mihomo 会自己去查 DNS, 查不到就整条节点连不上:
+#       resolve ECH config error: no ECH config found in DNS records  (HTTP=000)
+#   也就是说"开了 ECH"变成一个比不开还糟的状态。
+
+# ① 预置⑤ 必须真的带 ech 标记 (不能只在说明里写)
+if grep -E '⑤ CDN \+ ECH[^|]*\|[^|]*\|mlkem,ech"?' "$ROOT/conf/lib/preset.sh" >/dev/null; then
+    ok "预置⑤ 的标记列真的带 ech (说明与配置一致)"
+else
+    bad "预置⑤ 只在说明里写了 ECH, 标记列没有 → 建出来的节点没有 ECH"
+fi
+
+# ② plan() 必须真的把 ech_config 写进元数据 (而不是只写个布尔)
+#    实测过: 只写 `meta["ech"] = True` 时, to_mihomo 落到"只 enable 不给配置"，
+#    那正是会把节点打死的那条路。
+if sed -n '/^def plan/,/^def adopt/p' "$ROOT/conf/lib/deploy.py" \
+     | grep -F 'meta["ech_config"] = _cl' >/dev/null; then
+    ok "plan() 会把 ECH 配置串写进分享元数据"
+else
+    bad "plan() 只声明开了 ECH 而没写配置串 → 客户端产物拿不到能用的配置"
+fi
+# ③ 取不到配置时必须出声 (静默降级是这条链路上最难查的形态)
+if sed -n '/^def plan/,/^def adopt/p' "$ROOT/conf/lib/deploy.py" \
+     | grep -F '取不到 ECH 配置' >/dev/null; then
+    ok "取不到 ECH 配置时会明确告警"
+else
+    bad "取不到 ECH 配置是静默的"
+fi
+
+# ④ **绝不能**产出"只 enable 不给配置"的 ech-opts
+#    实测后果: mihomo 整条节点连不上。
+if grep -nE 'ech-opts' "$ROOT/conf/lib/to_mihomo.py" | grep -v '^[0-9]*: *#' \
+     | grep -F '"enable": True}' >/dev/null; then
+    bad "to_mihomo 仍会产出只带 enable 的 ech-opts → 那条节点在 mihomo 上必挂"
+else
+    ok "to_mihomo 不会产出只带 enable 的 ech-opts (要么带配置, 要么不写)"
+fi
+
+# ⑤ ECH 发现要能真拿到值, 且拿不到时安静返回空
+_ECHG=$(X_NO_ECH_DISCOVER= XRAY_ROOT="$ROOT" python3 - <<'PYX'
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["XRAY_ROOT"], "conf", "lib"))
+import nodes
+a = nodes.ech_discover("cloudflare.com", timeout=5)
+b = nodes.ech_discover("1.2.3.4", timeout=3)
+c = nodes.ech_discover("no-such-host-xyz.invalid", timeout=3)
+print("real=%s,ip=%s,bad=%s" % ("ok" if (a and len(a) > 20) else "MISS",
+                                  "empty" if not b else "LEAK",
+                                  "empty" if not c else "LEAK"))
+PYX
+)
+# 网络不可达时 a 会是 MISS —— 那是环境, 不是代码。所以只要不崩、IP 与坏域名不吃亏。
+if [[ "$_ECHG" == "real=ok,ip=empty,bad=empty" ]]; then
+    ok "ECH 发现: 真域名拿到配置, IP / 坏域名安静返回空"
+elif [[ "$_ECHG" == "real=MISS,ip=empty,bad=empty" ]]; then
+    # 本机取不到 HTTPS RR 是**环境** (无外网 / DNS 被劫持), 不是代码问题 ——
+    # 门禁在这里不该假红, 但也不能假装通过, 所以照实说清是哪一种。
+    ok "ECH 发现: IP / 坏域名安静返回空 (本机取不到 HTTPS RR, 属网络环境)"
+else
+    bad "ECH 发现行为不对: $_ECHG"
+fi
+
+# ⑥ VLESS 会话加密 (Xray 独有) 必须挡在产物之前
+#    实测 mihomo v1.19.32: `invaild vless encryption value` → **整份配置**不加载,
+#    不是"这个节点不可用", 是所有节点一起起不来。
+if grep -F 'def enc_unsupported' "$ROOT/conf/lib/to_mihomo.py" >/dev/null \
+   && sed -n '/^def proxy/,/^def /p' "$ROOT/conf/lib/to_mihomo.py" \
+        | grep -F 'if enc_unsupported(node):' >/dev/null; then
+    ok "Xray 独有会话加密的节点不会产出 mihomo YAML (带原因)"
+else
+    bad "会产出 mihomo 加载不了的 YAML → 用户整份配置起不来"
+fi
+_ENCG=$(XRAY_ROOT="$ROOT" python3 - <<'PYX'
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["XRAY_ROOT"], "conf", "lib"))
+import to_mihomo as M
+bad = M.enc_unsupported({"protocol": "vless",
+                         "encryption": "mlkem768x25519plus.native.600s.AAAA"})
+ok1 = M.enc_unsupported({"protocol": "vless", "encryption": "none"})
+ok2 = M.enc_unsupported({"protocol": "trojan", "encryption": "whatever"})
+print("bad=%s,none=%s,trojan=%s" % ("caught" if bad else "MISS",
+                                    "pass" if not ok1 else "FALSE",
+                                    "pass" if not ok2 else "FALSE"))
+PYX
+)
+assert_eq "$_ENCG" "bad=caught,none=pass,trojan=pass" \
+    "会话加密判据: 挡住 Xray 独有串, 放过 none 与非 VLESS"
+
+# ⑦ 菜单 13 要能**独立**选 ECH (不绑在后量子预置上)
+if sed -n '/ECH (加密 ClientHello/,/ECH: 不开/p' "$ROOT/conf/mknode.sh" | grep -c . >/dev/null \
+   && grep -F 'ECH (加密 ClientHello' "$ROOT/conf/mknode.sh" >/dev/null; then
+    ok "菜单 13 有独立的 ECH 选项 (不和 ML-KEM 绑死)"
+else
+    bad "ECH 只能靠预置⑤ 带出来 → 不用后量子的用户没法单开 ECH"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

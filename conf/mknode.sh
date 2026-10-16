@@ -481,6 +481,32 @@ mk_run() {
         _g "    上下行模式: $xhttp_mode"
     fi
 
+    # ---- ECH: 独立可选项 ----
+    #
+    # ★ 为什么独立问, 而不是跟着预置⑤走:
+    #   预置⑤ 把 "ECH" 和 "后量子 (ML-KEM)" 绑在一起。而实测 mihomo v1.19.32
+    #   直接拒绝 Xray 的 VLESS 会话加密串 (invaild vless encryption value,
+    #   整份配置都不加载) —— 于是"想用 ECH"的 mihomo 用户点⑤ 反而什么都拿不到。
+    #   ECH 和会话加密是**两层**, 本来就该分开选。
+    #
+    # ★ 只在 TLS 档问: ECH 是 TLS 层的东西, REALITY 有自己的机制(不需要也不兼容)。
+    local mk_ech=""
+    if [[ "$sec" == "tls" && "$tr" =~ ^(xhttp|ws|httpupgrade|h2|grpc)$ ]]; then
+        echo >&2
+        _y "  ECH (加密 ClientHello, 真实 SNI 不外泄):"
+        _o "    作用: 链路上看不到你连的是哪个域名, 只看到 CDN 的对外名字。"
+        _o "    前提: 这条节点**经 Cloudflare 橙云** —— ECH 由 CDN 边缘终结,"
+        _o "          源站不需要、也不该有那份私钥。"
+        _o "    取值: 从域名的 HTTPS RR 自动取, 取不到会明确告警(并让节点先能用)。"
+        local _ec=""
+        read -rp "  选择 [1-2, 回车=2 开]: " _ec || _ec=""
+        case "${_ec:-2}" in
+            1) mk_ech="" ;;
+            *) mk_ech="1" ;;
+        esac
+        [[ -n "$mk_ech" ]] && _g "    ECH: 开" || _g "    ECH: 不开"
+    fi
+
     # ---- 组装规格 ----
     #
     # ★ 命名统一走 conf/lib/naming.sh, 不再各处随手拼。
@@ -626,6 +652,7 @@ mk_run() {
 
     # python 侧拼 opts, 避免在 bash 里拼 JSON (引号地狱)
     local opts_json
+    [[ ",$enh," == *",ech,"* ]] && mk_ech="1"   # 预置自带 (如预置⑤) 也算
     opts_json=$(MK_PROTOCOL="$proto" MK_TRANSPORT="$tr" MK_SECURITY="$sec" \
                 MK_TAG="$tag" MK_PORT="$port" MK_CRED="$cred" \
                 MK_DOMAIN="$domain" MK_TIER="$tier" \
@@ -633,7 +660,7 @@ mk_run() {
                 MK_FALLBACK_PORT="$fallback_port" \
                 MK_CERT_TRUSTED="$cert_trusted" \
                 MK_DECRYPTION="$mk_dec" MK_MLDSA_SEED="$mldsa_seed" MK_MLDSA_VERIFY="$mldsa_verify" \
-                MK_XHTTP_MODE="$xhttp_mode" \
+                MK_XHTTP_MODE="$xhttp_mode" MK_ECH="$mk_ech" \
                 python3 - <<'PY'
 import json, os
 proto = os.environ["MK_PROTOCOL"]; cred = os.environ.get("MK_CRED", "")
@@ -666,6 +693,11 @@ _mv = os.environ.get("MK_MLDSA_VERIFY", "")
 if _mv: opts["mldsa65_verify"] = _mv
 _xm = os.environ.get("MK_XHTTP_MODE", "")
 if _xm: opts["xhttp_mode"] = _xm
+# ECH 标记 (预置⑤)。注意它**不是**"给服务端生成一对 ECH 密钥" ——
+# 走橙云时 ECH 由 Cloudflare 边缘终结, 源站不该有那份私钥。
+# 这个标记的作用是: 让客户端产物带上可用的 ECHConfigList (见 deploy.plan)。
+if os.environ.get("MK_ECH", "") == "1":
+    opts["ech"] = True
 if proto in ("vless", "vmess"):
     opts["uuid"] = cred
     # ★ flow 只在**裸 TCP** 上加。

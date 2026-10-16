@@ -239,6 +239,60 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
         meta["fingerprint"] = opts.get("fingerprint", "chrome")
     if opts.get("encryption"):
         meta["encryption"] = opts["encryption"]
+
+    # ---- ECH: 客户端产物必须拿到 ECHConfigList ----
+    #
+    # ★ 以前 plan() 这条路上**完全没有 ECH**: 预置⑤「CDN + ECH + 后量子」
+    #   建出来的节点, 服务端片段和客户端产物里都没有任何 ECH 信息 ——
+    #   说明里写着 ECH, 产物里没有, 而屏幕上看不出来。
+    #
+    #   更糟的是"只写 enable 不写配置"这种半吊子做法 (见 to_mihomo 的旧分支):
+    #   mihomo 拿到 `ech-opts: {enable: true}` 会去自己查 DNS, 查不到就
+    #   **整个节点连不上** (实测: resolve ECH config error: no ECH config
+    #   found in DNS records, curl HTTP=000)。所以要么给配置, 要么说清楚。
+    #
+    #   取值: 本节点自己终结 TLS 且有 echServerKeys → 由服务端密钥还原;
+    #         否则 (CDN 橙云终结 ECH) → 从域名的 HTTPS RR 查。
+    # 片段是唯一真相: 服务端密钥从落盘的片段里读回来, 不要求调用方再报一遍
+    # (报两遍就一定有一遍对不上 —— adopt() 里那条注释同理)。
+    ech_keys = None
+    try:
+        _ibs = (fragment or {}).get("inbounds") or []
+        ech_keys = (((_ibs[0].get("streamSettings") or {}).get("tlsSettings") or {})
+                    .get("echServerKeys"))
+    except Exception:                                       # noqa: BLE001
+        ech_keys = None
+
+    if (bool(opts.get("ech")) or bool(ech_keys)) and security == "tls":
+        meta["ech"] = True
+        _cl = ""
+        _src = ""
+        try:
+            import nodes as _nodes
+            _cl = _nodes.ech_config_list(ech_keys) or ""
+            if _cl:
+                _src = "服务端密钥"
+            else:
+                _cl = _nodes.ech_discover(domain or "")
+                if _cl:
+                    _src = "域名 HTTPS RR (CDN 边缘终结 ECH)"
+        except Exception as _e:                             # noqa: BLE001
+            print(f"[警告] ECH 配置取值失败: {_e}", file=sys.stderr)
+        if _cl:
+            meta["ech_config"] = _cl
+            print(f"[信息] ECH 已启用, 配置串已写进客户端产物 ({len(_cl)} 字符, 来源: {_src})",
+                  file=sys.stderr)
+        else:
+            print("[警告] 这个节点要开 ECH, 但取不到 ECH 配置 —— 客户端产物里"
+                  "**不会**写 ECH。\n"
+                  "       不写不是漏了: 实测'只写启用、不给配置'会让 mihomo 自己去查 DNS,"
+                  "查不到就整条连不上\n"
+                  "       (resolve ECH config error / HTTP 000) —— 比不开 ECH 糟得多。"
+                  "所以这里选择让节点先能用。\n"
+                  "       常见原因: 域名没有 HTTPS RR (type 65), 或本机查不了这个记录类型。\n"
+                  "       补救: 在能解析该域名的机器上执行  dig +short <域名> TYPE65\n"
+                  "             取出 ech= 后面那串, 手工填进客户端配置的 ech-opts.config。",
+                  file=sys.stderr)
     if opts.get("alpn"):
         meta["alpn"] = opts["alpn"]
     if opts.get("path"):
@@ -403,9 +457,54 @@ def adopt(frag_path, domain=None, tier=None, path=None, conf_dir=None):
     alpn = (ss.get("tlsSettings") or {}).get("alpn")
     if alpn:
         meta["alpn"] = alpn
+    # ---- ECH: 服务端两种形态, 客户端产物都要拿到 ECHConfigList ----
+    #
+    # ★ 以前这里只写了一个 `meta["ech"] = True`, 而**没人消费**它能不能用。
+    #   真正的后果是 mihomo 那头直接连不上 (实测见 nodes.ech_discover 的说明):
+    #       ech-opts: {enable: true}  →  resolve ECH config error:
+    #                                      no ECH config found in DNS records
+    #   于是"开了 ECH 的节点"变成一个比不开还糟的东西 —— 用户看到的是
+    #   节点坏了, 而不是"ECH 没生效"。
+    #
+    #   两种形态取值来源不同:
+    #     · 本节点自己终结 TLS 且开了 ECH (echServerKeys) → 由服务端密钥还原;
+    #     · CDN 前置 (橙云) → CDN 边缘终结, 值只能来自域名的 HTTPS RR。
+    #   取不到就**明说**, 不静默降级: 静默降级正是这条链路上最难查的形态。
     ech = (ss.get("tlsSettings") or {}).get("echServerKeys")
-    if ech:
+    _want_ech = bool(ech)
+    if _want_ech:
         meta["ech"] = True
+        try:
+            import nodes as _nodes
+            _cl = _nodes.ech_config_list(ech) or ""
+            if not _cl:
+                _cl = _nodes.ech_discover(meta.get("host") or domain or "")
+        except Exception as _e:                             # noqa: BLE001
+            _cl = ""
+            print(f"[警告] ECH 配置取值失败: {_e}", file=sys.stderr)
+        if _cl:
+            meta["ech_config"] = _cl
+        else:
+            print("[警告] 这个节点开了 ECH, 但取不到 ECH 配置 —— 客户端产物里只写了"
+                  "「启用 ECH」而没有配置串。\n"
+                  "       实测那样客户端会直接连不上 (它自己去 DNS 查不一定查得到),"
+                  "比不开 ECH 更糟。\n"
+                  "       取不到的原因通常是: 域名没有 HTTPS RR (type 65),"
+                  "或本机查不了这个记录类型。\n"
+                  "       补救: 在能解析该域名的机器上执行"
+                  "  dig +short <域名> TYPE65  取 ech= 后面那串, 填进客户端配置。",
+                  file=sys.stderr)
+        if opts.get("dl_ech"):
+            meta["dl_ech"] = True
+            _dlhost = opts.get("dl_address") or ""
+            try:
+                import nodes as _nodes2
+                _dlcl = _nodes2.ech_config_list(opts.get("dl_ech_server_keys")) or \
+                        _nodes2.ech_discover(_dlhost)
+            except Exception:                               # noqa: BLE001
+                _dlcl = ""
+            if _dlcl:
+                meta["dl_ech_config"] = _dlcl
     # 老脚本建的自签节点: 从片段的 certificates 里反算 pin (adopt 没有 opts,
     # 拿不到 cert_pin, 只能从证书文件本身算)。
     _certs = (ss.get("tlsSettings") or {}).get("certificates") or []
