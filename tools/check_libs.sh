@@ -8,6 +8,13 @@
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+# ★ 测试绝不能碰生产的分享服务。
+#
+#   批量建节点收尾会自动"确保一条覆盖全部节点的订阅", 而分享服务是**远端
+#   服务** —— 它不知道调用方在不在沙箱里。2026-10-16 数出来: 生产分享服务里
+#   堆了 20 条叫「全协议订阅」的记录, 引用的是沙箱里并不存在的 tag,
+#   时间戳正好对着几轮测试。所以这里显式关掉。
+export X_NO_SHARE_SUBSCRIBE=1
 LIB="$ROOT/conf/lib"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -6705,6 +6712,83 @@ if grep -F '12) panel_self_menu' "$_PAN" >/dev/null \
     ok "主菜单 12) 进更新面板脚本 (提示范围已同步)"
 else
     bad "菜单项 12 与提示范围 [0-1x] 不一致 → 用户以为没有这一项"
+fi
+
+group "沙箱隔离 (脚本不能无视 XRAY_BASE 写生产)"
+
+# ★ 这一组对应一次**我自己闯的祸** (2026-10-16), 而且它已经在同一台机器上
+#   发生过两次 —— 上一次是 10-12, 靠"节点已存在全部跳过"侥幸没写坏东西。
+#
+#   现场: 用 XRAY_BASE=/tmp/xxx 跑「全协议一键生成」, 批量脚本自己是认
+#   XRAY_BASE 的, 但它用 `bash conf/<proto>.sh add` 起**子进程** ——
+#   而 hysteria2.sh 那一行写的是 `BASE_DIR="${XRAY_BASE_DIR:-/root/catmi/xray}"`,
+#   只认 XRAY_BASE_DIR (从没设过) → 回落到生产目录。
+#   结果: 沙箱里空空如也, 生产 conf 上多了 hysteria-48/49/50 三个节点,
+#   而屏幕上一切正常。三个 ui_probe 用例各跑了一次批量, 所以正好三个。
+#
+#   两个层面的检查都要有:
+#     静态 —— 不许再把生产路径写死 (写死就必然回落);
+#     动态 —— 真的在沙箱里跑一遍, 再回头看生产目录有没有被动过。
+#   静态只能挡住"已知的写法", 动态才挡得住"下一个人换了个写法"。
+
+# ① 静态: conf/ 下 (legacy 除外) 不许把 /root/catmi/xray 写死成基础目录
+_HARD=$(grep -rnE '^[[:space:]]*(BASE_DIR|XRAY_BASE|CONF_DIR|OUT_DIR)="/root/catmi' \
+        "$ROOT/conf" --include='*.sh' 2>/dev/null | grep -v '/fd/legacy/' || true)
+if [[ -z "$_HARD" ]]; then
+    ok "没有脚本把生产目录写死成基础目录 (都会收 XRAY_BASE)"
+else
+    bad "这些脚本无视 XRAY_BASE, 会写到生产目录" "$(printf '%s' "$_HARD" | sed 's|^|          |')"
+fi
+
+# ② 静态: batch.sh 必须把 XRAY_BASE **export** 出去
+#    各协议是独立子进程, 靠继承拿这个值; 只赋值不 export 等于没传。
+if sed -n '/^XRAY_BASE="\${XRAY_BASE_DIR/,+6p' "$ROOT/conf/batch.sh" | grep '^export XRAY_BASE' >/dev/null; then
+    ok "batch.sh 把 XRAY_BASE export 给子进程"
+else
+    bad "batch.sh 只赋值不 export → 子进程收不到, 各自回落生产目录"
+fi
+
+# ③ 动态: 沙箱里跑一遍 hysteria2, 生产目录必须一个字节都没动
+#    (hysteria2 是漏网的那个; 这条测试用**只设 XRAY_BASE** 的方式复现它,
+#     不设 XRAY_BASE_DIR —— 老测试两个都设, 所以永远看不见这个缺陷。)
+_PROD="${XRAY_PROD_DIR:-/root/catmi/xray}"
+_prod_before=$(ls -1 "$_PROD/conf"/hysteria-*.json 2>/dev/null | wc -l | tr -d ' ')
+_prod_mtime_before=$(stat -c %Y "$_PROD/conf" 2>/dev/null || echo none)
+_HYB="$TMP/hyb_iso"; rm -rf "$_HYB"; mkdir -p "$_HYB/conf" "$_HYB/out"
+( cd "$ROOT" && XRAY_BASE="$_HYB" X_BATCH=1 X_NO_RELOAD=1 \
+    timeout 90 bash conf/hysteria2.sh add </dev/null ) >/dev/null 2>&1
+_hyb_n=$(ls -1 "$_HYB/conf"/hysteria-*.json 2>/dev/null | wc -l | tr -d ' ')
+_prod_after=$(ls -1 "$_PROD/conf"/hysteria-*.json 2>/dev/null | wc -l | tr -d ' ')
+_prod_mtime_after=$(stat -c %Y "$_PROD/conf" 2>/dev/null || echo none)
+
+if [[ "$_hyb_n" -ge 1 ]]; then
+    ok "沙箱里跑 hysteria2 落到了沙箱 (只给 XRAY_BASE)"
+else
+    bad "沙箱里跑 hysteria2 什么也没落 —— 说明它根本没认 XRAY_BASE"
+fi
+if [[ "$_prod_before" == "$_prod_after" && "$_prod_mtime_before" == "$_prod_mtime_after" ]]; then
+    ok "生产 conf 没有被沙箱运行碰到 (hysteria 片段数 $_prod_before → $_prod_after)"
+else
+    bad "沙箱运行写到了生产目录" \
+        "hysteria 片段 $_prod_before → $_prod_after (目录 mtime $_prod_mtime_before → $_prod_mtime_after)"
+fi
+rm -rf "$_HYB"
+
+# ④ 自动化测试绝不能在生产分享服务上建订阅
+#    现场: 生产分享服务里堆了 20 条「全协议订阅」, 引用的是沙箱里并不存在的
+#    tag —— 每跑一轮测试就多几条, 而本地一切正常。
+for _h in "tools/check_libs.sh" "tools/ui_probe.py" "tools/pty_journey.py"; do
+    if grep -F 'X_NO_SHARE_SUBSCRIBE' "$ROOT/$_h" >/dev/null; then
+        ok "$(basename "$_h") 关掉了自动订阅 (不碰生产分享服务)"
+    else
+        bad "$(basename "$_h") 没关自动订阅 → 每跑一次测试就在生产分享服务里留一条记录"
+    fi
+done
+if sed -n '/^share_ensure_subscription()/,/^}/p' "$ROOT/conf/share.sh" \
+     | grep -F 'X_NO_SHARE_SUBSCRIBE' >/dev/null; then
+    ok "share.sh 认这个开关"
+else
+    bad "share.sh 不认开关 → 测试没法关掉它"
 fi
 
 group "门禁自检 (没有静默跳过的检查)"

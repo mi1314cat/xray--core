@@ -154,6 +154,8 @@ def main():
         "LC_ALL": "C.UTF-8",
         # 别联网拉 lib: 那会把真正的交互问题掩掉, 而且慢
         "XRAY_RAW": env.get("XRAY_RAW", "file://" + repo),
+        # 别碰生产的分享服务 —— 见 check_libs.sh 顶部那条注释
+        "X_NO_SHARE_SUBSCRIBE": "1",
     })
 
     argv = ["bash", os.path.join(repo, a.script)]

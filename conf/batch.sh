@@ -55,6 +55,10 @@ BATCH_FRAG_PREFIX=(reality trojan ss2022 hysteria)
 #   两个都收, 并且把"设错了却被忽略"这件事**说出来**: 静默忽略最贵, 因为
 #   它让你以为自己测的是沙箱。
 XRAY_BASE="${XRAY_BASE_DIR:-${XRAY_BASE:-/root/catmi/xray}}"
+# ★ 必须 export: 各协议是 `bash conf/<proto>.sh add` 独立**子进程**, 靠继承
+#   拿这个值。上面这行只是在本进程里赋值 —— 本进程里它是 shell 变量;
+#   调用方若没 export 过, 子进程就什么也收不到, 然后各自回落生产目录。
+export XRAY_BASE
 # 沙箱标志: 两个变量任意一个指离生产就算沙箱
 X_IS_SANDBOX=false
 [[ "$XRAY_BASE" != /root/catmi/xray ]] && X_IS_SANDBOX=true

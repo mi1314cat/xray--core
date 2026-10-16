@@ -46,8 +46,20 @@ RESET="\e[0m"
 # ================================
 PROTO="vless-tcp-mlkem"
 PROTO_NAME="VLESS-TCP-ML-KEM"
-CONF_DIR="/root/catmi/xray/conf"
-XRAYLS_BIN="/root/catmi/xray/xrayls"   # 必需，用于生成 ML-KEM 密钥
+# ★ 基础目录必须收 XRAY_BASE —— **不能**写死 /root/catmi/xray。
+#
+#   这一条是 2026-10-16 在生产上踩出来的, 不是洁癖:
+#   测试/沙箱用 XRAY_BASE=/tmp/... 跑批量, 批量脚本自己是认 XRAY_BASE 的,
+#   但子进程调用本脚本时本脚本只认 XRAY_BASE_DIR (始终没设) → 回落到
+#   /root/catmi/xray → **节点直接写进了生产目录**。
+#   屏幕上一切正常, 沙箱里空空如也, 生产上多了三个节点。
+#
+#   静默忽略最贵: 它让你以为自己测的是沙箱。
+#   (同一条结论在 Reality.sh / Trojan.sh / Shadowsocks.sh / batch.sh 里
+#    都写过一遍, 那几个已经收了; 本脚本是漏网的那个。)
+XRAY_BASE="${XRAY_BASE_DIR:-${XRAY_BASE:-/root/catmi/xray}}"
+CONF_DIR="$XRAY_BASE/conf"
+XRAYLS_BIN="$XRAY_BASE/xrayls"   # 必需，用于生成 ML-KEM 密钥
 
 # ★ 这里原来有一行备用固定密钥 (FALLBACK_ENC="mlkem768x25519plus...")。
 #   已删除。两个理由, 第二个更要命:
