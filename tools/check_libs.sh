@@ -7254,9 +7254,18 @@ fi
 #    原因: 元数据只认 out/share/, 而协议脚本要么不写、要么把**伪装域名**
 #    当成对外地址写进去 (Reality 原来给的是 --domain "$DEST", DEST=go.dev)。
 if grep -F 'backfill_share_meta' "$ROOT/conf/batch.sh" >/dev/null; then
-    ok "批量收尾会补发布 (缺元数据的片段逐个 adopt)"
+    ok "批量会补发布 (缺元数据的片段逐个 adopt)"
 else
     bad "协议脚本建的节点永远不会进订阅 → 「全协议订阅」名不副实"
+fi
+# 补发布必须在**分离那一段之前** —— 订阅链接是在那段里建的, 补晚了那条订阅
+# 就只包含"当时有元数据"的几个节点 (实测 9 个里只进了 5 个, 屏幕上看不出来)
+_bk_line=$(awk '/^[[:space:]]*backfill_share_meta "/{print NR; exit}' "$ROOT/conf/batch.sh")
+_split_line=$(awk '/xHTTP 上下行分离 \(三个组合\)/{print NR; exit}' "$ROOT/conf/batch.sh")
+if [[ -n "$_bk_line" && -n "$_split_line" && "$_bk_line" -lt "$_split_line" ]]; then
+    ok "补发布跑在订阅创建之前 (订阅才会覆盖全部节点)"
+else
+    bad "补发布跑在订阅创建之后 → 订阅里少掉协议脚本建的节点"
 fi
 # 伪装域名不能当对外地址
 if sed -n '/--adopt/,+2p' "$ROOT/conf/Reality.sh" | grep -F 'link_ip' >/dev/null; then

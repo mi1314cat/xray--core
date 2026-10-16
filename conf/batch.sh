@@ -541,6 +541,21 @@ batch_main() {
 
     # ---------------------------------------------------- 上下行分离 (xHTTP)
     #
+    # ---- 补发布: 让协议脚本建的节点也进订阅 ----
+    # ★ **必须在分离那一段之前**。订阅链接是 preset_batch 收尾时建的
+    #   (它按当时的节点清单建一条"覆盖全部节点"的分享), 元数据补晚了,
+    #   那条订阅就只包含"当时有元数据"的几个节点 —— 实测 9 个节点里只进了 5 个,
+    #   而屏幕上一切正常。
+    #   对外地址: 域名优先 (CDN/nginx 档连的是域名), 否则本机公网地址。
+    local _pubhost="${X_BATCH_DOMAIN:-${X_BATCH_DOMAIN_BASE:-}}"
+    if [[ -z "$_pubhost" ]]; then
+        _pubhost=$(awk -F'"' '/^(link_ip|PUBLIC_IP)=/{print $2; exit}' \
+                   "$XRAY_BASE/install_info.env" 2>/dev/null || true)
+    fi
+    [[ -n "$_pubhost" ]] || _pubhost=$(XRAY_BASE="$XRAY_BASE" XRAY_RAW="$GH_RAW" \
+        bash -c 'source "$XRAY_BASE/conf/lib/addr.sh" 2>/dev/null; resolve_public_ip 2>/dev/null' 2>/dev/null || true)
+    backfill_share_meta "$_pubhost"
+
     # ★ 用户要求: "全协议脚本里面一定要有这个"。
     #
     #   全协议 = 全**传输与加密形态**, 少了上下行分离这一类就名不副实 ——
@@ -703,17 +718,6 @@ batch_main() {
         batch_summary false
         return 1
     fi
-
-    # ---- 补发布: 让协议脚本建的节点也进订阅 ----
-    #   对外地址: 域名优先 (CDN/nginx 档连的是域名), 否则本机公网地址。
-    local _pubhost="${X_BATCH_DOMAIN:-${X_BATCH_DOMAIN_BASE:-}}"
-    if [[ -z "$_pubhost" ]]; then
-        _pubhost=$(awk -F'"' '/^(link_ip|PUBLIC_IP)=/{print $2; exit}' \
-                   "$XRAY_BASE/install_info.env" 2>/dev/null || true)
-    fi
-    [[ -n "$_pubhost" ]] || _pubhost=$(XRAY_BASE="$XRAY_BASE" XRAY_RAW="$GH_RAW" \
-        bash -c 'source "$XRAY_BASE/conf/lib/addr.sh" 2>/dev/null; resolve_public_ip 2>/dev/null' 2>/dev/null || true)
-    backfill_share_meta "$_pubhost"
 
     # ---- 仅一次统一 reload (非沙箱 XRAY_BASE_DIR 才操作 systemd) ----
     local reloaded=false
