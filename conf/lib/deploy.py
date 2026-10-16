@@ -142,6 +142,78 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
     #   只动 tls: REALITY 的握手是 xray 自己做的, 不在这个结论覆盖范围内, 不动它。
     eff_security = "none" if (tier == ACCESS_NGINX and security == "tls") else security
 
+    # ---- xhttp 的模式: 过 nginx 时必须 packet-up ----
+    #
+    # ★ 实测出来的硬约束, 不是偏好:
+    #
+    #     mode=packet-up  →  经 nginx 200 / 经 Cloudflare 200
+    #     mode=stream-up  →  经 nginx 失败 / 经 Cloudflare 失败
+    #
+    #   原因: stream-up 的上行是**一条长连接的 POST 流** —— 请求体边发边等下行。
+    #   nginx 转发到 xray 之后, xray 的上行队列在等会话侧消费, 于是迟迟不读请求体;
+    #   nginx 跟着停止读取客户端 → 客户端发完第一个分片就卡住, 全线死等,
+    #   18 秒后超时。抓包看得很清楚: 直连时 POST 体是连续多个分片,
+    #   经 nginx 时只有一个分片然后静默。
+    #
+    #   而 packet-up 每个包都是一个**完整的 POST**(有始有终), nginx 转起来毫无压力。
+    #
+    #   附带说明: `auto` 在非 REALITY 下本来就解析成 packet-up, 所以"不写 mode"
+    #   反而能跑通 —— 但那是**碰巧**, 换个 security 就翻车。既然这里已经知道
+    #   自己在 nginx 后面, 就干脆写死 packet-up, 不留悬念给内核去猜。
+    #
+    #   这里**自动纠正并说明**, 而不是报错拒绝: 用户要的"经 nginx 的 xhttp"
+    #   本身完全可行, 只是模式要换一个。判断"是不是用户显式选的"用 _picked,
+    #   因为 auto/未填 是默认值 —— 那种情况不该刷一条警告。
+    if tier == ACCESS_NGINX and transport == "xhttp":
+        _picked = str(nopts.get("xhttp_mode") or "auto")
+        if _picked != "packet-up":
+            nopts["xhttp_mode"] = "packet-up"
+            if _picked in ("stream-up", "stream-one"):
+                print(f"[提示] xhttp 模式 {_picked} 过不了 nginx, 已自动改为 packet-up。\n"
+                      f"       原因: {_picked} 的上行是一条长连接 POST 流, nginx 转发时会卡住"
+                      f"(实测: 直连可用, 经 nginx/Cloudflare 必失败)。\n"
+                      f"       packet-up 每个包一个完整 POST, 实测经 nginx 与 Cloudflare 都是 200。",
+                      file=sys.stderr)
+        if nopts.get("dl_mode") and str(nopts["dl_mode"]) != "packet-up":
+            nopts["dl_mode"] = "packet-up"
+
+    # ---- nginx 档位的 path: **不能**默认落在 "/" ----
+    #
+    # ★ 这一条是"按用户的方式走一遍"才暴露的 —— 而且是端到端死活不通的根因。
+    #
+    #   现状: 菜单 13/14/15 建 nginx 档节点时**没人问过 path**, 于是 nginx_apply
+    #   拿到的是默认值 "/", 往站点里插 `location /`。而任何一个真在跑的站点
+    #   都已经有 `location /` 了 (那是它的首页), nginx_apply 正确地拒绝了
+    #   (插进去就是 duplicate location, nginx 直接 emerg)。
+    #
+    #   后果链条, 每一环单独看都"正常":
+    #       节点片段写好了 → 面板显示"已写入" → 分享元数据也写了
+    #       → 但没有人转发 → nginx 里没有这个 location
+    #       → 客户端连 域名:443 打到的是**网站首页**
+    #       → 表现是"配置全对、服务在跑、就是连不上"
+    #   实测: 全套按用户的操作路径走下来, 屏幕上只多了一行被截断的警告,
+    #   而这个节点永远不通。
+    #
+    #   修法: nginx 档位下, 用户没给 path 就**自己分配一个唯一前缀**。
+    #   路径本来就该是唯一的 (同一台机器上多个 xhttp 节点共用 443,
+    #   靠 path 区分), 而且不可猜 —— 固定的 "/" 等于把入口写在脸上。
+    #   CDN 档位不动: 那边 Cloudflare 直接回源到 xray 端口, 不经过 nginx,
+    #   "/" 不冲突; 而且改它会让已经发出去的订阅链接失效。
+    #
+    #   显式传了 path (哪怕就是 "/") 一律尊重 —— 用户说了算。
+    if (tier == ACCESS_NGINX and transport in ("ws", "httpupgrade", "xhttp", "h2")
+            and not opts.get("path")):
+        import secrets
+        nopts["path"] = "/" + secrets.token_hex(6)
+        print(f"[提示] 这条节点过 nginx, 已自动分配路径 {nopts['path']}。\n"
+              f"       原因: 不分配的话路径默认是 \"/\", 往站点里插 `location /` 会和"
+              f"网站首页冲突, nginx 会拒绝\n"
+              f"       (duplicate location), 于是**没有人转发这个节点** —— "
+              f"客户端连过去看到的是网站首页。\n"
+              f"       路径同时是这条节点的入口口令, 客户端产物/订阅里已经带上它,"
+              f"不用你手抄。",
+              file=sys.stderr)
+
     # ★ 必须把解析后的 security **按位置**传进去。
     #   build() 的第三个参数才是它真正用的加密层, opts 里的 "security" 它不看 ——
     #   所以以前那句 `nopts["security"] = ...` 从来没起过任何作用, 等于没写。
@@ -225,8 +297,9 @@ def plan(protocol, transport, security, opts=None, tier=ACCESS_CDN):
     #   件事), tcp/raw 根本没有 path —— 这两种仍用 `/`, 由 nginx_apply 的
     #   同名检查兜底报错。
     nginx_path = "/"
-    if transport in ("ws", "httpupgrade", "xhttp", "h2") and opts.get("path"):
-        nginx_path = opts["path"] if str(opts["path"]).startswith("/") else "/" + str(opts["path"])
+    if transport in ("ws", "httpupgrade", "xhttp", "h2") and nopts.get("path"):
+        nginx_path = (nopts["path"] if str(nopts["path"]).startswith("/")
+                      else "/" + str(nopts["path"]))
 
     nginx = None
     if tier == ACCESS_NGINX:
@@ -454,8 +527,20 @@ def _configure_nginx(r):
         return False, f"调用 nginx_apply.py 失败: {e}"
     if p.returncode == 0:
         return True, ""
-    detail = (p.stderr or p.stdout or "").strip().splitlines()
-    return False, (detail[-1] if detail else f"退出码 {p.returncode}")
+    detail = [ln for ln in (p.stderr or p.stdout or "").splitlines() if ln.strip()]
+    if not detail:
+        return False, f"退出码 {p.returncode}"
+    # ★ 必须把**整段**理由带回去。
+    #   原来写的是 `detail[-1]` —— 只取最后一行。而 nginx_apply.py 的拒绝
+    #   理由是多行的:
+    #       [错误] 该 server 块里已经有同名的 location: / —— 再插一个会让
+    #              nginx 直接 emerg (duplicate location), 已拒绝, 未做任何改动。
+    #              办法一 (推荐): 给这个节点单开一个前缀 ...
+    #              办法二: ...
+    #   取最后一行, 用户看到的就是:  "nginx 反代没配上 (       办法二: 如果...)"
+    #   —— 一个左括号配不上一句话, 前后都不知所云, 而真正的原因 (同名冲突)
+    #   和首选出路 (办法一) 全被丢掉了。实测时屏幕上就是这个样子。
+    return False, "\n".join(detail)
 
 
 def _write_plan(r, conf_dir, share_dir):
@@ -483,11 +568,20 @@ def _write_plan(r, conf_dir, share_dir):
         ok, why = _configure_nginx(r)
         n = r["nginx"]
         if ok:
-            print(f"已配置 nginx 反代: {n['domain']} → 127.0.0.1:{n['port']}", file=sys.stderr)
+            print(f"已配置 nginx 反代: {n['domain']}{'' if n.get('path') in (None, '/') else n['path']}"
+                  f" → 127.0.0.1:{n['port']}", file=sys.stderr)
         else:
             # 节点**保留** —— 见 _configure_nginx 的说明。
+            #
+            # ★ why 可能是多行 (nginx_apply.py 的拒绝理由本来就是一段话)。
+            #   不能塞进括号里 —— 换行会把括号撑成"左括号 + 半句话"。
+            #   第一行当标题, 其余原样缩进贴出来。
+            import textwrap
+            _first, _, _rest = why.partition("\n")
             print("", file=sys.stderr)
-            print(f"[警告] nginx 反代没配上 ({why})", file=sys.stderr)
+            print(f"[警告] nginx 反代没配上: {_first}", file=sys.stderr)
+            if _rest.strip():
+                print(textwrap.indent(_rest.strip(), "       "), file=sys.stderr)
             print(f"        这个节点监听 127.0.0.1:{n['port']}, 现在**外部访问不到**。", file=sys.stderr)
             print(f"        去 菜单 8) 服务与配置 → 6) Nginx 站点管理 给它补一个站点,", file=sys.stderr)
             print(f"        或先建好 {n['domain']} 的站点与证书再重建本节点。", file=sys.stderr)

@@ -445,6 +445,9 @@ mk_run() {
         local def_m="auto" def_i=4
         # REALITY + auto = 合流, 这不是用户以为的那回事 —— 默认改成 stream-up
         [[ "$sec" == "reality" ]] && { def_m="stream-up"; def_i=1; }
+        # nginx 档位下 stream-up / stream-one 一律过不去 (实测), 只有 packet-up 行。
+        # 默认直接落在 packet-up 上, 别让用户先选错再被"自动纠正"。
+        if [[ "$tier" == *nginx* ]]; then def_m="packet-up"; def_i=2; fi
         echo
         _y "  XHTTP 的上下行模式:"
         printf "    %s 1) stream-up    上下行分开: 下行独立 GET, 上行独立 POST (推荐)%s\n" "$_CYN" "$_RST"
@@ -453,6 +456,11 @@ mk_run() {
         printf "    %s 4) auto         让内核决定%s\n" "$_CYN" "$_RST"
         if [[ "$sec" == "reality" ]]; then
             _y "        注意: REALITY 下 auto 会退化成 stream-one (合流), 所以这里默认不是 auto"
+        fi
+        if [[ "$tier" == *nginx* ]]; then
+            _y "        注意: 过 nginx/CDN 时 stream-up 与 stream-one 都必失败 (上行是长连接 POST 流,"
+            _y "              会被 nginx 卡住; 实测直连可用、经 nginx/Cloudflare 超时), 默认已选 packet-up。"
+            _y "              选了别的也会在生成时自动改成 packet-up。"
         fi
         # ★ 这里原来是:
         #      mc=$(ui_ask_num "上下行模式 [1-4, 回车=$def_m]" 1 4) || return 0

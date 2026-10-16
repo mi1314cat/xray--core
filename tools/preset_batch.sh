@@ -337,9 +337,17 @@ o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
 #   实测: 同一条 vless:6, 菜单 13 给 "stream-up", 本脚本给 "auto"。
 #   默认口径与 mknode.sh 对齐 (REALITY → stream-up; 其余 → auto),
 #   可用 X_BATCH_XHTTP_MODE 覆盖。
+# ★ 但**过 nginx 档位**例外: stream-up / stream-one 的上行是一条长连接 POST 流,
+#   nginx 转发时会被卡死 (实测: 直连 200, 经 nginx/Cloudflare 必超时),
+#   只有 packet-up 行得通。deploy.plan() 里还会再兜一次底并打印说明。
 _mode = os.environ.get("X_BATCH_XHTTP_MODE", "").strip()
 if tr == "xhttp":
-    o["xhttp_mode"] = _mode or ("stream-up" if sec == "reality" else "auto")
+    if _mode:
+        o["xhttp_mode"] = _mode
+    elif tier == "nginx":
+        o["xhttp_mode"] = "packet-up"
+    else:
+        o["xhttp_mode"] = "stream-up" if sec == "reality" else "auto"
 if domain: o["domain"] = domain
 o.update(json.loads(cred))
 o.update(json.loads(extra))
