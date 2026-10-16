@@ -38,13 +38,15 @@ ui_cjk_w() {
     local t="$1" w=0 i ch
     for (( i = 0; i < ${#t}; i++ )); do
         ch="${t:i:1}"
-        if [[ "$ch" == [$'\u1100'-$'\u115f'] || "$ch" == [$'\u2e80'-$'\ua4cf'] \
-           || "$ch" == [$'\uac00'-$'\ud7a3'] || "$ch" == [$'\uf900'-$'\ufaff'] \
-           || "$ch" == [$'\ufe30'-$'\ufe4f'] || "$ch" == [$'\uff01'-$'\uff60'] ]]; then
-            w=$((w + 2))
-        else
-            w=$((w + 1))
-        fi
+        # 用 case 而不是 `[[ ... == [区间] ]]`: 后者让 shellcheck 报 error 级
+        # 解析错误并停止检查整个文件。区间一字未改。
+        case "$ch" in
+            [$'\u1100'-$'\u115f']|[$'\u2e80'-$'\ua4cf']|[$'\uac00'-$'\ud7a3']|\
+            [$'\uf900'-$'\ufaff']|[$'\ufe30'-$'\ufe4f']|[$'\uff01'-$'\uff60'])
+                w=$((w + 2)) ;;
+            *)
+                w=$((w + 1)) ;;
+        esac
     done
     printf '%s' "$w"
 }

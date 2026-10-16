@@ -1,3 +1,4 @@
+#!/bin/bash
     systemctl stop xrayls.service
     systemctl disable xrayls.service
     rm -rf /etc/xrayls

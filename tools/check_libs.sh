@@ -4247,6 +4247,112 @@ else
     bad "preset_batch 不设 xhttp mode → 与菜单13 走出不同配置"
 fi
 
+# ③b 过 nginx 的 xhttp **只能是 packet-up**。
+#     ★ 这一条是端到端实测出来的, 不是偏好:
+#         mode=packet-up → 经 nginx 200 / 经 Cloudflare 200
+#         mode=stream-up → 经 nginx 失败 / 经 Cloudflare 失败 (18s 超时)
+#       原因: stream-up 的上行是一条长连接 POST 流, xray 不急着读请求体,
+#       nginx 就跟着停止读客户端 → 全线死等。packet-up 每个包一个完整 POST。
+#       这条以前**没有任何拦截**: 面板让用户选, 选了 stream-up 就静静生成一个
+#       永远连不通的节点, 屏幕上全绿。
+_MODGATE=$(XRAY_ROOT="$ROOT" python3 - <<'PYX'
+import sys, os, io, contextlib
+sys.path.insert(0, os.path.join(os.environ["XRAY_ROOT"], "conf", "lib"))
+import deploy as D
+base = {"port": 30810, "uuid": "u", "domain": "a.com", "sni": "a.com",
+        "cert_file": "/tmp/c", "key_file": "/tmp/k", "tag": "t"}
+def mode(tier, m):
+    with contextlib.redirect_stderr(io.StringIO()):
+        r = D.plan("vless", "xhttp", "tls", dict(base, xhttp_mode=m), tier)
+    f = r.get("fragment") or {}
+    ib = (f.get("inbounds") or [{}])[0]
+    return (ib.get("streamSettings") or {}).get("xhttpSettings", {}).get("mode")
+out = []
+out.append("up->nginx=%s" % mode("nginx", "stream-up"))
+out.append("one->nginx=%s" % mode("nginx", "stream-one"))
+out.append("pu->nginx=%s" % mode("nginx", "packet-up"))
+out.append("up->cdn=%s" % mode("cdn", "stream-up"))
+out.append("auto->nginx=%s" % mode("nginx", "auto"))
+print(",".join(out))
+PYX
+)
+assert_eq "$_MODGATE" \
+    "up->nginx=packet-up,one->nginx=packet-up,pu->nginx=packet-up,up->cdn=stream-up,auto->nginx=packet-up" \
+    "过 nginx 的 xhttp 自动落到 packet-up (直连仍保留 stream-up)"
+
+# ③c 纠正时必须**出声** —— 静默改配置比报错更糟
+if sed -n '/xhttp 的模式: 过 nginx 时必须 packet-up/,/node_build.build/p' \
+       "$ROOT/conf/lib/deploy.py" | grep -F 'file=sys.stderr' >/dev/null; then
+    ok "xhttp mode 被纠正时打印原因 (不静默改)"
+else
+    bad "xhttp mode 被静默改写 → 用户看到的配置与真实不符"
+fi
+
+# ③d 路径 B 的默认值也要分档位, 否则批量脚本仍会生成连不通的节点
+if sed -n '/_mode = os.environ.get("X_BATCH_XHTTP_MODE"/,/^if domain/p' "$PB" \
+     | grep -F '"packet-up"' >/dev/null; then
+    ok "preset_batch 对 nginx 档默认 packet-up"
+else
+    bad "preset_batch 对 nginx 档仍默认 stream-up/auto"
+fi
+
+# ③e 菜单 13 的模式默认值也要分档位 (不能让用户先选错再被纠正)
+if sed -n '/XHTTP 的上下行模式/,/ui_ask_num "上下行模式"/p' "$ROOT/conf/mknode.sh" \
+     | grep -F 'def_i=2' >/dev/null; then
+    ok "mknode 对 nginx 档默认选中 packet-up"
+else
+    bad "mknode 对 nginx 档默认仍是 stream-up/auto"
+fi
+
+# ③f nginx 档的 path 不能默认落在 "/"。
+#     ★ 这是"按用户的操作路径走一遍"抓到的**端到端死活不通**的根因:
+#       mknode 从不问 path → nginx_apply 拿到 "/" → 往真站点里插 `location /`
+#       → 站点已经有首页 location / → 正确地拒绝 (duplicate location)
+#       → 没人转发 → 客户端连过去看到的是网站首页。
+#       全链路每一环单独看都"正常", 面板只多一行警告。
+_PATHGATE=$(XRAY_ROOT="$ROOT" python3 - <<'PYX'
+import sys, os
+sys.path.insert(0, os.path.join(os.environ["XRAY_ROOT"], "conf", "lib"))
+import deploy as D
+base = {"port": 31501, "uuid": "u", "domain": "a.com", "sni": "a.com",
+        "cert_file": "/tmp/c", "key_file": "/tmp/k", "tag": "t", "xhttp_mode": "packet-up"}
+a = D.plan("vless", "xhttp", "tls", dict(base), "nginx")
+b = D.plan("vless", "xhttp", "tls", dict(base, path="/keep"), "nginx")
+c = D.plan("vless", "xhttp", "tls", dict(base), "cdn")
+pa = a["fragment"]["inbounds"][0]["streamSettings"]["xhttpSettings"].get("path", "/")
+pb = b["fragment"]["inbounds"][0]["streamSettings"]["xhttpSettings"].get("path", "/")
+pc = c["fragment"]["inbounds"][0]["streamSettings"]["xhttpSettings"].get("path", "/")
+# 片段与 nginx 段必须是**同一个** path —— 不一致 = 客户端走一条、nginx 转发另一条
+same = "same" if a["nginx"]["path"] == pa else "MISMATCH"
+uniq = "uniq" if (pa not in ("/", "") and len(pa) > 8) else "short"
+print("auto=%s,keep=%s,cdn=%s,nginx-consist=%s,rand=%s"
+      % ("ok" if pa.startswith("/") and pa != "/" else "BAD", pb, pc, same, uniq))
+PYX
+)
+assert_eq "$_PATHGATE" "auto=ok,keep=/keep,cdn=/,nginx-consist=same,rand=uniq" \
+    "nginx 档自动分配唯一 path; 显式 path 尊重; CDN 档不变; 片段与 nginx 段一致"
+
+# ③g nginx 反代失败时, 理由必须是**完整的一段**, 不能只截最后一行。
+#     实测缺陷: 取 detail[-1] → 屏幕上出现 "nginx 反代没配上 (       办法二: ...)"
+#     —— 左括号配不上一句话, 真正的原因 (同名冲突) 和首选出路 (办法一) 全丢了。
+# 只看**代码**, 不看注释 —— 注释里正解释着"以前写的是 detail[-1]",
+# 不排掉注释的话这条门禁会把解释文字当成违规。
+_CFG_CODE=$(sed -n '/def _configure_nginx/,/^def /p' "$ROOT/conf/lib/deploy.py" \
+            | grep -v '^[[:space:]]*#')
+if printf '%s' "$_CFG_CODE" | grep -F 'join(detail)' >/dev/null \
+   && ! printf '%s' "$_CFG_CODE" | grep -F 'detail[-1]' >/dev/null; then
+    ok "nginx 反代失败理由带整段 (不再只取最后一行)"
+else
+    bad "nginx 反代失败理由仍被截断 → 用户看不懂为什么没配上"
+fi
+# 多行理由不能塞进括号 (换行会把括号撑成"左括号 + 半句话")
+if sed -n '/nginx 反代没配上/,/textwrap.indent/p' "$ROOT/conf/lib/deploy.py" \
+     | grep -F 'textwrap.indent' >/dev/null; then
+    ok "多行理由按缩进贴出, 没塞进括号"
+else
+    bad "多行理由被塞进括号 → 显示成半句话"
+fi
+
 # ④ 全协议 (菜单12) 要像 SB 一样自动配 nginx
 if grep -F 'resolve_cdn_auto' "$ROOT/conf/batch.sh" >/dev/null \
    && grep -F 'x_cdn_autosetup' "$ROOT/conf/batch.sh" >/dev/null; then
@@ -4807,6 +4913,8 @@ fi
 # 它会把**上一版的包和上一版的 .sha256 一起**给你，两个文件自洽、校验通过，
 # 于是"更新成功但版本没变"。实测踩到过（2.5.0 → 2.5.1 更新完还是 2.5.0）。
 group "镜像顺序 (实时源优先于 CDN)"
+# shellcheck disable=SC2066  # 故意的: 这个 for 现在只跑一个文件 (以后可能加),
+#   引号是为了路径里有空格也不散 —— 不是为了分词。
 for f in "$ROOT/Client/l.sh"; do
     [[ -f "$f" ]] || continue
     first=$(sed -n '/^MIRROR_DIRS=(/,/^)/p' "$f" | grep -oE '"[^"]+"' | awk 'NR==1')
@@ -6493,6 +6601,111 @@ CE_SN=$(printf '%s' "$CDOUT" | sed -n 's/^sn=//p')
 [[ "${CE_SN:-0}" -ge 1 ]] && ok "插入 location 没有动整站的 server_name" \
                          || bad "插入把 server_name 也弄没了 —— 会把整个站点搞坏"
 rm -rf "$NGT"
+
+group "面板自身更新 (进门自动比对 + 备份 + 回退)"
+
+# ★ 这一组对应一次**线上真实故障** (2026-10-15):
+#   用户从 GitHub 一键进来, 点菜单报
+#       [X] 取不到 /tmp/.xray-panel.XXXXXX/lib/print.sh —— 提示函数不可用
+#   仓库是好的, 网络也是好的 —— 坏的是他机器上那份 10-10 的旧面板:
+#   run_server 走 _get, 而 _get 是"本地优先", 在 /root 找到了那份旧的直接用,
+#   一次网络都不发。旧面板里那个已修掉的缓存 bug 于是又被跑了一遍。
+#   而取下来的面板落在 $TMP 里, 退出即删 —— 什么都不会留下, 下次还这样。
+_INST="$ROOT/install.sh"
+_PAN="$ROOT/xray-panel.sh"
+
+# ① 面板脚本必须**远端优先比对**, 不能沿用 _get 的本地优先
+if sed -n '/^run_server()/,/^}/p' "$_INST" | grep -F 'panel_autoupdate' >/dev/null; then
+    ok "进门会先比对远端 (不再直接吃本地那份旧的)"
+else
+    bad "进门仍然直接用本地副本 → 面板永远不更新"
+fi
+# ② 跑的是**托管副本**, 不是某个躺在 /root 下的历史遗留
+if sed -n '/^run_server()/,/^}/p' "$_INST" | grep -F 'PANEL_MANAGED' >/dev/null; then
+    ok "跑的是托管副本 \$SRV_ROOT/.panel/xray-panel.sh"
+else
+    bad "跑的仍可能是任意本地副本 → 用户那份 10-10 的还会被选中"
+fi
+# ③ 更新必须留退路: 备份 + 语法检查 + 回滚
+for _pair in "先备份再覆盖|panel_backup" \
+             "更新前语法检查|panel_sane" \
+             "落地后再验一次并在不过时回滚|已回滚到更新前的版本"; do
+    _k="${_pair%%|*}"; _p="${_pair##*|}"
+    if grep -F "$_p" "$_INST" >/dev/null; then ok "$_k"
+    else bad "$_k (找不到 $_p)"; fi
+done
+# ④ **任何情况下都不能把人挡在面板外面** (SB auto_update 的铁律)
+if sed -n '/^panel_autoupdate()/,/^}/p' "$_INST" | grep -E '\bdie\b|exit 1' >/dev/null; then
+    bad "更新失败会终止 → 网络一抖就进不去面板"
+else
+    ok "更新失败绝不终止 (连不上就用本机这份继续)"
+fi
+# ⑤ 进门检查有时限, 且**不能**跟着"有没有 tty"变行为。
+#    第一版加过 [[ -t 0 ]], 结果是"交互式进来会更新、管道进来永远不更新"。
+if sed -n '/^run_server()/,/^}/p' "$_INST" | grep -F -- '-t 0' >/dev/null; then
+    bad "进门检查跟着 tty 判定 → 同一台机器两种行为"
+else
+    ok "进门检查与 tty 无关 (该查就查)"
+fi
+if grep -F 'XRAY_UPDATE_BUDGET' "$_INST" >/dev/null \
+   && grep -F 'XRAY_NO_UPDATE' "$_INST" >/dev/null; then
+    ok "进门检查有时限也有开关 (XRAY_UPDATE_BUDGET / XRAY_NO_UPDATE)"
+else
+    bad "进门检查没有时限/开关 → 只能干等或者没法跳过"
+fi
+# ⑥ 回退入口必须能在面板里点到 (SB 也没有这一条)
+if grep -F 'panel_rollback' "$_INST" >/dev/null \
+   && grep -F 'panel-rollback' "$_PAN" >/dev/null; then
+    ok "回退在面板里有入口 (不用 SSH 手抄命令)"
+else
+    bad "回退只能命令行做 → 用户点不到"
+fi
+# ⑦ 回退/查看版本要**离线可用**: 本地那份 install.sh 优先
+if sed -n '/^_panel_self_run()/,/^}/p' "$_PAN" | grep -F '.panel/install.sh' >/dev/null; then
+    ok "回退走本地那份 install.sh (断网也能回退)"
+else
+    bad "回退也要现从 GitHub 取 → 最需要它的时候用不了"
+fi
+# ⑧ 版本号只能有一个来源: 托管副本旁边那份 VERSION。
+#    实测缺陷: 原来会"到处找 VERSION", 于是从仓库检出更新远端旧面板时
+#    打出 "已更新面板脚本 → v3.0.0" —— 而实际落地的是没有 VERSION 的旧版。
+#    报错的版本号比不报更糟。
+if [[ "$(sed -n '/^panel_ver()/,/^}/p' "$_INST" | grep -c 'panel_ver_dir "\$PANEL_DIR"')" == "1" ]] \
+   && ! sed -n '/^panel_ver()/,/^}/p' "$_INST" | grep -F '_SELF_DIR' >/dev/null; then
+    ok "版本号只认托管目录 (不会把别处的版本号报成当前版本)"
+else
+    bad "版本号会跨目录借 → 屏幕上的版本与实际跑的这份可能不是一回事"
+fi
+# ⑨ 取不到 VERSION 时不能显示成光秃秃一个 "v"
+if grep -F 'panel_self_label' "$_PAN" >/dev/null \
+   && grep -F '身份' "$_PAN" >/dev/null; then
+    ok "没有版本号时报文件身份, 不显示成裸 'v'"
+else
+    bad "没有版本号时显示裸 'v' → 像渲染坏了"
+fi
+# ⑩ 仓库根要有 VERSION, 否则永远只能显示"身份"
+if [[ -s "$ROOT/VERSION" ]]; then
+    ok "仓库根有 VERSION ($(head -1 "$ROOT/VERSION"))"
+else
+    bad "仓库根缺 VERSION → 面板没有版本号可显示"
+fi
+# ⑪ 新旧 install.sh 的子命令都要认 (面板调的就是这些)
+for _sub in update-panel panel-rollback panel-status; do
+    if grep -qE "^ *${_sub}\|" "$_INST"; then ok "install.sh 认子命令 $_sub"
+    else bad "install.sh 不认 $_sub → 面板里点了没反应"; fi
+done
+# ⑫ 主菜单要能看见版本, 而且要有一项能点进去
+if grep -F 'ui_kv "面板版本"' "$_PAN" >/dev/null; then
+    ok "主菜单显示面板版本"
+else
+    bad "主菜单看不到面板版本 → 用户分不清自己跑的是哪一份"
+fi
+if grep -F '12) panel_self_menu' "$_PAN" >/dev/null \
+   && grep -F '请选择 [0-12]' "$_PAN" >/dev/null; then
+    ok "主菜单 12) 进更新面板脚本 (提示范围已同步)"
+else
+    bad "菜单项 12 与提示范围 [0-1x] 不一致 → 用户以为没有这一项"
+fi
 
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then

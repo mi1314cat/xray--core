@@ -126,7 +126,12 @@ ui_pad() {
   local t="$1" w=0 i ch
   for (( i = 0; i < ${#t}; i++ )); do
     ch="${t:i:1}"
-    if [[ "$ch" == [$'\u4e00'-$'\u9fff'] ]]; then w=$((w + 2)); else w=$((w + 1)); fi
+    # case 而不是 `[[ == [区间] ]]` —— 见 conf/lib/print.sh 的说明:
+    # 后者会让 shellcheck 报 error 并停止检查整个文件。
+    case "$ch" in
+        [$'\u4e00'-$'\u9fff']) w=$((w + 2)) ;;
+        *)                      w=$((w + 1)) ;;
+    esac
   done
   printf '%s%*s' "$t" $(( $2 - w )) ""
 }

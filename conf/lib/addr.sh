@@ -288,7 +288,13 @@ x_link_addr() {
 x_url_host() {
     local h="${1:-}"
     case "$h" in
-        *:*) [[ "$h" == \[*\] ]] && printf '%s' "$h" || printf '[%s]' "$h" ;;
+        # 用 case 而不是 `[[ "$h" == \[*\] ]]` —— 后者让 shellcheck 报
+        # error 级解析错误。`\[*\]` 这个 case 模式与它语义相同:
+        # 以 [ 开头、以 ] 结尾。
+        *:*) case "$h" in
+                 \[*\]) printf '%s' "$h" ;;
+                 *)     printf '[%s]' "$h" ;;
+             esac ;;
         *)   printf '%s' "$h" ;;
     esac
 }
