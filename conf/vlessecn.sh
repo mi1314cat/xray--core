@@ -57,8 +57,25 @@ PROTO_NAME="VLESS-TCP-ML-KEM"
 #   静默忽略最贵: 它让你以为自己测的是沙箱。
 #   (同一条结论在 Reality.sh / Trojan.sh / Shadowsocks.sh / batch.sh 里
 #    都写过一遍, 那几个已经收了; 本脚本是漏网的那个。)
+# ★ 三个变量都要收, 而且**互相不能顶掉**:
+#     XRAY_BASE_DIR  安装器/老脚本用的名字
+#     XRAY_BASE      面板与 install.sh 用的名字
+#     XRAY_CONF_DIR  只指配置目录时的覆盖 (mknode / node.sh / share.sh 都认它)
+#
+#   只认前两个的后果是**静默写生产**: 有人(包括我自己的门禁)写
+#       XRAY_CONF_DIR=/tmp/x/conf bash conf/Reality.sh add
+#   以为在沙箱里, 而这一行把它原样丢掉、CONF_DIR 仍指 /root/catmi/xray/conf,
+#   于是在生产上凭空多出一个节点。实测踩到过: 跑一遍门禁, 生产 conf 里
+#   多出一个 reality-03.json。
+#
+#   静默忽略环境变量比报错危险得多 —— 它让你以为自己测的是沙箱。
 XRAY_BASE="${XRAY_BASE_DIR:-${XRAY_BASE:-/root/catmi/xray}}"
-CONF_DIR="$XRAY_BASE/conf"
+_XRAY_CONF_OVERRIDE="${XRAY_CONF_DIR:-}"
+_XRAY_OUT_OVERRIDE="${XRAY_OUT_DIR:-}"
+CONF_DIR="${_XRAY_CONF_OVERRIDE:-$XRAY_BASE/conf}"
+X_IS_SANDBOX=false
+[[ "$XRAY_BASE" != /root/catmi/xray || "$CONF_DIR" != /root/catmi/xray/conf ]] \
+    && X_IS_SANDBOX=true
 XRAYLS_BIN="$XRAY_BASE/xrayls"   # 必需，用于生成 ML-KEM 密钥
 
 # ★ 这里原来有一行备用固定密钥 (FALLBACK_ENC="mlkem768x25519plus...")。

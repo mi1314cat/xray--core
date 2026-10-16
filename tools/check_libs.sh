@@ -6751,14 +6751,19 @@ fi
 # ③ 动态: 沙箱里跑一遍 hysteria2, 生产目录必须一个字节都没动
 #    (hysteria2 是漏网的那个; 这条测试用**只设 XRAY_BASE** 的方式复现它,
 #     不设 XRAY_BASE_DIR —— 老测试两个都设, 所以永远看不见这个缺陷。)
+# ★ 快照必须是**整个 conf 目录**, 不能只数某一类。
+#   第一版只数 hysteria-*.json —— 于是"门禁自己往生产里写了一个 reality 节点"
+#   这件事它完全看不见 (实测踩到)。判据窄一寸, 漏掉的就是一整类。
 _PROD="${XRAY_PROD_DIR:-/root/catmi/xray}"
-_prod_before=$(ls -1 "$_PROD/conf"/hysteria-*.json 2>/dev/null | wc -l | tr -d ' ')
+_prod_snap_before=$(ls -1 "$_PROD/conf"/*.json 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+_prod_n_before=$(ls -1 "$_PROD/conf"/*.json 2>/dev/null | wc -l | tr -d ' ')
 _prod_mtime_before=$(stat -c %Y "$_PROD/conf" 2>/dev/null || echo none)
 _HYB="$TMP/hyb_iso"; rm -rf "$_HYB"; mkdir -p "$_HYB/conf" "$_HYB/out"
 ( cd "$ROOT" && XRAY_BASE="$_HYB" X_BATCH=1 X_NO_RELOAD=1 \
     timeout 90 bash conf/hysteria2.sh add </dev/null ) >/dev/null 2>&1
 _hyb_n=$(ls -1 "$_HYB/conf"/hysteria-*.json 2>/dev/null | wc -l | tr -d ' ')
-_prod_after=$(ls -1 "$_PROD/conf"/hysteria-*.json 2>/dev/null | wc -l | tr -d ' ')
+_prod_snap_after=$(ls -1 "$_PROD/conf"/*.json 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+_prod_n_after=$(ls -1 "$_PROD/conf"/*.json 2>/dev/null | wc -l | tr -d ' ')
 _prod_mtime_after=$(stat -c %Y "$_PROD/conf" 2>/dev/null || echo none)
 
 if [[ "$_hyb_n" -ge 1 ]]; then
@@ -6766,11 +6771,11 @@ if [[ "$_hyb_n" -ge 1 ]]; then
 else
     bad "沙箱里跑 hysteria2 什么也没落 —— 说明它根本没认 XRAY_BASE"
 fi
-if [[ "$_prod_before" == "$_prod_after" && "$_prod_mtime_before" == "$_prod_mtime_after" ]]; then
-    ok "生产 conf 没有被沙箱运行碰到 (hysteria 片段数 $_prod_before → $_prod_after)"
+if [[ "$_prod_snap_before" == "$_prod_snap_after" && "$_prod_mtime_before" == "$_prod_mtime_after" ]]; then
+    ok "生产 conf 一个字节没动 (共 $_prod_n_before 个片段, 目录 mtime 未变)"
 else
     bad "沙箱运行写到了生产目录" \
-        "hysteria 片段 $_prod_before → $_prod_after (目录 mtime $_prod_mtime_before → $_prod_mtime_after)"
+        "片段 $_prod_n_before → $_prod_n_after; 目录 mtime $_prod_mtime_before → $_prod_mtime_after"
 fi
 rm -rf "$_HYB"
 
@@ -7122,7 +7127,11 @@ fi
 _FLAT="$TMP/flat-batch"; rm -rf "$_FLAT"; mkdir -p "$_FLAT/lib" "$_FLAT/conf"
 cp "$ROOT/conf/Reality.sh" "$_FLAT/" 2>/dev/null
 for _l in proto_ui.sh ports.sh addr.sh; do cp "$ROOT/conf/lib/$_l" "$_FLAT/lib/" 2>/dev/null; done
-_FLAT_OUT=$(XRAY_CONF_DIR="$_FLAT/conf" X_BATCH=1 X_NO_RELOAD=1 \
+# ★ XRAY_BASE 必须一起给。这条门禁第一版只给了 XRAY_CONF_DIR —— 而协议脚本
+#   当时只认 XRAY_BASE, 于是它**在生产上凭空建了一个节点** (实测: 跑一遍门禁,
+#   /root/catmi/xray/conf 多出 reality-03.json)。写门禁的人踩了自己正在防的坑。
+_FLAT_OUT=$(XRAY_BASE="$_FLAT" XRAY_CONF_DIR="$_FLAT/conf" XRAY_OUT_DIR="$_FLAT/out" \
+            XRAY_INSTALL_DIR="$ROOT/.." X_BATCH=1 X_NO_RELOAD=1 \
             timeout 40 bash "$_FLAT/Reality.sh" add </dev/null 2>&1 || true)
 if printf '%s' "$_FLAT_OUT" | grep -F '缺少 conf/lib/proto_ui.sh' >/dev/null; then
     bad "平铺目录下 Reality.sh 仍报缺少共用层"
@@ -7145,6 +7154,26 @@ if grep -F '进入面板后选第 1 项' "$ROOT/install.sh" >/dev/null; then
 else
     ok "install.sh 的安装提示指向 7) 安装 / 更新内核"
 fi
+
+# ⑤ 只给 XRAY_CONF_DIR 时, 协议脚本也必须写到那儿去
+#    实测: 门禁给了 XRAY_CONF_DIR, 协议脚本只认 XRAY_BASE → 写到生产,
+#    生产 conf 里凭空多出一个 reality 节点, 而屏幕上一切正常。
+_SBX="$TMP/sbx-confdir"; rm -rf "$_SBX"; mkdir -p "$_SBX/conf" "$_SBX/out"
+_OVR=""
+for _f in Reality.sh Trojan.sh Shadowsocks.sh hysteria2.sh vlessxhttpecn.sh vlessecn.sh; do
+    _v=$(XRAY_CONF_DIR="$_SBX/conf" XRAY_OUT_DIR="$_SBX/out" \
+         bash -c "cd '$ROOT' && source conf/$_f >/dev/null 2>&1; printf '%s|%s' \"\$CONF_DIR\" \"\${X_IS_SANDBOX:-unset}\"" 2>/dev/null)
+    case "$_v" in
+        "$_SBX/conf|true") ;;
+        *) _OVR="$_OVR $_f($_v)" ;;
+    esac
+done
+if [[ -z "$_OVR" ]]; then
+    ok "只给 XRAY_CONF_DIR 时, 六个协议脚本都写到那儿且认作沙箱"
+else
+    bad "这些脚本无视 XRAY_CONF_DIR (会写到生产)" "$_OVR"
+fi
+rm -rf "$_SBX"
 
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then

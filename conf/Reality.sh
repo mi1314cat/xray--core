@@ -67,12 +67,30 @@ PROTO="reality"
 #
 #   两个都收, 并且把"设错了却被忽略"这件事**说出来**: 静默忽略最贵, 因为
 #   它让你以为自己测的是沙箱。
+# ★ 三个变量都要收, 而且**互相不能顶掉**:
+#     XRAY_BASE_DIR  安装器/老脚本用的名字
+#     XRAY_BASE      面板与 install.sh 用的名字
+#     XRAY_CONF_DIR  只指配置目录时的覆盖 (mknode / node.sh / share.sh 都认它)
+#
+#   只认前两个的后果是**静默写生产**: 有人(包括我自己的门禁)写
+#       XRAY_CONF_DIR=/tmp/x/conf bash conf/Reality.sh add
+#   以为在沙箱里, 而这一行把它原样丢掉、CONF_DIR 仍指 /root/catmi/xray/conf,
+#   于是在生产上凭空多出一个节点。实测踩到过: 跑一遍门禁, 生产 conf 里
+#   多出一个 reality-03.json。
+#
+#   静默忽略环境变量比报错危险得多 —— 它让你以为自己测的是沙箱。
 XRAY_BASE="${XRAY_BASE_DIR:-${XRAY_BASE:-/root/catmi/xray}}"
-if [[ -n "${XRAY_BASE:-}" && -z "${XRAY_BASE_DIR:-}" && "$XRAY_BASE" != /root/catmi/xray ]]; then
+_XRAY_CONF_OVERRIDE="${XRAY_CONF_DIR:-}"
+_XRAY_OUT_OVERRIDE="${XRAY_OUT_DIR:-}"
+CONF_DIR="${_XRAY_CONF_OVERRIDE:-$XRAY_BASE/conf}"
+# ★ 判定要跟着**真正生效的那个目录**走: 只给 XRAY_CONF_DIR 时 XRAY_BASE 仍是
+#   生产值, 但写的已经不是生产目录了 —— 那种情况必须也算沙箱, 否则会变成
+#   "配置写到别处、systemd 照样重启生产服务"。
+X_IS_SANDBOX=false
+if [[ "$XRAY_BASE" != /root/catmi/xray || "$CONF_DIR" != /root/catmi/xray/conf ]]; then
     X_IS_SANDBOX=true
 fi
-CONF_DIR="$XRAY_BASE/conf"
-OUT_DIR="$XRAY_BASE/out"
+OUT_DIR="${_XRAY_OUT_OVERRIDE:-$XRAY_BASE/out}"
 # 安装目录: 生产默认 /root/catmi/xray; 可用 XRAY_INSTALL_DIR 指到别处
 # (与 install.sh / verify.sh 同一个变量名), 也可跟随 XRAY_BASE_DIR 沙箱化 ——
 # 否则沙箱里生成的片段永远过不了 -test(找不到 xrayls), 而失败原因看起来是"配置错"。
