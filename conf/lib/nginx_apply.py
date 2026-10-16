@@ -681,7 +681,7 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
         L.append(f"{inner}    add_header Access-Control-Allow-Headers \"*\" always;")
         L.append(f"{inner}    return 204;")
         L.append(f"{inner}}}")
-        L.append(f"{inner}add_header Access-Control-Allow-Origin \"*\" always;")
+        # 同 CDN 分支: 被代理的响应不再补第二个 ACAO (xray 自己会回, 多值浏览器拒绝)
         L.append(f"{inner}proxy_set_header X-Real-IP $remote_addr;")
         L.append(f"{inner}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
         L.append(f"{inner}proxy_read_timeout 300s;")

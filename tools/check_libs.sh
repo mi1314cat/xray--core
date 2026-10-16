@@ -7398,8 +7398,12 @@ fi
 # ★ 但**不能**再给被代理的响应补一个 ACAO: xray 自己会回那个头 (它本来就支持
 #   跨源), 补第二个就变成"多值 ACAO", 而浏览器对多值是直接拒绝的
 #   ("contains multiple values"), 比没有还糟。实测过响应里出现两个。
+# ★ 别写 `grep -c ... || echo 0`: grep -c 匹配不到时**自己会打印 0 并返回 1**,
+#   `||` 再补一个就成了 "0\n0", 后面那句算术比较直接语法错误 —— 于是门禁永远
+#   走 else 分支 (假红)。这个坑本套件里已经修过 5 处, 这次是我自己又写了一遍。
 _cors_uncond=$(grep -c '^        L.append(f"{inner}add_header Access-Control-Allow-Origin' \
-               "$ROOT/conf/lib/nginx_apply.py" 2>/dev/null || echo 0)
+               "$ROOT/conf/lib/nginx_apply.py" 2>/dev/null) || true
+_cors_uncond=${_cors_uncond:-0}
 if [[ "${_cors_uncond:-0}" -eq 0 ]]; then
     ok "没有给被代理的响应重复补 ACAO (避免多值被浏览器拒绝)"
 else
