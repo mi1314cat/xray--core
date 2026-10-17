@@ -568,6 +568,13 @@ batch_main() {
         bash -c 'source "$XRAY_BASE/conf/lib/addr.sh" 2>/dev/null; resolve_public_ip 2>/dev/null' 2>/dev/null || true)
     backfill_share_meta "$_pubip" "$_pubdom"
 
+    # ★ 分离组合里"直连"那一段的地址: 默认用公网 IP。
+    #   REALITY 是裸 TLS 握手, 而橙云只代理 HTTP(S) —— 把橙云域名当直连地址,
+    #   握手打到 CF 边缘必失败。用户有灰云/独立域名时用 X_BATCH_DL_ADDRESS 覆盖。
+    if [[ -z "${X_BATCH_DL_ADDRESS:-}" && -n "$_pubip" ]]; then
+        export X_BATCH_DL_ADDRESS="$_pubip"
+    fi
+
     # ★ 用户要求: "全协议脚本里面一定要有这个"。
     #
     #   全协议 = 全**传输与加密形态**, 少了上下行分离这一类就名不副实 ——
@@ -652,19 +659,28 @@ batch_main() {
         #   是普通 TLS, nginx 代理过去对不上; 上下行又必须同一个 inbound 同端口),
         #   建出来也连不通 —— 所以这里**不建**, 并把原因写出来, 而不是悄悄多发
         #   一条死链。
-        local -a _split_specs=() _split_skip=()
-        local _sp
-        for _sp in cdn-cdn cdn-reality reality-reality; do
-            # 用到 REALITY 的组合 (第二段是 REALITY) 需要密钥对;
-            # 上面已经用内核现生成过, 生成不出来就跳过并说明。
-            if [[ "$_sp" != "cdn-cdn" && -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
-                _split_skip+=("$_sp")
+        # ★ 只建**真能连上**的组合。判据在内核里, 不是配置问题:
+        #   xHTTP 的会话表挂在每个 inbound 自己的 requestHandler 上, 下行 GET
+        #   必须落到同一个 inbound (否则拿到的是空会话, 下行永远没数据);
+        #   而一个 inbound 只有一个安全层。所以上下行必须同一个安全层。
+        #   详见 conf/lib/preset.sh 的 x_split_ok / x_split_why。
+        local -a _split_specs=() _split_skip=() _split_why=()
+        local _sp _si
+        for _sp in $(x_split_modes); do
+            if [ "$(x_split_ok "$_sp")" != "yes" ]; then
+                _split_skip+=("$_sp"); _split_why+=("$(x_split_why "$_sp")")
+                continue
+            fi
+            # 用到 REALITY 的组合需要密钥对 (上面已用内核现生成)
+            if [[ "$_sp" == *reality* && -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
+                _split_skip+=("$_sp"); _split_why+=("${_why_key:-REALITY 密钥对不可用}")
                 continue
             fi
             _split_specs+=("vless:4:split:$_sp")
         done
-        print_info "  reality-cdn 不生成: 上行 REALITY 只认 REALITY 握手, 下行经 CDN 是普通 TLS," \
-                   "两条要求冲突 (会话表又要求同一个 inbound) —— 建出来连不通"
+        for _si in "${!_split_skip[@]}"; do
+            print_info "  ${_split_skip[$_si]} 不生成: ${_split_why[$_si]}"
+        done
 
         if [[ ${#_split_specs[@]} -gt 0 ]]; then
             echo >&2
@@ -681,8 +697,11 @@ batch_main() {
             if [[ $src -eq 0 ]]; then
                 # 只报这次**真的**建了几个 —— 打"三个"而实际一个, 比不打更坏
                 if [[ ${#_split_skip[@]} -gt 0 ]]; then
-                    printf "${GREEN}[OK]${RESET} 已生成 %d 个组合 (跳过: %s —— %s)\n" \
-                        "${#_split_specs[@]}" "${_split_skip[*]}" "${_why_key:-REALITY 密钥对不可用}" >&2
+                    printf "${GREEN}[OK]${RESET} 已生成 %d 个组合 (未生成: %s)\n" \
+                        "${#_split_specs[@]}" "${_split_skip[*]}" >&2
+                    for _si in "${!_split_skip[@]}"; do
+                        print_info "    ${_split_skip[$_si]}: ${_split_why[$_si]}"
+                    done
                 else
                     printf "${GREEN}[OK]${RESET} 已生成 %d 个组合\n" "${#_split_specs[@]}" >&2
                 fi

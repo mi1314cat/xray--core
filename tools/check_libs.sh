@@ -3823,11 +3823,14 @@ assert_eq "$(grep -c 'xray-core BEGIN up.example.com' "$NGA")" "1" "双域名: �
 assert_eq "$(grep -c 'xray-core BEGIN down.example.com' "$NGB")" "1" "双域名: 下行域名插进 b.conf (各自找站点文件)"
 # ★ 双层 TLS (照 SB): xray inbound 自带 TLS 时, 回源必须是 https://,
 #   否则 nginx 向期待 TLS 的 xray 发明文 -> 502 / connection reset, xray 侧无日志。
-assert_eq "$(grep -c 'proxy_pass https://127.0.0.1:8443' "$NGA" "$NGB" | grep -c ':1')" "2" \
-    "双域名两段都用 https:// 回源 (双层 TLS)"
-assert_eq "$(grep -c 'proxy_ssl_server_name on' "$NGA" "$NGB" | grep -c ':1')" "2" "两段都带回源 SNI"
-assert_eq "$(grep -c 'proxy_buffering off' "$NGA" "$NGB" | grep -c ':1')" "2" \
-    "xhttp 关缓冲 (下行是长连接 GET, 缓冲了就不流式)"
+# ★ xhttp/gRPC 过 nginx 必须 grpc_pass (官方文档第 5 条), 与前面有没有
+#   Cloudflare 无关 —— CDN 分支以前先命中, 无条件写 proxy_pass, 于是所有
+#   经 CDN 的 xhttp 节点天然只支持 packet-up。回源仍按 origin-tls 选 scheme。
+assert_eq "$(grep -c 'grpc_pass grpcs://127.0.0.1:8443' "$NGA" "$NGB" | grep -c ':1')" "2" \
+    "双域名两段都用 grpcs:// 回源 (XHTTP 过 nginx 必须 grpc_pass)"
+assert_eq "$(grep -c 'grpc_ssl_server_name on' "$NGA" "$NGB" | grep -c ':1')" "2" "两段都带回源 SNI"
+assert_eq "$(grep -c 'grpc_read_timeout 300s' "$NGA" "$NGB" | grep -c ':1')" "2" \
+    "xhttp 走 grpc 的超时设置 (grpc_pass 本来就流式, 不用关缓冲)"
 
 # ---- 2) 幂等 ----
 # 存的是"两文件各自的内容", 比较时逐份比 —— cat 拼接和 printf 拼接的
@@ -6120,7 +6123,7 @@ rm -rf /tmp/sbx-probe
 # 借鉴 sing-box-core 的 cdn_autosetup / batch_next_port。三个 bug 值得钉住,
 # 它们的共同点是**静默失败**: 屏幕上一切正常, 功能从来没发生过。
 # ---------------------------------------------------- 上下行分离的三个组合
-group "xHTTP 上下行分离 (上行CDN/下行CDN, 上行CDN/下行REALITY, 上行REALITY/下行CDN)"
+group "xHTTP 上下行分离 (只有同一安全层能连: CDN+CDN / REALITY+REALITY)"
 source "$ROOT/conf/lib/preset.sh"
 
 # ① 三个模式都在, 且字段对得上
@@ -6152,17 +6155,35 @@ check_split() { # <模式> <上行> <下行> <下行挂nginx> <ECH> <监听档�
     else bad "$m 字段不对: 期望 [$want] 实得 [$got]"; fi
 }
 check_split cdn-cdn     tls      tls      yes yes nginx
-check_split cdn-reality tls      reality  no  yes cdn
+# cdn-reality 现在**不生成** (见下), 但表里这一行仍要自洽: 上行经 CDN →
+# 入站是明文 (nginx 终结 TLS), 所以档位是 nginx 而不是 cdn。
+check_split cdn-reality tls      reality  no  yes nginx
 check_split reality-cdn reality  tls      yes no  cdn
 
 # ② 监听档位: 有任一段直连就必须 0.0.0.0 (cdn), 全经 nginx 才 127.0.0.1 (nginx)
 #    判错的后果很隐蔽 —— 档位选 nginx 时 xray 只监听 127.0.0.1, 客户端直连
 #    那一段永远连不上, 而内核不报错。
-if [[ "$(x_split_tier cdn-reality)" == "cdn" && "$(x_split_tier reality-cdn)" == "cdn" \
-   && "$(x_split_tier cdn-cdn)" == "nginx" ]]
-then ok "有直连段就监听 0.0.0.0 (cdn), 全经 nginx 才收窄 (nginx)"
-else bad "监听档位不对: 直连段必须 cdn(0.0.0.0), 选成 nginx(127.0.0.1) 时直连段连不上"
+if [[ "$(x_split_tier cdn-cdn)" == "nginx" && "$(x_split_tier reality-reality)" == "cdn" ]]
+then ok "档位跟着每段是否直连走 (cdn-cdn→nginx, reality-reality→cdn)"
+else bad "监听档位不对: 全经 nginx 才收窄 127.0.0.1, 有直连段必须 0.0.0.0"
 fi
+
+# 3b) 能连上的组合只有两个 —— 跨安全层的两个必须被**判为不可用**
+#     (会话表 per-inbound + 一个 inbound 一个安全层, 见 preset.sh 的注释)
+_sok=""
+for _m in $(x_split_modes); do
+    [ "$(x_split_ok "$_m")" = yes ] && _sok="$_sok $_m"
+done
+if [ "$_sok" = " cdn-cdn reality-reality" ]; then
+    ok "只有同一安全层的两个组合被判为可用 (cdn-cdn / reality-reality)"
+else
+    bad "可用组合不对: 跨安全层的组合会被放出去 → 建出来下行收不到数据 (实得:$_sok)"
+fi
+# 被拒的两个都要有**原因**, 不能只是不列出来
+for _m in cdn-reality reality-cdn; do
+    if [ -n "$(x_split_why "$_m")" ]; then ok "$_m 被拒时说明了原因"
+    else bad "$_m 被拒但没给原因 → 用户以为是自己配错了"; fi
+done
 
 # ③ 未知模式要报错而不是默默当直连
 if x_split_ul_sec nosuchmode >/dev/null 2>&1; then
@@ -6585,13 +6606,16 @@ b=N.render_block('d.example.com', 24101, None, True, 'xhttp',
                  origin_tls=True, origin_sni='d.example.com', ind='    ', path='/x')
 print(b)
 " 2>/dev/null)
-if grep -qF 'proxy_request_buffering off' <<<"$NG_OUT"; then
-    ok "xHTTP 关了上行缓冲 (proxy_request_buffering off)"
+# ★ XHTTP 现在走 grpc_pass: grpc 模块本来就是流式转发, 不存在 proxy 那层
+#   请求体缓冲。断言改成"用的是 grpc_pass + grpc 超时", 而不是去找一个
+#   已经不该再出现的 proxy_request_buffering。
+if grep -qF 'grpc_pass grpcs://127.0.0.1:24101' <<<"$NG_OUT"; then
+    ok "xHTTP 用 grpc_pass 回源 (不做请求体缓冲, 上行不会被 nginx 收完再转)"
 else
-    bad "xHTTP 没关上行缓冲 → nginx 先收完整个请求体再转, 上行永远等不到下行"
+    bad "xHTTP 还是 proxy_pass → nginx 先收完整个请求体再转, 上行永远等不到下行"
 fi
-grep -qF 'proxy_buffering off' <<<"$NG_OUT" \
-    && ok "xHTTP 也关了下行缓冲" || bad "xHTTP 没关下行缓冲 → 下行长连接被 nginx 卡住"
+grep -qF 'grpc_read_timeout 300s' <<<"$NG_OUT" \
+    && ok "xHTTP 设了 grpc 读超时 (下行长连接不被卡住)" || bad "xHTTP 没设 grpc 读超时 → 下行长连接被 nginx 卡住"
 # 别的协议不该跟着关 —— 关了只是白白多几次转发
 NG_WS=$(cd "$ROOT" && python3 -c "
 import sys; sys.path.insert(0,'conf/lib')
@@ -7541,12 +7565,14 @@ else
     bad "只标了下行 dl_ech → 分享链接里没有 ech=, 而预置说明写着'默认开'"
 fi
 
-# ③e7 四个分离组合：三个能用, reality-cdn 是设计冲突, 不能在批量里悄悄建
-if grep -F 'for _sp in cdn-cdn cdn-reality reality-reality; do' "$ROOT/conf/batch.sh" >/dev/null \
-   && grep -F 'reality-cdn 不生成' "$ROOT/conf/batch.sh" >/dev/null; then
-    ok "全协议建三个可用的分离组合, 并说明 reality-cdn 为什么不建"
+# ③e7 分离组合: 只建**同一安全层**的两个, 跨安全层的两个要说清原因。
+#     判据来自内核结构 (sessions 是 per-inbound, 一个 inbound 一个安全层)。
+if grep -F 'for _sp in $(x_split_modes); do' "$ROOT/conf/batch.sh" >/dev/null \
+   && grep -F 'x_split_ok' "$ROOT/conf/batch.sh" >/dev/null \
+   && grep -F 'x_split_why' "$ROOT/conf/batch.sh" >/dev/null; then
+    ok "全协议按 x_split_ok 只建能连上的组合, 被跳过的逐条给原因"
 else
-    bad "全协议仍在建 reality-cdn (连不通) 或漏掉 reality-reality"
+    bad "全协议没按可用性筛组合 → 会建出连不通的节点"
 fi
 # 分离菜单要能选到 reality-reality
 if grep -F '4) SPLIT=reality-reality ;;' "$ROOT/tools/split_menu.sh" >/dev/null; then

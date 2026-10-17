@@ -85,6 +85,18 @@ for f in sys.argv[1:]:
         port = str(i.get("port") or "")
         if not port:
             continue
+        # ★ 只绑回环的入站是 nginx 档节点 —— 它由 deploy 自己配反代
+        #   (grpc_pass + 明文回源), 这里再配一遍只会把那段**覆盖**掉:
+        #   cdn_auto 以前无条件传 --origin-tls, 于是给我们刚配好的
+        #   grpc_pass/明文 段换成 proxy_pass https:// 明文端口 —— 上行
+        #   立刻 502, 而节点显示"生成成功"。
+        # ★ 只在**配置站点**这一趟里跳过回环; prune 那一趟必须看到它们 ——
+        #   否则"实时节点清单"里少了这些域名, 清空节点时会把它们正在用的
+        #   nginx 段当成孤儿删掉 (节点还在, 但没人转发了)。
+        _lsn = (i.get("listen") or ss.get("listen") or "")
+        if os.environ.get("_CD_SKIP_LOOPBACK") == "1" \
+           and _lsn in ("127.0.0.1", "::1", "localhost"):
+            continue
         xh = ss.get("xhttpSettings") or {}
         dl = xh.get("downloadSettings") or {}
         path = (xh.get("path") or "/")
@@ -135,13 +147,16 @@ for f in sys.argv[1:]:
             #   流量全被转到先插的那个端口 —— 而节点看起来都"生成成功"。
             #   nginx_apply 本来就按 `域名|/path` 打标记, 一节点一 path
             #   互不干扰, 删节点也只摘自己那一条。
-            rows.append((d_, port, tr, dl_dom if is_dl_tls else "", path))
+            # 第六列: 回源是否 TLS —— 由**片段自己的** security 决定, 不再
+            # 无条件开。tls 才是双层 TLS (xray 自带证书), none 必须明文回源。
+            _otls = "1" if (ss.get("security") or "none") == "tls" else "0"
+            rows.append((d_, port, tr, dl_dom if is_dl_tls else "", path, _otls))
 print("\n".join("|".join(r) for r in rows))
 PY
 }
 
-_cd_apply() {                     # <dom> <port> <tr> <cdn> <dl> <path> [dry]
-    local dom="$1" port="$2" tr="$3" cdn="$4" dl="$5" path="${6:-}" dry="${7:-}"
+_cd_apply() {                     # <dom> <port> <tr> <cdn> <dl> <path> <origin_tls> [dry]
+    local dom="$1" port="$2" tr="$3" cdn="$4" dl="$5" path="${6:-}" otls="${7:-}" dry="${8:-}"
     _cdlib_resolve || return 1
     local apy="$_CDLIB_DIR/lib/nginx_apply.py"
     [[ -r "$apy" ]] || { printf '[Error] 找不到 nginx_apply.py\n' >&2; return 1; }
@@ -172,7 +187,12 @@ _cd_apply() {                     # <dom> <port> <tr> <cdn> <dl> <path> [dry]
     [[ "$cdn" == "1" ]] && a+=(--cdn)
     # 回源 SNI 用**上行**那个域名 —— 下行域名是给客户端用的, 源站证书
     # 签的是上行域名, 用下行域名做 SNI 会证书不匹配。
-    a+=(--origin-tls --origin-sni "$dom")
+    #
+    # ★ --origin-tls 只在入站**自己**终结 TLS 时加 (来源: 片段的 security)。
+    #   对明文入站加它是 https → 明文端口, 回源 502。
+    if [[ "$otls" == "1" ]]; then
+        a+=(--origin-tls --origin-sni "$dom")
+    fi
     python3 "$apy" "${a[@]}" 2>&1
 }
 
@@ -190,11 +210,12 @@ x_cdn_autosetup() {
             *) break ;;
         esac
     done
-    local rows; rows=$(_cd_scan "$@")
+    # 配置这一趟跳过回环入站 (nginx 档节点由 deploy 自己配, 见上)
+    local rows; rows=$(_CD_SKIP_LOOPBACK=1 _cd_scan "$@")
     [[ -z "$rows" ]] && return 0                       # 照抄 SB: 没 CDN 就安静
 
-    local n=0 d0 port tr dl2 npath
-    while IFS='|' read -r d0 port tr dl2 npath; do
+    local n=0 d0 port tr dl2 npath otls
+    while IFS='|' read -r d0 port tr dl2 npath otls; do
         [[ -n "$d0" ]] && n=$((n+1))
     done <<< "$rows"
     [[ $n -eq 0 ]] && return 0
@@ -210,12 +231,12 @@ x_cdn_autosetup() {
     # 做完两个域名, 所以把"已经作为别人下行出现过"的域名跳过 —— 去重要
     # 连**端口与 path** 一起比, 只比域名会漏节点。
     local -a paired=()
-    while IFS='|' read -r d0 port tr dl2 npath; do
+    while IFS='|' read -r d0 port tr dl2 npath otls; do
         [[ -n "$dl2" ]] && paired+=("$dl2@$port@$npath")
     done <<< "$rows"
 
     local ok=0 bad=0
-    while IFS='|' read -r d0 port tr dl2 npath; do
+    while IFS='|' read -r d0 port tr dl2 npath otls; do
         [[ -z "$d0" ]] && continue
         if [[ -z "$dl2" ]]; then
             local skip=0 q
@@ -224,7 +245,7 @@ x_cdn_autosetup() {
         fi
         # 行内第一列就是**这个域名**, 下行域名在第四列 —— 双域名时 nginx_apply
         # 会为两个域名各找站点文件各插一段 (它们的 server 块本来就分开)。
-        if _cd_apply "$d0" "$port" "$tr" "1" "$dl2" "$npath" "$dry"; then
+        if _cd_apply "$d0" "$port" "$tr" "1" "$dl2" "$npath" "$otls" "$dry"; then
             ok=$((ok+1))
         else
             bad=$((bad+1))

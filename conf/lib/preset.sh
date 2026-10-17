@@ -180,7 +180,13 @@ _p_split_field() { # <模式> <第几列>
         cdn-reality:2)  echo "reality" ;;
         cdn-reality:3)  echo "no"      ;;   # 下行直连, 不挂 nginx
         cdn-reality:4)  echo "yes"     ;;
-        cdn-reality:5)  echo "cdn"     ;;   # 下行直连 → 必须 0.0.0.0
+        # ★ 上行走 CDN → 回源落在 nginx 上, 所以上行只绑 127.0.0.1 (明文),
+        #   TLS 由 nginx 终结。以前这里写 cdn (0.0.0.0 + 自带证书), 理由是
+        #   "下行直连必须 0.0.0.0" —— 但下行现在有**自己的** REALITY 入站
+        #   (见 preset_batch 的 dl_own_inbound), 上行不必再为此让路。
+        #   写 cdn 的后果: 片段监听 0.0.0.0 且自带 TLS, 客户端下行却按
+        #   REALITY 去握同一个端口 —— 服务器说的是 TLS, 握手必失败。
+        cdn-reality:5)  echo "nginx"  ;;   # 上行经 nginx, 下行独立入站直连
         reality-reality:1) echo "reality" ;;
         reality-reality:2) echo "reality" ;;
         reality-reality:3) echo "no"      ;;   # 上下行都直连, 不挂 nginx
@@ -192,6 +198,36 @@ _p_split_field() { # <模式> <第几列>
         reality-cdn:4)  echo "no"      ;;   # 上行 REALITY 无 TLS, 没 ECH 可开
         reality-cdn:5)  echo "cdn"     ;;   # 上行直连 → 必须 0.0.0.0
         *) return 1 ;;
+    esac
+}
+
+# ★ 哪些组合**真能连上** —— 由内核结构决定, 不是配置问题。
+#
+#   xHTTP 的会话表挂在**每个 inbound 自己的** requestHandler 上
+#   (transport/internet/splithttp/hub.go:36-42 的 sessions sync.Map);
+#   下行的 GET 带 sessionId 落到**同一个 inbound** 才拿得到上行的 uploadQueue
+#   (hub.go:380-390: conn.reader = currentSession.uploadQueue)。
+#   落到别的端口/inbound 时, 它只会在那边新建一个**空会话**: 下行能连上、
+#   却永远读不到上行数据 (实测两个 inbound: 下行 http=000, 连接空转)。
+#   而一个 inbound 只有一个 streamSettings.security —— 于是:
+#     · 上行经 CDN (回源是明文/nginx 终结 TLS) + 下行 REALITY → 要两个
+#       安全层, 同一个 inbound 做不到; 换端口又对不上会话表。
+#     · 上行 REALITY + 下行经 CDN → nginx 把普通 HTTP/2 转进只认 REALITY
+#       握手的入站, 握手就失败。
+#   ⇒ 上下行必须是**同一个安全层**: CDN+CDN, 或 REALITY+REALITY。
+x_split_ok() {
+    case "$1" in
+        cdn-cdn|reality-reality) printf 'yes' ;;
+        *) printf 'no' ;;
+    esac
+}
+x_split_why() {
+    case "$1" in
+        cdn-reality)
+            printf '上行经 CDN 时入站是明文 (TLS 由 nginx 终结), 同一个端口没法再做 REALITY 握手; 换端口则下行 GET 落到别的 inbound, 会话表对不上 (内核 hub.go 的 sessions 是 per-inbound)' ;;
+        reality-cdn)
+            printf '上行 REALITY 的入站只认 REALITY 握手, 而下行经 CDN 回源是普通 HTTP/2, nginx 转不进 REALITY 入站' ;;
+        *) printf '' ;;
     esac
 }
 

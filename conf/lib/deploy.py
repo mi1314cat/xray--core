@@ -211,12 +211,22 @@ def plan(protocol, transport, security, opts=None, tier=None):
     # 一个外部访问不到的端口, 表现是"链接导入正常但永远连不上"。
     public_port = opts.get("public_port") or (443 if tier == ACCESS_NGINX else port)
 
+    # ★ 对外地址不一定是域名。
+    #   经 CDN 的节点, 客户端连的是边缘: 域名:443。
+    #   直连的节点 (REALITY 上行) 客户端必须连**服务器**: IP:端口 —— 域名
+    #   若在橙云后面, 它解析到 CF 的边缘, 裸 REALITY 握手在那里必失败。
+    #   以前这里一律写 domain, 于是 reality-reality 的链接指向橙云域名,
+    #   导入正常、一连就断, 而服务端一切正常。
+    public_host = (opts.get("public_host") or "").strip() or domain
+
     meta = {
-        "host": domain,
+        "host": public_host,
         "port": public_port,
         "name": opts.get("name") or tag,
         "tier": tier,
     }
+    if opts.get("split_mode") or opts.get("split"):
+        meta["split"] = True
     if security == "reality":
         meta["public_key"] = opts.get("public_key")
         meta["short_id"] = opts.get("short_id", "")
@@ -339,6 +349,9 @@ def plan(protocol, transport, security, opts=None, tier=None):
             meta["dl_short_id"] = opts.get("dl_short_id") or ""
         # 客户端拿哪个地址连下行: 域名走 CDN, IP/其他是直连
         meta["dl_domain"] = opts.get("dl_domain") or dl_addr
+    if opts.get("dl_cdn"):
+        # 下行也走 CDN: 产物里要能看出"这一段的地址是边缘, 不是源站"
+        meta["dl_cdn"] = True
     if opts.get("dl_ech"):
         meta["dl_ech"] = True
     # ---- 自签证书的 pin ----

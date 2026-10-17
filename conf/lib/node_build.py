@@ -137,9 +137,13 @@ def _check_combo(protocol, transport, security, opts=None):
                 f"  ⚠ 这条检查在 xray run -test 阶段不会执行, 配置能校验通过、"
                 f"真连起来立刻失败。要分离请选 stream-up 或 packet-up。"
             )
-        # ② 端口必须与本 inbound 相同 (会话表 per-inbound, 见 _xhttp_download_settings)
+        # ② **直连**下行时端口必须与本 inbound 相同 (会话表 per-inbound)。
+        #    ★ 经 CDN 的下行例外: 客户端连的是**边缘** (443), 源站仍然是
+        #      同一个 inbound —— 端口不同是正常的。以前这里一刀切, 于是
+        #      cdn-cdn 这种"两段都走 CDN"的组合直接建不出来。
         dport = opts.get("dl_port")
-        if dport and int(dport) != int(opts.get("port") or 0):
+        if dport and not opts.get("dl_cdn") \
+                and int(dport) != int(opts.get("port") or 0):
             raise NodeError(
                 f"下行端口 {dport} 与本节点端口 {opts.get('port')} 不一致 —— 连不上。\n"
                 f"  原因: xHTTP 的会话表挂在**每个 inbound 自己**上 (hub.go:39/464), "
@@ -622,6 +626,7 @@ def build(protocol, transport, security, opts=None):
     }
     if opts.get("tag"):
         inbound["tag"] = opts["tag"]
+
     return {"inbounds": [inbound]}
 
 

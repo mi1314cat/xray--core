@@ -50,6 +50,24 @@ else
         || _y "  cdn_auto.sh 加载了但函数不在 (版本不匹配?)"
 fi
 
+# ★ 直连那一段 (REALITY) 的地址解析。
+#   域名如果在 Cloudflare 橙云后面, 它解析到的是**边缘 IP**, 而 REALITY 是
+#   裸 TLS 握手 —— 橙云只代理 HTTP(S), 直连那个域名的结果是握手打到 CF 上,
+#   必失败。所以直连地址默认取公网 IP; 有灰云/独立域名的人用
+#   X_BATCH_DL_ADDRESS 覆盖。
+_x_public_addr() {
+    local a=""
+    if [[ -n "${X_BATCH_DL_ADDRESS:-}" ]]; then
+        printf '%s' "$X_BATCH_DL_ADDRESS"; return 0
+    fi
+    a=$(awk -F'"' '/^link_ip=/{print $2; exit}' \
+        "${XRAY_BASE:-/root/catmi/xray}/install_info.env" 2>/dev/null || true)
+    if [[ -z "$a" ]]; then
+        a=$(curl -fsS4 --max-time 4 https://api.ipify.org 2>/dev/null || true)
+    fi
+    printf '%s' "$a"
+}
+
 PORTS_SH="$(_lib ports.sh)" || exit 1
 # shellcheck source=/dev/null
 source "$PRESET_SH"
@@ -303,9 +321,20 @@ PY
     #   所以默认 DL_DOMAIN 就是上行那个域名, 而 cdn-reality 这类"下行直连"
     #   的模式默认用**服务器自己的地址** (没有下行域名时, 连回同一个入口
     #   也对 —— 上下行仍然分开, 只是都从同一个地址进)。
+    DL_LISTEN_PORT=""
     if [[ -n "$SPLIT" ]]; then
+      # ★ 先问这个组合**能不能连上**。连不上的组合在这里就拒绝, 不往下走 ——
+      #   建出来的是"上行通、下行永远收不到数据"的节点, 而面板全绿。
+      #   判据与原因见 conf/lib/preset.sh 的 x_split_ok / x_split_why。
+      if [ "$(x_split_ok "$SPLIT")" != "yes" ]; then
+          _e "  $spec: 这个组合连不上, 已拒绝生成"
+          _y "      $(x_split_why "$SPLIT")"
+          fail=$((fail+1)); continue
+      fi
       SPLIT_DLSEC=$(x_split_dl_sec "$SPLIT")
-      if [ "$(x_split_dl_cdn "$SPLIT")" = yes ]; then
+      SPLIT_ULSEC=$(x_split_ul_sec "$SPLIT")
+      SPLIT_DLCN=$(x_split_dl_cdn "$SPLIT")
+      if [ "$SPLIT_DLCN" = yes ]; then
         # 下行也走 CDN: 可以是另一个域名, 也可以就是同一个 (最常见)
         DL_DOMAIN="${X_BATCH_DL_DOMAIN:-$domain}"
         if [[ "$DL_DOMAIN" != "$domain" ]]; then
@@ -314,20 +343,27 @@ PY
           _y "    下行域名: $DL_DOMAIN (与上行同一个 —— 上下行仍分开, 共用入口)"
         fi
       else
-        # 下行直连: 用 X_BATCH_DL_ADDRESS 给的地址, 默认与上行同一个入口
-        DL_DOMAIN="${X_BATCH_DL_ADDRESS:-${X_BATCH_DL_DOMAIN:-$domain}}"
-        _y "    下行: 直连 $DL_DOMAIN ($SPLIT_DLSEC) —— 不挂 nginx"
+        # 下行直连: 地址必须能**直连**到本机。橙云域名解析到边缘, REALITY
+        # 握手会被 CF 拒; 所以默认取公网 IP (X_BATCH_DL_ADDRESS 可覆盖)。
+        DL_DOMAIN="$(_x_public_addr)"
+        [[ -n "$DL_DOMAIN" ]] || DL_DOMAIN="${X_BATCH_DL_DOMAIN:-$domain}"
+        if [[ "$DL_DOMAIN" == "$domain" ]]; then
+            _y "    下行: 直连 $DL_DOMAIN ($SPLIT_DLSEC) —— 注意这个域名若在橙云后面, 直连握手会被 CF 拒"
+        else
+            _y "    下行: 直连 $DL_DOMAIN ($SPLIT_DLSEC) —— 不挂 nginx"
+        fi
       fi
     fi
   fi
 
-  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" <<'PY'
+  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" "${SPLIT_DLCN:-no}" "${SPLIT_ULSEC:-}" <<'PY'
 import json, os, sys
 # ★ import 一定要配齐: 这个 heredoc 原来只有 json, sys, 而下面用了
 #   os.environ —— NameError 被 2>/dev/null 吞掉, 命令替换拿到空串,
 #   表现是'规格拼装失败'或干脆静默不生成。项目在 mknode 上踩过一次
 #   (交接文档 10.3), 这里又踩了一次。
-proto,tr,sec,tag,port,tier,cred,extra,domain,split,dl_dom,ech_on,dlsec,dlsni,dlpub,dlsid,node_path = sys.argv[1:18]
+(proto, tr, sec, tag, port, tier, cred, extra, domain, split, dl_dom, ech_on,
+ dlsec, dlsni, dlpub, dlsid, node_path, dlcdn, ulsec) = sys.argv[1:20]
 o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
      "port":int(port),"tier":tier}
 # ★ xhttp 的 mode 必须显式给, 否则内核按 `auto` 解析 —— 而 **REALITY 下 auto
@@ -364,9 +400,38 @@ if split:
     #   path 同时也是 xHTTP 的真实路由, 一节点一个正合适。
     #   要共用 path (真要那么干) 就设 X_BATCH_SPLIT_PATH=/x。
     o["path"] = node_path or ("/%s-%s" % (split, port))
-    o["dl_address"] = dl_dom
-    o["dl_security"] = dlsec or sec
+    o["split"] = True
     o["dl_mode"] = "stream-up"
+    # ★ 上下行的"对外地址"必须各自对得上真实监听, 不能都填域名:
+    #     · 上行经 CDN  → 客户端连**边缘**: 域名:443 (TLS 由 CF 终结)
+    #     · 上行直连    → 客户端连**服务器**: IP:端口 (REALITY 裸握手)
+    #   以前一律写域名 + 源站端口, 于是:
+    #     - CDN 上行写成了源站端口 25293/25294, 而 CF 只代理 443 那几个端口;
+    #     - REALITY 上行写成橙云域名, 握手打到 CF 上必失败。
+    if ulsec == "reality":
+        # 直连上行: 对外地址就是直连地址 (IP 或灰云域名)
+        o["public_host"] = dl_dom or domain
+        # ★ REALITY 的 serverName / dest 必须给。只给 domain 时 node_build
+        #   的 target 会拼成 ":443" (它取的是 sni) —— 内核能过 -test,
+        #   但握手时没有回源目标, 一连就失败。
+        o["sni"] = domain
+    if dlcdn == "yes":
+        # 下行也走 CDN: 客户端连边缘 443, 不是源站端口
+        o["dl_cdn"] = True
+        o["dl_address"] = dl_dom
+        o["dl_port"] = 443
+        o["dl_security"] = "tls"
+        o["dl_sni"] = dlsni or domain
+        o["dl_ech"] = (ech_on == "yes")
+    else:
+        # 下行直连 REALITY: 地址必须是能直连到本机的, 端口见下
+        o["dl_address"] = dl_dom
+        o["dl_security"] = "reality"
+        o["dl_sni"] = dlsni or domain
+        o["dl_public_key"] = dlpub
+        o["dl_short_id"] = dlsid
+        # 上下行同一个 REALITY 入站 → 同端口 (会话表 per-inbound, 必须如此)
+        o["dl_port"] = int(port)
     # ★ ECH 要**两段都标**。
     #   以前只写了 dl_ech (下行), 于是:
     #     · 分享链接里没有 ech= (那个参数取的是 meta["ech"], 只有 uplink 才会写);
@@ -376,13 +441,6 @@ if split:
     #   客户端要拿的是域名的 ECHConfigList —— 由 deploy.plan 从 HTTPS RR 取。
     o["ech"] = (ech_on == "yes")
     o["dl_ech"] = (ech_on == "yes")
-    if (dlsec or sec) == "reality":
-        # 下行 REALITY 需要自己的 serverName / 公钥 / 短 ID。
-        # 优先用 dl_* 专用的, 没给就回落到上行那组 —— 上下行打同一个
-        # inbound 时其实可以是同一组凭据。
-        o["dl_sni"] = dlsni
-        o["dl_public_key"] = dlpub
-        o["dl_short_id"] = dlsid
 o["split_mode"] = split if split else ""
 print(json.dumps(o))
 PY

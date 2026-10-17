@@ -112,9 +112,13 @@ _bo "════ xHTTP 上下行分离 ════"
 _cy "  上下行真正分开: 下行走独立 GET、上行走独立 POST —— 不是一条连接上双工"
 echo >&2
 _in "  1) 上行 CDN + 下行 CDN        两段都走 Cloudflare 橙云, ECH 默认开, 藏得最深"
-_in "  2) 上行 CDN + 下行 REALITY    上行藏进 CDN, 下行直连 + REALITY 握手伪装"
-_in "  3) 上行 REALITY + 下行 CDN    ⚠ 实测不通 (见下), 保留了说明"
 _in "  4) 上行 REALITY + 下行 REALITY 两段都直连 + REALITY, 抗 DPI 最强, 不依赖 CDN"
+_wn "  ⚠ 2) 上行 CDN + 下行 REALITY 与 3) 上行 REALITY + 下行 CDN 连不上, 已不提供。"
+_wn "     原因在内核结构: xHTTP 的会话表挂在**每个 inbound 自己**上"
+_wn "     (splithttp/hub.go 的 sessions), 下行的 GET 必须落到同一个 inbound 才拿得到"
+_wn "     上行的 uploadQueue; 而一个 inbound 只有一个安全层 —— 上行是 CDN 回源时"
+_wn "     它已经是明文, 同一个端口没法再做 REALITY 握手; 换个端口下行只会连到"
+_wn "     一个空会话 (下行 000)。所以上下行必须同一个安全层。"
 echo >&2
 _wn "  只有一个域名也可以 —— 上下行仍然分开, 只是共用同一个入口。"
 _wn "  两个域名是**加出来的能力**, 不是前提。"
@@ -126,9 +130,17 @@ pick="${pick:-1}"
 case "$pick" in
     0|q|Q) exit 0 ;;
     1) SPLIT=cdn-cdn ;;
-    2) SPLIT=cdn-reality ;;
-    3) SPLIT=reality-cdn ;;
     4) SPLIT=reality-reality ;;
+    2|3)
+        if [ "$pick" = 2 ]; then _sp_pick=cdn-reality; else _sp_pick=reality-cdn; fi
+        _er "这个组合连不上, 不生成 —— 不是配置问题, 是内核结构限制"
+        _er "  $(x_split_why "$_sp_pick")"
+        _in "  xHTTP 的会话表是 per-inbound 的, 而一个 inbound 只能有一个安全层;"
+        _in "  上下行跨安全层时, 下行要么握不上手, 要么落进一个空会话 (下行 000),"
+        _in "  上层看起来「连上了」, 实际一个字节都收不到。"
+        _in "  要上下行分离, 请用 1) CDN+CDN 或 4) REALITY+REALITY。"
+        exit 1 ;;
+    *) _er "看不懂 (只有 1 和 4 能选)"; exit 1 ;;
     *) _er "看不懂"; exit 1 ;;
 esac
 

@@ -630,7 +630,34 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
         L.append(f"{ind}# <<< {MARK} END {tag} <<<")
         return L
 
-    if cdn:
+    # ★ XHTTP/gRPC 即使走 CDN 也必须 grpc_pass。
+    #
+    #   官方文档快速上手第 5 条讲的是 nginx 这一跳, 与"前面有没有 Cloudflare"
+    #   无关: 反代软件只要缓冲了那条长连接 POST, stream-up / stream-one 就
+    #   过不去 (实测 proxy_pass → 204/000/000, grpc_pass → 204/204/204)。
+    #   以前 cdn 分支先命中, 无条件写 proxy_pass, 于是**所有经 CDN 的
+    #   xhttp 节点**天然只支持 packet-up —— 而它们的 mode 大多是 auto 或
+    #   stream-up, 表现是"能连上、一下载就断", 服务端毫无日志。
+    #
+    #   回源 scheme 仍由 origin_tls 决定: xray 自带证书时用 grpcs://,
+    #   明文入站 (nginx 档/CDN 档回源) 用 grpc://。
+    if cdn and transport in ("xhttp", "grpc"):
+        _scheme = "grpcs" if origin_tls else "grpc"
+        L.append(f"{ind}# CDN 接入: 回源到本机 (grpc_pass —— XHTTP 的流式上行靠它穿透 nginx)")
+        L.append(f"{ind}location {path} {{")
+        L.append(f"{inner}grpc_pass {_scheme}://127.0.0.1:{port};")
+        if origin_tls:
+            L.append(f"{inner}grpc_ssl_server_name on;")
+            L.append(f"{inner}grpc_ssl_name {origin_sni or '$host'};")
+        L.append(f"{inner}grpc_set_header Host $host;")
+        L.append(f"{inner}grpc_set_header X-Real-IP $remote_addr;")
+        L.append(f"{inner}grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+        L.append(f"{inner}grpc_set_header X-Forwarded-Proto $scheme;")
+        L.append(f"{inner}grpc_read_timeout 300s;")
+        L.append(f"{inner}grpc_send_timeout 300s;")
+        L += _cors_options_lines(inner)
+        L.append(f"{ind}}}")
+    elif cdn:
         # ★ 双层 TLS (照 sing-box-core 的 cdn.sh):
         #     客户端 ──TLS──► Cloudflare ──TLS──► Nginx ──TLS──► xray
         #   nginx 终止掉 Cloudflare 的 TLS 之后, 会用**新的 TLS 连接**去连 xray;
