@@ -144,40 +144,23 @@ def plan(protocol, transport, security, opts=None, tier=None):
     #   只动 tls: REALITY 的握手是 xray 自己做的, 不在这个结论覆盖范围内, 不动它。
     eff_security = "none" if (tier == ACCESS_NGINX and security == "tls") else security
 
-    # ---- xhttp 的模式: 过 nginx 时必须 packet-up ----
+    # ---- xhttp 的 mode: 服务端**不设**, 由客户端选 ----
     #
-    # ★ 实测出来的硬约束, 不是偏好:
+    # ★ 这里以前会"自动纠正"成 packet-up (理由是实测 stream-up 过不了 nginx)。
+    #   那个实测没错, 但**结论下错了**: 真正过不去的原因是 nginx 用了
+    #   proxy_pass, 而官方文档的快速上手第 5 条写得很清楚 ——
+    #     「无法穿透 Nginx 的话, 把 Nginx 的 proxy_pass 改为 grpc_pass」
+    #   改成 grpc_pass 之后三种模式**全部**能过 (实测矩阵见 node_build.py 注释)。
+    #   而把服务端的 mode 钉死成 packet-up, 反而把 stream-up / stream-one
+    #   一起废掉了 —— 包括浏览器拨号那条路 (它的 HTTP 版本与 mode 由浏览器决定)。
     #
-    #     mode=packet-up  →  经 nginx 200 / 经 Cloudflare 200
-    #     mode=stream-up  →  经 nginx 失败 / 经 Cloudflare 失败
-    #
-    #   原因: stream-up 的上行是**一条长连接的 POST 流** —— 请求体边发边等下行。
-    #   nginx 转发到 xray 之后, xray 的上行队列在等会话侧消费, 于是迟迟不读请求体;
-    #   nginx 跟着停止读取客户端 → 客户端发完第一个分片就卡住, 全线死等,
-    #   18 秒后超时。抓包看得很清楚: 直连时 POST 体是连续多个分片,
-    #   经 nginx 时只有一个分片然后静默。
-    #
-    #   而 packet-up 每个包都是一个**完整的 POST**(有始有终), nginx 转起来毫无压力。
-    #
-    #   附带说明: `auto` 在非 REALITY 下本来就解析成 packet-up, 所以"不写 mode"
-    #   反而能跑通 —— 但那是**碰巧**, 换个 security 就翻车。既然这里已经知道
-    #   自己在 nginx 后面, 就干脆写死 packet-up, 不留悬念给内核去猜。
-    #
-    #   这里**自动纠正并说明**, 而不是报错拒绝: 用户要的"经 nginx 的 xhttp"
-    #   本身完全可行, 只是模式要换一个。判断"是不是用户显式选的"用 _picked,
-    #   因为 auto/未填 是默认值 —— 那种情况不该刷一条警告。
+    #   所以现在: 服务端不写 mode (接受三种), nginx 用 grpc_pass,
+    #   客户端产物里写 mode (那才是它该出现的地方)。
+    #   想故意只接受某一种, 用 XHTTP_SERVER_MODE / opts["xhttp_server_mode"]。
     if tier == ACCESS_NGINX and transport == "xhttp":
-        _picked = str(nopts.get("xhttp_mode") or "auto")
-        if _picked != "packet-up":
-            nopts["xhttp_mode"] = "packet-up"
-            if _picked in ("stream-up", "stream-one"):
-                print(f"[提示] xhttp 模式 {_picked} 过不了 nginx, 已自动改为 packet-up。\n"
-                      f"       原因: {_picked} 的上行是一条长连接 POST 流, nginx 转发时会卡住"
-                      f"(实测: 直连可用, 经 nginx/Cloudflare 必失败)。\n"
-                      f"       packet-up 每个包一个完整 POST, 实测经 nginx 与 Cloudflare 都是 200。",
-                      file=sys.stderr)
-        if nopts.get("dl_mode") and str(nopts["dl_mode"]) != "packet-up":
-            nopts["dl_mode"] = "packet-up"
+        _sm = (opts.get("xhttp_server_mode") or "").strip()
+        if _sm:
+            nopts["xhttp_server_mode"] = _sm
 
     # ---- nginx 档位的 path: **不能**默认落在 "/" ----
     #
@@ -192,9 +175,8 @@ def plan(protocol, transport, security, opts=None, tier=None):
     #       节点片段写好了 → 面板显示"已写入" → 分享元数据也写了
     #       → 但没有人转发 → nginx 里没有这个 location
     #       → 客户端连 域名:443 打到的是**网站首页**
-    #       → 表现是"配置全对、服务在跑、就是连不上"
-    #   实测: 全套按用户的操作路径走下来, 屏幕上只多了一行被截断的警告,
-    #   而这个节点永远不通。
+    #   (实测: 全套按用户的操作路径走下来, 屏幕上只多了一行被截断的警告,
+    #    而这个节点永远不通。)
     #
     #   修法: nginx 档位下, 用户没给 path 就**自己分配一个唯一前缀**。
     #   路径本来就该是唯一的 (同一台机器上多个 xhttp 节点共用 443,
@@ -249,6 +231,17 @@ def plan(protocol, transport, security, opts=None, tier=None):
     #       mihomo → proxy 0: invaild vless encryption value: …600s.…
     #       Xray   → 握手失败
     #   服务端片段完全正确, 面板上一切正常, 只有真连的时候炸。
+    # ★ 服务端片段不再写 xhttp 的 mode (官方口径: 服务端同时接受三种), 所以
+    #   用户在面板上选的那一项必须**落在元数据里** —— 否则它会凭空消失:
+    #   分享链接又变回 auto, 分离节点的下行模式也跟着丢, 而"我明明选了 X"
+    #   这件事在产物里再也看不到。客户端产物与链接都从这里取。
+    if transport == "xhttp":
+        _m = (opts.get("xhttp_mode") or "").strip()
+        if _m:
+            meta["mode"] = _m
+        _dm = (opts.get("dl_mode") or "").strip()
+        if _dm:
+            meta["dl_mode"] = _dm
     _cli_enc = (opts.get("client_encryption") or "").strip()
     if _cli_enc:
         meta["encryption"] = _cli_enc

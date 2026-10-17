@@ -705,6 +705,65 @@ def split_params(n, meta=None):
     return out
 
 
+# Xray 官方文档 (XHTTP: Beyond REALITY) 给 XMUX 的默认值。
+# 全为 0 (不写) 时内核取这三个 —— 也就是说客户端**本来**是这个行为;
+# 而 mihomo 的 reuse-settings **没有默认值**, 不写就是"每个请求开一条新连接"。
+_XMUX_DEFAULTS = {
+    "maxConcurrency": "16-32",
+    "hMaxRequestTimes": "600-900",
+    "hMaxReusableSecs": "1800-3000",
+}
+
+
+def xhttp_extra(n, meta=None):
+    """xhttp 的官方 `extra` (分享链接里那第四项)。没有内容时返回空 dict。
+
+    ★ 为什么必须有: 官方文档写得很明确 ——
+        「extra 是 host、path、mode 以外的所有参数的原始 JSON 分享方案，
+          当 extra 存在时，只有该四项会生效。**且分享链接中只有这四项**」
+      也就是说别人家的 GUI (v2rayN / v2rayNG / NekoBox ...) 认的是
+        vless://...#...?...&mode=...&path=...&host=...&extra=<URL 编码的 JSON>
+      而**不认识**我们自己那套 dlad/dlport/dlsec/... —— 那些参数在别人的客户端里
+      会被直接忽略, 于是"分享出去的链接在别人那里变成合流"甚至少半段配置,
+      而两边看着都正常。
+
+      我们自己那套 dl* 继续保留: 本项目客户端读的是它 (见 Client/lib/node.py),
+      忽略 extra。两套并存, 谁都不断。
+    """
+    meta = meta or {}
+    extra = {}
+    if n.get("network") == "xhttp":
+        extra["xmux"] = dict(_XMUX_DEFAULTS)
+    # ---- 上下行分离: 官方 shape 是"一套完整的 streamSettings + address/port" ----
+    dl_addr = (n.get("dl_address") or meta.get("dl_address") or "").strip()
+    if n.get("network") == "xhttp" and dl_addr:
+        dsec = (n.get("dl_security") or meta.get("dl_security") or "tls").lower()
+        dl = {
+            "address": dl_addr,
+            "port": int(n.get("dl_port") or meta.get("dl_port") or 443),
+            "network": "xhttp",
+            "security": dsec,
+        }
+        sni = (n.get("dl_sni") or meta.get("dl_sni")
+               or n.get("sni") or meta.get("host") or "")
+        if dsec == "reality":
+            dl["realitySettings"] = {
+                "serverName": sni,
+                "fingerprint": meta.get("fingerprint") or "chrome",
+                "password": n.get("dl_public_key") or meta.get("dl_public_key") or "",
+                "shortId": n.get("dl_short_id") or meta.get("dl_short_id") or "",
+                "spiderX": meta.get("spx") or "/",
+            }
+        else:
+            dl["tlsSettings"] = {"serverName": sni}
+        dl["xhttpSettings"] = {
+            "path": n.get("dl_path") or n.get("path") or "/",
+            "mode": n.get("dl_mode") or n.get("mode") or "auto",
+        }
+        extra["downloadSettings"] = dl
+    return extra
+
+
 def build_share_link(n, meta=None, notes=None):
     """从节点视图生成 Xray 分享链接。
 
@@ -801,8 +860,19 @@ def build_share_link(n, meta=None, notes=None):
         # ★ 以前链接里根本不带 mode, 客户端一律退回 auto。而 auto 在 REALITY 下
         #   解析成 stream-one (上下行**合流**) —— 分享出去再导入, 节点看起来
         #   一切正常, 只是没在分离。显式写了才不丢。
-        if n.get("network") == "xhttp" and n.get("mode"):
-            q["mode"] = n["mode"]
+        # ★ mode 现在存在**元数据**里 (服务端片段按官方口径不再写它),
+        #   所以两级取: 片段 (老节点) → 元数据 (新节点)。
+        _mode = (n.get("mode") or (meta or {}).get("mode") or "").strip()
+        if n.get("network") == "xhttp" and _mode:
+            q["mode"] = _mode
+        # ---- 官方 extra: 把 dl* 那套同时按官方形状发一份 ----
+        #   (文档: 分享链接里只有 host/path/mode/extra 四项是通用的)
+        if n.get("network") == "xhttp":
+            import json as _json
+            _ex = xhttp_extra(n, meta)
+            if _ex:
+                q["extra"] = _json.dumps(_ex, ensure_ascii=False,
+                                         separators=(",", ":"))
         # ---- 上下行分离 ----
         # 分享链接是节点搬家的唯一途径, 下行那一套目的地不带过去,
         # 换台设备导入就退化成合流, 而且**看不出**。

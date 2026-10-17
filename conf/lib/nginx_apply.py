@@ -563,6 +563,34 @@ def _trim_blanks(lines, idx):
 
 
 # ---------------------------------------------------------------- 生成片段
+def _cors_options_lines(inner):
+    """跨源预检就地 204 + CORS 头。
+
+    ★ 为什么 nginx 这边要管: 客户端的 Browser Dialer 页面跑在
+      http://127.0.0.1:18081, 却要去 fetch https://你的域名/path/... —— **跨源**。
+      浏览器先发 OPTIONS 预检, 而 xray 只在 GET/POST 的响应上带 CORS
+      (官方文档 PACKET-UP 第 3 条明说), 对 OPTIONS 它直接 404。
+      浏览器于是把请求拦在本地, **服务端一个请求都收不到**。实测控制台原文:
+        Access to fetch at 'https://<域名>/<path>/...' from origin
+        'http://127.0.0.1:18081' has been blocked by CORS policy:
+        Response to preflight request doesn't pass access control check:
+        No 'Access-Control-Allow-Origin' header is present on the requested resource.
+
+    ★ 只答预检。被代理的响应**不补**第二个 ACAO —— xray 自己会回, 补两个就是
+      "多值 ACAO", 浏览器对多值同样直接拒绝, 比没有还糟 (实测过)。
+    """
+    return [
+        f"{inner}# 跨源预检 (Browser Dialer 从 127.0.0.1 打过来; xray 不答 OPTIONS)",
+        f"{inner}if ($request_method = OPTIONS) {{",
+        f"{inner}    add_header Access-Control-Allow-Origin  \"*\" always;",
+        f"{inner}    add_header Access-Control-Allow-Methods \"GET, POST, OPTIONS\" always;",
+        f"{inner}    add_header Access-Control-Allow-Headers \"*\" always;",
+        f"{inner}    add_header Access-Control-Max-Age 86400 always;",
+        f"{inner}    return 204;",
+        f"{inner}}}",
+    ]
+
+
 def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
                 origin_tls=False, origin_sni="",
                  path="/"):
@@ -641,31 +669,32 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
             L.append(f"{inner}proxy_request_buffering off;")
             L.append(f"{inner}proxy_read_timeout 300s;")
             L.append(f"{inner}proxy_send_timeout 300s;")
-        # ★ CORS: 客户端那边的 Browser Dialer 是**跨源**请求 ——
-        #   页面跑在 http://127.0.0.1:18081, 却要去 fetch https://你的域名/path/...
-        #   浏览器先发 OPTIONS 预检, 没有 Access-Control-Allow-Origin 就直接拦掉,
-        #   连请求都发不出去。实测 (Chromium 控制台原文):
-        #     Access to fetch at 'https://<域名>/<path>/...' from origin
-        #     'http://127.0.0.1:18081' has been blocked by CORS policy:
-        #     Response to preflight request doesn't pass access control check:
-        #     No 'Access-Control-Allow-Origin' header is present
-        #   表现是"节点配置全对、Xray 也在跑、就是上不了网", 而服务端**一个请求
-        #   都没收到** (日志里干干净净)。
-        #   OPTIONS 必须**就地 204**, 不能转给 xray —— xray 对这个请求只会 404。
-        L.append(f"{inner}# 跨源预检 (Browser Dialer 从 127.0.0.1 打过来)")
-        L.append(f"{inner}if ($request_method = OPTIONS) {{")
-        L.append(f"{inner}    add_header Access-Control-Allow-Origin  \"*\" always;")
-        L.append(f"{inner}    add_header Access-Control-Allow-Methods \"GET, POST, OPTIONS\" always;")
-        L.append(f"{inner}    add_header Access-Control-Allow-Headers \"*\" always;")
-        L.append(f"{inner}    add_header Access-Control-Max-Age 86400 always;")
-        L.append(f"{inner}    return 204;")
-        L.append(f"{inner}}}")
         # ★ 这里**不再**无条件补一个 Access-Control-Allow-Origin。
         #   xray 自己会给带 Origin 的请求回 ACAO (它本来就支持跨源), 我们再补
         #   一个就变成**两个** ACAO 头 —— 而浏览器对"多值 ACAO"是直接拒绝的
         #   ("contains multiple values"), 比没有还糟。
         #   实测: OPTIONS 由 nginx 就地 204; GET/POST 转给 xray 后响应里已经
         #   带着 access-control-allow-origin。
+        L.append(f"{ind}}}")
+    elif transport in ("xhttp", "grpc"):
+        # ★ XHTTP / gRPC 一律 grpc_pass —— 官方文档快速上手第 5 条:
+        #     「无法穿透 Nginx 的话, 把 Nginx 的 proxy_pass 改为 grpc_pass」
+        #   实测矩阵 (RN 真连, 客户端三种 mode 各跑一遍, 服务端不写 mode):
+        #     proxy_pass → packet-up 204 / stream-up 000 / stream-one 000
+        #     grpc_pass  → packet-up 204 / stream-up 204 / stream-one 204
+        #   proxy_pass 过不去的原因是 nginx 会把上行那条长连接 POST 缓冲住;
+        #   grpc_pass 是 HTTP/2 流式转发, 不做那层缓冲。
+        #   (只有"必须用别的反代、动不了 nginx"时, 才退而求其次把 mode 设成 packet-up。)
+        L.append(f"{ind}# nginx 档: 本机反代 (grpc_pass —— XHTTP 的流式上行靠它穿透 nginx)")
+        L.append(f"{ind}location {path} {{")
+        L.append(f"{inner}grpc_pass grpc://127.0.0.1:{port};")
+        L.append(f"{inner}grpc_set_header Host $host;")
+        L.append(f"{inner}grpc_set_header X-Real-IP $remote_addr;")
+        L.append(f"{inner}grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
+        L.append(f"{inner}grpc_set_header X-Forwarded-Proto $scheme;")
+        L.append(f"{inner}grpc_read_timeout 300s;")
+        L.append(f"{inner}grpc_send_timeout 300s;")
+        L += _cors_options_lines(inner)
         L.append(f"{ind}}}")
     else:
         L.append(f"{ind}location {path} {{")
@@ -674,32 +703,19 @@ def render_block(domain, port, block, cdn, transport, ind="    ", inner=None,
         L.append(f"{inner}proxy_set_header Host $host;")
         L.append(f"{inner}proxy_set_header Upgrade $http_upgrade;")
         L.append(f"{inner}proxy_set_header Connection $connection_upgrade;")
-        # 同上: Browser Dialer 是跨源请求, 没有这几个头浏览器直接拦掉。
-        L.append(f"{inner}if ($request_method = OPTIONS) {{")
-        L.append(f"{inner}    add_header Access-Control-Allow-Origin  \"*\" always;")
-        L.append(f"{inner}    add_header Access-Control-Allow-Methods \"GET, POST, OPTIONS\" always;")
-        L.append(f"{inner}    add_header Access-Control-Allow-Headers \"*\" always;")
-        L.append(f"{inner}    return 204;")
-        L.append(f"{inner}}}")
-        # 同 CDN 分支: 被代理的响应不再补第二个 ACAO (xray 自己会回, 多值浏览器拒绝)
         L.append(f"{inner}proxy_set_header X-Real-IP $remote_addr;")
         L.append(f"{inner}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;")
         L.append(f"{inner}proxy_read_timeout 300s;")
         L.append(f"{inner}proxy_buffering off;")
-        # ★ 上行也必须关缓冲。
-        #   proxy_buffering 管的是**响应**方向; 客户端 POST 上来的一侧是
-        #   **请求**方向, 由 proxy_request_buffering 管, 默认 on。
-        #   开着的后果: nginx 会先把整个请求体收完再转给 xray —— 而 xHTTP
-        #   的上行恰恰是"边发边等下行", 请求体没收完, 下行就永远不开始。
-        #   实测症状: 源站 access log 里 POST/GET 都是 **200**, 看着完全
-        #   正常, 但 xray 侧只留下一行
+        # ★ 上行也必须关缓冲 (响应方向由 proxy_buffering 管, 请求方向由
+        #   proxy_request_buffering 管, 后者默认 on)。开着的后果: nginx 先把
+        #   整个请求体收完再转给 xray, 而 HTTP 类传输的上行是"边发边等下行"
+        #   —— 请求体没收完, 下行就永远不开始。实测症状: 源站 access log 里
+        #   POST/GET 都是 200, 看着完全正常, 而 xray 侧只有一行
         #       connection ends > http: invalid Read on closed Body
-        #   然后客户端就一直等到超时 —— 两头都没有报错, 极难定位。
-        #   只对 xhttp 关: 别的协议本来就要整包, 关了只是白白多几次转发。
-        if transport == "xhttp":
-            L.append(f"{inner}proxy_request_buffering off;")
-        if transport == "grpc":
-            L.append(f"{inner}proxy_pass http://127.0.0.1:{port};")
+        #   然后客户端等到超时, 两头都不报错。
+        L.append(f"{inner}proxy_request_buffering off;")
+        L += _cors_options_lines(inner)
         L.append(f"{ind}}}")
 
     L.append(f"{ind}# <<< {MARK} END {tag} <<<")

@@ -3537,12 +3537,13 @@ import sys; sys.path.insert(0, sys.argv[1])
 import node_build as B
 r = B.build("vless","xhttp","tls", dict(tag="t", port=34567,
           cert_file="/tmp/c", key_file="/tmp/k", sni="x.com",
-          ech_server_keys="ECHKEYS", xhttp_mode="stream-up"))
+          ech_server_keys="ECHKEYS"))
 ss = r["inbounds"][0]["streamSettings"]
-print("%s/%s" % (ss["tlsSettings"].get("echServerKeys","-"), ss["xhttpSettings"].get("mode")))
+print("%s/%s" % (ss["tlsSettings"].get("echServerKeys","-"),
+                 "no-mode" if "mode" not in ss["xhttpSettings"] else ss["xhttpSettings"]["mode"]))
 PYX
 )
-assert_eq "$EC" "ECHKEYS/stream-up" "ECH 服务端公钥写进 tlsSettings, xhttp mode 透传"
+assert_eq "$EC" "ECHKEYS/no-mode" "ECH 服务端公钥写进 tlsSettings; 服务端不写 xhttp mode (接受三种)"
 
 # 预置第 6 列 (加密增强) 能被取到, 且没有的档位兜成 none
 EN=$(bash -c "source '$LIB/preset.sh'; x_preset_field vless 1 6" 2>/dev/null)
@@ -3560,12 +3561,22 @@ import node_build as B
 base = dict(tag="t", port=34567, private_key="a"*43, public_key="b"*43,
             sni="www.cloudflare.com", dest="www.cloudflare.com:443", short_id="abcd")
 out = []
+# ★ 服务端**不该**写 mode —— 官方文档: 「服务端默认同时接受三种模式,
+#   若设为具体的模式就是仅接受它」。所以这里断言"选了 mode 也不落到服务端",
+#   只有显式要求钉死 (xhttp_server_mode) 时才写。
 for m in ("stream-up","packet-up","stream-one","auto"):
     try:
         r = B.build("vless","xhttp","reality", dict(base, xhttp_mode=m))
-        out.append(r["inbounds"][0]["streamSettings"]["xhttpSettings"]["mode"])
-    except Exception as e:
+        xh = r["inbounds"][0]["streamSettings"]["xhttpSettings"]
+        out.append("no-mode" if "mode" not in xh else xh["mode"])
+    except Exception:
         out.append("ERR")
+# 显式钉死时要写得进去 (给"我就只接受一种"的用法留口子)
+try:
+    r = B.build("vless","xhttp","reality", dict(base, xhttp_server_mode="packet-up"))
+    out.append(r["inbounds"][0]["streamSettings"]["xhttpSettings"]["mode"])
+except Exception:
+    out.append("ERR")
 bad = ""
 for m in ("bogus","","packet_up"):
     try:
@@ -3576,7 +3587,8 @@ for m in ("bogus","","packet_up"):
 print(",".join(out) + "|bad=" + (bad or "none"))
 PYX
 )
-assert_eq "${NM3%|bad=*}" "stream-up,packet-up,stream-one,auto" "xhttp 四个 mode 都能生成且原样写入"
+assert_eq "${NM3%|bad=*}" "no-mode,no-mode,no-mode,no-mode,packet-up" \
+    "服务端默认不写 xhttp mode (接受三种); 显式 xhttp_server_mode 才钉死"
 assert_eq "${NM3##*bad=}" "none" "非法 xhttp mode 在生成前就被拦 (不必等 xray -test)"
 
 # ★ Vision(XTLS) + 非裸TCP: xray run -test **放行**, 真连立刻失败
@@ -4265,61 +4277,116 @@ else
     bad "preset_batch 不设 xhttp mode → 与菜单13 走出不同配置"
 fi
 
-# ③b 过 nginx 的 xhttp **只能是 packet-up**。
-#     ★ 这一条是端到端实测出来的, 不是偏好:
-#         mode=packet-up → 经 nginx 200 / 经 Cloudflare 200
-#         mode=stream-up → 经 nginx 失败 / 经 Cloudflare 失败 (18s 超时)
-#       原因: stream-up 的上行是一条长连接 POST 流, xray 不急着读请求体,
-#       nginx 就跟着停止读客户端 → 全线死等。packet-up 每个包一个完整 POST。
-#       这条以前**没有任何拦截**: 面板让用户选, 选了 stream-up 就静静生成一个
-#       永远连不通的节点, 屏幕上全绿。
+# ③b 服务端**不写** xhttp mode; nginx 侧靠 grpc_pass 支持全部三种
+#
+#     ★ 这里纠正的是我自己上一版写错的判据。当时的实测是对的 (stream-up 过不了
+#       nginx), 但结论下错了 —— 真正的原因是 nginx 用了 proxy_pass, 而官方
+#       文档的快速上手第 5 条写得很清楚:
+#         「无法穿透 Nginx 的话, 把 Nginx 的 proxy_pass 改为 grpc_pass」
+#       改成 grpc_pass 之后, 三种模式**全部**能过 (RN 上真连实测):
+#         proxy_pass → packet-up 204 / stream-up 000 / stream-one 000
+#         grpc_pass  → packet-up 204 / stream-up 204 / stream-one 204
+#       而"把服务端 mode 钉死成 packet-up"会把 stream-up/stream-one 一起废掉
+#       (实测: 服务端写 packet-up + nginx grpc_pass → 仍然只有 packet-up 通),
+#       连浏览器拨号那条路也一起废 —— 它的 HTTP 版本与 mode 由浏览器决定。
 _MODGATE=$(XRAY_ROOT="$ROOT" python3 - <<'PYX'
 import sys, os, io, contextlib
 sys.path.insert(0, os.path.join(os.environ["XRAY_ROOT"], "conf", "lib"))
 import deploy as D
 base = {"port": 30810, "uuid": "u", "domain": "a.com", "sni": "a.com",
         "cert_file": "/tmp/c", "key_file": "/tmp/k", "tag": "t"}
-def mode(tier, m):
+def settings(tier, **kw):
     with contextlib.redirect_stderr(io.StringIO()):
-        r = D.plan("vless", "xhttp", "tls", dict(base, xhttp_mode=m), tier)
+        r = D.plan("vless", "xhttp", "tls", dict(base, **kw), tier)
     f = r.get("fragment") or {}
     ib = (f.get("inbounds") or [{}])[0]
-    return (ib.get("streamSettings") or {}).get("xhttpSettings", {}).get("mode")
+    return (ib.get("streamSettings") or {}).get("xhttpSettings", {})
+def m(tier, mode=None, **kw):
+    if mode:
+        kw["xhttp_mode"] = mode
+    xh = settings(tier, **kw)
+    return "no-mode" if "mode" not in xh else xh["mode"]
 out = []
-out.append("up->nginx=%s" % mode("nginx", "stream-up"))
-out.append("one->nginx=%s" % mode("nginx", "stream-one"))
-out.append("pu->nginx=%s" % mode("nginx", "packet-up"))
-out.append("up->cdn=%s" % mode("cdn", "stream-up"))
-out.append("auto->nginx=%s" % mode("nginx", "auto"))
+out.append("up->nginx=%s" % m("nginx", "stream-up"))
+out.append("one->nginx=%s" % m("nginx", "stream-one"))
+out.append("pu->nginx=%s" % m("nginx", "packet-up"))
+out.append("up->cdn=%s" % m("cdn", "stream-up"))
+out.append("auto->nginx=%s" % m("nginx", "auto"))
+out.append("pin->nginx=%s" % m("nginx", xhttp_server_mode="packet-up"))
+# 选什么 mode 都要能在**客户端产物**里找到它 (那才是 mode 该出现的地方)
+with contextlib.redirect_stderr(io.StringIO()):
+    r = D.plan("vless", "xhttp", "tls", dict(base, xhttp_mode="stream-up"), "nginx")
+out.append("meta.mode=%s" % (r["meta"].get("mode") or r["meta"].get("xhttp_mode") or "-"))
 print(",".join(out))
 PYX
 )
 assert_eq "$_MODGATE" \
-    "up->nginx=packet-up,one->nginx=packet-up,pu->nginx=packet-up,up->cdn=stream-up,auto->nginx=packet-up" \
-    "过 nginx 的 xhttp 自动落到 packet-up (直连仍保留 stream-up)"
+    "up->nginx=no-mode,one->nginx=no-mode,pu->nginx=no-mode,up->cdn=no-mode,auto->nginx=no-mode,pin->nginx=packet-up,meta.mode=stream-up" \
+    "服务端不写 xhttp mode (三种都接受); 显式钉死才写; mode 落在客户端产物里"
 
-# ③c 纠正时必须**出声** —— 静默改配置比报错更糟
-if sed -n '/xhttp 的模式: 过 nginx 时必须 packet-up/,/node_build.build/p' \
-       "$ROOT/conf/lib/deploy.py" | grep -F 'file=sys.stderr' >/dev/null; then
-    ok "xhttp mode 被纠正时打印原因 (不静默改)"
+# ③b2 nginx 片段里 xhttp 必须用 grpc_pass —— 官方快速上手第 5 条
+if grep -F 'grpc_pass grpc://127.0.0.1:{port};' "$ROOT/conf/lib/nginx_apply.py" >/dev/null \
+   && sed -n '/elif transport in ("xhttp", "grpc"):/,/L.append(f"{ind}}}")/p' \
+        "$ROOT/conf/lib/nginx_apply.py" | grep -F 'grpc_pass' >/dev/null; then
+    ok "nginx 片段对 xhttp/gRPC 用 grpc_pass (官方第 5 条, 三种 mode 都能过)"
 else
-    bad "xhttp mode 被静默改写 → 用户看到的配置与真实不符"
+    bad "nginx 用 proxy_pass 转 xhttp → stream-up/stream-one 过不去, 只能退化成 packet-up"
+fi
+# ③b3 非 xhttp 的传输层**不能**改成 grpc_pass (ws/httpupgrade 走 HTTP/1.1 升级)
+if sed -n '/^    else:$/,/L.append(f"{ind}}}")/p' "$ROOT/conf/lib/nginx_apply.py" \
+     | grep -F 'proxy_pass http://127.0.0.1:{port};' >/dev/null; then
+    ok "ws / httpupgrade 仍是 proxy_pass (grpc_pass 只适用于 xhttp/gRPC)"
+else
+    bad "把 ws/httpupgrade 也改成 grpc_pass 了 → 那两种会整体坏掉"
 fi
 
-# ③d 路径 B 的默认值也要分档位, 否则批量脚本仍会生成连不通的节点
-if sed -n '/_mode = os.environ.get("X_BATCH_XHTTP_MODE"/,/^if domain/p' "$PB" \
-     | grep -F '"packet-up"' >/dev/null; then
-    ok "preset_batch 对 nginx 档默认 packet-up"
+# ③c 取消"静默纠正 mode"这件事本身 —— 现在没有纠正可做了, 但要防它回来
+if sed -n '/^def plan/,/^def adopt/p' "$ROOT/conf/lib/deploy.py" \
+     | grep -F '已自动改为 packet-up' >/dev/null; then
+    bad "plan() 又在自动改写 xhttp mode → 服务端被限死, 另两种模式会连不上"
 else
-    bad "preset_batch 对 nginx 档仍默认 stream-up/auto"
+    ok "plan() 不再自动改写 xhttp mode (服务端接受三种)"
 fi
 
-# ③e 菜单 13 的模式默认值也要分档位 (不能让用户先选错再被纠正)
+# ③d 路径 B 的默认值: 跟着 Xray 的 auto 口径走, 不再按档位硬塞 packet-up
+#     (实测依据见 conf/lib/node_build.py 里 xhttp 那一段)
+if grep -F 'tier == "nginx"' "$PB" >/dev/null \
+   && sed -n '/tier == "nginx"/,+2p' "$PB" | grep -F 'packet-up' >/dev/null; then
+    bad "preset_batch 仍对 nginx 档默认 packet-up → 把 stream-up/stream-one 一起废掉"
+else
+    ok "preset_batch 不再按档位硬塞 packet-up"
+fi
+
+# ③e 菜单 13 的模式默认值同理
 if sed -n '/XHTTP 的上下行模式/,/ui_ask_num "上下行模式"/p' "$ROOT/conf/mknode.sh" \
      | grep -F 'def_i=2' >/dev/null; then
-    ok "mknode 对 nginx 档默认选中 packet-up"
+    bad "mknode 仍对 nginx 档默认选中 packet-up → 与服务端口径不一致"
 else
-    bad "mknode 对 nginx 档默认仍是 stream-up/auto"
+    ok "mknode 不再按档位硬塞 packet-up"
+fi
+
+# ③e2 mode 必须**落在客户端产物**里 (服务端不写它了, 别把它弄丢)
+if grep -F 'meta["mode"] = _m' "$ROOT/conf/lib/deploy.py" >/dev/null \
+   && grep -F '(meta or {}).get("mode")' "$ROOT/conf/lib/nodes.py" >/dev/null \
+   && grep -F 'meta.get("mode")' "$ROOT/conf/lib/to_mihomo.py" >/dev/null; then
+    ok "mode 写进元数据, 链接与 YAML 都从元数据兜底取 (不会丢)"
+else
+    bad "服务端不写 mode 之后没人接住它 → 用户选的那一项会凭空消失"
+fi
+
+# ③e3 分享链接要有官方 extra (GUI 只认 host/path/mode/extra 四项)
+if grep -F 'def xhttp_extra' "$ROOT/conf/lib/nodes.py" >/dev/null \
+   && grep -F 'q["extra"] = _json.dumps' "$ROOT/conf/lib/nodes.py" >/dev/null; then
+    ok "分享链接带官方 extra (别人家的 GUI 也认)"
+else
+    bad "链接只有自定义的 dl* 参数 → 其它客户端导入后配置被忽略"
+fi
+# mihomo 的 XMUX: 官方 wiki 说它没有默认值, 不写就每次新连接
+if grep -F 'reuse-settings' "$ROOT/conf/lib/to_mihomo.py" >/dev/null \
+   && grep -F 'h-max-reusable-secs' "$ROOT/conf/lib/to_mihomo.py" >/dev/null; then
+    ok "mihomo 产物带 reuse-settings (XMUX) —— 它没有默认值, 不写就是每个请求新连接"
+else
+    bad "mihomo 产物缺 reuse-settings → 连接复用完全没开"
 fi
 
 # ③f nginx 档的 path 不能默认落在 "/"。

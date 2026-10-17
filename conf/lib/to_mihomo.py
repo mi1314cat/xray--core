@@ -149,7 +149,8 @@ def node_from_fragment(frag, meta=None, name=None):
 
     # ---- 传输细节 ----
     xh = ss.get("xhttpSettings") or {}
-    node["mode"] = xh.get("mode") or ""
+    # 服务端片段不再写 mode (官方: 服务端接受三种), 用户选的那一项存在元数据里
+    node["mode"] = xh.get("mode") or meta.get("mode") or ""
     node["host"] = xh.get("host") or (ss.get("wsSettings") or {}).get(
         "headers", {}).get("Host") or ""
     node["grpc_service"] = (ss.get("grpcSettings") or {}).get("serviceName") or ""
@@ -297,6 +298,30 @@ def xhttp_download_settings(node):
     return dl
 
 
+# mihomo 的 reuse-settings (即 XMUX)。取值照官方文档给的默认值 ——
+# 也就是说"Xray 客户端默认是什么行为, mihomo 这边就写成什么"。
+#
+# ★ 为什么必须显式写: 官方 wiki 在 reuse-settings 一节里写明
+#     「注意：和原版实现不同，此项没有默认值，如果不填写则不开启链接复用，
+#       即每次打开一个新的底层链接」
+#   而 Xray 那边全为 0 时是**有**默认值的 (maxConcurrency "16-32"、
+#   hMaxRequestTimes "600-900"、hMaxReusableSecs "1800-3000", 见 XHTTP 那篇
+#   文档的 XMUX 小节)。不写这一项, 同一台服务器在 mihomo 上就是"每个请求
+#   一条新连接" —— 慢、连接数暴涨, 而且握手次数多得多, 特征更明显。
+#
+# 只写这三项: max-connections 与 max-concurrency **冲突** (wiki 明说只能二选一),
+# 而 Xray 的默认值里也没有它。
+_MIHOMO_XMUX = {
+    "max-concurrency": "16-32",
+    "h-max-request-times": "600-900",
+    "h-max-reusable-secs": "1800-3000",
+}
+
+
+def xmux_settings():
+    return dict(_MIHOMO_XMUX)
+
+
 def xhttp_opts(node):
     """mihomo 的 xhttp-opts; 带上下行时含 download-settings。"""
     opts = {}
@@ -319,8 +344,14 @@ def xhttp_opts(node):
         v = node["sc_min_posts_interval_ms"]
         opts["sc-min-posts-interval-ms"] = int(v) if str(v).isdigit() else v
 
+    # XMUX: mihomo 没有默认值, 不写就是"每个请求一条新连接"
+    opts["reuse-settings"] = xmux_settings()
+
     dl = xhttp_download_settings(node)
     if dl:
+        # 下行那一段也是独立的一套 XMUX (官方文档: 上下行的复用参数各自 roll,
+        # 互不相关 —— 这正是反分析的一部分), 同样要有默认值。
+        dl.setdefault("reuse-settings", xmux_settings())
         opts["download-settings"] = dl
     return opts
 

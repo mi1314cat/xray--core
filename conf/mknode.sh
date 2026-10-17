@@ -445,9 +445,8 @@ mk_run() {
         local def_m="auto" def_i=4
         # REALITY + auto = 合流, 这不是用户以为的那回事 —— 默认改成 stream-up
         [[ "$sec" == "reality" ]] && { def_m="stream-up"; def_i=1; }
-        # nginx 档位下 stream-up / stream-one 一律过不去 (实测), 只有 packet-up 行。
-        # 默认直接落在 packet-up 上, 别让用户先选错再被"自动纠正"。
-        if [[ "$tier" == *nginx* ]]; then def_m="packet-up"; def_i=2; fi
+        # (nginx 档以前会把默认值钉到 packet-up —— 现在不必了: nginx 片段用的是
+        #  grpc_pass, 三种 mode 都能过。实测矩阵见 conf/lib/node_build.py 的注释。)
         echo
         _y "  XHTTP 的上下行模式:"
         printf "    %s 1) stream-up    上下行分开: 下行独立 GET, 上行独立 POST (推荐)%s\n" "$_CYN" "$_RST"
@@ -458,9 +457,9 @@ mk_run() {
             _y "        注意: REALITY 下 auto 会退化成 stream-one (合流), 所以这里默认不是 auto"
         fi
         if [[ "$tier" == *nginx* ]]; then
-            _y "        注意: 过 nginx/CDN 时 stream-up 与 stream-one 都必失败 (上行是长连接 POST 流,"
-            _y "              会被 nginx 卡住; 实测直连可用、经 nginx/Cloudflare 超时), 默认已选 packet-up。"
-            _y "              选了别的也会在生成时自动改成 packet-up。"
+            _y "        注意: 这条会挂到 nginx 后面。本工具的 nginx 片段对 xhttp 用的是"
+            _y "              grpc_pass (官方推荐的穿透方式), 三种模式都能过 —— 随意选。"
+            _y "              只有你自己换成别的反代、且它只吃 HTTP/1.1 时, 才需要 packet-up。"
         fi
         # ★ 这里原来是:
         #      mc=$(ui_ask_num "上下行模式 [1-4, 回车=$def_m]" 1 4) || return 0

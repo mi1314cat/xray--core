@@ -231,14 +231,40 @@ def _stream_settings(transport, security, opts):
             ss["wsSettings"] = ws
 
     elif transport == "xhttp":
-        xh = {"mode": opts.get("xhttp_mode", "auto")}
+        # ★ 服务端**不写 mode**。
+        #
+        #   官方文档 (XHTTP: Beyond REALITY, 快速上手 + STREAM-UP/ONE 两节) 原文:
+        #     「服务端：默认同时接受三种模式，若设为具体的模式就是仅接受它」
+        #   也就是说 mode 是**客户端**的选择; 服务端一写就把自己限死了。
+        #   以前这里默认写 "auto"、nginx 档还会被改成 "packet-up", 于是:
+        #     · 服务端只认那一种;
+        #     · 客户端用别的模式 (比如浏览器拨号, 它的 HTTP 版本与 mode 由浏览器
+        #       决定) 一律连不上, 而服务端日志里什么都看不出来。
+        #   实测 (RN+CC 三模式矩阵):
+        #     服务端不写 mode + nginx 用 grpc_pass → packet-up/stream-up/stream-one 全部 204
+        #     服务端写 packet-up  + nginx 用 grpc_pass → 只有 packet-up 204, 另两个 000
+        #   想**故意**只接受某一种时, 显式传 xhttp_server_mode。
+        xh = {}
+        if opts.get("xhttp_server_mode"):
+            xh["mode"] = opts["xhttp_server_mode"]
         if opts.get("path"):
             xh["path"] = opts["path"]
         if opts.get("host"):
             xh["host"] = opts["host"]
         dl = _xhttp_download_settings(transport, security, opts)
         if dl:
-            xh["downloadSettings"] = dl
+            # ★ downloadSettings 是 **client only** (官方文档在 extra 的示例里
+            #   明确标注为 client only)。这里仍然写进片段, 但要说清楚这是**本
+            #   项目的内部载体**, 不是服务端配置的一部分:
+            #     · 内核侧: 入站不读它 (只有客户端的 xhttpSettings 用它);
+            #     · 本项目: conf/<tag>.json 是"这个节点是什么"的唯一真相,
+            #       分享元数据、客户端产物、面板展示都从它extract 出来
+            #       (nodes.py 的 dl_* 优先读片段, 元数据兜底);
+            #     · 它**不会**把 mode 之类带进服务端 —— 服务端的 mode 由上面
+            #       那句单独控制, 两者互不影响。
+            #   想彻底不要它, 传 strip_download_settings=True。
+            if not opts.get("strip_download_settings"):
+                xh["downloadSettings"] = dl
         ss["xhttpSettings"] = xh
 
     elif transport == "grpc":

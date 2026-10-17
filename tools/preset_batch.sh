@@ -344,8 +344,6 @@ _mode = os.environ.get("X_BATCH_XHTTP_MODE", "").strip()
 if tr == "xhttp":
     if _mode:
         o["xhttp_mode"] = _mode
-    elif tier == "nginx":
-        o["xhttp_mode"] = "packet-up"
     else:
         o["xhttp_mode"] = "stream-up" if sec == "reality" else "auto"
 if domain: o["domain"] = domain
