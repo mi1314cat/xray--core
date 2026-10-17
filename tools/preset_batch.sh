@@ -68,6 +68,24 @@ _x_public_addr() {
     printf '%s' "$a"
 }
 
+# ★ REALITY 的伪装域名 (sni/dest)。不能用"节点自己的域名":
+#   1. REALITY 的 dest 是**回源目标**, 内核会去它那里借证书; 而我们的域名
+#      在 Cloudflare 后面, 拿自己的域名当 dest 等于让 CF 参与握手;
+#   2. 更关键的是"像不像真的": 一个只跑代理的域名做 SNI, 一眼就认出来。
+#   项目本来就在维护 dest_server (domains.sh 持久化), 直接复用 ——
+#   自签证书那边 (cert.sh 的 x_cert_camo_domain) 也是同一个口径。
+_x_camo_domain() {
+    local f="${XRAY_BASE:-/root/catmi/xray}/install_info.env" d=""
+    if [[ -n "${X_BATCH_REALITY_SNI:-}" ]]; then
+        printf '%s' "$X_BATCH_REALITY_SNI"; return 0
+    fi
+    if [[ -r "$f" ]]; then
+        d=$(sed -n 's/^dest_server=["'"'"']*\?\([^"'"'"']*\)["'"'"']*.*/\1/p' "$f" | tail -1)
+        d="${d%%:*}"
+    fi
+    printf '%s' "$d"
+}
+
 PORTS_SH="$(_lib ports.sh)" || exit 1
 # shellcheck source=/dev/null
 source "$PRESET_SH"
@@ -257,6 +275,12 @@ PY
 )
   creds=$(python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('uuid') or d.get('password') or '')" <<< "$cred_json")
 
+  # 分离组合里凡是 REALITY 那一段, 伪装域名都用 dest_server (见 _x_camo_domain)
+  CAMO_DOM=""
+  if [[ -n "$SPLIT" ]] && [[ "$(x_split_dl_sec "$SPLIT")" == "reality" || "$(x_split_ul_sec "$SPLIT")" == "reality" ]]; then
+      CAMO_DOM="$(_x_camo_domain)"
+  fi
+
   # REALITY 走交互: 私钥+公钥必须配对, 批量里无法自动造一对可用密钥
   extra_json="{}"
   if [[ "$sec" == "reality" ]]; then
@@ -356,14 +380,14 @@ PY
     fi
   fi
 
-  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" "${SPLIT_DLCN:-no}" "${SPLIT_ULSEC:-}" <<'PY'
+  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" "${SPLIT_DLCN:-no}" "${SPLIT_ULSEC:-}" "${CAMO_DOM:-}" <<'PY'
 import json, os, sys
 # ★ import 一定要配齐: 这个 heredoc 原来只有 json, sys, 而下面用了
 #   os.environ —— NameError 被 2>/dev/null 吞掉, 命令替换拿到空串,
 #   表现是'规格拼装失败'或干脆静默不生成。项目在 mknode 上踩过一次
 #   (交接文档 10.3), 这里又踩了一次。
 (proto, tr, sec, tag, port, tier, cred, extra, domain, split, dl_dom, ech_on,
- dlsec, dlsni, dlpub, dlsid, node_path, dlcdn, ulsec) = sys.argv[1:20]
+ dlsec, dlsni, dlpub, dlsid, node_path, dlcdn, ulsec, camo) = sys.argv[1:21]
 o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
      "port":int(port),"tier":tier}
 # ★ xhttp 的 mode 必须显式给, 否则内核按 `auto` 解析 —— 而 **REALITY 下 auto
@@ -411,10 +435,18 @@ if split:
     if ulsec == "reality":
         # 直连上行: 对外地址就是直连地址 (IP 或灰云域名)
         o["public_host"] = dl_dom or domain
-        # ★ REALITY 的 serverName / dest 必须给。只给 domain 时 node_build
-        #   的 target 会拼成 ":443" (它取的是 sni) —— 内核能过 -test,
-        #   但握手时没有回源目标, 一连就失败。
-        o["sni"] = domain
+        # ★ REALITY 的 serverName / dest 必须是**真的能握手的第三方站点**:
+        #   内核要连它借证书, 客户端也拿它当 SNI。给节点自己的域名时
+        #   REALITY 认证失败 (实测 mihomo: REALITY authentication failed)。
+        if camo:
+            o["sni"] = camo
+            o["dest"] = camo + ":443"
+        # ★ shortId 必须非空且两端一致。空串含义是"不校验", 但 mihomo 那边
+        #   缺省字段时发的是空串, 与空列表混在一起很容易踩成认证失败 ——
+        #   统一用一个随机十六进制, 服务端/链接/产物都从这里取。
+        _sid = os.environ.get("X_BATCH_REALITY_SHORT_ID", "")
+        if _sid:
+            o["short_id"] = _sid
     if dlcdn == "yes":
         # 下行也走 CDN: 客户端连边缘 443, 不是源站端口
         o["dl_cdn"] = True
@@ -427,9 +459,9 @@ if split:
         # 下行直连 REALITY: 地址必须是能直连到本机的, 端口见下
         o["dl_address"] = dl_dom
         o["dl_security"] = "reality"
-        o["dl_sni"] = dlsni or domain
+        o["dl_sni"] = camo or dlsni or domain
         o["dl_public_key"] = dlpub
-        o["dl_short_id"] = dlsid
+        o["dl_short_id"] = dlsid or os.environ.get("X_BATCH_REALITY_SHORT_ID", "")
         # 上下行同一个 REALITY 入站 → 同端口 (会话表 per-inbound, 必须如此)
         o["dl_port"] = int(port)
     # ★ ECH 要**两段都标**。

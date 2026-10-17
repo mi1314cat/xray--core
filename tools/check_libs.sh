@@ -6185,6 +6185,37 @@ for _m in cdn-reality reality-cdn; do
     else bad "$_m 被拒但没给原因 → 用户以为是自己配错了"; fi
 done
 
+# ③b 上行 REALITY 的伪装域名必须是**第三方站点** (dest_server), 不是节点域名。
+#     用节点域名时内核会去 Cloudflare 借证书, 实测 mihomo 直接报
+#     REALITY authentication failed —— 而产物/链接看起来一切正常。
+if grep -F '_x_camo_domain' "$ROOT/tools/preset_batch.sh" >/dev/null \
+   && grep -F 'o["dest"] = camo + ":443"' "$ROOT/tools/preset_batch.sh" >/dev/null; then
+    ok "上行 REALITY 用 dest_server 当伪装域名并设了 dest"
+else
+    bad "上行 REALITY 拿节点域名当 dest → 实测 REALITY 认证失败"
+fi
+
+# ③c shortId 必须非空 (空串在两端混用会踩成认证失败)
+_cr_guard=$(awk '/X_BATCH_REALITY_SHORT_ID", ""/{print; exit}' "$ROOT/tools/preset_batch.sh")
+if [ -n "$_cr_guard" ]; then ok "分离节点的 shortId 从随机十六进制来 (两端一致且非空)"
+else bad "分离节点没写上行 shortId → 与下行/链接对不上"; fi
+
+# ③d CDN 下行允许端口不同: 客户端连边缘 443, 源站仍是同一个 inbound
+if grep -F 'and not opts.get("dl_cdn")' "$ROOT/conf/lib/node_build.py" >/dev/null; then
+    ok "CDN 下行 (边缘 443) 不会被 per-inbound 端口检查误拦"
+else
+    bad "CDN 下行被当成直连检查端口 → cdn-cdn 建不出来"
+fi
+
+# ③e cdn_auto 不能重配回环入站 (那是 nginx 档节点, deploy 已配好),
+#     回源 TLS 也必须按片段自己的 security 判, 不能无条件开
+if grep -F '_CD_SKIP_LOOPBACK' "$ROOT/tools/cdn_auto.sh" >/dev/null \
+   && grep -F '_otls = "1" if' "$ROOT/tools/cdn_auto.sh" >/dev/null; then
+    ok "cdn_auto 跳过回环入站, 且回源 TLS 按片段判 (不再无条件 https)"
+else
+    bad "cdn_auto 会覆盖 nginx 档节点的 grpc_pass 段 / 或对明文端口发 TLS"
+fi
+
 # ③ 未知模式要报错而不是默默当直连
 if x_split_ul_sec nosuchmode >/dev/null 2>&1; then
     bad "未知分离模式没被拒绝 (会照直生成一个普通节点)"
