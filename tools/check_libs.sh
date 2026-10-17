@@ -5460,8 +5460,10 @@ MAP = {"status": "state", "apply": "apply_config", "cert": "cert_fix",
 # status 走的是 GET /api/state（面板每次轮询就调它），不是 action
 if "api/state" in panel:
     acts.add("state")
+# sub = `xbd sub <URL>`: 与 `node sub` 完全等价的**命令别名**, 面板上的
+#      订阅入口走的是同一个动作 (import), 不需要为别名再开一个面板按钮。
 ALLOW = {"install", "uninstall", "menu", "update", "start", "stop", "restart",
-         "family", "multi", "diagnose", "ech"}
+         "family", "multi", "diagnose", "ech", "sub"}
 miss = [c for c in sorted(cmds)
         if c not in ALLOW and c not in acts and MAP.get(c) not in acts]
 print(" ".join(miss))
