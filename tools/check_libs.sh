@@ -6216,6 +6216,29 @@ else
     bad "cdn_auto 会覆盖 nginx 档节点的 grpc_pass 段 / 或对明文端口发 TLS"
 fi
 
+# ③f 分享链接的 extra 里, REALITY 下行公钥必须写**两遍**:
+#     password (Xray 官方) + publicKey (mihomo)。只写 password 时 mihomo
+#     导入订阅会整份失败 —— 0 个节点, 报
+#     "'xhttp-opts.download-settings.reality-opts' has unset fields: public-key"。
+#     行为验证: 真的调一次 xhttp_extra, 而不是 grep 关键字。
+_EXJS=$(cd "$ROOT" && python3 - <<'PYX' 2>&1
+import sys, json
+sys.path.insert(0, "conf/lib")
+import nodes
+n = {"network": "xhttp", "dl_address": "1.2.3.4", "dl_port": 443,
+     "dl_security": "reality", "dl_public_key": "PBK", "dl_short_id": "abcd",
+     "dl_sni": "e.co", "dl_path": "/x", "dl_mode": "stream-up"}
+x = nodes.xhttp_extra(n, {})
+r = (x.get("downloadSettings") or {}).get("realitySettings") or {}
+print(json.dumps({"password": r.get("password"), "publicKey": r.get("publicKey")}))
+PYX
+)
+if [ "$_EXJS" = '{"password": "PBK", "publicKey": "PBK"}' ]; then
+    ok "extra 的 REALITY 下行公钥两套字段都写了 (Xray + mihomo 都能读)"
+else
+    bad "extra 只写一套字段 → mihomo 导入订阅会整份失败 (实得: ${_EXJS:-空})"
+fi
+
 # ③ 未知模式要报错而不是默默当直连
 if x_split_ul_sec nosuchmode >/dev/null 2>&1; then
     bad "未知分离模式没被拒绝 (会照直生成一个普通节点)"

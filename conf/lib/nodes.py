@@ -747,10 +747,23 @@ def xhttp_extra(n, meta=None):
         sni = (n.get("dl_sni") or meta.get("dl_sni")
                or n.get("sni") or meta.get("host") or "")
         if dsec == "reality":
+            # ★ 公钥要写**两遍**:
+            #     password  = Xray 官方 schema 的字段名 (realitySettings 在
+            #                 客户端角色下, password 就是公钥)
+            #     publicKey = mihomo 认的字段名
+            #   实测 (mihomo v1.19.32 导入订阅):
+            #     只有 password → 整份 provider 解析失败, 0 个节点, 报
+            #        "'xhttp-opts.download-settings.reality-opts' has unset
+            #         fields: public-key"
+            #     两个都给    → 正常解析
+            #   Xray 用标准 json.Unmarshal, 会忽略它不认识的字段, 所以多出来的
+            #   publicKey 对 Xray 客户端无害。
+            _pbk = n.get("dl_public_key") or meta.get("dl_public_key") or ""
             dl["realitySettings"] = {
                 "serverName": sni,
                 "fingerprint": meta.get("fingerprint") or "chrome",
-                "password": n.get("dl_public_key") or meta.get("dl_public_key") or "",
+                "password": _pbk,
+                "publicKey": _pbk,
                 "shortId": n.get("dl_short_id") or meta.get("dl_short_id") or "",
                 "spiderX": meta.get("spx") or "/",
             }
