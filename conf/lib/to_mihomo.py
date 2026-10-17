@@ -93,6 +93,12 @@ def node_from_fragment(frag, meta=None, name=None):
     #   本机自测看不出来 (nginx 自己会 400), 所以这个分叉特别隐蔽。
     if str(meta.get("tier") or "").strip().lower() == "nginx" and sec == "none":
         sec = "tls"
+    # ★ 上行 REALITY 前置 (#4118): 片段第一个入站是 raw 的握手前置, 客户端
+    #   真正的上行传输是 xhttp —— 按元数据纠正, 否则产物会写成 tcp/reality,
+    #   与 download-settings 完全不匹配。
+    _upnet = str(meta.get("uplink_network") or "").strip()
+    if _upnet:
+        net = _upnet
 
     def _norm_path(p):
         p = str(p or "").strip()
@@ -107,7 +113,8 @@ def node_from_fragment(frag, meta=None, name=None):
         # 对外地址走元数据 —— 片段里的 listen 是 0.0.0.0 / 127.0.0.1, 不是客户端该连的
         "address": meta.get("host") or "",
         "port": meta.get("port") or ib.get("port"),
-        "path": _norm_path((ss.get("xhttpSettings") or {}).get("path")
+        "path": _norm_path(str(meta.get("uplink_path") or "").strip()
+                           or (ss.get("xhttpSettings") or {}).get("path")
                            or (ss.get("wsSettings") or {}).get("path")
                            or (ss.get("httpupgradeSettings") or {}).get("path")
                            or ""),
@@ -191,7 +198,21 @@ def node_from_fragment(frag, meta=None, name=None):
 
     # ---- 上下行分离 ----
     dl = xh.get("downloadSettings") or {}
-    if dl.get("address"):
+    # ★ 前置布局 (#4118) 的片段里**没有** downloadSettings —— 服务端只多一个
+    #   REALITY 前置入站, 下行参数全在元数据里。此时按元数据补齐, 否则产物
+    #   会缺一整段 download-settings (客户端变成"只有上行"的普通节点)。
+    if not dl.get("address") and meta.get("dl_address"):
+        node["dl_address"] = meta.get("dl_address") or ""
+        node["dl_port"] = meta.get("dl_port") or ib.get("port")
+        node["dl_security"] = meta.get("dl_security") or sec
+        node["dl_sni"] = meta.get("dl_sni") or node.get("sni") or ""
+        node["dl_public_key"] = meta.get("dl_public_key") or ""
+        node["dl_short_id"] = meta.get("dl_short_id") or ""
+        node["dl_mode"] = meta.get("dl_mode") or node["mode"]
+        node["dl_path"] = meta.get("dl_path") or node["path"]
+        node["dl_ech"] = meta.get("dl_ech_config") or ""
+        node["dl_ech_enable"] = bool(meta.get("dl_ech"))
+    elif dl.get("address"):
         node["dl_address"] = dl.get("address") or ""
         node["dl_port"] = dl.get("port") or ib.get("port")
         node["dl_security"] = dl.get("security") or sec

@@ -164,12 +164,27 @@ SB **完全没有**，M 只能校验、不能生成。X 这边是全套。
 
 **四个组合与实测**（2026-10-17 复核，客户端 mihomo v1.19.32，RN↔CC 真连）：
 
-| 组合 | 上行 | 下行 | 实测 |
+| 组合 | 上行 | 下行 | 实测 (2026-10-17, RN↔CC) |
 |---|---|---|---|
-| `cdn-cdn` | CDN(TLS) | CDN(TLS) | ✅ 200，3MB 下行 1.3MB/s |
-| `reality-reality` | REALITY 直连 | REALITY 直连 | ✅ 200，3MB 下行 0.8MB/s |
-| `cdn-reality` | CDN(TLS) | REALITY 直连 | ❌ 客户端 `REALITY authentication failed` |
-| `reality-cdn` | REALITY 直连 | CDN(TLS) | ❌ nginx 明文转不进 REALITY 入站 |
+| `cdn-cdn` | CDN(TLS) | CDN(TLS) | ✅ 200，出口=RN |
+| `cdn-reality` | CDN(TLS) | REALITY 前置 | ✅ 200，出口=RN |
+| `reality-reality` | REALITY 直连 | REALITY 直连 | ✅ 200，出口=RN |
+| `reality-cdn` | REALITY 前置 | CDN(TLS) | ✅ 200（**Xray 客户端**；mihomo 见下） |
+
+**跨安全层靠 #4118 的"REALITY 前置 + fallbacks"**：前置只做握手，握手后的字节
+fallback 进**同一个** xhttp 入站；nginx 那条 grpc_pass 也落到同一个入站。于是
+会话表仍然只有一份，两个方向共用同一套服务端布局，差别只在客户端的
+`download-settings`：
+
+```
+0.0.0.0:<front>  vless+reality  --fallbacks--> 127.0.0.1:<xhttp>
+nginx:443        grpc_pass      -------------> 127.0.0.1:<xhttp>
+```
+
+⚠ `reality-cdn` 在 **mihomo** 上走不通：它的 `download-settings` 没写
+`reality-opts` 时会把**顶层**的 reality 配置继承到下行，于是下行拿 REALITY
+去握 nginx（`REALITY authentication failed`）。Xray 客户端没有这个继承，实测
+200。产物 YAML 里这条节点的注释会标明。
 
 **为什么只有两个能通**：xHTTP 的会话表 `h.sessions` 挂在**每个 inbound 自己**
 的 `requestHandler` 上（`splithttp/hub.go:36-42`），下行的 GET 带 sessionId

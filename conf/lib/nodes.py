@@ -786,6 +786,13 @@ def build_share_link(n, meta=None, notes=None):
     (创建 / 刷新 / 面板), 提示必须跟着返回值走, 否则总有一条路径不吭声。
     """
     meta = meta or {}
+    # 上行 REALITY 前置 (#4118): 客户端上行是 xhttp 套在 REALITY 里
+    if meta.get("uplink_network") or meta.get("uplink_path"):
+        n = dict(n)
+        if meta.get("uplink_network"):
+            n["network"] = meta["uplink_network"]
+        if meta.get("uplink_path"):
+            n["path"] = meta["uplink_path"]
     proto = n.get("protocol")
     host, port, note, refuse = share_target(n, meta)
     if notes is not None and note:

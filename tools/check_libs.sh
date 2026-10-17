@@ -6168,22 +6168,37 @@ then ok "档位跟着每段是否直连走 (cdn-cdn→nginx, reality-reality→c
 else bad "监听档位不对: 全经 nginx 才收窄 127.0.0.1, 有直连段必须 0.0.0.0"
 fi
 
-# 3b) 能连上的组合只有两个 —— 跨安全层的两个必须被**判为不可用**
-#     (会话表 per-inbound + 一个 inbound 一个安全层, 见 preset.sh 的注释)
+# 3b) 四个组合都可用: 跨安全层的两个靠 #4118 的"前置 + fallback"。
+#     判据是服务端布局: 需要前置的组合, 片段里必须有 raw/reality 入站且带
+#     fallbacks 指回 xhttp 入站 —— 少了它, 下行/上行那一段根本没人接。
 _sok=""
 for _m in $(x_split_modes); do
     [ "$(x_split_ok "$_m")" = yes ] && _sok="$_sok $_m"
 done
-if [ "$_sok" = " cdn-cdn reality-reality" ]; then
-    ok "只有同一安全层的两个组合被判为可用 (cdn-cdn / reality-reality)"
+if [ "$_sok" = " cdn-cdn cdn-reality reality-reality reality-cdn" ] \
+   || [ "$_sok" = " cdn-cdn cdn-reality reality-cdn reality-reality" ]; then
+    ok "四个组合都可用 (跨层的那两个走 REALITY 前置)"
 else
-    bad "可用组合不对: 跨安全层的组合会被放出去 → 建出来下行收不到数据 (实得:$_sok)"
+    bad "可用组合不对 (实得:$_sok)"
 fi
-# 被拒的两个都要有**原因**, 不能只是不列出来
-for _m in cdn-reality reality-cdn; do
-    if [ -n "$(x_split_why "$_m")" ]; then ok "$_m 被拒时说明了原因"
-    else bad "$_m 被拒但没给原因 → 用户以为是自己配错了"; fi
-done
+if [ "$(x_split_front cdn-reality)" = yes ] && [ "$(x_split_front reality-reality)" = no ]; then
+    ok "只有跨层组合需要 REALITY 前置"
+else
+    bad "x_split_front 判据不对 → 同层组合会白开一个前置端口"
+fi
+# 前置必须真的 fallback 进 xhttp 入站 (而不是自己当第二个 xhttp 入站)
+if grep -F '"fallbacks": [{"dest": "127.0.0.1:%d"' "$ROOT/conf/lib/node_build.py" >/dev/null; then
+    ok "REALITY 前置把字节 fallback 进同一个 xhttp 入站"
+else
+    bad "前置没有 fallback → 会话表还是 per-inbound, 下行必落空会话"
+fi
+# reality-cdn 的上行是前置, 片段第一个入站必须是它 (链接/产物按 inbounds[0] 取)
+if grep -F 'opts.get("front_first")' "$ROOT/conf/lib/node_build.py" >/dev/null \
+   && grep -F 'uplink_network' "$ROOT/conf/lib/deploy.py" >/dev/null; then
+    ok "reality-cdn 把前置放第一个入站, 并用元数据纠正上行传输"
+else
+    bad "reality-cdn 的片段/元数据顺序不对 → 客户端产物会写成 tcp"
+fi
 
 # ③b 上行 REALITY 的伪装域名必须是**第三方站点** (dest_server), 不是节点域名。
 #     用节点域名时内核会去 Cloudflare 借证书, 实测 mihomo 直接报

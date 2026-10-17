@@ -203,6 +203,10 @@ def plan(protocol, transport, security, opts=None, tier=None):
     #   所以以前那句 `nopts["security"] = ...` 从来没起过任何作用, 等于没写。
     #   配合上面被清掉的证书, 产出就是一个"要 TLS 却没证书"的入站。
     fragment = node_build.build(protocol, transport, eff_security, nopts)
+    # ★ 片段里可能有多个入站 (REALITY 前置 + xhttp)。前置的 tag 带 -front,
+    #   而文件/分享元数据必须按**主节点**的 tag 落盘 —— 用 inbounds[0] 的 tag
+    #   会让节点名字变成 xxx-front, 删节点/发链接全都对不上。
+    r_tag = tag
 
     # ---- 分享元数据 ----
     #
@@ -236,6 +240,20 @@ def plan(protocol, transport, security, opts=None, tier=None):
     #   (哪怕在 download-settings 里) 就要求它:
     #       REALITY is based on uTLS, please set a client-fingerprint
     #   缺了就是客户端直接连不上, 而产物看起来只差一个字段。
+    elif opts.get("front_first") or (opts.get("uplink_security") or "").lower() == "reality":
+        # 上行 REALITY 前置 (#4118): 片段第一个入站是 RELAITY 前置, 位置参数
+        # security 是 none (xhttp 入站), 但客户端那一段要按 REALITY 生成 ——
+        # 公钥/短 ID/serverName 全从 opts 带进元数据。
+        if opts.get("public_key"):
+            meta["public_key"] = opts["public_key"]
+            meta["short_id"] = opts.get("short_id", "")
+            meta["fingerprint"] = opts.get("fingerprint", "chrome")
+            meta["sni"] = opts.get("sni") or domain
+            # ★ 前置是 raw/reality, 而客户端**上行**是 xhttp 套在 REALITY 里。
+            #   节点视图按 inbounds[0] 会得出 network=tcp 的假结论 —— 这里把
+            #   真正的上行传输写进元数据, 链接与产物都以它为准。
+            meta["uplink_network"] = transport
+            meta["uplink_path"] = nopts.get("path") or ""
     elif (opts.get("dl_security") or "").strip().lower() == "reality":
         meta["fingerprint"] = opts.get("fingerprint", "chrome")
     # ★ 客户端产物里这一项必须是**客户端**的 encryption, 不是服务端的 decryption。
@@ -403,7 +421,8 @@ def plan(protocol, transport, security, opts=None, tier=None):
             "cdn": False,          # nginx 模式已经是"经过 CDN 之后"的形态
         }
 
-    return {"fragment": fragment, "meta": meta, "nginx": nginx, "errors": []}
+    return {"fragment": fragment, "meta": meta, "nginx": nginx, "errors": [],
+            "tag": r_tag}
 
 
 def _reality_pubkey_from_private(private_key):
@@ -750,7 +769,7 @@ def _write_plan(r, conf_dir, share_dir):
     share_dir = share_dir or default_share_dir()
     os.makedirs(conf_dir, exist_ok=True)
     os.makedirs(share_dir, exist_ok=True)
-    tag = r["fragment"]["inbounds"][0]["tag"]
+    tag = r.get("tag") or r["fragment"]["inbounds"][0]["tag"]
     node_build.write(os.path.join(conf_dir, f"{tag}.json"), r["fragment"])
     share_meta.save(share_dir, tag, r["meta"])
     ib = r["fragment"]["inbounds"][0]

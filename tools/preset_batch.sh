@@ -275,6 +275,12 @@ PY
 )
   creds=$(python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('uuid') or d.get('password') or '')" <<< "$cred_json")
 
+  # 直连那一段的地址 (REALITY 只能直连; 下行走 CDN 时 DL_DOMAIN 是域名, 不能混用)
+  DIRECT_ADDR=""
+  if [[ -n "$SPLIT" ]]; then
+      DIRECT_ADDR="$(_x_public_addr)"
+  fi
+
   # 分离组合里凡是 REALITY 那一段, 伪装域名都用 dest_server (见 _x_camo_domain)
   CAMO_DOM=""
   if [[ -n "$SPLIT" ]] && [[ "$(x_split_dl_sec "$SPLIT")" == "reality" || "$(x_split_ul_sec "$SPLIT")" == "reality" ]]; then
@@ -358,6 +364,18 @@ PY
       SPLIT_DLSEC=$(x_split_dl_sec "$SPLIT")
       SPLIT_ULSEC=$(x_split_ul_sec "$SPLIT")
       SPLIT_DLCN=$(x_split_dl_cdn "$SPLIT")
+      SPLIT_FRONT=$(x_split_front "$SPLIT")
+      FRONT_PORT=""
+      if [[ "$SPLIT_FRONT" == "yes" ]]; then
+          # #4118: REALITY 前置是另一个监听端口, 它 fallback 进 xhttp 入站。
+          # 跨层组合的 xhttp 入站一律收窄到回环 (CDN 那条由 nginx 进)。
+          FRONT_PORT="$(x_random_free_port 2>/dev/null || true)"
+          if [[ -z "$FRONT_PORT" ]]; then
+              _e "  $disp: 需要 REALITY 前置端口, 但找不到空闲端口"
+              fail=$((fail+1)); continue
+          fi
+          tier="nginx"
+      fi
       if [ "$SPLIT_DLCN" = yes ]; then
         # 下行也走 CDN: 可以是另一个域名, 也可以就是同一个 (最常见)
         DL_DOMAIN="${X_BATCH_DL_DOMAIN:-$domain}"
@@ -380,14 +398,14 @@ PY
     fi
   fi
 
-  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" "${SPLIT_DLCN:-no}" "${SPLIT_ULSEC:-}" "${CAMO_DOM:-}" <<'PY'
+  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" "${SPLIT_DLCN:-no}" "${SPLIT_ULSEC:-}" "${CAMO_DOM:-}" "${SPLIT_FRONT:-no}" "${FRONT_PORT:-}" "${DIRECT_ADDR:-}" <<'PY'
 import json, os, sys
 # ★ import 一定要配齐: 这个 heredoc 原来只有 json, sys, 而下面用了
 #   os.environ —— NameError 被 2>/dev/null 吞掉, 命令替换拿到空串,
 #   表现是'规格拼装失败'或干脆静默不生成。项目在 mknode 上踩过一次
 #   (交接文档 10.3), 这里又踩了一次。
 (proto, tr, sec, tag, port, tier, cred, extra, domain, split, dl_dom, ech_on,
- dlsec, dlsni, dlpub, dlsid, node_path, dlcdn, ulsec, camo) = sys.argv[1:21]
+ dlsec, dlsni, dlpub, dlsid, node_path, dlcdn, ulsec, camo, front, front_port, direct_addr) = sys.argv[1:24]
 o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
      "port":int(port),"tier":tier}
 # ★ xhttp 的 mode 必须显式给, 否则内核按 `auto` 解析 —— 而 **REALITY 下 auto
@@ -432,7 +450,26 @@ if split:
     #   以前一律写域名 + 源站端口, 于是:
     #     - CDN 上行写成了源站端口 25293/25294, 而 CF 只代理 443 那几个端口;
     #     - REALITY 上行写成橙云域名, 握手打到 CF 上必失败。
-    if ulsec == "reality":
+    if front == "yes":
+        # 服务端对两个跨层方向**完全相同**: 明文 xhttp 入站 + REALITY 前置。
+        # 差别只在客户端哪一段连哪个前置, 所以这里只摆布局, 方向在下面定。
+        o["security"] = "none"          # xhttp 入站是明文 (TLS 在 nginx, REALITY 在前置)
+        o["front_reality"] = True
+        o["front_port"] = int(front_port)
+        o["front_sni"] = camo or domain
+        o["front_dest"] = (camo or domain) + ":443"
+        o["front_private_key"] = os.environ.get("X_BATCH_REALITY_PRIVATE_KEY", "")
+        o["front_short_id"] = os.environ.get("X_BATCH_REALITY_SHORT_ID", "")
+        o["front_uuid"] = o.get("uuid") or ""
+        if ulsec == "reality":
+            # reality-cdn: 上行走前置 → 片段第一个入站要是前置
+            o["front_first"] = True
+            o["public_host"] = direct_addr or dl_dom or domain
+            o["public_port"] = int(front_port)
+            o["sni"] = camo or domain
+            o["public_key"] = os.environ.get("X_BATCH_REALITY_PUBLIC_KEY", "")
+            o["short_id"] = os.environ.get("X_BATCH_REALITY_SHORT_ID", "")
+    if ulsec == "reality" and front != "yes":
         # 直连上行: 对外地址就是直连地址 (IP 或灰云域名)
         o["public_host"] = dl_dom or domain
         # ★ REALITY 的 serverName / dest 必须是**真的能握手的第三方站点**:
@@ -447,7 +484,23 @@ if split:
         _sid = os.environ.get("X_BATCH_REALITY_SHORT_ID", "")
         if _sid:
             o["short_id"] = _sid
-    if dlcdn == "yes":
+    if front == "yes" and ulsec != "reality":
+        # cdn-reality: 上行走 CDN (域:443), 下行走 REALITY 前置
+        o["dl_address"] = dl_dom or domain
+        o["dl_port"] = int(front_port)
+        o["dl_security"] = "reality"
+        o["dl_sni"] = camo or domain
+        o["dl_public_key"] = os.environ.get("X_BATCH_REALITY_PUBLIC_KEY", "")
+        o["dl_short_id"] = os.environ.get("X_BATCH_REALITY_SHORT_ID", "")
+    elif front == "yes" and ulsec == "reality":
+        # reality-cdn: 上行 REALITY 前置, 下行 CDN 边缘
+        o["dl_cdn"] = True
+        o["dl_address"] = domain
+        o["dl_port"] = 443
+        o["dl_security"] = "tls"
+        o["dl_sni"] = domain
+        o["dl_ech"] = (ech_on == "yes")
+    elif dlcdn == "yes":
         # 下行也走 CDN: 客户端连边缘 443, 不是源站端口
         o["dl_cdn"] = True
         o["dl_address"] = dl_dom

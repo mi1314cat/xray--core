@@ -217,7 +217,19 @@ _p_split_field() { # <模式> <第几列>
 #   ⇒ 上下行必须是**同一个安全层**: CDN+CDN, 或 REALITY+REALITY。
 x_split_ok() {
     case "$1" in
+        # 同一安全层: 一个入站直接搞定
         cdn-cdn|reality-reality) printf 'yes' ;;
+        # 跨安全层: 靠 #4118 的"REALITY 前置 + fallbacks" —— 前置只做握手,
+        # 之后把字节 fallback 进**同一个** xhttp 入站, nginx 那条 grpc_pass
+        # 也落到同一个入站, 会话表因此只有一份。
+        cdn-reality|reality-cdn) printf 'yes' ;;
+        *) printf 'no' ;;
+    esac
+}
+# 需要 REALITY 前置吗 (跨安全层的那两个)
+x_split_front() {
+    case "$1" in
+        cdn-reality|reality-cdn) printf 'yes' ;;
         *) printf 'no' ;;
     esac
 }

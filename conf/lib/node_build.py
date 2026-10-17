@@ -142,7 +142,9 @@ def _check_combo(protocol, transport, security, opts=None):
         #      同一个 inbound —— 端口不同是正常的。以前这里一刀切, 于是
         #      cdn-cdn 这种"两段都走 CDN"的组合直接建不出来。
         dport = opts.get("dl_port")
-        if dport and not opts.get("dl_cdn") \
+        # ★ front_reality: 下行连的是 REALITY 前置端口 (另一个监听), 它 fallback
+        #   进同一个 xhttp 入站 —— 会话表仍是一份, 端口不同是正确形态。
+        if dport and not opts.get("dl_cdn") and not opts.get("front_reality") \
                 and int(dport) != int(opts.get("port") or 0):
             raise NodeError(
                 f"下行端口 {dport} 与本节点端口 {opts.get('port')} 不一致 —— 连不上。\n"
@@ -626,8 +628,46 @@ def build(protocol, transport, security, opts=None):
     }
     if opts.get("tag"):
         inbound["tag"] = opts["tag"]
+    spec = {"inbounds": [inbound]}
 
-    return {"inbounds": [inbound]}
+    # ---- REALITY 前置 (#4118) ----
+    #  0.0.0.0:<front>  vless+reality  --fallbacks--> 127.0.0.1:<xhttp>
+    #  nginx:443        grpc_pass      -------------> 127.0.0.1:<xhttp>
+    # 两条来路落到同一个 xhttp 入站, 会话表只有一份; 前置只做握手。
+    if opts.get("front_reality"):
+        fp = opts.get("front_port")
+        if not fp:
+            raise NodeError("需要 REALITY 前置, 但没给 front_port")
+        fo = dict(opts)
+        fo["listen"] = "0.0.0.0"
+        fo["port"] = int(fp)
+        fo["tag"] = (opts.get("tag") or "") + "-front"
+        fo["sni"] = opts.get("front_sni") or opts.get("sni") or opts.get("domain") or ""
+        fo["private_key"] = opts.get("front_private_key") or opts.get("private_key") or ""
+        fo["short_id"] = opts.get("front_short_id") or opts.get("short_id") or ""
+        fo["dest"] = opts.get("front_dest") or ((fo["sni"] + ":443") if fo["sni"] else "")
+        if not fo["private_key"]:
+            raise NodeError("REALITY 前置缺私钥 (front_private_key)")
+        front = {
+            "listen": fo["listen"],
+            "port": fo["port"],
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": opts.get("front_uuid") or opts.get("uuid") or ""}],
+                "decryption": "none",
+                "fallbacks": [{"dest": "127.0.0.1:%d" % int(opts["port"]), "xver": 0}],
+            },
+            "streamSettings": _stream_settings("raw", "reality", fo),
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"],
+                         "routeOnly": True},
+            "tag": fo["tag"],
+        }
+        # reality-cdn 的上行就是前置 → 放第一个 (分享链接/产物按 inbounds[0] 取)
+        if opts.get("front_first"):
+            spec["inbounds"].insert(0, front)
+        else:
+            spec["inbounds"].append(front)
+    return spec
 
 
 def write(path, spec, indent=2):
