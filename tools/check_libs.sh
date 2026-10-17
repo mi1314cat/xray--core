@@ -7224,6 +7224,41 @@ else
     bad "分离组合要靠手设 X_BATCH_REALITY_*, 否则 cdn-reality 必失败"
 fi
 
+# ②a4 解析 x25519 输出必须容忍内核的真实写法 —— 26.x 打的是
+#     "Password (PublicKey):", 只认 "^Password:" 会取到空公钥, 于是
+#     cdn-reality / reality-reality 被静默跳过, 汇总却写"三个组合已生成"
+#     (实测: 屏幕上只有 1 个节点, 还显示成功)。
+#     这里把 batch.sh 里**真正那两行** awk 抠出来喂内核的真实输出, 行为验证,
+#     而不是 grep 关键字 —— 关键字对了、正则以写错照样取空。
+_PA="$TMP/x25519-parse.sh"
+{
+  printf '%s\n' '_kp=$(cat <<"EOK"'
+  printf '%s\n' 'PrivateKey: uLX22Cx-uPwqBKf83VPrGwtkzaS7piASPzClsA4v91w'
+  printf '%s\n' 'Password (PublicKey): Fci5CbGLzth1VHVYqupvgVytngRPmN0AiIQN3qFmRjw'
+  printf '%s\n' 'Hash32: ZTznqado8ELL9dUs-3eLKOL0sjCSIjVgymIfG9WJUio'
+  printf '%s\n' 'EOK'
+  printf '%s\n' ')'
+  grep -F '_pk=$(printf' "$ROOT/conf/batch.sh" | awk 'NR==1'
+  grep -F '_pub=$(printf' "$ROOT/conf/batch.sh" | awk 'NR==1'
+  printf '%s\n' 'printf "%s|%s" "$_pk" "$_pub"'
+} > "$_PA"
+_RES=$(bash "$_PA" 2>/dev/null || true)
+_EXP='uLX22Cx-uPwqBKf83VPrGwtkzaS7piASPzClsA4v91w|Fci5CbGLzth1VHVYqupvgVytngRPmN0AiIQN3qFmRjw'
+if [ "$_RES" = "$_EXP" ]; then
+    ok "x25519 输出解析对得上内核真实写法 (Password (PublicKey) 也认)"
+else
+    bad "x25519 输出解析取不到公钥 (实得: ${_RES:-空}) → 两个 REALITY 组合会被静默跳过"
+fi
+
+# ②a5 汇总不许写死"三个组合" —— 真建了几个就报几个
+_cnt_msg=$(awk '/printf/ && /已生成 %d 个组合/' "$ROOT/conf/batch.sh")
+_hard_msg=$(awk '!/^[[:space:]]*#/ && /三个组合已生成/' "$ROOT/conf/batch.sh")
+if [ -n "$_cnt_msg" ] && [ -z "$_hard_msg" ]; then
+    ok "分离组合的汇总按实际数量报 (不写死三个)"
+else
+    bad "汇总写死'三个组合已生成' → 只建了一个也报成功"
+fi
+
 # ②b 下下来的每个文件都要验语法, 而且**按类型用对工具** ——
 #     一视同仁 bash -n 会对 .py 报 "syntax error near unexpected token `0,'",
 #     看起来像"下载损坏", 其实是拿错工具验它了。
@@ -7328,7 +7363,7 @@ fi
 # 补发布必须在**分离那一段之前** —— 订阅链接是在那段里建的, 补晚了那条订阅
 # 就只包含"当时有元数据"的几个节点 (实测 9 个里只进了 5 个, 屏幕上看不出来)
 _bk_line=$(awk '/^[[:space:]]*backfill_share_meta "/{print NR; exit}' "$ROOT/conf/batch.sh")
-_split_line=$(awk '/xHTTP 上下行分离 \(三个组合\)/{print NR; exit}' "$ROOT/conf/batch.sh")
+_split_line=$(awk '/xHTTP 上下行分离 \(/{print NR; exit}' "$ROOT/conf/batch.sh")
 if [[ -n "$_bk_line" && -n "$_split_line" && "$_bk_line" -lt "$_split_line" ]]; then
     ok "补发布跑在订阅创建之前 (订阅才会覆盖全部节点)"
 else

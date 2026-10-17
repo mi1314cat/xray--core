@@ -607,20 +607,38 @@ batch_main() {
         #   失败 (下行 REALITY 缺 password/shortId) —— 用户看到的是一半能成,
         #   还得自己去翻文档找该设哪两个变量。
         #   内核的 x25519 子命令本来就在手边 (面板装的 xrayls 就有)。
+        local _why_key=""
         if [[ -z "${X_BATCH_REALITY_PRIVATE_KEY:-}" || -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
             local _xb _kp _pk _pub
             _xb="$(command -v xray 2>/dev/null || true)"
-            [[ -x "$_xb" ]] || _xb="$XRAY_BASE/xrayls"
+            [[ -n "$_xb" && -x "$_xb" ]] || _xb="$XRAY_BASE/xrayls"
             if [[ -x "$_xb" ]]; then
                 _kp=$("$_xb" x25519 2>/dev/null || true)
                 # 不用 `| head -1`: 管道里 head 会让产出方吃 SIGPIPE
-                _pk=$(printf '%s\n' "$_kp" | awk -F': *' '/^PrivateKey:/{print $2; exit}')
-                _pub=$(printf '%s\n' "$_kp" | awk -F': *' '/^Password:/{print $2; exit}')
+                #
+                # ★ 解析必须容忍内核的几种写法。实测 26.x 打的是
+                #   "Password (PublicKey): xxx", 而这里原来只认 "^Password:",
+                #   公钥于是永远是空串 → 两个 REALITY 组合被静默跳过, 汇总却
+                #   照样打一句"组合已生成" (屏幕上是 1 个, 还写着成功)。
+                #   同一份错在 deploy.py 的 _reality_pubkey_from_private 也犯过。
+                _pk=$(printf '%s\n' "$_kp" | awk -F': *' '/^Private ?[Kk]ey:/{print $2; exit}')
+                _pub=$(printf '%s\n' "$_kp" | awk -F': *' '/^(Password|Public ?[Kk]ey)/{print $2; exit}')
+                # 只收 base64url 且长度够的, 免得把 "not supported" 之类当密钥
+                [[ "$_pk" =~ ^[A-Za-z0-9_-]{40,}$ ]] || _pk=""
+                [[ "$_pub" =~ ^[A-Za-z0-9_-]{40,}$ ]] || _pub=""
                 if [[ -n "$_pk" && -n "$_pub" ]]; then
                     export X_BATCH_REALITY_PRIVATE_KEY="$_pk"
                     export X_BATCH_REALITY_PUBLIC_KEY="$_pub"
                     print_info "  已用内核现生成 REALITY 密钥对 (分离组合要用)"
+                else
+                    _why_key="内核 x25519 没给出可用的密钥对"
                 fi
+            else
+                _why_key="找不到内核 ($XRAY_BASE/xrayls), 生成不了 REALITY 密钥对"
+            fi
+            if [[ -n "$_why_key" ]]; then
+                print_warn "  $_why_key —— 两个用到 REALITY 的组合会被跳过"
+                print_warn "  要手动给: export X_BATCH_REALITY_PRIVATE_KEY=... X_BATCH_REALITY_PUBLIC_KEY=..."
             fi
         fi
         # 下行 REALITY 还要一个 shortId: 十六进制, 长度 <= 16 且偶数位
@@ -634,13 +652,13 @@ batch_main() {
         #   是普通 TLS, nginx 代理过去对不上; 上下行又必须同一个 inbound 同端口),
         #   建出来也连不通 —— 所以这里**不建**, 并把原因写出来, 而不是悄悄多发
         #   一条死链。
-        local -a _split_specs=()
+        local -a _split_specs=() _split_skip=()
         local _sp
         for _sp in cdn-cdn cdn-reality reality-reality; do
             # 用到 REALITY 的组合 (第二段是 REALITY) 需要密钥对;
             # 上面已经用内核现生成过, 生成不出来就跳过并说明。
-            if [[ "$_sp" != cdn-cdn && -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
-                print_warn "跳过 $_sp (需要 REALITY 密钥对, 但内核 x25519 没给出)"
+            if [[ "$_sp" != "cdn-cdn" && -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
+                _split_skip+=("$_sp")
                 continue
             fi
             _split_specs+=("vless:4:split:$_sp")
@@ -650,7 +668,7 @@ batch_main() {
 
         if [[ ${#_split_specs[@]} -gt 0 ]]; then
             echo >&2
-            print_title "xHTTP 上下行分离 (三个组合)"
+            print_title "xHTTP 上下行分离 (${#_split_specs[@]} 个组合)"
             print_info "  域名: ${X_BATCH_DOMAIN:-未设置}${X_BATCH_DL_DOMAIN:+ / 下行 ${X_BATCH_DL_DOMAIN}}"
             print_info "  直连下行地址: ${X_BATCH_DL_ADDRESS:-未设置}"
             printf "${CYAN}• %-12s${RESET} %s\n" "xhttp-split" "${_split_specs[*]}" >&2
@@ -661,7 +679,13 @@ batch_main() {
             local src=$?
             sed 's/^/    /' "$LOG_DIR/x-batch-split.log" >&2 || true
             if [[ $src -eq 0 ]]; then
-                printf "${GREEN}[OK]${RESET} 三个组合已生成\n" >&2
+                # 只报这次**真的**建了几个 —— 打"三个"而实际一个, 比不打更坏
+                if [[ ${#_split_skip[@]} -gt 0 ]]; then
+                    printf "${GREEN}[OK]${RESET} 已生成 %d 个组合 (跳过: %s —— %s)\n" \
+                        "${#_split_specs[@]}" "${_split_skip[*]}" "${_why_key:-REALITY 密钥对不可用}" >&2
+                else
+                    printf "${GREEN}[OK]${RESET} 已生成 %d 个组合\n" "${#_split_specs[@]}" >&2
+                fi
                 BATCH_OK+=("xhttp-split")
             else
                 printf "${RED}[失败]${RESET} (详见 $LOG_DIR/x-batch-split.log)\n" >&2
