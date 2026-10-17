@@ -6239,6 +6239,37 @@ else
     bad "extra 只写一套字段 → mihomo 导入订阅会整份失败 (实得: ${_EXJS:-空})"
 fi
 
+# ③g 只要有一段是 REALITY (包括只有下行), 产物就必须带 client-fingerprint。
+#     mihomo 见到 download-settings 里的 reality-opts 就要求它, 缺了直接
+#     连不上 (报 "REALITY is based on uTLS, please set a client-fingerprint")。
+_FPJS=$(cd "$ROOT" && python3 - <<'PYX' 2>&1
+import sys
+sys.path.insert(0, "conf/lib")
+import to_mihomo
+frag = {"inbounds": [{
+    "tag": "t", "port": 25360, "protocol": "vless", "listen": "0.0.0.0",
+    "settings": {"clients": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]},
+    "streamSettings": {
+        "network": "xhttp", "security": "tls",
+        "tlsSettings": {"serverName": "e.co"},
+        "xhttpSettings": {"path": "/p", "mode": "auto",
+            "downloadSettings": {"address": "1.2.3.4", "port": 25360,
+                "network": "xhttp", "security": "reality",
+                "realitySettings": {"serverName": "e.co", "password": "PBK",
+                                    "shortId": "ab"},
+                "xhttpSettings": {"path": "/p", "mode": "stream-up"}}}}}]}
+meta = {"host": "e.co", "port": 443, "tier": "cdn", "fingerprint": "chrome"}
+n = to_mihomo.node_from_fragment(frag, meta, name="t")
+p = to_mihomo.proxy(n) or {}
+print(p.get("client-fingerprint") or "")
+PYX
+)
+if [ "$_FPJS" = "chrome" ]; then
+    ok "只有下行是 REALITY 时产物也带 client-fingerprint"
+else
+    bad "下行 REALITY 缺 client-fingerprint → mihomo 直接连不上 (实得: ${_FPJS:-空})"
+fi
+
 # ③ 未知模式要报错而不是默默当直连
 if x_split_ul_sec nosuchmode >/dev/null 2>&1; then
     bad "未知分离模式没被拒绝 (会照直生成一个普通节点)"

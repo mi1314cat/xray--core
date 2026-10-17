@@ -162,14 +162,34 @@ SB **完全没有**，M 只能校验、不能生成。X 这边是全套。
 | **绝不用 `extra` 字段** | 内核里 `extra` 非空会**整体替换**整个 xhttpSettings，且 `-test` 不报错 |
 | `scMaxEachPostBytes` / `xPaddingBytes` 服务端必须 ≥ 客户端 | 否则 413 / 400 |
 
-**四个组合与实测**：
+**四个组合与实测**（2026-10-17 复核，客户端 mihomo v1.19.32，RN↔CC 真连）：
 
 | 组合 | 上行 | 下行 | 实测 |
 |---|---|---|---|
-| `cdn-cdn` | CDN(TLS) | CDN(TLS) | ✅ |
-| `cdn-reality` | CDN(TLS) | REALITY 直连 | ✅ |
-| `reality-reality` | REALITY 直连 | REALITY 直连 | ✅ |
-| `reality-cdn` | REALITY 直连 | CDN(TLS) | ❌ **设计冲突**（已如实提示） |
+| `cdn-cdn` | CDN(TLS) | CDN(TLS) | ✅ 200，3MB 下行 1.3MB/s |
+| `reality-reality` | REALITY 直连 | REALITY 直连 | ✅ 200，3MB 下行 0.8MB/s |
+| `cdn-reality` | CDN(TLS) | REALITY 直连 | ❌ 客户端 `REALITY authentication failed` |
+| `reality-cdn` | REALITY 直连 | CDN(TLS) | ❌ nginx 明文转不进 REALITY 入站 |
+
+**为什么只有两个能通**：xHTTP 的会话表 `h.sessions` 挂在**每个 inbound 自己**
+的 `requestHandler` 上（`splithttp/hub.go:36-42`），下行的 GET 带 sessionId
+必须落到**同一个 inbound** 才能拿到上行的 `uploadQueue`（`hub.go:380-390`）；
+而一个 inbound 只有一个 `streamSettings.security`。于是：
+
+* 上行经 CDN 时入站是**普通 TLS/明文**，REALITY 客户端握手必然失败
+  （`REALITY authentication failed`）；换一个端口给下行，又会因为会话表
+  per-inbound 而落进**空会话**（下行 000，连接空转）。
+* 上行是 REALITY 时，下行若经 CDN 回源是**普通 HTTP/2**，nginx 转不进只认
+  REALITY 握手的入站。
+
+⇒ 上下行必须是**同一个安全层**。跨安全层的两个组合在生成阶段就被拒绝，
+并把原因打印出来（`conf/lib/preset.sh` 的 `x_split_ok` / `x_split_why`），
+而不是发一条连不上的死链。
+
+**仍要保留的约束**：下行 `path` 必须与上行一致；`stream-one` 不能配
+`downloadSettings`；REALITY 上行的 `dest` 必须是**真能握手的第三方站点**
+（用节点自己的橙云域名会 `REALITY authentication failed`），`shortId`
+非空且两端一致。
 
 ### 3.2 回落（fallback）—— 已做成**选配**
 

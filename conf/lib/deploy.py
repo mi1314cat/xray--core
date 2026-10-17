@@ -231,6 +231,13 @@ def plan(protocol, transport, security, opts=None, tier=None):
         meta["public_key"] = opts.get("public_key")
         meta["short_id"] = opts.get("short_id", "")
         meta["fingerprint"] = opts.get("fingerprint", "chrome")
+    # ★ 只要有一段是 REALITY 就要给 client-fingerprint —— 包括**只有下行**
+    #   是 REALITY 的组合 (上行 TLS 经 CDN)。mihomo 见到 reality-opts
+    #   (哪怕在 download-settings 里) 就要求它:
+    #       REALITY is based on uTLS, please set a client-fingerprint
+    #   缺了就是客户端直接连不上, 而产物看起来只差一个字段。
+    elif (opts.get("dl_security") or "").strip().lower() == "reality":
+        meta["fingerprint"] = opts.get("fingerprint", "chrome")
     # ★ 客户端产物里这一项必须是**客户端**的 encryption, 不是服务端的 decryption。
     #
     #   实测 (2026-10-16): 这两个串长得像、作用相反 ——

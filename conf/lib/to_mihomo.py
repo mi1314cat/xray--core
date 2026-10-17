@@ -535,6 +535,12 @@ def proxy(node):
         out["tls"] = True
         if sni:
             out["servername"] = sni
+        # ★ 上行是 TLS, 但**下行是 REALITY** 时也要 client-fingerprint。
+        #   mihomo 只要在 download-settings 里看到 reality-opts 就要求它:
+        #     REALITY is based on uTLS, please set a client-fingerprint
+        #   缺了整条节点连不上, 而产物只差这一个字段, 肉眼很难看出来。
+        if str(node.get("dl_security") or "").strip().lower() == "reality":
+            out["client-fingerprint"] = str(node.get("fingerprint") or "chrome")
         if node.get("pinned_cert_sha256"):
             out["certificate"] = node["pinned_cert_sha256"]
         elif node.get("allow_insecure"):

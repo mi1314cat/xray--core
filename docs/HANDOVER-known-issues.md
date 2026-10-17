@@ -7,18 +7,26 @@
 
 ## 一、上下行分离三组合 · 实测状态
 
-| 组合 | 片段/元数据/投影 | 真实连通性 | 备注 |
+> **2026-10-17 复核结论：跨安全层的两个组合不成立，已从生成列表移除。**
+
+| 组合 | 生成 | 真实连通性 | 备注 |
 |---|---|---|---|
-| `cdn-cdn` | ✅ | ✅ **200** | RN↔CC 双端实测 |
-| `cdn-reality` | ✅ | ✅ **200** | 环回 + RN↔CC |
-| `reality-reality` | ✅ | ✅ **200** | **上下行都 REALITY 直连**; 环回跑通, RN↔CC 连打 5 次全 200 |
-| `reality-cdn` | ✅ | ❌ **不通** | 设计冲突, 见第二节 |
+| `cdn-cdn` | ✅ | ✅ **200** | RN↔CC 真连, 3MB 下行 1.3MB/s, 订阅导入后同样可用 |
+| `reality-reality` | ✅ | ✅ **200** | 上下行都 REALITY 直连; 3MB 下行 0.8MB/s |
+| `cdn-reality` | ❌ 已拒绝 | ❌ **REALITY authentication failed** | 上行入站是普通 TLS, REALITY 客户端握不上 |
+| `reality-cdn` | ❌ 已拒绝 | ❌ 不通 | 见第二节 |
 
-`reality-reality` 是第四个组合, 实测通: 上行下行都用 REALITY 直连同一个端口,
-不经任何第三方。它和 `cdn-reality` 对称 —— 一个上行藏进 CDN, 一个下行藏进
-REALITY; 也有各自的代价 (`cdn-reality` 依赖 CF, `reality-reality` 完全不依赖)。
+判据是**内核结构**，不是配置调优：xHTTP 的会话表 `h.sessions` 是
+per-inbound 的（`splithttp/hub.go:36-42`），下行 GET 必须落到同一个 inbound
+才拿得到上行的 `uploadQueue`（`hub.go:380-390`）；而一个 inbound 只有一个
+`security`。所以上下行必须同一安全层。
 
-验收脚本: `tools/e2e_journey.sh` (22 通过 / 0 失败 / 2 跳过)。
+`cdn-reality` 曾经在文档里标 ✅ —— 那是在"下行给个独立入站"的设想下测的，
+而独立入站会因会话表 per-inbound 拿到**空会话**（下行 000）；同一端口又只能
+有一个安全层。两条路都实测过了，现在生成阶段直接拒绝并打印原因。
+
+验收脚本: `tools/e2e_journey.sh`。订阅导入 (mihomo proxy-provider) 另外单独
+验过：6 个节点全部解析，两个分离节点都能真连。
 
 ---
 
