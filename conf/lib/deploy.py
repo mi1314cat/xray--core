@@ -252,6 +252,7 @@ def plan(protocol, transport, security, opts=None, tier=None):
             # ★ 前置是 raw/reality, 而客户端**上行**是 xhttp 套在 REALITY 里。
             #   节点视图按 inbounds[0] 会得出 network=tcp 的假结论 —— 这里把
             #   真正的上行传输写进元数据, 链接与产物都以它为准。
+            meta["front_uplink"] = True
             meta["uplink_network"] = transport
             meta["uplink_path"] = nopts.get("path") or ""
     elif (opts.get("dl_security") or "").strip().lower() == "reality":

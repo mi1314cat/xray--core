@@ -277,6 +277,11 @@ def collect(conf_dir):
             bad.append((os.path.basename(f), "顶层不是对象"))
             continue
         for ib in d.get("inbounds") or []:
+            # ★ REALITY 前置 (#4118) 不是节点: 它只做握手并把字节 fallback 进
+            #   同一个 xhttp 入站。当成节点收进来会多出 xxx-front 条目, 而它
+            #   没有公钥/路径, 分享时被拒发, 列表里还多两条"坏节点"。
+            if str(ib.get("tag") or "").endswith("-front"):
+                continue
             n = extract(ib, f, frag=d)
             if n:
                 nodes.append(n)
@@ -436,6 +441,12 @@ def share_target(n, meta=None):
     tier = str(meta.get("tier") or "").strip().lower()
     node_port = n.get("port")
     meta_port = meta.get("port")
+
+    # ★ 上行走 REALITY 前置 (#4118): 对外就是**前置**的地址与端口, 与 nginx
+    #   无关。以前这里按 tier=nginx 走"前端端口 443", 于是 reality-cdn 被
+    #   发布成 域名:443 —— 客户端拿它当 CDN 节点连, 连不上。
+    if meta.get("front_uplink") and host and meta_port:
+        return host, meta_port, None, None
 
     if not is_loopback_bound(n):
         if not host or not (meta_port or node_port):

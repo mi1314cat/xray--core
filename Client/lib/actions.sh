@@ -306,6 +306,7 @@ cmd_node() {
     browser|bd)  cmd_node_browser "$@" ;;
     probe|test)  cmd_node_probe "$@" ;;
     sub|subscription) cmd_node_subscription "$@" ;;
+    prune|clean)  cmd_node_prune "$@" ;;
       sub-refresh|refresh) cmd_node_sub_refresh "$@" ;;
     import-file) cmd_node_import_file "$@" ;;
     -h|--help|"") info "用法: xbd node <add|list|use|remove|check|browser|probe|sub|sub-refresh|import-file>" ;;
@@ -719,6 +720,90 @@ except Exception: print(0)' "$out" 2>/dev/null || printf '0'
 }
 
 
+# 清理"订阅里已经不存在的节点" —— 服务端删了节点, 客户端不该一直留着。
+#
+# ★ 为什么需要: 订阅只做"增/改", 从不做"删"。服务端删掉一个节点后, 客户端
+#   列表里它还在, 甚至会因为它是"当前节点"而一直用一个连不上的入口。实测
+#   (2026-10-17): 当前节点指向的 25350 在服务端已删除, 面板却一切正常。
+#
+# 判定只针对**订阅托管**的节点 (subs.json 里记录的 nodes 列表), 手工导入的
+# 节点一律不动 —— 那些不归订阅管, 拿订阅内容去比对会误删。
+# 默认只列不删, 加 --apply 才真删。
+cmd_node_prune() {
+  local apply=0
+  case "${1:-}" in --apply|-y) apply=1 ;; esac
+  local rows
+  rows=$(python3 - "$XBD_PREFIX" <<'PYX' 2>/dev/null
+import json, os, sys
+p = os.path.join(sys.argv[1], "runtime", "subs.json")
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    raise SystemExit
+for s in d.get("subs") or []:
+    url = s.get("url") or ""
+    nodes = s.get("nodes") or []
+    if url and nodes:
+        print("%s\t%s" % (url, " ".join(nodes)))
+PYX
+)
+  [ -n "$rows" ] || { info "没有由订阅管理的节点，无需清理"; return 0; }
+
+  local url files tmp n total=0 removed=0 bad=0
+  while IFS=$'\t' read -r url files; do
+    [ -n "$url" ] || continue
+    tmp=$(mktemp)
+    if ! n=$(_sub_fetch_nodes "$url" "$tmp" 2>/dev/null) || [ "${n:-0}" -le 0 ]; then
+      warn "订阅拉取失败，跳过: $url"
+      rm -f "$tmp"; bad=$((bad + 1)); continue
+    fi
+    local out
+    out=$(python3 - "$tmp" "$XBD_NODES" $files <<'PYX' 2>/dev/null
+import json, os, sys
+fresh = {str(x.get("name") or "") for x in json.load(open(sys.argv[1]))}
+nodes_dir = sys.argv[2]
+for fn in sys.argv[3:]:
+    path = os.path.join(nodes_dir, os.path.basename(fn))
+    if not os.path.isfile(path):
+        continue
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        continue
+    name = str(d.get("name") or "")
+    if name and name not in fresh:
+        print("%s\t%s" % (os.path.basename(fn), name))
+PYX
+)
+    rm -f "$tmp"
+    [ -n "$out" ] || continue
+    local fn nm
+    while IFS=$'\t' read -r fn nm; do
+      [ -n "$fn" ] || continue
+      total=$((total + 1))
+      if [ "$apply" = "1" ]; then
+        if [ "$(readlink "$XBD_NODES/current" 2>/dev/null)" = "$fn" ]; then
+          warn "  跳过当前节点: $nm (先切到别的节点再清理)"
+          continue
+        fi
+        rm -f "$XBD_NODES/$fn" && { ok "  已删除: $nm"; removed=$((removed + 1)); }
+      else
+        info "  订阅里已不存在: $nm ($fn)"
+      fi
+    done <<< "$out"
+  done <<< "$rows"
+
+  if [ "$apply" = "1" ]; then
+    ok "清理完成: 删除 $removed 个，发现 $total 个"
+  elif [ "$total" -gt 0 ]; then
+    info "以上 $total 个节点在订阅里已经不存在 —— 加 --apply 真删"
+  elif [ "$bad" -gt 0 ]; then
+    warn "有 $bad 条订阅拉取失败，无法判断是否一致（上面的跳过项）"
+  else
+    ok "客户端与订阅一致，没有需要清理的节点"
+  fi
+}
+
 cmd_node_subscription() {
   local url="${1:-}" sub_name="${2:-}"
   [ -n "$url" ] || die "用法: xbd node sub <订阅URL> [组名]"
@@ -775,9 +860,13 @@ PY
     bound=$(python3 "$XBD_LIBDIR/subs.py" bind-latest "$XBD_PREFIX" "$gid" \
             $(cat "$before" 2>/dev/null | tr '\n' ' ') 2>/dev/null \
             | python3 -c 'import json,sys;print((json.load(sys.stdin) or {}).get("stamped",0))' 2>/dev/null)
-    ok "已导入 $c 个节点，归入分组「${gname:-$sub_name}」(${bound:-0} 个)"
+    local _sk=$((n - c))
+    ok "新增 $c 个节点，归入分组「${gname:-$sub_name}」(${bound:-0} 个)"
+    [ "$_sk" -gt 0 ] && info "  其余 $_sk 个已存在或内核不支持，未重复导入（订阅共 $n 个）"
   else
-    ok "已导入 $c 个节点"
+    local _sk=$((n - c))
+    ok "新增 $c 个节点"
+    [ "$_sk" -gt 0 ] && info "  其余 $_sk 个已存在或内核不支持，未重复导入（订阅共 $n 个）"
   fi
   rm -f "$before"
 }
@@ -1111,6 +1200,26 @@ cmd_node_remove() {
   fi
   rm -f "$path"
   ok "已删除 $base"
+  # ★ 订阅登记里可能还记着这个文件: 不清掉的话, prune 会拿一个不存在的路径
+  #   去读 (FileNotFoundError), 而"节点已删但订阅还记着"本身就是脏数据。
+  python3 "$XBD_LIBDIR/subs.py" list "$XBD_PREFIX" >/dev/null 2>&1 &&   python3 - "$XBD_PREFIX" "$(basename "${file:-}")" <<'PYX' 2>/dev/null || true
+import json, os, sys
+p = os.path.join(sys.argv[1], "runtime", "subs.json")
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    raise SystemExit
+name = sys.argv[2]
+ch = False
+for s in d.get("subs") or []:
+    ns = s.get("nodes") or []
+    if name and name in ns:
+        s["nodes"] = [x for x in ns if x != name]
+        ch = True
+if ch:
+    json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+PYX
+
 }
 
 # 节点延时：真实发一次请求测完整往返，比 TCP ping 准
@@ -2605,6 +2714,9 @@ xbd_main() {
     update)     cmd_update "$@" ;;
     uninstall)  cmd_uninstall "$@" ;;
     node)       cmd_node "$@" ;;
+    # ★ 顶层 `xbd sub` 与 `xbd node sub` 等价 —— 帮助里一直写的是前者, 而
+    #   以前只认后者: 用户敲 `xbd sub` 得到"未知命令", 很容易以为订阅坏了。
+    sub)        cmd_node_subscription "$@" ;;
     start)      cmd_start "$@" ;;
     stop)       cmd_stop "$@" ;;
     restart)    cmd_restart "$@" ;;
