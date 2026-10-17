@@ -274,8 +274,14 @@ x_cdn_prune_stale() {
     #   conf/ 后 prune 什么都不做, 两个站点的 location 原样留着, 节点已经
     #   没了却还反代到不存在的端口 → Cloudflare 回源 502。
     #   所以这里继续往下走, 让 live 为空 = 全部都是孤儿。
+    # ★ 存活清单要按**完整 tag** (`域名` 与 `域名|/path`) 给, 不能只给域名:
+    #   prune 现在按 tag 精确比对, 只给域名的话带路径的段会被判成孤儿
+    #   (反过来, 只按域名判又永远漏报同域名的孤儿 —— 两头都不对)。
     local live=""
-    [[ ${#frags[@]} -gt 0 ]] && live=$(_cd_scan "${frags[@]}" | cut -d'|' -f1 | sort -u | tr '\n' ',' | sed 's/,$//')
+    if [[ ${#frags[@]} -gt 0 ]]; then
+        live=$(_cd_scan "${frags[@]}" | awk -F'|' '{print $1; if ($5 != "") print $1"|"$5}' \
+               | sort -u | tr '\n' ',' | sed 's/,$//')
+    fi
     [[ -z "$live" ]] && live="__none__"
     python3 "$apy" --prune-orphans "$live" 2>&1 || true
 }

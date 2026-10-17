@@ -6270,6 +6270,38 @@ else
     bad "下行 REALITY 缺 client-fingerprint → mihomo 直接连不上 (实得: ${_FPJS:-空})"
 fi
 
+# ③h 删除/改名前的配置校验必须与服务启动口径一致 (-confdir), 否则删除
+#     永远失败并回滚 —— 实测 2026-10-17: 报 "open .../config.json: no such
+#     file", 界面上只说"配置校验失败", 用户以为节点删不掉。
+if grep -F 'run -test "${_vargs[@]}"' "$ROOT/conf/node.sh" >/dev/null \
+   && grep -F '_vargs=(-confdir "$CONF_DIR")' "$ROOT/conf/node.sh" >/dev/null; then
+    ok "删除/改名的配置校验用 -confdir (与 systemd 单元一致)"
+else
+    bad "删除校验还在用 -c config.json → 本项目的安装里那个文件不存在, 删除必失败"
+fi
+
+# ③i 删 CDN 档节点也要摘 nginx 段 (cdn_auto 给它插过), 并清掉客户端产物
+if grep -F 'case "$tier" in nginx|cdn) ;; *) return 0 ;; esac' "$ROOT/conf/node.sh" >/dev/null; then
+    ok "删 CDN 档节点时也会摘掉它的 nginx 段 (不留 502 孤儿)"
+else
+    bad "只摘 nginx 档的段 → 删 CDN 节点后站点里留着指向死端口的 location"
+fi
+if grep -F '已删除客户端产物' "$ROOT/conf/node.sh" >/dev/null; then
+    ok "删节点会一并删掉 out/<tag>.yaml (不留孤儿产物)"
+else
+    bad "删节点留下客户端产物 → 用户以为节点还在"
+fi
+
+# ③j 孤儿检查与清理必须按**完整 tag** 判 (域名|/path), 不能只按域名 ——
+#     一节点一 path 是常规用法, 按域名判会永远漏报同域名下的孤儿。
+if grep -F 'if t.strip() not in live' "$ROOT/conf/lib/nginx_apply.py" >/dev/null \
+   && grep -F "tags.add(host + '|' + p)" "$ROOT/conf/node.sh" >/dev/null \
+   && grep -F 'print $1"|"$5' "$ROOT/tools/cdn_auto.sh" >/dev/null; then
+    ok "孤儿检查/清理按完整 tag 判 (同域名多节点也漏不掉)"
+else
+    bad "孤儿检查只按域名判 → 同域名下删掉的节点永远检查不出来"
+fi
+
 # ③ 未知模式要报错而不是默默当直连
 if x_split_ul_sec nosuchmode >/dev/null 2>&1; then
     bad "未知分离模式没被拒绝 (会照直生成一个普通节点)"
@@ -6776,7 +6808,7 @@ fi
 # ④ 片段一个都没有时 prune 也要动手 —— 那正是"节点全删了"的时候。
 # 用 grep -F 固定串: 正则里那一堆 [ ] { } $ 转义后基本没法维护,
 # 而断言本身只要看"有没有这一句"就够了。
-if grep -qF '[[ ${#frags[@]} -gt 0 ]] && live=' "$ROOT/tools/cdn_auto.sh"
+if grep -qF 'if [[ ${#frags[@]} -gt 0 ]]; then' "$ROOT/tools/cdn_auto.sh"
 then ok "conf/ 空时 prune 不会早退 (节点全删正是最该收拾的时刻)"
 else bad "conf/ 空时 prune 直接返回 → 站点 location 留着反代到不存在的端口"
 fi

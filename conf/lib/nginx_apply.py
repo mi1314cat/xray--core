@@ -1278,7 +1278,13 @@ def prune_orphans(live_domains, args):
       这里只认 `# >>> xray-core BEGIN <tag> >>>` / `END` 配对的段: 认领范围
       是确定的, 段外一个字符都不动。标记之外的配置**永远**不在回收范围里。
     """
-    live = {d for d in live_domains if d}
+    # ★ 判据是**完整 tag** (`域名` 或 `域名|/路径`), 不是域名。
+    #   按域名判时, 同一个域名下只要还有一个节点活着, **所有**同域名的
+    #   孤儿段都会被当成"还活着"永远留着 —— 而一个域名下挂多个隧道正是
+    #   本项目的常规用法 (一节点一 path)。实测 2026-10-17: 删掉节点后
+    #   `deltest-a` 的段还在, 孤儿检查却报"没有孤儿", 清理命令也不动它。
+    #   兼容: 只写域名的旧参数照旧生效 (那一段的 tag 就是纯域名)。
+    live = {d.strip() for d in live_domains if d and d.strip()}
     files = [args.file] if args.file else site_files(args.docker)
     total = 0
     for path in files:
@@ -1290,10 +1296,10 @@ def prune_orphans(live_domains, args):
         lines = raw.decode("utf-8-sig" if had_bom else "utf-8",
                            errors="replace").splitlines()
         spans = [(s, e, t) for (s, e, t) in find_all_marked_spans_all(lines)
-                 if tag_domain(t) not in live]
+                 if t.strip() not in live]
         dspan = None
         for (s, e, t) in find_all_marked_spans_all(lines, dirs=True):
-            if tag_domain(t) not in live:
+            if t.strip() not in live:
                 dspan = dspan or (s, e, t)
         if not spans and not dspan:
             continue

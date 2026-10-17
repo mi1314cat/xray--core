@@ -297,7 +297,13 @@ import share_meta
 m = share_meta.load(os.environ['SHARE_DIR'], os.environ['TAG']) or {}
 print(m.get('tier', ''))
 " 2>/dev/null)
-    [[ "$tier" == "nginx" ]] || return 0
+    # ★ CDN 档节点也**会**有 nginx 片段: cdn_auto.sh 建完 CDN 节点会自动往
+    #   站点里插一段 (回源到该端口)。原来这里只认 nginx 档, 于是删 CDN 档
+    #   节点后那段 location 留在站点里 —— 指向一个已经不存在的端口, 访问
+    #   那条路径就是回源 502, 而节点列表里已经看不到它了。
+    #   现在两档都尝试摘除: nginx_apply.py --remove 找不到标记段时会明确
+    #   回"没有找到", 对没有片段的节点 (如直连 REALITY) 是无害的。
+    case "$tier" in nginx|cdn) ;; *) return 0 ;; esac
 
     domain=$(SHARE_DIR="$SHARE_DIR" TAG="$tag" LIB="$LIB_DIR" py -c "
 import os, sys
@@ -420,28 +426,52 @@ for f in N.site_files(dk):
         raw = N.c_read(f, dk).decode('utf-8', 'replace')
     except Exception:
         continue
-    # tag 可能是「域名」或「域名|/路径」—— 存活判断按**域名**做, 所以这里
-    # 只取竖线前面那半截。取整段的话带路径的片段会被永远当成孤儿。
+    # ★ 这里取**完整 tag** (域名 或 域名|/路径)。
+    #   以前只取域名, 于是同一个域名下只要还有一个节点活着, 所有同域名的
+    #   孤儿段都被算成"还活着" —— 一节点一 path 是本项目的常规用法, 这种
+    #   漏报等于孤儿检查形同虚设 (实测 2026-10-17 删节点后仍报"没有孤儿")。
     for m in re.finditer(r'>>>\s*xray-core\s+BEGIN\s+(\S+)', raw):
-        print(N.tag_domain(m.group(1)))
+        print(m.group(1))
 " 2>/dev/null | sort -u)
     if [[ -z "$marked" ]]; then
         ok "没有发现 xray-core 插入的 nginx 片段"
         return 0
     fi
 
-    # 当前还活着的节点域名 (tier=nginx 的那些)
+    # 当前还活着的**标记** (`域名` 与 `域名|/path`)。
+    #   ★ 不能只看 tier=nginx: CDN 档节点同样被 cdn_auto 插过段;
+    #     也不能只看域名 (见上)。所以从**片段**里取路径、从元数据里取域名。
     local live
-    live=$(SHARE_DIR="$SHARE_DIR" LIB="$LIB_DIR" py -c "
+    live=$(CONF_DIR="$CONF_DIR" SHARE_DIR="$SHARE_DIR" LIB="$LIB_DIR" py -c "
 import glob, json, os, sys
 sys.path.insert(0, os.environ['LIB'])
 import share_meta
-d = os.environ['SHARE_DIR']
-for f in glob.glob(os.path.join(d, '*.json')):
-    try: m = json.load(open(f, encoding='utf-8'))
-    except Exception: continue
-    if m.get('tier') == 'nginx' and m.get('host'):
-        print(m['host'])
+cd, sd = os.environ['CONF_DIR'], os.environ['SHARE_DIR']
+tags = set()
+for f in glob.glob(os.path.join(cd, '*.json')):
+    try:
+        j = json.load(open(f, encoding='utf-8'))
+    except Exception:
+        continue
+    ib = (j.get('inbounds') or [{}])[0]
+    tag = ib.get('tag') or os.path.basename(f)[:-5]
+    m = share_meta.load(sd, tag) or {}
+    host = (m.get('host') or '').strip()
+    if not host:
+        continue
+    tags.add(host)
+    ss = ib.get('streamSettings') or {}
+    net = ss.get('network') or 'tcp'
+    p = ''
+    if net == 'ws': p = (ss.get('wsSettings') or {}).get('path', '')
+    elif net == 'httpupgrade': p = (ss.get('httpupgradeSettings') or {}).get('path', '')
+    elif net == 'xhttp': p = (ss.get('xhttpSettings') or {}).get('path', '')
+    elif net == 'h2': p = (ss.get('h2Settings') or {}).get('path', '')
+    if p:
+        p = p if p.startswith('/') else '/' + p
+        tags.add(host + '|' + p)
+for t in sorted(tags):
+    print(t)
 " 2>/dev/null | sort -u)
 
     local orphan=0 dom
@@ -532,6 +562,12 @@ node_delete() {
 
     # --- 第 3 步: 重载成功后才吊销分享 ---
     revoke_shares_for "$tag"
+    # 客户端产物 (out/<tag>.yaml) 跟着删 —— 不留孤儿文件。
+    # 不删的话用户下次在产物目录里还能看到这个节点, 以为它还在。
+    local _od="${XRAY_OUT_DIR:-$XRAY_BASE/out}"
+    if [[ -f "$_od/$tag.yaml" ]]; then
+        rm -f "$_od/$tag.yaml" && info "已删除客户端产物: $_od/$tag.yaml"
+    fi
     ok "节点已删除: $tag"
     return 0
 }
@@ -539,7 +575,24 @@ node_delete() {
 validate_and_reload() {
     local xb; xb=$(command -v xray || echo /usr/local/bin/xray)
     if [[ -x "$xb" ]]; then
-        if ! "$xb" run -test -c "$MAIN_CONFIG" >/tmp/xray-validate.log 2>&1; then
+        # ★ 校验口径必须与服务**实际启动方式**一致。
+        #   本项目的 systemd 单元是 `xrayls -confdir $CONF_DIR`, 没有
+        #   $XRAY_BASE/config.json 这个文件。这里原来固定 `-c $MAIN_CONFIG`,
+        #   于是删除/改名**永远**走到这个分支:
+        #       failed to read config: open .../config.json: no such file
+        #   然后回滚, 界面上只写"配置校验或重载失败" —— 看不出是路径问题,
+        #   用户会觉得"节点删不掉"。实测 (2026-10-17) 删除 100% 失败。
+        #
+        #   先试 -confdir (与单元一致), 没有 conf/ 时才退回老的单文件口径。
+        local -a _vargs=()
+        if [[ -d "$CONF_DIR" ]] && [[ -n "$(ls -A "$CONF_DIR" 2>/dev/null)" ]]; then
+            _vargs=(-confdir "$CONF_DIR")
+        elif [[ -f "$MAIN_CONFIG" ]]; then
+            _vargs=(-c "$MAIN_CONFIG")
+        fi
+        if [[ ${#_vargs[@]} -eq 0 ]]; then
+            warn "找不到可校验的配置 (conf/ 与 config.json 都不在), 跳过配置校验"
+        elif ! "$xb" run -test "${_vargs[@]}" >/tmp/xray-validate.log 2>&1; then
             err "xray 配置校验不通过:"
             tail -5 /tmp/xray-validate.log | sed 's/^/    /' >&2
             return 1
