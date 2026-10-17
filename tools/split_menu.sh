@@ -113,13 +113,14 @@ _cy "  上下行真正分开: 下行走独立 GET、上行走独立 POST —— 
 echo >&2
 _in "  1) 上行 CDN + 下行 CDN        两段都走 Cloudflare 橙云, ECH 默认开, 藏得最深"
 _in "  2) 上行 CDN + 下行 REALITY    上行藏进 CDN, 下行直连 + REALITY 握手伪装"
-_in "  3) 上行 REALITY + 下行 CDN    上行不经过第三方, 最常见的折中"
+_in "  3) 上行 REALITY + 下行 CDN    ⚠ 实测不通 (见下), 保留了说明"
+_in "  4) 上行 REALITY + 下行 REALITY 两段都直连 + REALITY, 抗 DPI 最强, 不依赖 CDN"
 echo >&2
 _wn "  只有一个域名也可以 —— 上下行仍然分开, 只是共用同一个入口。"
 _wn "  两个域名是**加出来的能力**, 不是前提。"
 echo >&2
 
-printf '  选哪个组合 [1-3, 回车=1, 0=退出]: '
+printf '  选哪个组合 [1-4, 回车=1, 0=退出]: '
 read -r pick || { echo >&2; exit 0; }
 pick="${pick:-1}"
 case "$pick" in
@@ -127,11 +128,21 @@ case "$pick" in
     1) SPLIT=cdn-cdn ;;
     2) SPLIT=cdn-reality ;;
     3) SPLIT=reality-cdn ;;
+    4) SPLIT=reality-reality ;;
     *) _er "看不懂"; exit 1 ;;
 esac
 
 # ---------------------------------------------------------------- 域名
-_up_hint="上行域名 (Cloudflare 橙云指向这里, TLS 要证书)"
+# ★ 上行的域名/地址在两个组合里是两件事, 问法必须跟着变:
+#   · 上行走 CDN → 是**节点域名** (Cloudflare 橙云指向它, TLS 要证书);
+#   · 上行是 REALITY → 不经 CDN、也不需要证书, 它只是**握手伪装用的 SNI**
+#     (客户端发这个 SNI, 服务端拿它当目标去借证书)。问成"Cloudflare 橙云
+#     指向这里"会把只做 REALITY 的人挡在门外, 他既没有 CDN 也不想配证书。
+if [ "$(x_split_ul_sec "$SPLIT")" = reality ]; then
+    _up_hint="上行 REALITY 伪装域名 (不必解析到本机, 只是握手时对外声称的 SNI)"
+else
+    _up_hint="上行域名 (Cloudflare 橙云指向这里, TLS 要证书)"
+fi
 read -rp "  $_up_hint: " UP_DOM
 UP_DOM="${UP_DOM// /}"
 if [[ -z "$UP_DOM" ]]; then

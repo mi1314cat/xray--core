@@ -628,18 +628,25 @@ batch_main() {
             export X_BATCH_REALITY_SHORT_ID="$(openssl rand -hex 4 2>/dev/null || printf 'a1b2c3d4')"
         fi
 
+        # ★ 生成的组合要**按能不能用**来定, 不是按表里有几个。
+        #   cdn-cdn / cdn-reality / reality-reality 三个可用; reality-cdn 是
+        #   设计冲突 (上行 REALITY 的 inbound 只认 REALITY 握手, 而下行走 CDN
+        #   是普通 TLS, nginx 代理过去对不上; 上下行又必须同一个 inbound 同端口),
+        #   建出来也连不通 —— 所以这里**不建**, 并把原因写出来, 而不是悄悄多发
+        #   一条死链。
         local -a _split_specs=()
         local _sp
-        for _sp in cdn-cdn cdn-reality reality-cdn; do
-            # reality-cdn 的上行是 REALITY, 需要密钥对; 没给就跳过这一个,
-            # 而不是让整批失败 —— 另外两个组合不需要。
-            if [[ "$_sp" == reality-cdn && -z "${X_BATCH_REALITY_PRIVATE_KEY:-}" ]]; then
-                print_warn "跳过 $_sp (需要 REALITY 密钥对; 设 X_BATCH_REALITY_PRIVATE_KEY 与 X_BATCH_REALITY_PUBLIC_KEY)"
+        for _sp in cdn-cdn cdn-reality reality-reality; do
+            # 用到 REALITY 的组合 (第二段是 REALITY) 需要密钥对;
+            # 上面已经用内核现生成过, 生成不出来就跳过并说明。
+            if [[ "$_sp" != cdn-cdn && -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
+                print_warn "跳过 $_sp (需要 REALITY 密钥对, 但内核 x25519 没给出)"
                 continue
             fi
-            # 有 CDN 段的才需要域名; 两个域名都由 X_BATCH_DOMAIN / _DL_DOMAIN 给
             _split_specs+=("vless:4:split:$_sp")
         done
+        print_info "  reality-cdn 不生成: 上行 REALITY 只认 REALITY 握手, 下行经 CDN 是普通 TLS," \
+                   "两条要求冲突 (会话表又要求同一个 inbound) —— 建出来连不通"
 
         if [[ ${#_split_specs[@]} -gt 0 ]]; then
             echo >&2

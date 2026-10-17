@@ -367,6 +367,14 @@ if split:
     o["dl_address"] = dl_dom
     o["dl_security"] = dlsec or sec
     o["dl_mode"] = "stream-up"
+    # ★ ECH 要**两段都标**。
+    #   以前只写了 dl_ech (下行), 于是:
+    #     · 分享链接里没有 ech= (那个参数取的是 meta["ech"], 只有 uplink 才会写);
+    #     · 预置表里写着"ECH 默认开", 而实际产物里一格 ECH 都没有 —— 屏幕上
+    #       看不出来, 只有抓包才知道 ClientHello 里根本没有 65037。
+    #   uplink 走 CDN 的组合 (cdn-cdn / cdn-reality), ECH 是 Cloudflare 边缘终结的,
+    #   客户端要拿的是域名的 ECHConfigList —— 由 deploy.plan 从 HTTPS RR 取。
+    o["ech"] = (ech_on == "yes")
     o["dl_ech"] = (ech_on == "yes")
     if (dlsec or sec) == "reality":
         # 下行 REALITY 需要自己的 serverName / 公钥 / 短 ID。

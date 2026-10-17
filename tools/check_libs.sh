@@ -7498,6 +7498,34 @@ else
     bad "CTAG 赋值失败会让 set -e 杀掉启动脚本 → 单节点模式服务起不来且无报错"
 fi
 
+# ③e6 ECH 必须**两段都标**, 否则链接里没有 ech= (预置表写着"默认开"却一格都没有)
+if sed -n '/o\["ech"\] = (ech_on/,+1p' "$ROOT/tools/preset_batch.sh" | grep -c . >/dev/null \
+   && grep -F 'o["ech"] = (ech_on == "yes")' "$ROOT/tools/preset_batch.sh" >/dev/null; then
+    ok "分离预置把 ECH 标到了上行 (链接里才会有 ech=)"
+else
+    bad "只标了下行 dl_ech → 分享链接里没有 ech=, 而预置说明写着'默认开'"
+fi
+
+# ③e7 四个分离组合：三个能用, reality-cdn 是设计冲突, 不能在批量里悄悄建
+if grep -F 'for _sp in cdn-cdn cdn-reality reality-reality; do' "$ROOT/conf/batch.sh" >/dev/null \
+   && grep -F 'reality-cdn 不生成' "$ROOT/conf/batch.sh" >/dev/null; then
+    ok "全协议建三个可用的分离组合, 并说明 reality-cdn 为什么不建"
+else
+    bad "全协议仍在建 reality-cdn (连不通) 或漏掉 reality-reality"
+fi
+# 分离菜单要能选到 reality-reality
+if grep -F '4) SPLIT=reality-reality ;;' "$ROOT/tools/split_menu.sh" >/dev/null; then
+    ok "菜单 15 能选到 reality-reality (四个组合齐)"
+else
+    bad "菜单 15 只有三个组合 → 用户点不到 reality-reality"
+fi
+# 上行是 REALITY 时, 问法不能是"Cloudflare 橙云指向这里"
+if grep -F '上行 REALITY 伪装域名' "$ROOT/tools/split_menu.sh" >/dev/null; then
+    ok "上行 REALITY 的域名问法跟着组合变 (不再问成 CDN 域名)"
+else
+    bad "上行 REALITY 仍问成 CDN 域名 → 只做 REALITY 的人被挡在门外"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
