@@ -7719,6 +7719,60 @@ else
     bad "上行 REALITY 仍问成 CDN 域名 → 只做 REALITY 的人被挡在门外"
 fi
 
+group "客户端产物 (换指纹 / 换地址后重建, 且不把 CDN 域名换成 IP)"
+
+# ① 指纹与地址都在元数据里 —— 产物必须能从元数据重建
+if grep -qF 'node["fingerprint"] = (meta.get("fingerprint") or "").strip()' "$ROOT/conf/lib/to_mihomo.py"; then
+    ok "指纹从元数据进节点视图 (TLS 节点也生效)"
+else
+    bad "指纹只在 reality 分支读 → TLS 节点换完指纹产物永远还是 chrome"
+fi
+if grep -qF 'x_rebuild_products || true' "$ROOT/conf/share.sh"; then
+    ok "换指纹/换地址后调用产物重建"
+else
+    bad "换完指纹/地址不重建产物 → 链接与 YAML 对不上"
+fi
+
+# ② 整份可运行配置: 客户端拿来就能 mihomo -f
+if [ -f "$ROOT/conf/lib/products.py" ] \
+   && grep -qF '"mixed-port"' "$ROOT/conf/lib/products.py" \
+   && grep -qF '"proxy-groups"' "$ROOT/conf/lib/products.py" \
+   && grep -qF '"MATCH,%s"' "$ROOT/conf/lib/products.py"; then
+    ok "重建产物同时生成整份可运行 mihomo 配置 (mixed-port + 组 + 规则)"
+else
+    bad "只生成节点片段 → 客户端还得自己补 mixed-port/组/规则"
+fi
+
+# ③ 行为: CDN 域名不被换成 IP (SB 当年的事故), 且指纹真的写进 YAML
+_CT="$TMP/prodtest"; rm -rf "$_CT"; mkdir -p "$_CT/conf" "$_CT/out/share" "$_CT/out"
+cat > "$_CT/conf/t-cdn.json" <<'JE'
+{"inbounds":[{"listen":"127.0.0.1","port":25400,"protocol":"vless","tag":"t-cdn",
+ "settings":{"clients":[{"id":"11111111-1111-1111-1111-111111111111"}],"decryption":"none"},
+ "streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/t"}}}]}
+JE
+cat > "$_CT/out/share/t-cdn.json" <<'JE'
+{"tag":"t-cdn","name":"t-cdn","host":"cdn.example.com","port":443,"tier":"nginx","fingerprint":"firefox"}
+JE
+_CR=$( cd "$ROOT" && python3 conf/lib/products.py --conf-dir "$_CT/conf" --share-dir "$_CT/out/share" --out-dir "$_CT/out" 2>&1 )
+_csrv=$(awk '/^  server:/{print $2; exit}' "$_CT/out/t-cdn.yaml" 2>/dev/null)
+_cfp=$(awk '/^  client-fingerprint:/{print $2; exit}' "$_CT/out/t-cdn.yaml" 2>/dev/null)
+if [ "$_csrv" = "cdn.example.com" ]; then
+    ok "CDN 域名在产物里保持域名 (不会被换成 IP)"
+else
+    bad "产物把 CDN 域名写成了别的地址 ($_csrv) —— 这正是 SB 当年那个事故"
+fi
+if [ "$_cfp" = "firefox" ]; then
+    ok "元数据里的指纹真的写进了 YAML"
+else
+    bad "YAML 里的指纹没跟着元数据变 ($_cfp)"
+fi
+if grep -qF 'mixed-port' "$_CT/out/mihomo-full.yaml" 2>/dev/null; then
+    ok "整份配置里带 mixed-port"
+else
+    bad "整份配置没生成/缺 mixed-port (实得: ${_CR:-空})"
+fi
+rm -rf "$_CT"
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

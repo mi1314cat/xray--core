@@ -937,6 +937,37 @@ share_meta.save(os.environ["SHARE_DIR"], os.environ["TAG"],
     ok "$tag: 指纹 ${old:-$X_DEFAULT_UTLS_FP} -> $fp"
     # 内容里嵌着 fp=, 不刷新的话令牌还是旧指纹而面板显示一切正常。
     share_refresh_all
+    x_rebuild_products || true
+
+}
+
+# ---------------------------------------------------------------- 产物重建
+# ★ 换完指纹 / 地址之后**必须**重建客户端产物: 产物是创建那一刻的快照,
+#   而指纹与对外地址都来自 share_meta。只改元数据不重建, 就会出现
+#   "链接里是新指纹, out/<tag>.yaml 里还是旧的" —— 两边对不上, 面板正常。
+#   与 SB 的做法一致 (改元数据/JSON 后重新生成 YAML), 只是这里以元数据为准。
+x_rebuild_products() {
+    local pyf
+    for d in "$LIB_DIR/products.py" "$(dirname "${BASH_SOURCE[0]:-$0}")/lib/products.py"; do
+        [[ -r "$d" ]] && { pyf="$d"; break; }
+    done
+    [[ -n "${pyf:-}" ]] || { warn "找不到 conf/lib/products.py, 产物未重建"; return 1; }
+    local out="${XRAY_OUT_DIR:-${XRAY_BASE:-/root/catmi/xray}/out}"
+    local js
+    js=$(python3 "$pyf" --conf-dir "${CONF_DIR:-$XRAY_BASE/conf}" \
+             --share-dir "${SHARE_DIR:-$XRAY_BASE/out/share}" --out-dir "$out" 2>&1) \
+        || { warn "产物重建失败: ${js:-无输出}"; return 1; }
+    printf '%s' "$js" | python -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: raise SystemExit
+sk = d.get("skipped") or []
+print("  已重建 %d 个节点产物, 整份配置 %s" % (d.get("nodes", 0),
+      "已生成" if d.get("full") else "未生成 (没有可用节点)"))
+for s in sk[:6]:
+    print("    跳过 %s: %s" % (s.get("tag"), s.get("why")))
+' 2>/dev/null || info "产物已重建"
+    return 0
 }
 
 share_change_fp() {
@@ -1069,6 +1100,10 @@ print("%d\t%s" % (n, ",".join(kept)))
     fi
     # 内容里嵌着地址, 必须刷新 —— 不刷新的后果是令牌还是老地址而面板一切正常
     share_refresh_all
+    # ★ 产物是快照: 地址换了, out/*.yaml 与整份配置里的 server 还是旧地址。
+    #   这里按元数据重建, 产物与链接天然一致 (SB 当年也是"改完重生成")。
+    #   域名节点的 host 是 CDN 域名 —— 它**不在**白名单里, 重建时原样保留。
+    x_rebuild_products || true
     return 0
 }
 
@@ -1594,6 +1629,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         switch-family)      x_switch_addr_family "${2:-}" ;;
         switch-family-menu) x_switch_addr_family_menu ;;
         change-fp)          share_change_fp ;;
+        rebuild-products)   x_rebuild_products ;;
         retag)   share_retag "${2:-}" "${3:-}" ;;
         affected) share_affected "${2:-}" ;;
         menu)    share_menu ;;

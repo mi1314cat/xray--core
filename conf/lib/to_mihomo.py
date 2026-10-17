@@ -121,6 +121,10 @@ def node_from_fragment(frag, meta=None, name=None):
     }
 
     # ---- 凭据 ----
+    # ★ 指纹 (uTLS ClientHello 伪装) 是**元数据**字段 —— 换指纹只改元数据,
+    #   产物必须跟着变。以前只在 reality 分支里读它, 于是 TLS 节点换完指纹
+    #   产物里永远是 chrome, 链接/订阅却是新指纹: 两边对不上而面板正常。
+    node["fingerprint"] = (meta.get("fingerprint") or "").strip()
     node["id"] = meta.get("uuid") or ""
     clients = settings.get("clients") or []
     if ib.get("protocol") == "vless":
@@ -562,6 +566,9 @@ def proxy(node):
         #   缺了整条节点连不上, 而产物只差这一个字段, 肉眼很难看出来。
         if str(node.get("dl_security") or "").strip().lower() == "reality":
             out["client-fingerprint"] = str(node.get("fingerprint") or "chrome")
+        elif node.get("fingerprint"):
+            # 普通 TLS 节点也带 uTLS 指纹 —— 换指纹就是要它真的作用到握手。
+            out["client-fingerprint"] = str(node["fingerprint"])
         if node.get("pinned_cert_sha256"):
             out["certificate"] = node["pinned_cert_sha256"]
         elif node.get("allow_insecure"):

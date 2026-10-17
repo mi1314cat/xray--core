@@ -151,6 +151,10 @@ _XRAY_LIB_FILES=(
     proto_ui.sh
     deploy.py dns_edit.py nginx_apply.py naming.py node_build.py nodes.py
     share_meta.py share_payload.py token_store.py
+    # products.py = 客户端产物重建 (每节点 YAML + 整份可运行 mihomo 配置)。
+    # 换指纹/换地址之后靠它把产物刷成新值; 漏登记时症状是"换完 UI 说成功,
+    # 但 out/*.yaml 一个字没变", 而 x_rebuild_products 只是 warn 一句。
+    products.py
     hy2_products.py
     # to_mihomo.py = 节点 → mihomo YAML。产物要两种客户端格式, 而 mihomo 的
     # 字段名/嵌套与 Xray 完全不同 (xhttp-opts vs xhttpSettings), 转不了,
@@ -700,6 +704,8 @@ client_menu() {
         ui_menu 2 "更换 uTLS 指纹  客户端握手伪装，10 种可选"
         ui_menu 3 "更换连接 IP     IPv4 / IPv6 切换，CDN 域名不动"
         ui_menu 4 "刷新分享内容    换完指纹/地址后把已发链接更新到最新"
+        ui_menu 5 "重建全部产物    按当前元数据重生成 YAML + 整份 mihomo 配置"
+        ui_menu 6 "查看整份配置    out/mihomo-full.yaml (mixed-port + 组 + 规则)"
         ui_menu 0 "返回"
         echo >&2
         printf '  %s请选择%s: ' "$_CYN" "$_RST" >&2
@@ -709,11 +715,28 @@ client_menu() {
             2) xray_run conf/share.sh change-fp ;;
             3) xray_run conf/share.sh switch-family-menu ;;
             4) xray_run conf/share.sh refresh; ui_pause ;;
+            5) xray_run conf/share.sh rebuild-products; ui_pause ;;
+            6) show_full_config ;;
             0|"") return 0 ;;
             *) ui_invalid "$c" ;;
         esac
         ui_pause
     done
+}
+
+# 整份可运行配置: 直接给客户端 `mihomo -f` 用的那种, 不是片段。
+show_full_config() {
+    local f="${OUT_DIR:-${XRAY_BASE:-/root/catmi/xray}/out}/mihomo-full.yaml"
+    if [[ ! -f "$f" ]]; then
+        warn "还没有整份配置 —— 先按 5) 重建全部产物"
+        return 1
+    fi
+    ui_title "整份 mihomo 配置"
+    printf '  %s文件: %s (%s 字节)%s\n' "$_DIM" "$f" "$(wc -c < "$f" 2>/dev/null)" "$_RST" >&2
+    echo >&2
+    sed -n '1,40p' "$f" >&2
+    echo >&2
+    printf '  %s(只显示前 40 行; 完整内容用 1) 查看产物内容 或 scp 取走)%s\n' "$_DIM" "$_RST" >&2
 }
 
 # 客户端产物顶部状态 —— 三个值都必须是**便宜**的 (菜单每步都重画):
