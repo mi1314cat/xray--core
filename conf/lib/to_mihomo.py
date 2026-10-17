@@ -192,6 +192,20 @@ def node_from_fragment(frag, meta=None, name=None):
         node["sni"] = (meta.get("sni") or ts.get("serverName")
                        or (meta.get("host") if str(meta.get("tier") or "").lower() == "nginx" else "")
                        or "")
+        # ★ 片段既没写 serverName、元数据也没记 sni 时 (hysteria 这类节点就是:
+        #   证书里才有域名), 从**证书本身**取。不取的话产物只剩 `tls: true`,
+        #   客户端拿服务器 IP 当 SNI → 证书校验失败:
+        #     x509: cannot validate certificate for <IP> because it doesn't
+        #     contain any IP SANs   → HTTP 000
+        #   实测 (2026-10-17): hysteria-01 的 YAML 缺 sni, 链接里却有 sni ——
+        #   链接能用、产物连不上, 两边不一致且屏幕上看不出来。
+        if not node["sni"]:
+            try:
+                import nodes as _nodes
+                _c0 = ((ts.get("certificates") or [{}])[0] or {})
+                node["sni"] = _nodes.cert_domain(_c0.get("certificateFile") or "") or ""
+            except Exception:                                   # noqa: BLE001
+                node["sni"] = ""
         node["pinned_cert_sha256"] = (meta.get("pinned_cert_sha256")
                                       or ts.get("pinnedPeerCertSha256") or "")
         # 服务端字段是 echServerKeys, 客户端才是 echConfigList —— 库里不能互相顶替。
@@ -589,6 +603,17 @@ def proxy(node):
 
     if (node.get("flow") or "").strip():
         out["flow"] = str(node["flow"]).strip()
+
+    # ★ SNI 的字段名**按协议不同**, 写错不报错、只是被忽略 —— 然后客户端拿
+    #   服务器 IP 当 SNI, 证书校验失败 (`no IP SANs`) 或 REALITY 握手失败。
+    #   mihomo 文档 (2026-10 复核):
+    #     vless / vmess          → servername
+    #     trojan / hysteria2 /
+    #     tuic / anytls          → sni
+    #   实测: hysteria-01 的产物写 servername → mihomo 忽略 → 000;
+    #        改成 sni 之后正常。
+    if proto in ("trojan", "hysteria", "hysteria2", "tuic", "anytls") and "servername" in out:
+        out["sni"] = out.pop("servername")
 
     return out
 

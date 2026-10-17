@@ -7775,6 +7775,36 @@ else
 fi
 rm -rf "$_CT"
 
+group "SNI 字段名按协议 (写错不报错, 只是连不上)"
+
+# mihomo 文档: vless/vmess 用 servername; trojan/hysteria2/tuic/anytls 用 sni。
+# 写错字段名 mihomo 不报错, 只是忽略 → 客户端拿 IP 当 SNI → 证书校验失败
+# (no IP SANs) 或 REALITY 握手失败。实测 2026-10-17: hysteria-01 与 TROJAN-01
+# 的产物都写成了 servername, 两条都 000; 改成 sni 后都 200。
+_SNIJS=$(cd "$ROOT" && python3 - <<'PYX' 2>&1
+import sys, json
+sys.path.insert(0, "conf/lib")
+import to_mihomo
+out = {}
+for proto, sec, extra in (("vless", "reality", {}),
+                           ("trojan", "reality", {"password": "x"}),
+                           ("hysteria", "tls", {"password": "x"})):
+    n = {"tag": "t", "name": "t", "protocol": proto, "network": "tcp",
+         "security": sec, "address": "1.2.3.4", "port": 443, "id": "u",
+         "sni": "e.co", "reality_public_key": "PBK", "reality_short_id": "ab",
+         "fingerprint": "chrome"}
+    n.update(extra)
+    p = to_mihomo.proxy(n) or {}
+    out[proto] = [k for k in ("sni", "servername") if p.get(k)]
+print(json.dumps(out, sort_keys=True))
+PYX
+)
+if [ "$_SNIJS" = '{"hysteria": ["sni"], "trojan": ["sni"], "vless": ["servername"]}' ]; then
+    ok "vless 用 servername、trojan/hysteria2 用 sni (与 mihomo 文档一致)"
+else
+    bad "SNI 字段名按协议写错了 → 产物连不上而链接正常 (实得: ${_SNIJS:-空})"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"
