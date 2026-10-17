@@ -449,10 +449,18 @@ mk_run() {
         #  grpc_pass, 三种 mode 都能过。实测矩阵见 conf/lib/node_build.py 的注释。)
         echo
         _y "  XHTTP 的上下行模式:"
-        printf "    %s 1) stream-up    上下行分开: 下行独立 GET, 上行独立 POST (推荐)%s\n" "$_CYN" "$_RST"
-        printf "    %s 2) packet-up    上下行分开, 每个上行包一个 POST (更碎, 请求更多)%s\n" "$_CYN" "$_RST"
+        printf "    %s 1) stream-up    上下行分开: 下行独立 GET, 上行独立 POST (推荐, 上行也流式)%s\n" "$_CYN" "$_RST"
+        printf "    %s 2) packet-up    上下行分开, 每个上行包一个 POST (兼容性最好)%s\n" "$_CYN" "$_RST"
         printf "    %s 3) stream-one   合流: 双向都走同一条 POST%s\n" "$_CYN" "$_RST"
-        printf "    %s 4) auto         让内核决定%s\n" "$_CYN" "$_RST"
+        printf "    %s 4) auto         让内核决定 (TLS 下 stream-up / 否则 packet-up)%s\n" "$_CYN" "$_RST"
+        # ★ 这一条是内核侧的真实限制, 不是我们的偏好:
+        #   Browser Dialer 的 XHTTP 只实现了 packet-up —— stream-up / stream-one
+        #   会得到 "bidirectional streaming for browser dialer not implemented yet"。
+        #   用户选了后两种, 这条节点在客户端里就点不了"浏览器拨号"(仍可用普通模式)。
+        #   不写出来, 用户只会看到客户端的"不支持"然后以为是面板配错了。
+        _y "        注意: 选 1) 或 3) 之后, 客户端那边的「浏览器拨号」(Browser Dialer)"
+        _y "              对这条节点不可用 —— 内核的 BD 只实现了 packet-up。"
+        _y "              节点本身照常能用 (普通 Xray 模式); 要 BD 就选 2) 或 4)。"
         if [[ "$sec" == "reality" ]]; then
             _y "        注意: REALITY 下 auto 会退化成 stream-one (合流), 所以这里默认不是 auto"
         fi

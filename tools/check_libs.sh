@@ -7477,6 +7477,27 @@ else
     bad "被代理的响应上补了第二个 ACAO → 浏览器会以'多值'拒绝"
 fi
 
+# ③e4 浏览器拨号只支持 packet-up —— 选模式时必须说出这个代价
+#     内核侧依据: splithttp 的 BD 路径对 stream-up/stream-one 返回
+#     "bidirectional streaming for browser dialer not implemented yet"。
+#     客户端里会如实显示"不支持", 但用户会以为是面板配错了。
+if sed -n '/XHTTP 的上下行模式/,/上下行模式 \[1-4/p' "$ROOT/conf/mknode.sh" \
+     | grep -F '浏览器拨号' >/dev/null; then
+    ok "选 xhttp mode 时说明了浏览器拨号的限制"
+else
+    bad "没说清 stream-up/stream-one 会让浏览器拨号不可用 → 用户以为配错了"
+fi
+
+# ③e5 客户端启动脚本在 set -e 下不能因为"取不到 sidecar"就整体退出
+#     单节点模式没有 runtime/xray-gen.json, 裸赋值里的命令替换失败会让
+#     set -e 直接杀掉脚本 —— 服务起不来, 日志里却一句错都没有。
+if sed -n '/CTAG=\$(python3/,+1p' "$ROOT/Client/scripts/run-xray.sh" \
+     | grep -F '|| CTAG=""' >/dev/null; then
+    ok "客户端启动脚本对缺失的 sidecar 有兜底 (不会因 set -e 整个退出)"
+else
+    bad "CTAG 赋值失败会让 set -e 杀掉启动脚本 → 单节点模式服务起不来且无报错"
+fi
+
 group "门禁自检 (没有静默跳过的检查)"
 if [[ -s "$GHOST_LOG" ]]; then
     bad "门禁没有调用不存在的命令"         "$(sort -u "$GHOST_LOG" | tr '\n' ' ') —— 这些检查被静默跳过, 全绿是假的"

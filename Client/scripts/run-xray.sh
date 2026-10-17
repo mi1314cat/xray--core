@@ -142,8 +142,14 @@ for _ in $(seq 1 40); do          # 最多等 4 秒, 一步 100ms
   if "$XRAY" api lso --server="$API" >/dev/null 2>&1; then
     # 从生成结果里取 current_tag; 取不到就跳过 —— 此时行为退回"自动选",
     # 总比等不到 API 就不敢启动强。
+    # ★ 必须 `|| CTAG=""`。这个脚本是 set -euo pipefail, 而单节点模式下
+    #   runtime/xray-gen.json 根本不存在 (sidecar 只在多出站模式写) ——
+    #   裸赋值里命令替换失败会**直接退出整个脚本**, 于是
+    #       xray-client.service: Failed with result 'exit-code'
+    #   而注释里写的是"取不到就跳过"。实测: 切到一个 xhttp 节点后服务起不来,
+    #   日志里只有 Starting/Stopping, 一句错都没有。
     CTAG=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("current_tag") or "")' \
-           "$PREFIX/runtime/xray-gen.json" 2>/dev/null)
+           "$PREFIX/runtime/xray-gen.json" 2>/dev/null) || CTAG=""
     if [ -n "$CTAG" ]; then
       "$XRAY" api bo --server="$API" -b xbd-bal "$CTAG" >/dev/null 2>&1 \
         && echo "已选中节点: $CTAG" >&2
