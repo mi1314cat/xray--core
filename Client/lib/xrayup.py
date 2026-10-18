@@ -102,6 +102,70 @@ def fetch(url: str, proxy: str = "", timeout: int = 120) -> bytes:
         return b""
 
 
+def download_first(cands, tmp: str, timeout: int = 180):
+    """并行下载多个候选，谁先完整下完用谁。
+
+    为什么不是串行：实测同一台机器上
+        GitHub 官方（经本机代理） 415 KB/s
+        gh-proxy.com（直连）      119 KB/s
+        ghproxy.net（直连）         9 KB/s
+    串行会先在最慢的镜像上耗满 max-time；并行则是"能下的那条先到"。
+    返回 (bytes, url, proxy)，全失败返回 (b"", "", "")。
+    """
+    procs = []
+    for i, (url, px) in enumerate(cands):
+        out = os.path.join(tmp, f"dl-{i}")
+        args = ["curl", "-fsSL", "--connect-timeout", "10",
+                "--speed-limit", "1024", "--speed-time", "30",
+                "--max-time", str(timeout), "-o", out]
+        if px:
+            args += ["-x", px]
+        args.append(url)
+        try:
+            p = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        procs.append((p, out, url, px))
+        print(f"  尝试: {url.split('/')[2]}{'（代理）' if px else ''}", file=sys.stderr)
+
+    deadline = time.time() + timeout
+    win = None
+    while time.time() < deadline:
+        for p, out, url, px in procs:
+            if p.poll() is not None:
+                try:
+                    size = os.path.getsize(out)
+                except OSError:
+                    size = 0
+                if p.returncode == 0 and size > 1000:
+                    win = (out, url, px)
+                    break
+        if win:
+            break
+        if all(p.poll() is not None for p, _, _, _ in procs):
+            break
+        time.sleep(0.3)
+
+    for p, _out, _url, _px in procs:
+        if p.poll() is None:
+            p.kill()
+    for p, _out, _url, _px in procs:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    if not win:
+        return b"", "", ""
+    out, url, px = win
+    try:
+        with open(out, "rb") as f:
+            return f.read(), url, px
+    except OSError:
+        return b"", "", ""
+
+
 def latest_version(proxy: str = "") -> str:
     """取最新版本号。
 
@@ -344,37 +408,46 @@ def cmd_update(as_json=False, force=False) -> int:
     else:
         pathpart = f"releases/latest/download/Xray-linux-{asset}.zip"
 
-    # 候选顺序：能直连时 GitHub 官方优先；不能直连时**镜像直连优先**，
-    # 最后才走代理。代理链（尤其家宽→VPS）常能连上但吞吐很差，先试代理
-    # 的 GitHub 官方会白白卡几十秒 —— 实测踩过。
+    # 并行候选：官方 + 两个镜像的直连，以及（有代理时）官方走代理。
+    # 直连不通时把镜像排前面；直连可用时官方排前面，但代理也一起跑，
+    # 谁快谁赢（实测同一台机器代理 415KB/s、镜像 9KB/s）。
     github = f"https://github.com/{REPO}/{pathpart}"
-    mirrors = [
-        f"https://ghproxy.net/https://github.com/{REPO}/{pathpart}",
-        f"https://gh-proxy.com/https://github.com/{REPO}/{pathpart}",
-    ]
-    order = [github] + mirrors if direct else mirrors + [github]
-    cands = [(u, "") for u in order]
+    ghproxy = f"https://ghproxy.net/https://github.com/{REPO}/{pathpart}"
+    ghprox2 = f"https://gh-proxy.com/https://github.com/{REPO}/{pathpart}"
+    base_order = [github, ghprox2, ghproxy] if direct else [ghprox2, ghproxy, github]
+    cands = [(u, "") for u in base_order]
     if proxy:
-        cands += [(u, proxy) for u in order]
+        cands.insert(0, (github, proxy))
+    # 去重并限制并发数：4 条已经够覆盖直连/镜像/代理，别把本机带宽打满
+    seen = set()
+    uniq = []
+    for u, px in cands:
+        k = (u, px)
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append((u, px))
+    cands = uniq[:4]
     tmp = tempfile.mkdtemp(prefix="xbd-upd-")
     try:
-        blob = b""
-        base = ""
-        used_proxy = ""
-        for u, px in cands:
-            print(f"  尝试: {u.split('/')[2]}{'（代理）' if px else ''}", file=sys.stderr)
-            blob = fetch(u, px, 180)
-            if blob:
-                base = u
-                used_proxy = px
-                break
+        blob, base, used_proxy = download_first(cands, tmp, 180)
         if not blob:
             msg = "下载失败（直连与镜像都不通）"
             print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False) if as_json else f"  ✗ {msg}")
             return 1
 
         # 校验：官方 .dgst 里的 SHA2-256（取不到就记未验证）
-        dgst = fetch(base + ".dgst", used_proxy or proxy, 60).decode("utf-8", "replace")
+        # .dgst 跟随**实际成功的通道**，不要无条件绕代理；直连镜像下的
+        # .dgst 通常也直连最快，失败再退回代理。
+        if base:
+            print(f"  下载源: {base.split('/')[2]}{'（代理）' if used_proxy else '（直连）'}",
+                  file=sys.stderr)
+        dgst_raw = fetch(base + ".dgst", used_proxy, 60)
+        if not dgst_raw and proxy and used_proxy != proxy:
+            dgst_raw = fetch(base + ".dgst", proxy, 60)
+        if not dgst_raw and used_proxy:
+            dgst_raw = fetch(base + ".dgst", "", 60)
+        dgst = dgst_raw.decode("utf-8", "replace")
         want = ""
         for line in dgst.splitlines():
             if "SHA2-256" in line:
