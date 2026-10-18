@@ -18,6 +18,8 @@
 #      XBD_PREFIX      安装目录（默认 /opt/xray-browser-dialer）
 #      XBD_REF         分支/标签（默认 main）
 #      XBD_ARCHIVE     自定义压缩包地址
+#      XBD_DL_PROXY    下载用的本机代理，如 http://127.0.0.1:7890
+#                      （不填则自动扫描 10808/7890/10809/1080 并实际验证）
 # ============================================================================
 set -uo pipefail
 
@@ -57,6 +59,22 @@ MIRROR_DIRS=(
 )
 ARCHIVE_URL="${XBD_ARCHIVE:-${MIRROR_DIRS[0]}/$ARCHIVE_NAME}"
 
+# XBD_ARCHIVE 允许给“目录”或“指向压缩包的完整地址”。以前它只影响探针，
+# 真正下载仍走 MIRROR_DIRS —— 自定义地址形同虚设。这里归一成目录，并
+# 用它单独作为唯一来源（本地文件/自建 HTTP 服务就能离线装）。
+if [ -n "${XBD_ARCHIVE:-}" ]; then
+  case "$XBD_ARCHIVE" in
+    http://*|https://*|file://*) ;;
+    /*) XBD_ARCHIVE="file://$XBD_ARCHIVE" ;;
+  esac
+  case "$XBD_ARCHIVE" in
+    */"$ARCHIVE_NAME") XBD_ARCHIVE="${XBD_ARCHIVE%/$ARCHIVE_NAME}" ;;
+    */) XBD_ARCHIVE="${XBD_ARCHIVE%/}" ;;
+  esac
+  MIRROR_DIRS=("$XBD_ARCHIVE")
+  ARCHIVE_URL="$XBD_ARCHIVE/$ARCHIVE_NAME"
+fi
+
 if [ -t 1 ]; then
   R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[36m'; D=$'\033[2m'; O=$'\033[0m'
 else
@@ -82,21 +100,24 @@ PASS_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --vless)    PASS_ARGS+=(--vless "${2:-}"); shift 2 ;;
-    --yes|-y)   PASS_ARGS+=(--yes); shift ;;
+    --yes|-y)   PASS_ARGS+=(--yes); AUTO_YES=1; shift ;;
     --no-start) PASS_ARGS+=(--no-start); shift ;;
     --ref)
       REF="${2:-}"
       # --ref 换分支时重建同一套镜像链（顺序理由见文件上方 MIRROR_DIRS 的注释）
       # 同一套顺序（理由见文件上方 MIRROR_DIRS 的注释）
-      MIRROR_DIRS=(
-        "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
-        "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
-        "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
-        "https://github.com/$REPO/raw/refs/heads/$REF/$SUBDIR"
-        "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
-      )
-      ARCHIVE_URL="${MIRROR_DIRS[0]}/$ARCHIVE_NAME"
+      if [ -z "${XBD_ARCHIVE:-}" ]; then
+        MIRROR_DIRS=(
+          "https://ghproxy.net/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
+          "https://gh-proxy.com/https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
+          "https://raw.githubusercontent.com/$REPO/$REF/$SUBDIR"
+          "https://github.com/$REPO/raw/refs/heads/$REF/$SUBDIR"
+          "https://cdn.jsdelivr.net/gh/$REPO@$REF/$SUBDIR"
+        )
+        ARCHIVE_URL="${MIRROR_DIRS[0]}/$ARCHIVE_NAME"
+      fi
       shift 2 ;;
+    --proxy)    USER_PROXY="${2:-}"; shift 2 ;;
     --prefix)   PREFIX="${2:-}"; shift 2 ;;
     -h|--help)
       cat <<EOF
@@ -106,6 +127,7 @@ Xray Client 一键部署
   --yes, -y          全自动不交互
   --no-start         只部署不启动
   --ref <分支>       拉取指定分支（默认 $REF）
+  --proxy <url>      下载用代理，如 http://127.0.0.1:7890
   --prefix <目录>    安装目录（默认 $PREFIX）
 
   XBD_ARCHIVE=<url>  自定义压缩包地址
@@ -145,25 +167,58 @@ ok "架构: $(uname -m)  发行版: $(. /etc/os-release 2>/dev/null; printf '%s'
 [ -x "$PREFIX/bin/xbd" ] && warn "检测到已安装（$PREFIX），将执行更新"
 
 CURL_MODE=()
+USER_PROXY="${USER_PROXY:-${XBD_DL_PROXY:-}}"
+DL_PROXY=""
+proxy_ok() {  # $1=代理 URL，实际请求一次再认定可用（只测端口会把别的服务当代理）
+  [ -n "$1" ] || return 1
+  timeout 10 curl -fsS --max-time 8 -x "$1" -o /dev/null \
+    https://www.gstatic.com/generate_204 2>/dev/null
+}
 detect_proxy() {
-  local p
-  for p in 10808 7890 10809 1080; do
-    timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$p" 2>/dev/null && { printf 'http://127.0.0.1:%s' "$p"; return 0; }
+  local p u
+  for u in "${USER_PROXY:-}" "${https_proxy:-}" "${http_proxy:-}"; do
+    [ -n "$u" ] || continue
+    proxy_ok "$u" && { printf '%s' "$u"; return 0; }
+    warn "  指定的代理不可用: $u" >&2
+  done
+  for p in 10808 7890 10809 1080 1088 20171 8080; do
+    u="http://127.0.0.1:$p"
+    proxy_ok "$u" && { printf '%s' "$u"; return 0; }
   done
   return 1
 }
+ask_proxy() {
+  # 交互式兜底：自动扫不到时让用户给端口。非交互/--yes 直接跳过。
+  [ -t 0 ] && [ -t 1 ] || return 1
+  [ "${AUTO_YES:-0}" = 1 ] && return 1
+  local ans u
+  printf '  本机代理端口或 URL（回车跳过）: ' >&2
+  read -r ans || return 1
+  [ -n "$ans" ] || return 1
+  case "$ans" in
+    http://*|https://*|socks5://*) u="$ans" ;;
+    *[!0-9]*) warn "  无效代理: $ans" >&2; return 1 ;;
+    *) u="http://127.0.0.1:$ans" ;;
+  esac
+  proxy_ok "$u" || { warn "  代理 $u 不可用（无法访问 gstatic）" >&2; return 1; }
+  printf '%s' "$u"
+}
 probe_channel() {
   if timeout 8 curl -fsS --max-time 8 -o /dev/null "$ARCHIVE_URL" 2>/dev/null; then
-    CURL_MODE=(); dim "  下载通道: 直连"; return 0
+    CURL_MODE=(); DL_PROXY=""; dim "  下载通道: 直连"; return 0
   fi
   local proxy; proxy=$(detect_proxy 2>/dev/null || true)
   if [ -n "$proxy" ] && timeout 12 curl -fsS --max-time 12 -x "$proxy" -o /dev/null "$ARCHIVE_URL" 2>/dev/null; then
-    CURL_MODE=(-x "$proxy"); dim "  下载通道: 本机代理 $proxy"; return 0
+    CURL_MODE=(-x "$proxy"); DL_PROXY="$proxy"; dim "  下载通道: 本机代理 $proxy"; return 0
   fi
-  CURL_MODE=()
+  proxy=$(ask_proxy 2>/dev/null || true)
+  if [ -n "$proxy" ] && timeout 12 curl -fsS --max-time 12 -x "$proxy" -o /dev/null "$ARCHIVE_URL" 2>/dev/null; then
+    CURL_MODE=(-x "$proxy"); DL_PROXY="$proxy"; dim "  下载通道: 本机代理 $proxy"; return 0
+  fi
+  CURL_MODE=(); DL_PROXY=""
   warn "  下载通道探测未成功，仍尝试直连"
 }
-fetch() { curl -fsSL --connect-timeout 8 --max-time 180 --retry 1 --retry-delay 1 "${CURL_MODE[@]}" -o "$2" "$1" 2>>"$LOG"; }
+fetch() { curl -fsSL --connect-timeout 8 --max-time 180 --retry 1 --retry-delay 1 ${CURL_MODE[@]+"${CURL_MODE[@]}"} -o "$2" "$1" 2>>"$LOG"; }
 
 # 逐个镜像试。为什么不是"主 + 一个备用"：
 #   实测这台机器（CN 网络）直连 github.com **直接卡死** —— 既不报错也不返回，
@@ -249,6 +304,13 @@ if [ -n "$CUR_VER" ] && [ "$PKG_VER" = "$CUR_VER" ]; then
 fi
 
 step "开始安装"
+# 把探测到的代理传给包内安装器：xbd install 下载内核时会优先用它，
+# 免去“包能下、内核下不动”的两套网络判断。
+if [ -n "$DL_PROXY" ]; then
+  export XBD_DL_PROXY="$DL_PROXY"
+  dim "  内核下载代理: $DL_PROXY"
+fi
+mkdir -p "$PREFIX/kernels" 2>/dev/null || true
 XBD_PREFIX="$PREFIX" bash "$WORKDIR/src/RUN.sh" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
 rc=$?
 if [ "$rc" -ne 0 ]; then
@@ -281,6 +343,11 @@ info "   xbd node add \"<链接>\"  添加节点"
 info "   xbd dialer on|off    启用/关闭 Browser Dialer"
 info "   xbd panel            面板地址与令牌"
 info "   xbd diagnose         全面诊断"
+info "   xbd xray install-local  用本机上传的内核安装（完全离线）"
+info ""
+info " 内核手动上传（GitHub 下载不动时用）："
+info "   把 Xray-linux-*.zip 放到 $PREFIX/kernels/"
+info "   再执行: xbd xray install-local"
 info ""
 info " 文档: $PREFIX/README.md"
 info " 日志: $LOG"

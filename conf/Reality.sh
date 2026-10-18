@@ -26,6 +26,8 @@ fi
 #
 # 默认「最高配置」：
 #   - flow: xtls-rprx-vision            （Xray 官方唯一推荐的 Reality flow）
+#     ★ REALITY 的伪装目标必须做**真实握手自检**：golang.org / microsoft.com
+#       这类目标会让握手失败并回落到真证书；生成后会自动探测并告警。
 #   - 加密: ML-KEM-768 后量子 VLESS Encryption（SERVER_DEC，来自 xrayls vlessenc）
 #   - realitySettings.maxTimeDiff = 40000（默认 0=不限时，最高配启用 40s 防重放）
 #   - sniffing          = 开启（destOverride http,tls,quic）
@@ -218,6 +220,61 @@ list_configs() {
 }
 
 # ================================
+# REALITY 目标真实握手自检
+# ================================
+# 为什么需要：REALITY 的“配置正确”不等于“能连”。golang.org / microsoft.com
+# 这类目标会让握手失败，服务端把连接回落到目标站，客户端只看到真证书
+# （"received real certificate"），而密钥、SNI、shortId、-test 全部正常。
+# 这里用刚生成的服务端/客户端片段起一对**本地临时实例**，真连一次
+# generate_204；失败只告警，不删节点（交互式场景让用户自己决定）。
+_reality_handshake_ok() (
+    set +e
+    local sfile="$1" cfile="$2"
+    command -v curl >/dev/null 2>&1 || return 0   # 没 curl 就不阻断，交给用户
+    local tmp sport cport spid cpid rc=1 i
+    tmp=$(mktemp -d /tmp/reality-probe-XXXXXX) || return 0
+    sport=$(random_free_port)
+    cport=$(random_free_port)
+    [ "$sport" = "$cport" ] && cport=$((cport + 1))
+    python3 - "$sfile" "$cfile" "$tmp" "$sport" "$cport" <<'PY' || { rm -rf "$tmp"; return 0; }
+import json, sys
+s = json.load(open(sys.argv[1]))
+c = json.load(open(sys.argv[2]))
+tmp, sport, cport = sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+s.setdefault("log", {})["loglevel"] = "warning"
+s["inbounds"][0]["listen"] = "127.0.0.1"
+s["inbounds"][0]["port"] = sport
+# 片段本身只有入站；临时实例要自己补 freedom，否则服务端报
+# "default outbound handler not exist"，看起来像目标站不兼容。
+s["outbounds"] = [{"protocol": "freedom"}]
+c["settings"]["vnext"][0]["address"] = "127.0.0.1"
+c["settings"]["vnext"][0]["port"] = sport
+client = {"log": {"loglevel": "warning"},
+          "inbounds": [{"listen": "127.0.0.1", "port": cport, "protocol": "socks",
+                        "settings": {"auth": "noauth", "udp": True}}],
+          "outbounds": [c]}
+json.dump(s, open(tmp + "/server.json", "w"), ensure_ascii=False)
+json.dump(client, open(tmp + "/client.json", "w"), ensure_ascii=False)
+PY
+    "$XRAY_BIN" -c "$tmp/server.json" >"$tmp/server.log" 2>&1 & spid=$!
+    "$XRAY_BIN" -c "$tmp/client.json" >"$tmp/client.log" 2>&1 & cpid=$!
+    sleep 1
+    for i in 1 2 3; do
+        if curl -fsS --max-time 6 -x "socks5h://127.0.0.1:$cport" \
+             -o /dev/null https://www.gstatic.com/generate_204 2>/dev/null; then
+            rc=0
+            break
+        fi
+        sleep 1
+    done
+    [ "$rc" -ne 0 ] && { echo "--- server ---"; tail -8 "$tmp/server.log" >&2; echo "--- client ---"; tail -8 "$tmp/client.log" >&2; }
+    kill "$spid" "$cpid" 2>/dev/null
+    wait "$spid" "$cpid" 2>/dev/null
+    rm -rf "$tmp"
+    return "$rc"
+)
+
+# ================================
 # 新增配置（默认最高配置）
 # ================================
 add_config() {
@@ -240,11 +297,21 @@ add_config() {
     yn=$(clean_input "$yn")
     [[ "$yn" == "1" ]] && encryption_mode="plain"
 
+    # 实测（Xray 26.3.27）：ML-KEM 与 XTLS Vision 可以叠加，不必二选一。
+    # 真正会把 REALITY 打挂的是**目标站不兼容**：golang.org / microsoft.com
+    # 这类站点的 TLS 行为会让 REALITY 握手失败，客户端只看到目标站真证书
+    # （"received real certificate"），而配置和密钥看起来全都正常。
+    # 换 www.cloudflare.com 后同一对密钥、同一份 ML-KEM 配置立即恢复。
     local flow="xtls-rprx-vision"
     printf "flow 默认 xtls-rprx-vision（官方唯一推荐）。输入 1 降级为无 flow: " >&2
     read yn
     yn=$(clean_input "$yn")
     [[ "$yn" == "1" ]] && flow="none" && encryption_mode="plain"
+
+    # JSON 里没有 flow 时必须是**空字符串**；写 "none" 不是合法 flow，
+    # 内核 -test 不校验它，但真握手会失败（"配好了却连不上"）。
+    local flow_json="$flow"
+    [[ "$flow" == "none" ]] && flow_json=""
 
     next=$(get_next_index)
     tag_name="REALITY-${next}"
@@ -270,7 +337,7 @@ cat <<EOF > "$file"
         "clients": [
           {
             "id": "$UUID",
-            "flow": "$flow"
+            "flow": "$flow_json"
           }
         ],
         "decryption": "$decryption"
@@ -319,7 +386,7 @@ EOF
           {
             "id": "$UUID",
             "encryption": "$([ "$encryption_mode" = "mldsa" ] && echo "$CLIENT_ENC" || echo none)",
-            "flow": "$flow"
+            "flow": "$flow_json"
           }
         ]
       }
@@ -340,7 +407,18 @@ EOF
 }
 EOF
 
+    # ---- 目标站真实握手自检（见 _reality_handshake_ok 注释）----
+    if _reality_handshake_ok "$file" "$OUT_DIR/$PROTO-$next.json"; then
+        print_ok "REALITY 目标实测通过: $DEST"
+    else
+        print_warn "REALITY 目标 $DEST 实测握手失败 —— 客户端很可能只看到目标站真证书"
+        print_warn "  golang.org / microsoft.com 这类目标已实测不可用，建议改用 www.cloudflare.com"
+        print_warn "  节点已保留；需要可用节点请换目标后重建（或直接改 realitySettings.target/serverNames）"
+    fi
+
     # ---- mihomo (Clash.Meta) YAML 客户端文件（M 内核）----
+    local flow_yaml=""
+    [[ "$flow" != "none" ]] && flow_yaml=$'\n    flow: '"$flow"
     cat > "$OUT_DIR/$PROTO-client-$next.yaml" <<EOF
 # mihomo (Clash.Meta) 客户端配置 —— Reality-$next
 # M 内核需为支持 VLESS Encryption（mlkem768）的新版本；旧版 M 内核请选纯 X25519 模式重新生成
@@ -352,8 +430,7 @@ proxies:
     uuid: $UUID
     network: tcp
     tls: true
-    udp: true
-    flow: $flow
+    udp: true${flow_yaml}
     servername: $DEST
     encryption: $([ "$encryption_mode" = "mldsa" ] && echo "$CLIENT_ENC" || echo none)
     reality-opts:
@@ -363,7 +440,9 @@ proxies:
 EOF
 
     # ---- 分享链接 ----
-    echo "vless://${UUID}@${link_ip}:${lport}?flow=${flow}&security=reality&sni=${DEST}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${short_id}&type=tcp${link_enc}#Reality-${next}" \
+    local flow_param=""
+    [[ "$flow" != "none" ]] && flow_param="flow=${flow}&"
+    echo "vless://${UUID}@${link_ip}:${lport}?${flow_param}security=reality&sni=${DEST}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${short_id}&type=tcp${link_enc}#Reality-${next}" \
         > "$OUT_DIR/$PROTO-share-$next.txt"
 
     
@@ -400,7 +479,7 @@ EOF
     fi
 
 print_ok "新增 Reality 配置成功（最高配置）"
-    echo -e "编号: $next\n监听: 0.0.0.0:$lport\nUUID: $UUID\nflow: $flow\n加密: $([ "$encryption_mode" = "mldsa" ] && echo 'ML-KEM-768 (PQ 量子抗性)' || echo '纯 X25519 (无 PQ)')\nSNI/target: ${DEST}:443\nmaxTimeDiff: 40000\nTag: $tag_name\n入站碎片: $file\n客户端文件(X内核): $OUT_DIR/$PROTO-$next.json\n客户端文件(M内核YAML): $OUT_DIR/$PROTO-client-$next.yaml\n分享链接: $OUT_DIR/$PROTO-share-$next.txt" >&2
+    echo -e "编号: $next\n监听: 0.0.0.0:$lport\nUUID: $UUID\nflow: $([[ "$flow" == "none" ]] && echo '无（纯 X25519）' || echo "$flow")\n加密: $([ "$encryption_mode" = "mldsa" ] && echo 'ML-KEM-768 (PQ 量子抗性)' || echo '纯 X25519 (无 PQ)')\nSNI/target: ${DEST}:443\nmaxTimeDiff: 40000\nTag: $tag_name\n入站碎片: $file\n客户端文件(X内核): $OUT_DIR/$PROTO-$next.json\n客户端文件(M内核YAML): $OUT_DIR/$PROTO-client-$next.yaml\n分享链接: $OUT_DIR/$PROTO-share-$next.txt" >&2
 }
 
 # ================================

@@ -65,24 +65,35 @@ cmd_install() {
   step "写入配置（幂等，不覆盖已有内容）"
   xbd_write_default_configs
 
-  step "安装 systemd 单元"
-  local u
-  for u in "$XBD_U_XRAY" "$XBD_U_SHARE" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
-    install -m 0644 "$XBD_SERVICE/$u" "/etc/systemd/system/$u"
-  done
-  systemctl daemon-reload
-  ok "已安装 5 个单元（xray-client / chromium + panel / health / timer）"
+  # 自定义前缀只用于测试/多实例：systemd 单元名是全系统共享的，
+  # 照常安装会把**生产**单元覆盖成指向测试目录 —— 实测踩过。
+  # 文件与内核照装，只跳过单元和启动；节点导入等仍然照常。
+  local test_prefix=0
+  if [ "$XBD_PREFIX" != "/opt/xray-browser-dialer" ]; then
+    test_prefix=1
+    warn "自定义前缀: $XBD_PREFIX"
+    info "  跳过 systemd 单元安装与启动（单元名与主安装共用，会覆盖生产环境）"
+    info "  文件已部署，内核已就绪；测试可手动运行 $XBD_SCRIPTS/run-xray.sh"
+  else
+    step "安装 systemd 单元"
+    local u
+    for u in "$XBD_U_XRAY" "$XBD_U_SHARE" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do
+      install -m 0644 "$XBD_SERVICE/$u" "/etc/systemd/system/$u"
+    done
+    systemctl daemon-reload
+    ok "已安装 5 个单元（xray-client / chromium + panel / health / timer）"
 
-  # 清理 v1/v2 遗留单元，避免与新架构冲突
-  local old
-  for old in xray-browser-client.service browser-dialer-health.service browser-dialer-health.timer; do
-    if [ -f "/etc/systemd/system/$old" ] && [ "$old" != "$XBD_U_HEALTH" ] && [ "$old" != "$XBD_U_TIMER" ]; then
-      systemctl disable --now "$old" >/dev/null 2>&1 || true
-      rm -f "/etc/systemd/system/$old"
-      dim "  已移除旧单元 $old"
-    fi
-  done
-  systemctl daemon-reload
+    # 清理 v1/v2 遗留单元，避免与新架构冲突
+    local old
+    for old in xray-browser-client.service browser-dialer-health.service browser-dialer-health.timer; do
+      if [ -f "/etc/systemd/system/$old" ] && [ "$old" != "$XBD_U_HEALTH" ] && [ "$old" != "$XBD_U_TIMER" ]; then
+        systemctl disable --now "$old" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$old"
+        dim "  已移除旧单元 $old"
+      fi
+    done
+    systemctl daemon-reload
+  fi
 
   # 迁移旧节点文件到统一模型
   menu_migrate_nodes
@@ -97,6 +108,10 @@ cmd_install() {
     return 0
   fi
   if [ "$want_start" -eq 1 ]; then
+    if [ "$test_prefix" -eq 1 ]; then
+      info "  自定义前缀，跳过服务启动"
+      return 0
+    fi
     cmd_start
   else
     warn "已按 --no-start 跳过启动"
@@ -225,6 +240,21 @@ menu_xray_ensure() {
     return 0
   fi
 
+  # 0) 用户上传到 kernels/ 的内核优先 —— 完全离线，不碰 GitHub。
+  #    这是给“能下安装包、下不动内核”的机器留的路：把 zip 传上去再装。
+  local kdir="${XBD_KERNEL_DIR:-$XBD_PREFIX/kernels}"
+  mkdir -p "$kdir" 2>/dev/null || true
+  if [ -n "$(find "$kdir" -maxdepth 1 -type f ! -name '*.part' -print -quit 2>/dev/null)" ]; then
+    info "  发现上传的内核（$kdir），优先离线安装"
+    if python3 "$XBD_LIBDIR/xrayup.py" install-local --force 2>&1 | sed 's/^/  /'; then
+      if [ -x "$XBD_XRAY" ]; then
+        ok "Xray 安装完成: $(first_line "$XBD_XRAY" version)"
+        return 0
+      fi
+    fi
+    warn "  上传的内核不可用，继续尝试系统副本/联网下载"
+  fi
+
   # 1) 系统里已有就直接复用一份（不覆盖原文件，只复制）
   local src
   for src in /usr/local/bin/xray /usr/bin/xray; do
@@ -246,8 +276,12 @@ menu_xray_ensure() {
   fi
 
   bad "Xray 未就绪，无法继续"
-  info "  可手动下载官方二进制放到: $XBD_XRAY"
-  info "  下载页: https://github.com/XTLS/Xray-core/releases"
+  info "  离线装法（GitHub 完全下不动时）："
+  info "    1) 在能上网的机器下载 Xray-linux-$(uname -m).zip"
+  info "       下载页: https://github.com/XTLS/Xray-core/releases"
+  info "    2) 上传到: $kdir/"
+  info "    3) 执行: xbd xray install-local"
+  info "  也可以先放系统 Xray 到 /usr/local/bin/xray，再重跑安装"
   return 1
 }
 
@@ -1808,6 +1842,19 @@ cmd_status() {
     info "安装: xbd install"
     return 2
   fi
+  # 自定义前缀没有自己的 systemd 单元：单元名是全系统共用的，不能拿
+  # 生产的 xray-client.service 冒充“本目录在运行”。只报文件级事实。
+  if [ "$XBD_PREFIX" != "/opt/xray-browser-dialer" ]; then
+    warn "自定义前缀（测试/多实例）: $XBD_PREFIX"
+    info "  未安装 systemd 单元，不读取共享的生产服务状态"
+    info "  内核: $(first_line "$XBD_XRAY" version)"
+    if [ -f "$XBD_CONF/ports.env" ]; then
+      info "  端口配置:"
+      sed 's/^/    /' "$XBD_CONF/ports.env"
+    fi
+    info "  手动运行: $XBD_SCRIPTS/run-xray.sh"
+    return 0
+  fi
   local quick=""
   [ "${1:-}" = "--quick" ] && quick="--quick"
   XBD_PREFIX="$XBD_PREFIX" python3 "$XBD_LIBDIR/state.py" $quick
@@ -2443,11 +2490,45 @@ cmd_xray() {
   case "$op" in
     version) python3 "$XBD_LIBDIR/xrayup.py" version ;;
     check)   python3 "$XBD_LIBDIR/xrayup.py" check ;;
+    dir|kernels)
+      local kdir="${XBD_KERNEL_DIR:-$XBD_PREFIX/kernels}"
+      mkdir -p "$kdir"
+      info "内核上传目录: $kdir"
+      if [ -n "$(find "$kdir" -maxdepth 1 -type f ! -name '*.part' -print -quit 2>/dev/null)" ]; then
+        find "$kdir" -maxdepth 1 -type f ! -name '*.part' -printf '  %f\n' 2>/dev/null || ls -1 "$kdir"
+      else
+        info "  （空）把 Xray-linux-*.zip / .gz / 裸二进制放进来"
+      fi
+      ;;
+    install-local)
+      need_root
+      step "用上传的内核安装 Xray"
+      local kdir="${XBD_KERNEL_DIR:-$XBD_PREFIX/kernels}"
+      mkdir -p "$kdir"
+      dim "  目录: $kdir（离线，不走 GitHub）"
+      python3 "$XBD_LIBDIR/xrayup.py" install-local --force || return 1
+      # 安装器只换二进制；已经在跑的实例要重启才会用上新内核。
+      if [ "$XBD_PREFIX" = "/opt/xray-browser-dialer" ] && [ -f "/etc/systemd/system/$XBD_U_XRAY" ]; then
+        systemctl restart "$XBD_U_XRAY"
+        sleep 3
+        unit_active "$XBD_U_XRAY" && ok "$XBD_U_XRAY 已重启" || { bad "Xray 重启失败"; journalctl -u "$XBD_U_XRAY" -n 12 --no-pager; return 1; }
+        if unit_active "$XBD_U_CHROMIUM"; then
+          systemctl restart "$XBD_U_CHROMIUM" 2>/dev/null || true
+          info "已同步重启 Chromium（Xray 重启会换 CSRF token）"
+        fi
+      else
+        info "  服务还没安装，稍后执行 xbd install 即可"
+      fi
+      ;;
     update|upgrade)
       need_root
       step "更新 Xray 内核"
       dim "  只更新本项目副本 $XBD_XRAY，不碰系统 Xray"
       python3 "$XBD_LIBDIR/xrayup.py" update || return 1
+      if [ "$XBD_PREFIX" != "/opt/xray-browser-dialer" ]; then
+        info "  自定义前缀，跳过服务重启"
+        return 0
+      fi
       systemctl restart "$XBD_U_XRAY"
       sleep 3
       unit_active "$XBD_U_XRAY" && ok "$XBD_U_XRAY 已重启" || { bad "Xray 重启失败"; journalctl -u "$XBD_U_XRAY" -n 12 --no-pager; return 1; }
@@ -2456,7 +2537,7 @@ cmd_xray() {
         info "已同步重启 Chromium（Xray 重启会换 CSRF token）"
       fi
       ;;
-    -h|--help|"") info "用法: xbd xray <version|check|update>" ;;
+    -h|--help|"") info "用法: xbd xray <version|check|update|install-local|dir>" ;;
     *) die "未知操作: $op" ;;
   esac
 }
@@ -2672,6 +2753,8 @@ Xray Client Web Manager v$XBD_VERSION
     install [--no-start] [--vless <uri>]   安装（幂等）
     update                                 更新本项目脚本
     xray version|check|update              查看/检查/更新 Xray 内核
+    xray install-local                     用上传到 kernels/ 的内核离线安装
+    xray dir                               显示 / 打开内核上传目录
     uninstall                              安全卸载（先列清单）
 
   节点（共享资产；是否需要浏览器拨号由服务器按节点自动决定）
