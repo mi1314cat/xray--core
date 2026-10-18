@@ -30,11 +30,10 @@ print_ok()    { printf "${GREEN}[OK]${RESET}  %s\n" "$1" >&2; }
 print_warn()  { printf "${YELLOW}[Warn]${RESET} %s\n" "$1" >&2; }
 print_error() { printf "${RED}[Error]${RESET} %s\n" "$1" >&2; }
 print_title() {
-    printf "${MAGENTA}${BOLD}" >&2
-    printf "╔══════════════════════════════════════════════╗\n" >&2
-    printf "║ %-42s ║\n" "$1" >&2
-    printf "╚══════════════════════════════════════════════╝\n" >&2
-    printf "${RESET}" >&2
+    # 原来的 %-42s 按字节算宽度，中文标题会把右边框顶歪；
+    # 改成"标题 + 分隔线"，不再需要手算宽度。
+    printf '%b\n' "${MAGENTA}${BOLD}  ${1}${RESET}" >&2
+    printf '%b\n' "${MAGENTA}  ──────────────────────────────────────────${RESET}" >&2
 }
 clean_input() { echo "$1" | tr -d '\000-\037'; }
 
