@@ -460,6 +460,91 @@ _bt_server_name() {
     printf '%s' "$n"
 }
 
+# 自动探测 TLS 节点的域名：优先从现有 X 片段的证书/证书路径推断，
+# 其次 /root/catmi/certs 的证书文件名，最后 nginx server_name。
+# 全协议里的 xHTTP/CDN 与分离组合都需要一个域名，而直接跑菜单时
+# 环境变量 X_BATCH_DOMAIN 往往是空的 —— 不探测就会静默跳过这些形态。
+_bt_domain_from_conf() {
+    python3 - "$CONF_DIR" <<'PY' 2>/dev/null
+import glob, json, os, re, sys
+conf = sys.argv[1]
+doms = []
+for f in glob.glob(os.path.join(conf, "*.json")):
+    try:
+        j = json.load(open(f, encoding="utf-8"))
+    except Exception:
+        continue
+    for ib in (j.get("inbounds") or []):
+        ss = ib.get("streamSettings") or {}
+        if ss.get("security") != "tls":
+            continue
+        tls = ss.get("tlsSettings") or {}
+        sn = (tls.get("serverName") or "").strip()
+        if sn and "." in sn:
+            doms.append(sn)
+        for c in (tls.get("certificates") or []):
+            p = c.get("certificateFile") or ""
+            b = os.path.basename(p)
+            b = re.sub(r"\.(crt|pem|cer)$", "", b)
+            b = re.sub(r"(_cert|^cert-|_key)$", "", b)
+            if "." in b and not re.fullmatch(r"[0-9.]+", b):
+                doms.append(b)
+for d in doms:
+    print(d)
+PY
+}
+
+_bt_detect_domain() {
+    local d=""
+    d=$(_bt_domain_from_conf | head -1)
+    [[ -n "$d" ]] && { printf '%s' "$d"; return; }
+    local f b
+    for f in /root/catmi/certs/*_cert.pem /root/catmi/certs/*.crt "$XRAY_BASE"/certs/*_cert.pem; do
+        [[ -f "$f" ]] || continue
+        b=$(basename "$f")
+        b=$(printf '%s' "$b" | sed -E 's/\.(crt|pem|cer)$//; s/(_cert|_key)$//')
+        if [[ "$b" == *.* && ! "$b" =~ ^[0-9.]+$ ]]; then printf '%s' "$b"; return; fi
+    done
+    d=$(grep -rhoE '^[[:space:]]*server_name[[:space:]]+[^;]+;' /etc/nginx /home/web/conf.d 2>/dev/null \
+        | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/;[[:space:]]*$//' \
+        | tr ' ' '\n' | grep -vE '^(_|localhost|example\.com)$' | grep -E '\.' | head -1)
+    [[ -n "$d" ]] && printf '%s' "$d"
+}
+
+# 当前配置里是否已经有某种形态？用于给"全协议"扩展项做幂等，
+# 避免每跑一次就多出一组 xHTTP/CDN 节点。
+_bt_has_form() { # <proto> <transport> <security>
+    python3 - "$CONF_DIR" "$1" "$2" "$3" <<'PY' 2>/dev/null
+import glob, json, os, sys
+conf, proto, tr, sec = sys.argv[1:5]
+for f in glob.glob(os.path.join(conf, "*.json")):
+    try:
+        j = json.load(open(f, encoding="utf-8"))
+    except Exception:
+        continue
+    for ib in (j.get("inbounds") or []):
+        if str(ib.get("protocol") or "") != proto:
+            continue
+        ss = ib.get("streamSettings") or {}
+        if str(ss.get("network") or "") != tr:
+            continue
+        got = str(ss.get("security") or "")
+        # CDN 档的源站在 nginx 后面，片段里写的 security 是 none（TLS 由 nginx 终结）；
+        # 直连档才是 tls。两种都算"已经有 xHTTP+TLS 形态"。
+        if sec == "tls":
+            if got not in ("tls", "none"):
+                continue
+        elif got != sec:
+            continue
+        # 分离节点有 downloadSettings；全协议扩展项要的是"普通"那条
+        xs = ss.get("xhttpSettings") or {}
+        if xs.get("downloadSettings"):
+            continue
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 # ★ 一律问, 回车即默认 (对齐 SB 的 sb_ask_server_name)。
 #
 #   原来这里只在 batch.sh 自己问一次, 而命名权威在 conf/lib/naming.py ——
@@ -560,6 +645,15 @@ batch_main() {
     #   那条订阅就只包含"当时有元数据"的几个节点 —— 实测 9 个节点里只进了 5 个,
     #   而屏幕上一切正常。
     #   对外地址: 域名优先 (CDN/nginx 档连的是域名), 否则本机公网地址。
+    if [[ -z "${X_BATCH_DOMAIN:-}" && -z "${X_BATCH_DOMAIN_BASE:-}" ]]; then
+        local _auto_dom; _auto_dom=$(_bt_detect_domain)
+        if [[ -n "$_auto_dom" ]]; then
+            export X_BATCH_DOMAIN="$_auto_dom"
+            print_info "  自动识别域名: ${X_BATCH_DOMAIN} (xHTTP/CDN 与分离组合要用)"
+        else
+            print_warn "  没有识别到域名 —— xHTTP/CDN 节点会被跳过 (分离组合里的 REALITY 仍可生成)"
+        fi
+    fi
     local _pubdom="${X_BATCH_DOMAIN:-${X_BATCH_DOMAIN_BASE:-}}"
     local _pubip
     _pubip=$(awk -F'"' '/^(link_ip|PUBLIC_IP)=/{print $2; exit}' \
@@ -665,7 +759,22 @@ batch_main() {
         #   而一个 inbound 只有一个安全层。所以上下行必须同一个安全层。
         #   详见 conf/lib/preset.sh 的 x_split_ok / x_split_why。
         local -a _split_specs=() _split_skip=() _split_why=()
+        local -a _preset_specs=()
         local _sp _si
+
+        # ---- xHTTP 扩展形态: 普通 CDN 节点 + REALITY+XHTTP ----
+        if [[ "${X_BATCH_XHTTP:-1}" == "1" ]]; then
+            if ! _bt_has_form vless xhttp tls; then
+                if [[ -n "${X_BATCH_DOMAIN:-}" ]]; then
+                    _preset_specs+=("vless:4")     # XHTTP + TLS（CDN 首选）
+                else
+                    print_warn "  没有域名，跳过 xHTTP+TLS（CDN）节点"
+                fi
+            fi
+            if ! _bt_has_form vless xhttp reality; then
+                _preset_specs+=("vless:6")         # REALITY + XHTTP
+            fi
+        fi
         for _sp in $(x_split_modes); do
             if [ "$(x_split_ok "$_sp")" != "yes" ]; then
                 _split_skip+=("$_sp"); _split_why+=("$(x_split_why "$_sp")")
@@ -681,29 +790,30 @@ batch_main() {
         for _si in "${!_split_skip[@]}"; do
             print_info "  ${_split_skip[$_si]} 不生成: ${_split_why[$_si]}"
         done
+        _preset_specs+=("${_split_specs[@]}")
 
-        if [[ ${#_split_specs[@]} -gt 0 ]]; then
+        if [[ ${#_preset_specs[@]} -gt 0 ]]; then
             echo >&2
-            print_title "xHTTP 上下行分离 (${#_split_specs[@]} 个组合)"
+            print_title "xHTTP/CDN + 上下行分离 (${#_preset_specs[@]} 项)"
             print_info "  域名: ${X_BATCH_DOMAIN:-未设置}${X_BATCH_DL_DOMAIN:+ / 下行 ${X_BATCH_DL_DOMAIN}}"
             print_info "  直连下行地址: ${X_BATCH_DL_ADDRESS:-未设置}"
-            printf "${CYAN}• %-12s${RESET} %s\n" "xhttp-split" "${_split_specs[*]}" >&2
+            printf "${CYAN}• %-12s${RESET} %s\n" "presets" "${_preset_specs[*]}" >&2
             X_BATCH_NO_RELOAD=1 X_NO_RELOAD=1 \
                 timeout "$BATCH_PROTO_TIMEOUT" bash "$SCRIPT_DIR/../tools/preset_batch.sh" \
-                    "${_split_specs[@]}" </dev/null \
+                    "${_preset_specs[@]}" </dev/null \
                     >"$LOG_DIR/x-batch-split.log" 2>&1
             local src=$?
             sed 's/^/    /' "$LOG_DIR/x-batch-split.log" >&2 || true
             if [[ $src -eq 0 ]]; then
                 # 只报这次**真的**建了几个 —— 打"三个"而实际一个, 比不打更坏
                 if [[ ${#_split_skip[@]} -gt 0 ]]; then
-                    printf "${GREEN}[OK]${RESET} 已生成 %d 个组合 (未生成: %s)\n" \
-                        "${#_split_specs[@]}" "${_split_skip[*]}" >&2
+                    printf "${GREEN}[OK]${RESET} 已生成 %d 项 (未生成: %s)\n" \
+                        "${#_preset_specs[@]}" "${_split_skip[*]}" >&2
                     for _si in "${!_split_skip[@]}"; do
                         print_info "    ${_split_skip[$_si]}: ${_split_why[$_si]}"
                     done
                 else
-                    printf "${GREEN}[OK]${RESET} 已生成 %d 个组合\n" "${#_split_specs[@]}" >&2
+                    printf "${GREEN}[OK]${RESET} 已生成 %d 项\n" "${#_preset_specs[@]}" >&2
                 fi
                 BATCH_OK+=("xhttp-split")
             else
@@ -1066,6 +1176,7 @@ main() {
     while true; do
         print_title "全协议一键生成 (Batch Generator)"
         echo -e "${CYAN}协议:${RESET} Reality / Trojan / SS2022 / Hysteria2"
+        echo -e "${CYAN}扩展:${RESET} xHTTP（TLS/CDN、REALITY）+ 上下行分离组合"
         echo -e "${CYAN}1)${RESET} 全协议生成      ${DIM}逐项确认 (服务器标识 + 端口范围)${RESET}"
         echo -e "${CYAN}2)${RESET} 全协议快速生成  ${DIM}只问端口范围${RESET} ${DIM}← 回车默认${RESET}"
         echo -e "${CYAN}3)${RESET} 全协议重建      ${YELLOW}强制覆盖已有节点 (端口/UUID 会换新)${RESET}"
@@ -1078,7 +1189,9 @@ main() {
         #   手还在回车上, 先看见的是一句报错 —— 脚本没坏, 但观感上跟坏了没区别。
         #   这里让回车 = 推荐动作 (2 快速生成), 并且**在提示里写明**,
         #   免得用户以为脚本自己动了。
-        read -r -p "  ${CYAN}请输入选项 [0-4, 回车=${BATCH_DEF}]:${RESET} " c || { echo; exit 0; }
+        local _cp
+        printf -v _cp '%b' "  ${CYAN}请输入选项 [0-4, 回车=${BATCH_DEF}]:${RESET} "
+        read -r -p "$_cp" c || { echo; exit 0; }
         c=$(clean_input "$c")
         c="${c:-$BATCH_DEF}"
         case "$c" in
