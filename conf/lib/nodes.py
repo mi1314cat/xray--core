@@ -416,8 +416,15 @@ def client_security(n, meta=None):
 
     cdn 档不一样: 客户端直连源站端口, 片段里写什么就是什么 (tls / reality / none)。
     """
+    meta = meta or {}
+    # ★ 上行 REALITY 前置 (#4118): 片段里的 security 是 xhttp 入站的 none,
+    #   而客户端上行必须先和前置做 REALITY 握手。这里以前按 tier=nginx
+    #   返回 tls —— 生成的链接是"明文 TLS 打 REALITY 端口", 客户端 000,
+    #   服务端日志里什么都没有。判据在元数据里 (front_uplink), 不在片段里。
+    if meta.get("front_uplink"):
+        return "reality"
     sec = str(n.get("security") or "none").lower()
-    tier = str((meta or {}).get("tier") or "").strip().lower()
+    tier = str(meta.get("tier") or "").strip().lower()
     if tier == "nginx" and sec == "none":
         return "tls"
     return sec
@@ -781,8 +788,13 @@ def xhttp_extra(n, meta=None):
         else:
             dl["tlsSettings"] = {"serverName": sni}
         dl["xhttpSettings"] = {
-            "path": n.get("dl_path") or n.get("path") or "/",
-            "mode": n.get("dl_mode") or n.get("mode") or "auto",
+            # 服务端片段按官方口径不再写 mode (同时接受三种), 所以下行模式
+            # 只在元数据里 —— 不取 meta 就会退回 "auto", 而 auto 在 REALITY
+            # 下是 stream-one (合流), 分享出去就"看起来分离、实际没分离"。
+            "path": n.get("dl_path") or meta.get("dl_path")
+                    or n.get("path") or "/",
+            "mode": n.get("dl_mode") or meta.get("dl_mode")
+                    or n.get("mode") or "auto",
         }
         extra["downloadSettings"] = dl
     return extra
@@ -842,23 +854,26 @@ def build_share_link(n, meta=None, notes=None):
         # "security=reality 但缺少 pbk" 而静默丢弃该节点 (compat.py),
         # 表现是"分享了 4 个节点客户端只收到 3 个"且没有任何报错。
         # 生成一条连不上的链接比不生成更糟 —— 用户会以为已经分享成功了。
-        if n.get("security") == "reality" and not meta.get("public_key"):
+        if client_security(n, meta) == "reality" and not meta.get("public_key"):
             if notes is not None:
                 notes.append(f"{n.get('tag') or '?'}: 未发布 —— REALITY 缺公钥(pbk), "
                              "客户端会静默丢弃这条链接")
             return None
+        _sec = client_security(n, meta)
         q = {
             "encryption": meta.get("encryption", "none"),
-            "security": client_security(n, meta),
+            "security": _sec,
             "type": n.get("network") or "tcp",
         }
         if n.get("flow"):
             q["flow"] = n["flow"]
-        if n.get("security") == "reality":
+        if _sec == "reality":
             # REALITY 的 SNI 仍然只来自 serverNames (握手伪装的目标站点) ——
             # 这一条不动。只拦"serverNames 里被填成 IP"这种病态配置:
             # 那不是域名, 客户端拿它做 SNI 必然对不上。
-            sni = reality_sni(n)
+            # ★ 前置节点的片段 (xhttp, security=none) 里没有 serverNames,
+            #   真正的 serverName 在前置入站里, 由元数据带过来 (sni)。
+            sni = reality_sni(n) or str(meta.get("sni") or "").strip()
             if sni:
                 q["sni"] = sni
             q["fp"] = meta.get("fingerprint", "chrome")
@@ -867,7 +882,7 @@ def build_share_link(n, meta=None, notes=None):
             if meta.get("public_key"):
                 q["pbk"] = meta["public_key"]
             q["spx"] = meta.get("spx", "")
-        elif n.get("security") == "tls":
+        elif _sec == "tls":
             # ★ 这里以前是 `if n.get("sni")`, 而 n["sni"] 只从 REALITY 的
             #   serverNames 取 —— 于是 TLS 节点的链接**永远没有 sni=**。
             sni = link_sni(n, meta)
@@ -918,8 +933,9 @@ def build_share_link(n, meta=None, notes=None):
             if notes is not None:
                 notes.append(f"{n.get('tag') or '?'}: 未发布 —— REALITY 缺公钥(pbk)")
             return None
-        q = {"security": client_security(n, meta), "type": n.get("network") or "tcp"}
-        if n.get("security") == "reality":
+        _sec = client_security(n, meta)
+        q = {"security": _sec, "type": n.get("network") or "tcp"}
+        if _sec == "reality":
             sni = reality_sni(n)
             if sni:
                 q["sni"] = sni
@@ -928,7 +944,7 @@ def build_share_link(n, meta=None, notes=None):
                 q["sid"] = meta["short_id"]
             if meta.get("public_key"):
                 q["pbk"] = meta["public_key"]
-        elif n.get("security") == "tls":
+        elif _sec == "tls":
             sni = link_sni(n, meta)
             if sni:
                 q["sni"] = sni
