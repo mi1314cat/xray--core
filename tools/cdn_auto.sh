@@ -300,7 +300,14 @@ cd_batch_take_port() {
     local s="${X_BATCH_PORT_START:-20000}" e="${X_BATCH_PORT_END:-50000}"
     mkdir -p "$XRAY_BASE" 2>/dev/null || true
     local n=$s
-    [[ -s "$used" ]] && n=$(( $(tail -1 "$used" 2>/dev/null || echo 0) + 1 ))
+    # X_BATCH_RESET_PORTS=1: 全协议本次显式给了端口范围，从范围起点重新领，
+    # 不被上一次批次留下的 .batch-used 游标带跑（实测：请求 36600-36800，
+    # 实际从 25430 开始，用户完全看不出来）。
+    if [[ "${X_BATCH_RESET_PORTS:-0}" == "1" ]]; then
+        : >"$used" 2>/dev/null || true
+    else
+        [[ -s "$used" ]] && n=$(( $(tail -1 "$used" 2>/dev/null || echo 0) + 1 ))
+    fi
     while (( n <= e )); do
         if ! ss -tuln 2>/dev/null | grep -qE "[:.]$n\$" \
            && ! x_port_taken "$n" 2>/dev/null \

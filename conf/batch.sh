@@ -797,7 +797,9 @@ batch_main() {
         if [[ "${X_BATCH_XHTTP:-1}" == "1" ]]; then
             if ! _bt_has_form vless xhttp tls; then
                 if [[ -n "${X_BATCH_DOMAIN:-}" ]]; then
-                    _preset_specs+=("vless:4")     # XHTTP + TLS（CDN 首选）
+                    # 走 nginx 档：源站只监听 127.0.0.1，TLS 由 nginx 终结，
+                    # deploy 会自动分配唯一 path，避免 location / 冲突。
+                    _preset_specs+=("vless:4:nginx")
                 else
                     print_warn "  没有域名，跳过 xHTTP+TLS（CDN）节点"
                 fi
@@ -840,6 +842,8 @@ batch_main() {
             print_info "  直连下行地址: ${X_BATCH_DL_ADDRESS:-未设置}"
             printf "${CYAN}• %-12s${RESET} %s\n" "presets" "${_preset_specs[*]}" >&2
             X_BATCH_NO_RELOAD=1 X_NO_RELOAD=1 \
+            X_BATCH_PORT_START="${X_BATCH_PORT_START:-}" X_BATCH_PORT_END="${X_BATCH_PORT_END:-}" \
+            X_BATCH_RESET_PORTS=1 \
                 timeout "$BATCH_PROTO_TIMEOUT" bash "$TOOLS_DIR/preset_batch.sh" \
                     "${_preset_specs[@]}" </dev/null \
                     >"$LOG_DIR/x-batch-split.log" 2>&1
