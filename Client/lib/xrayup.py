@@ -86,7 +86,12 @@ def pick_proxy() -> str:
 
 
 def fetch(url: str, proxy: str = "", timeout: int = 120) -> bytes:
-    args = ["curl", "-fsSL", "--max-time", str(timeout)]
+    # --connect-timeout / --speed-time：GitHub 有时 TCP 能连上但完全不发数据，
+    # 只给 --max-time 会让安装卡满 5 分钟。连接 10s、30s 内低于 1KB/s 就放弃，
+    # 交给下一个候选（尤其是镜像/代理）。
+    args = ["curl", "-fsSL", "--connect-timeout", "10",
+            "--speed-limit", "1024", "--speed-time", "30",
+            "--max-time", str(timeout)]
     if proxy:
         args += ["-x", proxy]
     args.append(url)
@@ -303,15 +308,16 @@ def cmd_update(as_json=False, force=False) -> int:
             return 0
 
     # 直连优先；不通再用本机代理（本项目 HTTP 代理优先，其次 mihomo）
-    if not reachable("api.github.com", 443, 5):
-        if not proxy:
-            print(json.dumps({"ok": False, "error": "无法访问 GitHub 且无本机代理"},
-                             ensure_ascii=False) if as_json else
-                  "  ✗ 无法访问 GitHub，且本机没有可用代理（先 xbd proxy on）")
-            return 1
+    direct = reachable("api.github.com", 443, 5)
+    if not direct and not proxy:
+        print(json.dumps({"ok": False, "error": "无法访问 GitHub 且无本机代理"},
+                         ensure_ascii=False) if as_json else
+              "  ✗ 无法访问 GitHub，且本机没有可用代理（先 xbd proxy on）")
+        return 1
+    if not direct and proxy:
         print(f"  直连不通，改用代理 {proxy}" if not as_json else "", end="" if not as_json else "\n")
 
-    latest = latest_version(proxy)
+    latest = latest_version(proxy if not direct else "")
     if not latest:
         # GitHub API 不通不代表 release 文件不可达：用 /releases/latest/download/
         # 直链 + 镜像继续试，版本号装完由 xray version 读出来。
@@ -338,21 +344,29 @@ def cmd_update(as_json=False, force=False) -> int:
     else:
         pathpart = f"releases/latest/download/Xray-linux-{asset}.zip"
 
-    # 直连优先，再试两个 GitHub 镜像（镜像同样支持 /releases/latest/download/）
-    urls = [
-        f"https://github.com/{REPO}/{pathpart}",
+    # 候选顺序：能直连时 GitHub 官方优先；不能直连时**镜像直连优先**，
+    # 最后才走代理。代理链（尤其家宽→VPS）常能连上但吞吐很差，先试代理
+    # 的 GitHub 官方会白白卡几十秒 —— 实测踩过。
+    github = f"https://github.com/{REPO}/{pathpart}"
+    mirrors = [
         f"https://ghproxy.net/https://github.com/{REPO}/{pathpart}",
         f"https://gh-proxy.com/https://github.com/{REPO}/{pathpart}",
     ]
+    order = [github] + mirrors if direct else mirrors + [github]
+    cands = [(u, "") for u in order]
+    if proxy:
+        cands += [(u, proxy) for u in order]
     tmp = tempfile.mkdtemp(prefix="xbd-upd-")
     try:
         blob = b""
         base = ""
-        for u in urls:
-            print(f"  尝试: {u.split('/')[2]}", file=sys.stderr)
-            blob = fetch(u, proxy, 300)
+        used_proxy = ""
+        for u, px in cands:
+            print(f"  尝试: {u.split('/')[2]}{'（代理）' if px else ''}", file=sys.stderr)
+            blob = fetch(u, px, 180)
             if blob:
                 base = u
+                used_proxy = px
                 break
         if not blob:
             msg = "下载失败（直连与镜像都不通）"
@@ -360,7 +374,7 @@ def cmd_update(as_json=False, force=False) -> int:
             return 1
 
         # 校验：官方 .dgst 里的 SHA2-256（取不到就记未验证）
-        dgst = fetch(base + ".dgst", proxy, 60).decode("utf-8", "replace")
+        dgst = fetch(base + ".dgst", used_proxy or proxy, 60).decode("utf-8", "replace")
         want = ""
         for line in dgst.splitlines():
             if "SHA2-256" in line:
