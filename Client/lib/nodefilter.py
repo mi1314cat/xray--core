@@ -12,6 +12,7 @@
     nodefilter.py <解析出的节点数组.json> <lib目录> <是否保留不支持:0|1> <nodes目录>
 输出:
     stdout  = 每行一个 JSON（要导入的节点）
+    /tmp/.xbd_updated.json = [[名字, 已有文件路径], ...] 参数变化、已原地更新
     /tmp/.xbd_skipped.json = [[名字, 原因, 已有节点路径(可能为空)], ...] 供调用方处理
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ import os
 import sys
 
 SKIPPED_PATH = "/tmp/.xbd_skipped.json"
+UPDATED_PATH = "/tmp/.xbd_updated.json"
 
 
 def load_compat(libdir: str):
@@ -29,6 +31,23 @@ def load_compat(libdir: str):
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+def sig(n: dict) -> str:
+    """连接参数签名：用来判"同一个节点，参数是否变了"。
+
+    ident() 只回答"是不是同一个节点"（协议/地址/端口/凭据/传输）；
+    但同一个节点的 path、security、sni、REALITY 公钥、mode、下行设置
+    都可能变 —— 2026-10-17 前置 REALITY 修复后，服务端把 security 从
+    tls 改成 reality，客户端按 ident 判重直接跳过，旧节点永远不更新，
+    表现是"订阅刷新成功、节点还是连不上"。签名把这些字段都算进来。
+
+    刻意排除：source（来源文件名，会变）、pinned_cert_sha256（本机探针）、
+    raw/raw_params（原始链接文本，等价信息已在结构化字段里）。
+    """
+    skip = {"source", "pinned_cert_sha256", "raw", "raw_params"}
+    return json.dumps({k: v for k, v in n.items() if k not in skip},
+                      ensure_ascii=False, sort_keys=True, default=str)
 
 
 def ident(n: dict) -> str:
@@ -63,6 +82,7 @@ def main(argv) -> int:
                 pass          # 坏文件不该阻断整批导入
 
     skipped = []
+    updated = []
     try:
         incoming = json.load(open(src, encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -88,18 +108,43 @@ def main(argv) -> int:
             continue
         k = ident(n)
         if k in seen:
+            path = seen_path.get(k, "")
+            # ---- 同一个节点、参数变了 → 原地**更新**，不能只报"重复" ----
+            # 不更新的话，服务端改了 path/security/密钥之后，客户端永远
+            # 拿着旧参数（实测：前置 REALITY 节点修好后，刷新订阅仍然连不上）。
+            old = None
+            if path:
+                try:
+                    old = json.load(open(path, encoding="utf-8"))
+                except Exception:
+                    old = None
+            if old is not None and sig(old) != sig(n):
+                merged = {**old, **n}
+                try:
+                    tmp = path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as fh:
+                        json.dump(merged, fh, ensure_ascii=False, indent=1)
+                    os.replace(tmp, path)
+                    updated.append((n.get("name"), path))
+                    continue
+                except OSError:
+                    pass          # 写不进去就走"重复"分支，别让导入整个失败
             # 第三条是『已有那份』的路径：重复导入时调用方要用它去补/修指纹。
             # 为什么必须给路径：实测用户重新导入一次以为能修好，但去重直接跳过，
             # 那份没指纹的坏节点根本没人碰，于是『再次导入还是不行』。
             skipped.append((n.get("name"),
                             "与已有节点或本批前面的条目重复（同协议/地址/端口/凭据）",
-                            seen_path.get(k, "")))
+                            path))
             continue
         seen.add(k)
         print(json.dumps(n, ensure_ascii=False))
 
     try:
         json.dump(skipped, open(SKIPPED_PATH, "w", encoding="utf-8"), ensure_ascii=False)
+    except OSError:
+        pass
+    try:
+        json.dump(updated, open(UPDATED_PATH, "w", encoding="utf-8"), ensure_ascii=False)
     except OSError:
         pass
     return 0

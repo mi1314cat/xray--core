@@ -371,6 +371,8 @@ cmd_node_add() {
     cmd_node_import_file /tmp/.xbd_one.json && count=$((count+1))
   done < /tmp/.xbd_kept.jsonl
 
+  _xbd_updated_report
+
   # 汇总跳过项
   local nskip
   nskip=$(python3 -c 'import json;print(len(json.load(open("/tmp/.xbd_skipped.json"))))' 2>/dev/null || echo 0)
@@ -405,7 +407,7 @@ if dup:
     fi
     info "  （想保留这些节点存档：加 --keep-unsupported）"
   fi
-  rm -f /tmp/.xbd_kept.jsonl /tmp/.xbd_skipped.json /tmp/.xbd_skipped.txt
+  rm -f /tmp/.xbd_kept.jsonl /tmp/.xbd_skipped.json /tmp/.xbd_skipped.txt /tmp/.xbd_updated.json
 
   rm -f "$tmp" /tmp/.xbd_one.json /tmp/.xbd_multi_err
   # 修好已有节点也算成功：用户"重新导入"的意图就是让它能用，
@@ -860,11 +862,15 @@ PY
     bound=$(python3 "$XBD_LIBDIR/subs.py" bind-latest "$XBD_PREFIX" "$gid" \
             $(cat "$before" 2>/dev/null | tr '\n' ' ') 2>/dev/null \
             | python3 -c 'import json,sys;print((json.load(sys.stdin) or {}).get("stamped",0))' 2>/dev/null)
-    local _sk=$((n - c))
+    _xbd_updated_report
+    local _upd; _upd=$(_xbd_updated_count)
+    local _sk=$((n - c - ${_upd:-0}))
     ok "新增 $c 个节点，归入分组「${gname:-$sub_name}」(${bound:-0} 个)"
     [ "$_sk" -gt 0 ] && info "  其余 $_sk 个已存在或内核不支持，未重复导入（订阅共 $n 个）"
   else
-    local _sk=$((n - c))
+    _xbd_updated_report
+    local _upd; _upd=$(_xbd_updated_count)
+    local _sk=$((n - c - ${_upd:-0}))
     ok "新增 $c 个节点"
     [ "$_sk" -gt 0 ] && info "  其余 $_sk 个已存在或内核不支持，未重复导入（订阅共 $n 个）"
   fi
@@ -877,6 +883,23 @@ PY
   # transport, 与已落盘节点比对。
   _sub_filter() {   # $1=解析结果文件  $2=保留不支持项(0/1)
     python3 "$XBD_LIBDIR/nodefilter.py" "$1" "$XBD_LIBDIR" "$2" "$XBD_NODES"
+  }
+
+  # nodefilter 会把"同一节点、参数变了"的条目原地更新，并记在 .xbd_updated.json。
+  # 两条导入路径（粘贴 / 订阅）都要把它报出来 —— 否则用户只看到"新增 0"，
+  # 以为没生效，其实节点已经更新成新参数了。
+  _xbd_updated_count() {
+    python3 -c 'import json;print(len(json.load(open("/tmp/.xbd_updated.json"))))' 2>/dev/null || echo 0
+  }
+  _xbd_updated_report() {
+    local k; k=$(_xbd_updated_count)
+    [ "${k:-0}" -gt 0 ] || return 0
+    ok "已更新 $k 个节点（连接参数有变化，原地覆盖）"
+    python3 -c '
+import json
+for rec in json.load(open("/tmp/.xbd_updated.json"))[:5]:
+    print("    · %s" % str(rec[0])[:56])
+' 2>/dev/null || true
   }
 
   # 刷新订阅: 拉取 → 去重 → 增量落盘。

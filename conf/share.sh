@@ -390,10 +390,17 @@ share_create() {
     #   (电脑、手机、路由器各拉一次), 1 次就废等于没建。
     #   所以自动订阅用 0 次 (不限) / 永久, 并把这句写在屏幕上让用户知道。
     if [[ "${SHARE_AUTO:-0}" == "1" ]]; then
-        name="全协议订阅"
-        max_uses=0
-        ttl_hours=0
-        printf '  %s自动订阅: 不限次数 / 永久有效 (批量建节点后自动生成)%s\n' "$_DIM" "$_RST" >&2
+        name="${SHARE_AUTO_NAME:-全协议订阅}"
+        # 自动模式默认仍是"不限次数 / 永久"（订阅要反复拉取）；
+        # 需要一次性链接时用环境变量显式指定，例如总链接:
+        #   SHARE_AUTO=1 SHARE_AUTO_MAX_USES=1 SHARE_AUTO_TTL_HOURS=0
+        max_uses="${SHARE_AUTO_MAX_USES:-0}"
+        ttl_hours="${SHARE_AUTO_TTL_HOURS:-0}"
+        [[ "$max_uses" =~ ^[0-9]+$ ]] || max_uses=0
+        [[ "$ttl_hours" =~ ^[0-9]+$ ]] || ttl_hours=0
+        printf '  %s自动订阅: %s 次 / %s (批量建节点后自动生成)%s\n' "$_DIM" \
+            "$([[ "$max_uses" -eq 0 ]] && echo 不限 || echo "$max_uses")" \
+            "$([[ "$ttl_hours" -eq 0 ]] && echo 永久 || echo "${ttl_hours} 小时")" "$_RST" >&2
     else
     name=$(ui_ask "分享名称" "分享")
 
@@ -1293,6 +1300,89 @@ share_pick_token() { # <动作名>
 }
 
 # ---------------------------------------------------------------- 菜单
+# ---------------------------------------------------------------- 清理失效分享
+# 过期 / 用尽 / 停用 / 引用的节点已经全部删掉的记录 —— 留着只会让"分享列表"
+# 越滚越长 (真机实测 19+ 条叫「全协议订阅」的历史记录, 7 条指向已删节点)。
+# 默认只列不删, 加 --apply 才真删; 永远不动仍然有效的记录。
+share_clean() {
+    local apply=0
+    case "${1:-}" in --apply|-y) apply=1 ;; esac
+    local client; client=$(_x_ensure_client) || { warn "找不到 share_client.py, 跳过清理"; return 1; }
+    local recs
+    recs=$(SHARE_PROVIDER=xray python "$client" list 2>/dev/null) || { warn "读取分享列表失败"; return 1; }
+    [[ -n "$recs" ]] || { info "分享列表是空的"; return 0; }
+    local dead
+    dead=$(RECS="$recs" CONF="$CONF_DIR" python3 - <<'PYX' 2>/dev/null
+import json, os, time
+try:
+    recs = json.loads(os.environ["RECS"])
+except Exception:
+    raise SystemExit(0)
+cur = set()
+d = os.environ["CONF"]
+for f in os.listdir(d):
+    if not f.endswith(".json"):
+        continue
+    try:
+        j = json.load(open(os.path.join(d, f), encoding="utf-8"))
+    except Exception:
+        continue
+    for ib in (j.get("inbounds") or []):
+        t = str(ib.get("tag") or "")
+        if t and not t.endswith("-front"):
+            cur.add(t)
+now = time.time()
+for r in (recs if isinstance(recs, list) else []):
+    tok = r.get("token") or ""
+    if not tok:
+        continue
+    meta = r.get("meta") or {}
+    tags = meta.get("tags") or []
+    reason = ""
+    if not r.get("enabled", True) or r.get("state", "active") != "active":
+        reason = "停用/撤销"
+    else:
+        exp = int(r.get("expires_at") or 0)
+        mu = int(r.get("max_uses") or 0)
+        uc = int(r.get("used_count") or 0)
+        if exp and exp < now:
+            reason = "已过期"
+        elif mu and uc >= mu:
+            reason = "已用尽"
+        elif tags and not (set(tags) & cur):
+            reason = "引用的节点已全部删除"
+    if reason:
+        name = (meta.get("name") or "")[:28]
+        print("%s\t%s\t%s" % (tok, reason, name))
+PYX
+)
+    if [[ -z "$dead" ]]; then
+        ok "没有失效的分享记录，不需要清理"
+        return 0
+    fi
+    local n; n=$(printf '%s\n' "$dead" | wc -l)
+    warn "发现 $n 条失效分享："
+    local tok reason name
+    while IFS=$'\t' read -r tok reason name; do
+        [[ -n "$tok" ]] || continue
+        printf '    · %s…  %-22s %s\n' "${tok:0:12}" "$reason" "$name"
+    done <<<"$dead"
+    if (( ! apply )); then
+        info "  只列出，不删除。确认后执行: bash conf/share.sh clean --apply"
+        return 0
+    fi
+    local okc=0 badc=0
+    while IFS=$'\t' read -r tok reason name; do
+        [[ -n "$tok" ]] || continue
+        if _x_share_api delete --token "$tok" >/dev/null 2>&1; then
+            okc=$((okc+1))
+        else
+            badc=$((badc+1)); warn "删除失败: ${tok:0:12}…"
+        fi
+    done <<<"$dead"
+    ok "清理完成: 删除 $okc 条, 失败 $badc 条"
+}
+
 share_menu() {
     while :; do
         printf '\n' >&2
@@ -1313,9 +1403,10 @@ share_menu() {
         ui_menu 9 "重新生成 Token  换一条新地址, 旧的立即作废"
         ui_menu 10 "删除分享链接"
         ui_menu 11 "分享服务管理    公共基础服务：安装 / 升级 / 统计 / 防火墙"
+        ui_menu 12 "清理失效分享    过期/用尽/节点已删的记录 (默认只看)"
         ui_menu 0 "返回"
         echo >&2
-        if ! read -r -p "  ${_CYN}请选择 [0-11, 回车=返回]${_RST}: " c; then return 0; fi
+        if ! read -r -p "  ${_CYN}请选择 [0-12, 回车=返回]${_RST}: " c; then return 0; fi
         case "$c" in
             1) share_create ;;
             2) share_create_all ;;
@@ -1367,6 +1458,11 @@ share_menu() {
                 fi
                 ;;
             11) share_service_menu ;;
+            12)
+                printf '  %s直接删除? [y/N]: %s' "${_DIM:-}" "${_RST:-}" >&2
+                read -r a || true
+                if [[ "$a" == "y" || "$a" == "Y" ]]; then share_clean --apply; else share_clean; fi
+                ui_pause ;;
             0|"") return 0 ;;
             *) warn "无效选择"; ui_pause ;;
         esac
@@ -1621,7 +1717,7 @@ PYEOF
 # ---------------------------------------------------------------- 直跑
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-menu}" in
-        create)  share_create ;;
+        create)  shift; share_create "${1:-pick}" ;;
         list)    share_list ;;
         refresh) share_refresh_all ;;
         ensure-subscription) share_ensure_subscription ;;
@@ -1630,9 +1726,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         switch-family-menu) x_switch_addr_family_menu ;;
         change-fp)          share_change_fp ;;
         rebuild-products)   x_rebuild_products ;;
+        clean)              share_clean "${2:-}" ;;
         retag)   share_retag "${2:-}" "${3:-}" ;;
         affected) share_affected "${2:-}" ;;
         menu)    share_menu ;;
-        *) die "用法: share.sh [menu|create|list|refresh|migrate|retag <旧> <新>|affected <tag>|switch-family v4|v6|switch-family-menu|change-fp]" ;;
+        *) die "用法: share.sh [menu|create|list|refresh|clean [--apply]|migrate|retag <旧> <新>|affected <tag>|switch-family v4|v6|switch-family-menu|change-fp]" ;;
     esac
 fi
