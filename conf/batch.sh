@@ -118,11 +118,37 @@ LOG_DIR="${X_BATCH_LOG_DIR:-/tmp}"
 # 就近使用 batch.sh 同目录下的协议脚本 (仓库内/服务器临时部署);
 # 否则(curl|bash 场景)从 GitHub 下载到临时目录再执行, 与面板其余选项一致
 SCRIPT_DIR=""
+TOOLS_DIR=""
+
+# 确保 tools/ 在**与 conf 同级**的位置可用。
+# ★ 之前只有"conf 脚本不存在"的下载分支才会铺 tools/；真实安装的
+#   /root/conf 已经有协议脚本，于是直接 return，preset_batch.sh 永远不存在，
+#   全协议里的 xHTTP/CDN/上下行分离整段 127 失败（真机实测）。
+#   这里单独保证：缺什么补什么，补到 $SCRIPT_DIR/../tools。
+ensure_tools() {
+    local tooldir="$SCRIPT_DIR/../tools"
+    if ! mkdir -p "$tooldir" 2>/dev/null; then
+        tooldir="${X_BATCH_TMP_DIR:-/tmp/x-batch-scripts}/tools"
+        mkdir -p "$tooldir" || { print_error "创建 tools 目录失败: $tooldir"; return 1; }
+    fi
+    local t
+    for t in preset_batch.sh cdn_auto.sh; do
+        if [[ ! -s "$tooldir/$t" ]]; then
+            curl -fsSL "$GH_RAW/tools/$t" -o "$tooldir/$t" \
+                || { print_error "下载 tools/$t 失败 (上下行分离/CDN 要用)"; return 1; }
+            bash -n "$tooldir/$t" || { print_error "tools/$t 语法错误(下载损坏)"; return 1; }
+        fi
+    done
+    TOOLS_DIR="$tooldir"
+    return 0
+}
+
 resolve_scripts_dir() {
     local here
     here="$(dirname "${BASH_SOURCE[0]:-$0}")"
     if [[ -f "$here/Reality.sh" && -f "$here/Trojan.sh" ]]; then
         SCRIPT_DIR="$here"
+        ensure_tools || return 1
         return 0
     fi
     # ★ 下载之后必须**照着仓库的目录形状**摆, 不能平铺。
@@ -213,6 +239,7 @@ resolve_scripts_dir() {
 
     # 组装写的是 SCRIPT_DIR/../tools/... , 所以 SCRIPT_DIR 必须是 conf/ 那一层
     SCRIPT_DIR="$confdir"
+    TOOLS_DIR="$tooldir"
     return 0
 }
 
@@ -747,11 +774,8 @@ batch_main() {
         fi
 
         # ★ 生成的组合要**按能不能用**来定, 不是按表里有几个。
-        #   cdn-cdn / cdn-reality / reality-reality 三个可用; reality-cdn 是
-        #   设计冲突 (上行 REALITY 的 inbound 只认 REALITY 握手, 而下行走 CDN
-        #   是普通 TLS, nginx 代理过去对不上; 上下行又必须同一个 inbound 同端口),
-        #   建出来也连不通 —— 所以这里**不建**, 并把原因写出来, 而不是悄悄多发
-        #   一条死链。
+        #   是否可用由 preset.sh 的 x_split_ok / x_split_why 决定；这里不写死
+        #   组合清单，避免与判定表漂移。
         # ★ 只建**真能连上**的组合。判据在内核里, 不是配置问题:
         #   xHTTP 的会话表挂在每个 inbound 自己的 requestHandler 上, 下行 GET
         #   必须落到同一个 inbound (否则拿到的是空会话, 下行永远没数据);
@@ -759,6 +783,14 @@ batch_main() {
         #   详见 conf/lib/preset.sh 的 x_split_ok / x_split_why。
         local -a _split_specs=() _split_skip=() _split_why=()
         local -a _preset_specs=()
+        # 已有任何分离节点（share meta 里 split=true）时，默认不再追加一整组 ——
+        # 否则每跑一次全协议就多一组重复 tag/端口。要重建用 X_BATCH_SPLIT_FORCE=1。
+        local _has_split=0
+        if [[ "${X_BATCH_SPLIT_FORCE:-0}" != "1" ]] \
+           && grep -rqs '"split"[[:space:]]*:[[:space:]]*true' "$SHARE_DIR" 2>/dev/null; then
+            _has_split=1
+            print_info "  检测到已有分离节点，本次跳过分离组合 (X_BATCH_SPLIT_FORCE=1 可强制再加一组)"
+        fi
         local _sp _si
 
         # ---- xHTTP 扩展形态: 普通 CDN 节点 + REALITY+XHTTP ----
@@ -775,6 +807,10 @@ batch_main() {
             fi
         fi
         for _sp in $(x_split_modes); do
+            if (( _has_split )); then
+                _split_skip+=("$_sp"); _split_why+=("已有分离节点（默认幂等跳过）")
+                continue
+            fi
             if [ "$(x_split_ok "$_sp")" != "yes" ]; then
                 _split_skip+=("$_sp"); _split_why+=("$(x_split_why "$_sp")")
                 continue
@@ -782,6 +818,12 @@ batch_main() {
             # 用到 REALITY 的组合需要密钥对 (上面已用内核现生成)
             if [[ "$_sp" == *reality* && -z "${X_BATCH_REALITY_PUBLIC_KEY:-}" ]]; then
                 _split_skip+=("$_sp"); _split_why+=("${_why_key:-REALITY 密钥对不可用}")
+                continue
+            fi
+            # 幂等：同模式已有分离节点就跳过（除非 X_BATCH_SPLIT_FORCE=1）。
+            # 否则每跑一次全协议就多一组分离节点 —— 重复 tag、白占端口。
+            if [[ "${X_BATCH_SPLIT_FORCE:-0}" != "1" ]]                && grep -rqs "\"split_mode\"[[:space:]]*:[[:space:]]*\"$_sp\"" "$SHARE_DIR" 2>/dev/null; then
+                _split_skip+=("$_sp"); _split_why+=("已存在同模式分离节点，跳过 (X_BATCH_SPLIT_FORCE=1 可强制重建)")
                 continue
             fi
             _split_specs+=("vless:4:split:$_sp")
@@ -798,7 +840,7 @@ batch_main() {
             print_info "  直连下行地址: ${X_BATCH_DL_ADDRESS:-未设置}"
             printf "${CYAN}• %-12s${RESET} %s\n" "presets" "${_preset_specs[*]}" >&2
             X_BATCH_NO_RELOAD=1 X_NO_RELOAD=1 \
-                timeout "$BATCH_PROTO_TIMEOUT" bash "$SCRIPT_DIR/../tools/preset_batch.sh" \
+                timeout "$BATCH_PROTO_TIMEOUT" bash "$TOOLS_DIR/preset_batch.sh" \
                     "${_preset_specs[@]}" </dev/null \
                     >"$LOG_DIR/x-batch-split.log" 2>&1
             local src=$?
@@ -961,9 +1003,9 @@ batch_main() {
     #   CI、`bash batch.sh --auto && 下一步`)都把这一批当成成功 ——
     #   "四个协议里少了一个"要等到用户导入客户端才发现。
     #   失败清单在 batch_summary 里已经逐条打印(含日志末尾 3 行), 这里只补退出码。
-    if ((${#fail_list[@]} > 0)); then
-        print_error "本批有 ${#fail_list[@]} 个协议失败: ${fail_list[*]} —— 退出码 1"
-        print_info "失败详情: $LOG_DIR/x-batch-<协议>.log"
+    if ((${#BATCH_FAIL[@]} > 0)); then
+        print_error "本批有 ${#BATCH_FAIL[@]} 项失败: ${BATCH_FAIL[*]} —— 退出码 1"
+        print_info "失败详情: $LOG_DIR/x-batch-<协议>.log 与 x-batch-split.log"
         return 1
     fi
     print_ok "全协议一键生成流程结束"
