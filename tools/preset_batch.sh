@@ -281,10 +281,21 @@ PY
       DIRECT_ADDR="$(_x_public_addr)"
   fi
 
-  # 分离组合里凡是 REALITY 那一段, 伪装域名都用 dest_server (见 _x_camo_domain)
+  # 非分离的 REALITY 直连节点（xhttp / 裸 TCP）也必须按“IP 直连 + 伪装域名”
+  # 发布：域名若在 Cloudflare 后面，客户端解析到的是边缘 IP，连源站高位端口
+  # 会直接超时（实测 hxicc:42480）。同时 REALITY 的 SNI/dest 不能用节点自己的
+  # CDN 域名，必须用 dest_server 里维护的第三方伪装站。
+  if [[ -z "$DIRECT_ADDR" && "$sec" == "reality" ]]; then
+      DIRECT_ADDR="$(_x_public_addr)"
+  fi
   CAMO_DOM=""
   if [[ -n "$SPLIT" ]] && [[ "$(x_split_dl_sec "$SPLIT")" == "reality" || "$(x_split_ul_sec "$SPLIT")" == "reality" ]]; then
       CAMO_DOM="$(_x_camo_domain)"
+  elif [[ "$sec" == "reality" ]]; then
+      CAMO_DOM="$(_x_camo_domain)"
+  fi
+  if [[ "$sec" == "reality" && -z "${X_BATCH_REALITY_SHORT_ID:-}" ]]; then
+      export X_BATCH_REALITY_SHORT_ID="$(openssl rand -hex 4 2>/dev/null || printf 'a1b2c3d4')"
   fi
 
   # REALITY 走交互: 私钥+公钥必须配对, 批量里无法自动造一对可用密钥
@@ -427,6 +438,19 @@ if tr == "xhttp":
 if domain: o["domain"] = domain
 o.update(json.loads(cred))
 o.update(json.loads(extra))
+
+if sec == "reality" and not split:
+    # 非分离 REALITY: 对外地址用直连 IP, SNI/dest 用伪装域名；不能拿 CDN 域名
+    # 当 REALITY 目标（Cloudflare 边缘会参与握手，实测认证失败）。
+    if direct_addr:
+        o["domain"] = direct_addr
+        o["public_host"] = direct_addr
+    if camo:
+        o["sni"] = camo
+        o["dest"] = camo + ":443"
+    _sid = os.environ.get("X_BATCH_REALITY_SHORT_ID", "")
+    if _sid:
+        o["short_id"] = _sid
 
 if split:
     # ★ 上下行分离要三样, 少一样就退化成"看着分离、其实合流":

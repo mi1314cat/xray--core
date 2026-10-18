@@ -200,7 +200,12 @@ def _stream_settings(transport, security, opts):
 
     elif security == "reality":
         rs = {
-            "target": opts.get("dest") or f"{opts.get('sni','')}:443",
+            # target 为空会写成 ":443" —— 内核能过 -test，真握手必然失败。
+            # 以前只回退 sni；xhttp REALITY 预置只填 domain 时 target 就成了
+            # ":443"（实测 42480 节点）。domain 也是合法的回退目标。
+            "target": opts.get("dest") or (
+                f"{(opts.get('sni') or opts.get('domain') or '').strip()}:443"
+                if (opts.get('sni') or opts.get('domain')) else ""),
             "serverNames": [opts.get("sni") or opts.get("domain", "")],
             "privateKey": opts["private_key"],
             "shortIds": [opts.get("short_id", "")],

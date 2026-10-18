@@ -439,6 +439,18 @@ proxies:
 EOF
     fi
 
+    # ---- 补发布：刷新分享元数据 ----
+    # 只写 conf 不刷新元数据，端口/密码/REALITY 公钥变了但订阅还发旧值；
+    # 一致性校验发现后会整条拒发，表现是"节点建好了，订阅里却没有"。
+    local _ad
+    _ad="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/deploy.py"
+    if [[ -r "$_ad" ]]; then
+        python3 "$_ad" --adopt "$file" --domain "$server_ip" >&2 \
+            || print_warn "分享元数据没补上（节点本身已生成，订阅可能缺这一条）"
+    else
+        print_warn "找不到 lib/deploy.py，分享元数据未刷新"
+    fi
+
     print_ok "新增 Trojan 配置成功（默认最高配置）"
     echo -e "编号: $next\n监听: 0.0.0.0:$lport\n安全层: $([ "$security" = "reality" ] && echo "REALITY（target=$R_TARGET pbk=${R_PK:0:10}... sid=$R_SID）" || echo 'none（裸 Trojan，仅内网）')\n密码: ${TJPASS}\nTag: $tag_name\n入站碎片: $file\n客户端文件(X内核): $OUT_DIR/$PROTO-$next.json\n客户端文件(M内核YAML): $OUT_DIR/$PROTO-client-$next.yaml\n分享链接: $OUT_DIR/$PROTO-share-$next.txt" >&2
 }

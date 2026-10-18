@@ -939,6 +939,16 @@ EOF
     echo "$link" >> "$OUT_DIR/hysteria.txt"
     echo "$link" > "$OUT_DIR/hy2_share-$index.txt"
 
+    # ---- 补发布：刷新分享元数据（端口/UUID/证书可能刚变）----
+    local _ad
+    _ad="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/deploy.py"
+    if [[ -r "$_ad" ]]; then
+        python3 "$_ad" --adopt "$CONF_DIR/$PROTO-$index.json" --domain "$server_ip" >&2 \
+            || print_warn "分享元数据没补上（节点本身已生成，订阅可能缺这一条）"
+    else
+        print_warn "找不到 lib/deploy.py，分享元数据未刷新"
+    fi
+
     print_ok "配置生成成功"
     echo -e "编号: $index\n端口: $hysteria_port\nUUID: $uuid\n域名: $domain\n证书: $CERT_FILE $([[ "$CERT_TRUSTED" == "true" ]] && echo "CA可信真证书" || echo "自签")\n监听: $listen_ip\n服务端配置: $CONF_DIR/$PROTO-$index.json\nXray客户端片段: $xray_client_file\nmihomo客户端: $mihomo_file\n分享链接: $OUT_DIR/hy2_share-$index.txt" >&2
     echo "$link" >&2

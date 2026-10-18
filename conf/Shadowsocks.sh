@@ -482,6 +482,16 @@ proxies:
 EOF
     fi
 
+    # ---- 补发布：刷新分享元数据（端口/PSK 变了，旧元数据必须更新）----
+    local _ad
+    _ad="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lib/deploy.py"
+    if [[ -r "$_ad" ]]; then
+        python3 "$_ad" --adopt "$file" --domain "$server_ip" >&2 \
+            || print_warn "分享元数据没补上（节点本身已生成，订阅可能缺这一条）"
+    else
+        print_warn "找不到 lib/deploy.py，分享元数据未刷新"
+    fi
+
     print_ok "新增 Shadowsocks-2022 配置成功（最高配置）"
     echo -e "编号: $next\n监听: 0.0.0.0:$lport\n方法: $method\nPSK: ${PSK:0:10}...(${PSK_BYTES} 字节)\nUDP: $([ "$network" = "tcp,udp" ] && echo '已开启 (session 化中继)' || echo '未开启')\n安全层: $([ "$security" = "reality" ] && echo "REALITY（target=$R_TARGET sid=$R_SID）" || echo "裸 SS2022（全部客户端兼容）")\nTag: $tag_name\n入站碎片: $file\n客户端文件(X内核): $OUT_DIR/$PROTO-$next.json\n客户端文件(M内核YAML): $OUT_DIR/$PROTO-client-$next.yaml\n分享链接: $OUT_DIR/$PROTO-share-$next.txt" >&2
 }

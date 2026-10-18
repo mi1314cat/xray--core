@@ -494,6 +494,14 @@ def build_stream(node: dict, mode: str) -> dict:
             try:
                 parsed = json.loads(node["extra"]) if isinstance(node["extra"], str) else node["extra"]
                 if parsed:
+                    # ★ extra.downloadSettings 会**整体盖掉**下面的
+                    #   xhttpSettings.downloadSettings（Xray 的 extra 语义是
+                    #   "存在即替换"）。订阅链接里那份 extra 是给别人家 GUI 用的，
+                    #   形状与我们自己按 dl_* 生成的那份不完全一致；两份同时
+                    #   写进去，实测主上行 200、下行永远没数据。
+                    #   统一以 _xhttp_download_settings() 生成的顶层那份为准。
+                    if isinstance(parsed, dict):
+                        parsed.pop("downloadSettings", None)
                     xh["extra"] = parsed
             except (ValueError, TypeError):
                 pass

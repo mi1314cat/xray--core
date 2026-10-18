@@ -606,7 +606,7 @@ def ech_discover(domain, timeout=3):
     return ""
 
 
-def ech_param(n, host=None):
+def ech_param(n, host=None, meta=None):
     """这个节点的分享链接该不该写 `ech=`, 写什么值。取不到返回 ""。
 
     **ECH 是端到端绑定的** —— 客户端发出去的 ECH 只有"它以为在连的那个
@@ -623,6 +623,14 @@ def ech_param(n, host=None):
     cl = ech_config_list(n.get("ech_server_keys"))
     if cl:
         return cl
+    # 元数据里已经由 deploy 阶段解析好的 ECHConfigList。老节点 (CDN/ECH)
+    # 的片段本身没有 echServerKeys，值只存在 share_meta.ech_config 里；
+    # 以前这里完全不看元数据，于是订阅链接把 ech 整段丢掉，客户端也就
+    # 不会写 tlsSettings.echConfigList —— ECH 静默失效。
+    # 只在连接目标是域名时用：连源站 IP 却塞 CDN 的 ECH 会握手失败。
+    mc = str((meta or {}).get("ech_config") or "").strip()
+    if mc and host and not is_ip_literal(host):
+        return mc
     if n.get("declared_server_name") and host and not is_ip_literal(host):
         return ECH_CDN_DISCOVERY
     return ""
@@ -646,6 +654,12 @@ def link_sni(n, meta=None):
     host = str((meta or {}).get("host") or "").strip()
     if host and not is_ip_literal(host):
         return host
+    # 上下行分离节点常见形态: host 是直连 IP, 真正该做 SNI 的是 nginx 的
+    # server_name (host_header)。以前这里只认 host，于是 443 上行链接
+    # 没有 sni=，客户端拿 IP 当 SNI，nginx 直接 reset。实测补上后 204。
+    hh = str((meta or {}).get("host_header") or "").strip()
+    if hh and not is_ip_literal(hh):
+        return hh
     return ""
 
 
@@ -810,12 +824,24 @@ def build_share_link(n, meta=None, notes=None):
     """
     meta = meta or {}
     # 上行 REALITY 前置 (#4118): 客户端上行是 xhttp 套在 REALITY 里
-    if meta.get("uplink_network") or meta.get("uplink_path"):
+    # ★ front_uplink（REALITY 前置）例外：前置入站本身是 **raw REALITY**，
+    #   uplink_network=xhttp 描述的是它后面 fallback 的 xhttp 入站，不是
+    #   客户端到前置的传输。把它套到客户端链接上会生成 type=xhttp 的链接，
+    #   而服务端前置是 raw —— 实测 31475 这条就是这样从 204 变成 000。
+    #   前置链接必须保持 raw/tcp + REALITY，不带 path。
+    if (meta.get("uplink_network") or meta.get("uplink_path")) \
+            and not meta.get("front_uplink"):
         n = dict(n)
         if meta.get("uplink_network"):
             n["network"] = meta["uplink_network"]
         if meta.get("uplink_path"):
             n["path"] = meta["uplink_path"]
+    if meta.get("front_uplink"):
+        # 前置入站是 raw REALITY（见上面注释）。nodes.collect 取到的是同一
+        # tag 下的 xhttp 入站，必须在这里显式改回 raw，并去掉 xhttp 的 path。
+        n = dict(n)
+        n["network"] = "raw"
+        n["path"] = ""
     proto = n.get("protocol")
     host, port, note, refuse = share_target(n, meta)
     if notes is not None and note:
@@ -890,7 +916,7 @@ def build_share_link(n, meta=None, notes=None):
                 q["sni"] = sni
             # ★ ech 与 sni 同源同命: 脚本产物里有、这里整段丢, 客户端就
             #   静默退化成"没开 ECH"。判据与值都在 ech_param() 一处实现。
-            ech = ech_param(n, host)
+            ech = ech_param(n, host, meta)
             if ech:
                 q["ech"] = ech
             if n.get("network") == "ws":
@@ -924,7 +950,9 @@ def build_share_link(n, meta=None, notes=None):
         # 换台设备导入就退化成合流, 而且**看不出**。
         # ★ 放在 tls/reality 分支**外面** —— 放里面就只有 TLS 节点带得上,
         #   而上下行分离最常见的用法恰恰是 REALITY (见 node_build 的说明)。
-        q.update(split_params(n, meta))
+        # 前置链接是单条 raw REALITY；dl* 属于另一条 443 上行，不能混进来
+        if not meta.get("front_uplink"):
+            q.update(split_params(n, meta))
         qs = "&".join(f"{k}={_qval(v)}" for k, v in q.items() if v not in (None, ""))
         return f"vless://{n.get('id') or ''}@{_q(host)}:{port}?{qs}#{_q(name)}"
 
@@ -948,7 +976,7 @@ def build_share_link(n, meta=None, notes=None):
             sni = link_sni(n, meta)
             if sni:
                 q["sni"] = sni
-            ech = ech_param(n, host)
+            ech = ech_param(n, host, meta)
             if ech:
                 q["ech"] = ech
             if n.get("network") == "ws" and n.get("path"):
@@ -1033,7 +1061,7 @@ def build_share_link(n, meta=None, notes=None):
             "tls": "tls" if n.get("security") in ("tls", "reality") else "",
             "sni": reality_sni(n) if n.get("security") == "reality"
             else link_sni(n, meta),
-            "ech": "" if n.get("security") == "reality" else ech_param(n, host),
+            "ech": "" if n.get("security") == "reality" else ech_param(n, host, meta),
         }
         b = base64.b64encode(json.dumps(obj, ensure_ascii=False).encode()).decode()
         return f"vmess://{b}"
