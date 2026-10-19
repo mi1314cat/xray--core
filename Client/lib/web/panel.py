@@ -2958,8 +2958,15 @@ function visibleFiles(){
   return out;
 }
 async function batchTest(btn){
-  const files = selectedOrVisible();
-  if (!files.length) return say('节点还在加载，或当前分组为空；稍后再点一次', 'err');
+  let files = selectedOrVisible();
+  if (!files.length){
+    // 首次进入页面时点击“一键测速”：节点状态可能还没拉到。这里主动
+    // 等一次 load() 再取，而不是直接报“没有节点”让用户以为按钮坏了。
+    say('节点还在加载，稍等…');
+    try { await load(); } catch(e) { /* 下面统一报错 */ }
+    files = selectedOrVisible();
+  }
+  if (!files.length) return say('当前分组确实没有节点；先选分组或勾选节点', 'err');
   const total = files.length;
   files.forEach(f => { LAT[f] = {loading:true}; });
   renderNodes();
