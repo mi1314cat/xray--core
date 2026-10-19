@@ -12,23 +12,23 @@
 | 项 | 数量 |
 |---|---|
 | 支持的协议 | **7** 个 |
-| 预置档位（协议 × 传输 × 加密） | **28** 档 |
+| 预置档位（协议 × 传输 × 加密） | **29** 档 |
 | 推荐度分档 | 4 档（core / cdn / compat / special） |
-| 全协议一键生成默认取哪几档 | `core` + `cdn`（共 15 档） |
-| 本次新增 | VMess+HTTPUpgrade 预置、回落选配、Hysteria2 混淆 |
+| 全协议一键生成默认取哪几档 | `core` + `cdn`（共 12 档） |
+| 本次新增 | mack-a 0（VLESS TCP/TLS+Vision）、mack-a 12（REALITY+XHTTP）预置；预置批量补 ECH/Vision 标记 |
 
 ### 每个协议有多少种选择
 
 | 协议 | 档数 | 推荐首档 | 传输选配 | 加密选配 |
 |---|:--:|---|---|---|
-| **VLESS** | **10** | ① REALITY + Vision + 后量子 | raw/tcp、xhttp、ws、grpc、httpupgrade | reality、tls、none |
+| **VLESS** | **11** | ① REALITY + Vision + 后量子 | raw/tcp、xhttp、ws、grpc、httpupgrade | reality、tls、none |
 | **Trojan** | **5** | ① REALITY | tcp、xhttp、ws、grpc | reality、tls |
 | **VMess** | **5** | ① XHTTP + TLS | xhttp、ws、grpc、**httpupgrade**、tcp | tls |
 | **Shadowsocks** | **3** | ① REALITY | tcp | reality、tls、none |
 | **Hysteria2** | **1** | ① UDP + TLS | hysteria（UDP） | tls |
 | **SOCKS5** | **2** | ① 无认证（仅内网） | tcp | none、tls |
 | **HTTP** | **2** | ① 无认证（仅内网） | tcp | none、tls |
-| | **28** | | | |
+| | **29** | | | |
 
 ---
 
@@ -48,7 +48,7 @@
 | trojan ⑤ 裸 TCP + TLS | 同上 | 同上 |
 | vmess ⑤ 裸 TCP + TLS | 同上 | 同上 |
 
-**"全协议一键生成"默认不取这些** —— 它只取 `core` + `cdn` 两档（共 15 档）。
+**"全协议一键生成"默认不取这些** —— 它只取 `core` + `cdn` 两档（共 12 档）。
 上表这些是 `special` / 部分 `compat`，必须手动点名才会生成。
 
 另外两条**跨协议**的公网前提：
@@ -60,12 +60,12 @@
 
 ---
 
-## 二、推荐配置报表（28 档全表）
+## 二、推荐配置报表（29 档全表）
 
 `★` = 推荐档；`[档位]` = 推荐度，决定它进不进"全协议一键生成"。
 `ext` = Xray 特有的加密增强。
 
-### VLESS（10 档）
+### VLESS（11 档）
 
 | # | 传输 | 加密 | 档位 | ext | 一句话说明 |
 |:--:|---|---|---|---|---|
@@ -78,6 +78,8 @@
 | ⑦ | ws | tls | compat | — | 官方已弃用，仅兼容 |
 | ⑧ | grpc | tls | compat | — | 官方已弃用 |
 | ⑨ | httpupgrade | tls | compat | — | 官方已弃用 |
+| ⑩ ★ | tcp | tls | core | vision | mack-a 0：VLESS TCP/TLS + XTLS Vision |
+| ⑪ | xhttp | reality | cdn | xhttp-auto | mack-a 12：REALITY + XHTTP（mode=auto） |
 | ⑩ | tcp | tls | special | — | 最易被识别 |
 
 ### Trojan（5 档）

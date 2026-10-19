@@ -179,6 +179,11 @@ _cd_apply() {                     # <dom> <port> <tr> <cdn> <dl> <path> <origin_
     #   (还打印了完整的 server 块), 实际磁盘上一个字都没改。
     #   自动配置的核心就是"真的写进去", 预演必须由调用方显式要。
     local -a a=(--domain "$dom_arg" --port "$port" --transport "$tr")
+    # 用户在 batch 菜单里明确选的站点文件。只在单域名时传 —— 双域名可能
+    # 各自在不同站点文件，强行传一个会让另一段找错文件。
+    if [[ -n "${X_CD_NGINX_FILE:-}" && ( -z "$dl" || "$dl" == "$dom" ) ]]; then
+        a+=(--file "$X_CD_NGINX_FILE")
+    fi
     [[ -n "$dry" ]] && a+=(--dry-run)
     # 一节点一 path: nginx 里按 path 分段, 同域名多个节点互不覆盖。
     # 只在非根路径时才传 —— 传 --path / 和不传是同一件事, 但显式传能让

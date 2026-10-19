@@ -1544,6 +1544,8 @@ def main():
                         "只认本工具的标记, 段外一个字符都不动")
     p.add_argument("--list-backups", action="store_true",
                    help="列出本工具在这份站点旁留下的备份")
+    p.add_argument("--list-sites", action="store_true",
+                   help="列出可用的 nginx 站点（文件<TAB>server_name）")
     args = p.parse_args()
 
     # 容器自动探测只在"需要自己去找站点文件"时才做。
@@ -1562,6 +1564,11 @@ def main():
         args.docker = probe_docker()
     if args.file and not args.docker:
         args.docker = None
+
+    if args.list_sites:
+        for f, sn in list_sites(args.docker):
+            print(f"{f}\t{sn}")
+        return 0
 
     # ---- 回收 / 巡检这两个模式不需要 --domain, 先分流 ----
     if args.prune_orphans is not None:

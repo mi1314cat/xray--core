@@ -3898,6 +3898,19 @@ assert_ne0 "$CB" "清空全部/重建 会调用 nginx 片段清理"
 assert_eq "$(grep -c '< <(_collect_nginx_targets)' "$ROOT/conf/batch.sh" 2>/dev/null)" "2" \
     "清空与重建都在**删除前**收集要摘的片段 (删完就读不出域名了)"
 # 收集器必须把双域名的下行域名也算进去
+assert_ne0 "$(grep -c 'wipe_all_nodes' "$ROOT/conf/batch.sh" 2>/dev/null)" \
+    "清空/重建用 wipe_all_nodes（不是只删 4 个协议前缀）"
+assert_ne0 "$(grep -c '_all_node_frags' "$ROOT/conf/batch.sh" 2>/dev/null)" \
+    "全量节点识别按 inbounds 解析（覆盖 xHTTP/分离）"
+assert_ne0 "$(grep -c '_bt_pick_nginx_site' "$ROOT/conf/batch.sh" 2>/dev/null)" \
+    "全协议生成前会征询 Nginx 站点"
+assert_ne0 "$(grep -c 'list-sites' "$ROOT/conf/lib/nginx_apply.py" 2>/dev/null)" \
+    "nginx_apply 提供 --list-sites 供交互选择"
+assert_ne0 "$(grep -c 'xhttp-auto' "$ROOT/conf/lib/preset.sh" "$ROOT/tools/preset_batch.sh" 2>/dev/null | awk -F: '{s+=$2} END{print s}')" \
+    "mack-a 12 preset（xhttp-auto）已接入 preset_batch"
+assert_ne0 "$(grep -c 'vision' "$ROOT/conf/lib/preset.sh" 2>/dev/null)" \
+    "mack-a 0（VLESS TCP/TLS + Vision）已进预置表"
+
 assert_eq "$(grep -c 'dl_domain' "$ROOT/conf/batch.sh" 2>/dev/null)" "1" \
     "收集器认双域名的下行域名 (两段都要摘)"
 # node.sh 的单节点删除也要认双域名
@@ -4833,7 +4846,7 @@ TJ_TLS=$(preset_index_by_name trojan "CDN 友好")
 assert_ne0 "$VL_TLS" "vless 有 TLS 档"
 assert_ne0 "$TJ_TLS" "trojan 有 TLS 档"
 PB="$TMP/pb"; mkdir -p "$PB"
-XRAY_CONF_DIR="$PB/conf" XRAY_SHARE_DIR="$PB/share" X_BATCH_DOMAIN=a.example.com \
+XRAY_CONF_DIR="$PB/conf" XRAY_SHARE_DIR="$PB/share" X_BATCH_DOMAIN=a.example.com X_CD_ALLOW_NO_CERT=1 \
   bash "$ROOT/tools/preset_batch.sh" "vless:$VL_TLS" "trojan:$TJ_TLS" >/dev/null 2>&1
 assert_eq "$(ls "$PB/conf"/*.json 2>/dev/null | wc -l)" "2" "批量落盘 2 个片段"
 assert_eq "$(ls "$PB/share"/*.json 2>/dev/null | wc -l)" "2" "批量落盘 2 份元数据"
@@ -4844,7 +4857,7 @@ print(d['inbounds'][0]['listen'])")
 assert_eq "$PD" "0.0.0.0" "默认 CDN 档位: Xray 听 0.0.0.0"
 # 基础域名 + 序号: 每个 TLS 节点一个不同域名
 PB2="$TMP/pb2"; mkdir -p "$PB2"
-XRAY_CONF_DIR="$PB2/conf" XRAY_SHARE_DIR="$PB2/share" X_BATCH_DOMAIN_BASE=b.example.com \
+XRAY_CONF_DIR="$PB2/conf" XRAY_SHARE_DIR="$PB2/share" X_BATCH_DOMAIN_BASE=b.example.com X_CD_ALLOW_NO_CERT=1 \
   bash "$ROOT/tools/preset_batch.sh" "vless:$VL_TLS" "trojan:$TJ_TLS" >/dev/null 2>&1
 HOSTS=$(python3 -c "
 import json,glob
@@ -4853,7 +4866,7 @@ print(','.join(hs))")
 assert_eq "$HOSTS" "b.example.com-1,b.example.com-2" "基础域名按序号递增"
 # nginx 档位
 PB3="$TMP/pb3"; mkdir -p "$PB3"
-XRAY_CONF_DIR="$PB3/conf" XRAY_SHARE_DIR="$PB3/share" X_BATCH_DOMAIN=a.com \
+XRAY_CONF_DIR="$PB3/conf" XRAY_SHARE_DIR="$PB3/share" X_BATCH_DOMAIN=a.com X_CD_ALLOW_NO_CERT=1 \
   bash "$ROOT/tools/preset_batch.sh" "vless:$VL_TLS:nginx" >/dev/null 2>&1
 NG=$(python3 -c "
 import json,glob

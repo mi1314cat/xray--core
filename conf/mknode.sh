@@ -681,7 +681,7 @@ mk_run() {
                 MK_TAG="$tag" MK_PORT="$port" MK_CRED="$cred" \
                 MK_DOMAIN="$domain" MK_TIER="$tier" \
                 MK_CERT_FILE="$cert_file" MK_KEY_FILE="$key_file" MK_CERT_PIN="$cert_pin" \
-                MK_FALLBACK_PORT="$fallback_port" \
+                MK_FALLBACK_PORT="$fallback_port" MK_ENH="$enh" \
                 MK_CERT_TRUSTED="$cert_trusted" \
                 MK_DECRYPTION="$mk_dec" MK_CLIENT_ENC="$mk_cli_enc" \
                 MK_MLDSA_SEED="$mldsa_seed" MK_MLDSA_VERIFY="$mldsa_verify" \
@@ -735,8 +735,11 @@ if proto in ("vless", "vmess"):
     #   (它只查 flow 这个名字合不合法), 于是用户拿到一个"配好了、校验通过、
     #   就是慢/连不上"的节点。sing-box 面板专门写了 sb_flow_conflict() 拦这个
     #   组合, 这里对齐。
-    if (proto == "vless" and opts["security"] == "reality"
-            and opts["transport"] in ("raw", "tcp")):
+    # 预置表第 6 列 enh=vision：mack-a 的 VLESS TCP/TLS+Vision 也要 flow。
+    # 仍然只在裸 TCP 上加（XHTTP/gRPC 上 Vision 自相矛盾）。
+    _enh = os.environ.get("MK_ENH", "")
+    if (proto == "vless" and opts["transport"] in ("raw", "tcp")
+            and (opts["security"] == "reality" or "vision" in _enh)):
         opts["flow"] = "xtls-rprx-vision"
 elif proto in ("trojan", "hysteria2"):
     opts["password"] = cred

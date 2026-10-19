@@ -35,6 +35,9 @@ _lib() {
 
 PRESET_SH="$(_lib preset.sh)" || exit 1
 DEPLOY_PY="$(_lib deploy.py)" || exit 1
+# TLS 档位必须带证书：只写 serverName 的入站内核能启动，但每次握手都失败
+# (tls: no certificates configured)。cert.sh 的查找规则与 mknode 一致。
+CERT_SH="$(_lib cert.sh 2>/dev/null || true)"
 # CDN 自动配 nginx + 端口账本 (借鉴 sing-box-core 的 cdn_autosetup / batch_next_port)
 # ★ cdn_auto.sh 与本脚本**同目录** (tools/)。我原来写 $_lib_dir/cdn_auto.sh,
 #   而 _lib_dir 指的是 conf/ —— 于是 [[ -r ]] 判断一直为假, 文件从没被
@@ -97,6 +100,10 @@ PORTS_SH="$(_lib ports.sh)" || exit 1
 source "$PRESET_SH"
 # shellcheck source=/dev/null
 source "$PORTS_SH"
+if [[ -n "$CERT_SH" && -r "$CERT_SH" ]]; then
+    # shellcheck source=/dev/null
+    source "$CERT_SH"
+fi
 
 XRAY_BASE="${XRAY_BASE:-/root/catmi/xray}"
 CONF_DIR="${XRAY_CONF_DIR:-$XRAY_BASE/conf}"
@@ -211,8 +218,13 @@ for spec in "${SPECS[@]}"; do
   tr=$(x_preset_field "$proto" "$idx" 2)
   sec=$(x_preset_field "$proto" "$idx" 3)
   disp=$(x_preset_field "$proto" "$idx" 4)
+  # 第 6 列是增强标记 (mlkem,mldsa65,ech,vision …)。以前这里完全没读，
+  # 于是预置⑤写着 ECH、预置①写着后量子，从菜单 14 建出来却一个都没有。
+  enh=$(x_preset_field "$proto" "$idx" 6); enh=${enh:-none}
 
-  SPLIT=""; DL_DOMAIN=""; ECH_ON="no"; SPLIT_DLSEC=""
+  SPLIT=""; DL_DOMAIN=""; ECH_ON="no"; VISION_ON="no"; SPLIT_DLSEC=""
+  [[ ",$enh," == *",ech,"* ]] && ECH_ON="yes"
+  [[ ",$enh," == *",vision,"* ]] && VISION_ON="yes"
   if [[ "$tier" == split:* ]]; then
     SPLIT="${tier#split:}"
     if ! declare -F x_split_ul_sec >/dev/null; then
@@ -372,6 +384,29 @@ PY
     #   所以默认 DL_DOMAIN 就是上行那个域名, 而 cdn-reality 这类"下行直连"
     #   的模式默认用**服务器自己的地址** (没有下行域名时, 连回同一个入口
     #   也对 —— 上下行仍然分开, 只是都从同一个地址进)。
+    # TLS 档位找证书（nginx 档由 nginx 终结，不需要 Xray 带证书）。
+    # 找不到就明确拒绝 —— 不能生成一个“配置合法、握手必失败”的节点。
+    CERT_FILE=""; KEY_FILE=""
+    if [[ "$sec" == "tls" && "$tier" != "nginx" ]]; then
+        if declare -F x_cert_find_for_domain >/dev/null 2>&1; then
+            _pair=""
+            _pair=$(x_cert_find_for_domain "$domain" 2>/dev/null) || _pair=""
+            if [[ -n "$_pair" ]]; then
+                CERT_FILE="${_pair%%$'\t'*}"
+                KEY_FILE="${_pair#*$'\t'}"
+            fi
+        fi
+        if [[ -z "$CERT_FILE" || -z "$KEY_FILE" ]]; then
+            if [[ "${X_CD_ALLOW_NO_CERT:-0}" == "1" ]]; then
+                _y "  测试模式: $domain 没有证书，按 X_CD_ALLOW_NO_CERT=1 继续（生产禁止）"
+            else
+                _e "  $disp: 域名 $domain 没有找到证书，拒绝生成无证书 TLS 节点"
+                _y "     先跑菜单 5) 证书管理（或把证书放到 x_cert_search_dirs 能扫到的位置）"
+                fail=$((fail+1)); continue
+            fi
+        fi
+    fi
+
     DL_LISTEN_PORT=""
     if [[ -n "$SPLIT" ]]; then
       # ★ 先问这个组合**能不能连上**。连不上的组合在这里就拒绝, 不往下走 ——
@@ -419,16 +454,21 @@ PY
     fi
   fi
 
-  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" "${SPLIT_DLCN:-no}" "${SPLIT_ULSEC:-}" "${CAMO_DOM:-}" "${SPLIT_FRONT:-no}" "${FRONT_PORT:-}" "${DIRECT_ADDR:-}" <<'PY'
+  opts_json=$(python3 - "$proto" "$tr" "$sec" "$tag" "$use_port" "$tier" "$cred_json" "$extra_json" "$domain" "$SPLIT" "$DL_DOMAIN" "$ECH_ON" "${SPLIT_DLSEC:-}" "${DL_SNI:-$domain}" "${DL_PUBLIC_KEY:-${X_BATCH_REALITY_PUBLIC_KEY:-}}" "${DL_SHORT_ID:-${X_BATCH_REALITY_SHORT_ID:-}}" "${X_BATCH_SPLIT_PATH:-}" "${SPLIT_DLCN:-no}" "${SPLIT_ULSEC:-}" "${CAMO_DOM:-}" "${SPLIT_FRONT:-no}" "${FRONT_PORT:-}" "${DIRECT_ADDR:-}" "$VISION_ON" "$enh" "$CERT_FILE" "$KEY_FILE" <<'PY'
 import json, os, sys
 # ★ import 一定要配齐: 这个 heredoc 原来只有 json, sys, 而下面用了
 #   os.environ —— NameError 被 2>/dev/null 吞掉, 命令替换拿到空串,
 #   表现是'规格拼装失败'或干脆静默不生成。项目在 mknode 上踩过一次
 #   (交接文档 10.3), 这里又踩了一次。
 (proto, tr, sec, tag, port, tier, cred, extra, domain, split, dl_dom, ech_on,
- dlsec, dlsni, dlpub, dlsid, node_path, dlcdn, ulsec, camo, front, front_port, direct_addr) = sys.argv[1:24]
+ dlsec, dlsni, dlpub, dlsid, node_path, dlcdn, ulsec, camo, front, front_port,
+ direct_addr, vision_on, enh, cert_file, key_file) = sys.argv[1:28]
 o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
      "port":int(port),"tier":tier}
+# mack-a 的 VLESS TCP/TLS + Vision：flow 只在裸 TCP 上有效。
+if vision_on == "yes" and proto == "vless" and tr in ("raw", "tcp") \
+        and sec in ("tls", "reality"):
+    o["flow"] = "xtls-rprx-vision"
 # ★ xhttp 的 mode 必须显式给, 否则内核按 `auto` 解析 —— 而 **REALITY 下 auto
 #   解析成 stream-one (上下行合流)**。这正是预置 ⑥「REALITY + XHTTP 上下行分离」
 #   的说明里写着要避免的那件事: 从菜单 13 (mknode) 建出来是 stream-up,
@@ -445,7 +485,13 @@ if tr == "xhttp":
         o["xhttp_mode"] = _mode
     else:
         o["xhttp_mode"] = "stream-up" if sec == "reality" else "auto"
+    # mack-a 12 的 REALITY+XHTTP 用 auto（合流），不是 split 的 stream-up。
+    if "xhttp-auto" in enh:
+        o["xhttp_mode"] = "auto"
 if domain: o["domain"] = domain
+if cert_file and key_file:
+    o["cert_file"] = cert_file
+    o["key_file"] = key_file
 o.update(json.loads(cred))
 o.update(json.loads(extra))
 
@@ -560,6 +606,10 @@ if split:
     #   客户端要拿的是域名的 ECHConfigList —— 由 deploy.plan 从 HTTPS RR 取。
     o["ech"] = (ech_on == "yes")
     o["dl_ech"] = (ech_on == "yes")
+# 非分离预置的 ECH 标记（预置⑤）。以前只在 split 分支里写 o["ech"]，
+# 于是菜单 14 建 vless:5 时 ECH 静默丢失。
+if ech_on == "yes":
+    o["ech"] = True
 o["split_mode"] = split if split else ""
 print(json.dumps(o))
 PY
@@ -579,10 +629,19 @@ done
 
 echo
 
+# ★ 沙箱（XRAY_BASE 不是生产目录）绝不写生产 nginx / 生产订阅。
+#   以前这里没有判断，测试跑一遍就会在真实的 nginx 和分享服务里留下
+#   指向临时端口的垃圾记录（实测：/tmp 沙箱生成了 test.local 订阅）。
+X_PB_SANDBOX=false
+[[ "${XRAY_BASE:-}" != "/root/catmi/xray" ]] && X_PB_SANDBOX=true
+export X_IS_SANDBOX="$X_PB_SANDBOX"
+
 # ★ 建完顺手把 CDN 站点配好 (借鉴 SB: 建完 CDN 节点自动插 nginx)。
 #   放在"完成"汇总**之前**: 汇总要如实反映 nginx 到底配没配上, 放在后面
 #   就成了"先报成功、再报失败"。
-if [[ "$ok" -gt 0 ]] && declare -F x_cdn_autosetup >/dev/null 2>&1; then
+if [[ "$X_PB_SANDBOX" == true && "${X_CD_ALLOW_NGINX:-0}" != "1" ]]; then
+    _y "  沙箱模式: 跳过 nginx 写入（需要时显式 X_CD_ALLOW_NGINX=1）"
+elif [[ "$ok" -gt 0 ]] && declare -F x_cdn_autosetup >/dev/null 2>&1; then
     shopt -s nullglob
     _all=("$CONF_DIR"/*.json)
     shopt -u nullglob
@@ -600,7 +659,9 @@ _o "════════ 完成: $ok 成功, $fail 失败 ══════
 # 在这之前 X 不会自动建订阅 —— 用户得自己去 菜单 4 → 2) 全协议分享 点一遍。
 # 失败一律不阻断: 节点本身已经建好了。
 _share_sh="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/conf/share.sh"
-if [[ -r "$_share_sh" ]]; then
+if [[ "$X_PB_SANDBOX" == true && "${X_CD_ALLOW_SHARE:-0}" != "1" ]]; then
+    _y "  沙箱模式: 跳过自动订阅（需要时显式 X_CD_ALLOW_SHARE=1）"
+elif [[ -r "$_share_sh" ]]; then
     XRAY_BASE="$XRAY_BASE" XRAY_CONF_DIR="$CONF_DIR" XRAY_SHARE_DIR="$SHARE_DIR" \
         bash "$_share_sh" ensure-subscription 2>&1 | sed 's/^/  /' || true
 else

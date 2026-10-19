@@ -112,6 +112,8 @@ py() { python3 "$@"; }
 X_IS_SANDBOX=false
 [[ "$XRAY_BASE" != /root/catmi/xray || "$CONF_DIR" != /root/catmi/xray/conf ]] \
     && X_IS_SANDBOX=true
+# 给 cdn_auto.sh / 子进程判断用：沙箱里绝不能写生产 nginx 或刷新生产订阅。
+export X_IS_SANDBOX
 LOG_DIR="${X_BATCH_LOG_DIR:-/tmp}"
 
 ########## 脚本目录解析 ##########
@@ -272,6 +274,66 @@ if resolve_cdn_auto; then
 else
     print_warn "找不到 tools/cdn_auto.sh —— nginx 反代不会自动配置"
 fi
+
+# 选择 Nginx 站点。以前全协议自动识别域名后直接写第一个匹配站点，用户
+# 有多个站点/域名时无从选择（实测 hxicc 与其它站点并存，默认用了第一个）。
+# 交互时列出站点；选中的域名同时作为本批 X_BATCH_DOMAIN，文件通过
+# X_CD_NGINX_FILE 传给 cdn_auto，避免 nginx_apply 再按域名猜。
+_bt_pick_nginx_site() {
+    [[ "${X_BATCH_NGINX_PROMPT:-1}" == "0" ]] && return 0
+    [[ -t 0 ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local apy="$LIB_DIR/nginx_apply.py"
+    [[ -r "$apy" ]] || return 0
+    local listing; listing=$(python3 "$apy" --list-sites 2>/dev/null || true)
+    [[ -n "$listing" ]] || return 0
+
+    local -a files=() names=()
+    local f sn d _seen
+    while IFS=$'\t' read -r f sn; do
+        [[ -n "$f" ]] || continue
+        # 取第一个可用 server_name；跳过默认站点 / 通配
+        d=""
+        for _seen in $sn; do
+            case "$_seen" in _|""|\*|*.local) continue ;; esac
+            d="$_seen"; break
+        done
+        [[ -n "$d" ]] || continue
+        files+=("$f"); names+=("$d")
+    done <<< "$listing"
+    ((${#names[@]} > 0)) || return 0
+
+    # 环境变量显式指定：支持域名或文件路径，供自动化使用。
+    if [[ -n "${X_BATCH_NGINX_SITE:-}" ]]; then
+        local i
+        for i in "${!names[@]}"; do
+            if [[ "$X_BATCH_NGINX_SITE" == "${names[$i]}" || "$X_BATCH_NGINX_SITE" == "${files[$i]}" ]]; then
+                export X_BATCH_DOMAIN="${X_BATCH_DOMAIN:-${names[$i]}}"
+                export X_CD_NGINX_FILE="${files[$i]}"
+                print_info "Nginx 站点: ${names[$i]}  (${files[$i]})"
+                return 0
+            fi
+        done
+        print_warn "X_BATCH_NGINX_SITE=$X_BATCH_NGINX_SITE 未匹配到站点，改为交互选择"
+    fi
+
+    print_title "Nginx 站点"
+    local i
+    for i in "${!names[@]}"; do
+        printf "  %2d) %-36s %s\n" "$((i+1))" "${names[$i]}" "${files[$i]}" >&2
+    done
+    printf "   0) 自动识别（默认）\n" >&2
+    local c
+    read -r -p "  这批 CDN/xHTTP 节点挂到哪个站点? [0-${#names[@]}, 回车=0]: " c || return 0
+    c="${c:-0}"
+    if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#names[@]} )); then
+        export X_BATCH_DOMAIN="${names[$((c-1))]}"
+        export X_CD_NGINX_FILE="${files[$((c-1))]}"
+        print_info "Nginx 站点: ${X_BATCH_DOMAIN}  (${X_CD_NGINX_FILE})"
+    else
+        print_info "Nginx 站点: 自动识别"
+    fi
+}
 
 resolve_share_sh() {
     local here f
@@ -612,20 +674,67 @@ wipe_proto() {
     printf '%s' "$n"
 }
 
+# 列出**全部**节点碎片：任何带非空 inbounds 的 conf/*.json。
+# 不能用 BATCH_FRAG_PREFIX 列表判断 —— 那只覆盖 4 个协议脚本，
+# xHTTP/CDN/上下行分离是 preset_batch 建的，前缀完全不同。实测用户点
+# 「清空全部节点」只删了 4 个直连节点，xhttp/split 全留在盘里。
+_all_node_frags() {
+    python3 - "$CONF_DIR" <<'PYPARSE'
+import glob, json, os, sys
+d = sys.argv[1]
+for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+    if os.path.basename(f) == "00-base.json":
+        continue
+    try:
+        x = json.load(open(f, encoding="utf-8"))
+    except Exception:
+        continue
+    if isinstance(x, dict) and x.get("inbounds"):
+        print(f)
+PYPARSE
+}
+
 # 列出将被清掉的节点碎片, 让用户先看见再决定。
 list_will_wipe() {
-    local pfx f
-    for pfx in "${BATCH_FRAG_PREFIX[@]}"; do
-        for f in "$CONF_DIR"/"$pfx"-*.json; do
-            [[ -e "$f" ]] && printf "    %s\n" "$(basename "$f")"
-        done
-    done
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && printf "    %s\n" "$(basename "$f")"
+    done < <(_all_node_frags)
+}
+
+# 清掉全部节点：conf 碎片 + share 元数据 + out 产物 + 端口/分离账本。
+# 00-base.json（基础出站/日志）保留；备份在 batch_main 开头已经做过。
+wipe_all_nodes() {
+    local f n=0
+    while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        rm -f "$f" && n=$((n + 1))
+    done < <(_all_node_frags)
+    rm -f "$SHARE_DIR"/*.json 2>/dev/null || true
+    find "$OUT_DIR" -maxdepth 1 -type f -delete 2>/dev/null || true
+    rm -f "$XRAY_BASE/.batch-used" "$XRAY_BASE/.batch-used.reset" \
+          "$CONF_DIR/.batch-ports" 2>/dev/null || true
+    printf '%s' "$n"
+}
+
+_refresh_share_after_wipe() {
+    # 沙箱里的删除不能去刷新生产分享服务 —— 它不知道 XRAY_BASE 是临时目录。
+    [[ "$X_IS_SANDBOX" == true && "${X_CD_ALLOW_SHARE:-0}" != "1" ]] && return 0
+    local _shf
+    _shf=$(resolve_share_sh 2>/dev/null || true)
+    [[ -n "$_shf" ]] || return 0
+    XRAY_BASE="$XRAY_BASE" XRAY_CONF_DIR="$CONF_DIR" \
+        bash "$_shf" refresh >/dev/null 2>&1 || true
 }
 
 ########## 主流程 ##########
 batch_main() {
     mkdir -p "$CONF_DIR" "$OUT_DIR" "$LOG_DIR"
     resolve_scripts_dir || return 1
+
+    # 先让用户选 Nginx 站点，再生成节点。选中的域名会作为本批
+    # X_BATCH_DOMAIN，避免“先自动用了第一个站点、事后没法改”。
+    [[ "${X_BATCH_XHTTP:-1}" == "1" ]] && _bt_pick_nginx_site
 
     print_title "X 内核 全协议一键生成"
 
@@ -816,6 +925,17 @@ batch_main() {
                 _preset_specs+=("vless:6")         # REALITY + XHTTP
             fi
         fi
+
+        # mack-a/v2ray-agent 的两档推荐配置：
+        #   0  = VLESS TCP/TLS + Vision   -> preset ⑩
+        #   12 = VLESS Reality + XHTTP    -> preset ⑪
+        # 已存在同形态时跳过；clean 重建后会真正生成。
+        if [[ "${X_BATCH_MACKA:-1}" == "1" ]]; then
+            # mack-a 0 (VLESS TCP/TLS+Vision) 是 443 直连形态，放到随机高位
+            # 端口在橙云域名下连不上；它放在预置表/菜单 14 里按需建。
+            # 这里只加 mack-a 12 (REALITY+XHTTP)，它不依赖证书/443。
+            _bt_has_form vless xhttp reality || _preset_specs+=("vless:11")
+        fi
         for _sp in $(x_split_modes); do
             if (( _has_split )); then
                 _split_skip+=("$_sp"); _split_why+=("已有分离节点（默认幂等跳过）")
@@ -986,7 +1106,9 @@ PY
     #   放在 batch_summary **之前**: 汇总要如实反映 nginx 到底配没配上,
     #   放到后面就成了"先报成功、再报失败"。
     local _ng_ok=0 _ng_fail=0
-    if declare -F x_cdn_autosetup >/dev/null 2>&1; then
+    if [[ "$X_IS_SANDBOX" == true && "${X_CD_ALLOW_NGINX:-0}" != "1" ]]; then
+        print_info "沙箱模式: 跳过 nginx 写入（需要时显式 X_CD_ALLOW_NGINX=1）"
+    elif declare -F x_cdn_autosetup >/dev/null 2>&1; then
         shopt -s nullglob
         local -a _frags=("$CONF_DIR"/*.json)
         shopt -u nullglob
@@ -1150,6 +1272,8 @@ for n in names:
 }
 
 prune_nginx_after_wipe() {   # <"域名<TAB>路径" 清单>
+    # 沙箱测试时绝不动生产 nginx；要测清理逻辑请显式 X_CD_ALLOW_NGINX=1。
+    [[ "$X_IS_SANDBOX" == true && "${X_CD_ALLOW_NGINX:-0}" != "1" ]] && return 0
     local pyf line dom path n=0
     local -a targets=("$@")
     (( ${#targets[@]} )) || return 0
@@ -1194,12 +1318,15 @@ clear_all_nodes() {
     local -a ng_targets=()
     while IFS= read -r _l; do [[ -n "$_l" ]] && ng_targets+=("$_l"); done < <(_collect_nginx_targets)
 
-    local p del=0
-    for p in "${BATCH_PROTOS[@]}"; do
-        del=$(( del + $(wipe_proto "$p") ))
-    done
+    local del=0
+    del=$(wipe_all_nodes)
     prune_nginx_after_wipe "${ng_targets[@]}"
-    print_ok "已删除 $del 个节点碎片 (conf/out 已备份, 分享令牌需手动重建)"
+    _refresh_share_after_wipe
+    if [[ "$X_IS_SANDBOX" == true && "${X_CD_ALLOW_SHARE:-0}" != "1" ]]; then
+        print_ok "已删除 $del 个节点碎片（含 xHTTP/CDN/分离）；沙箱模式未刷新生产分享"
+    else
+        print_ok "已删除 $del 个节点碎片（含 xHTTP/CDN/分离），分享内容已刷新"
+    fi
     return 0
 }
 
@@ -1223,8 +1350,9 @@ rebuild_all() {
     local -a ng_targets=()
     while IFS= read -r _l; do [[ -n "$_l" ]] && ng_targets+=("$_l"); done < <(_collect_nginx_targets)
     prune_nginx_after_wipe "${ng_targets[@]}"
-    for p in "${BATCH_PROTOS[@]}"; do wipe_proto "$p" >/dev/null; done
-    print_ok "已清掉旧节点, 开始重新生成"
+    wipe_all_nodes >/dev/null
+    _refresh_share_after_wipe
+    print_ok "已清掉全部旧节点（含 xHTTP/CDN/分离）, 开始重新生成"
     return 0
 }
 
@@ -1249,7 +1377,7 @@ main() {
         echo -e "${CYAN}1)${RESET} 全协议生成      ${DIM}逐项确认 (服务器标识 + 端口范围)${RESET}"
         echo -e "${CYAN}2)${RESET} 全协议快速生成  ${DIM}只问端口范围${RESET} ${DIM}← 回车默认${RESET}"
         echo -e "${CYAN}3)${RESET} 全协议重建      ${YELLOW}强制覆盖已有节点 (端口/UUID 会换新)${RESET}"
-        echo -e "${CYAN}4)${RESET} 清空全部节点    ${RED}(破坏性)${RESET}"
+        echo -e "${CYAN}4)${RESET} 清空全部节点    ${RED}(含 xHTTP/CDN/分离, 破坏性)${RESET}"
         echo -e "${CYAN}0)${RESET} 返回"
         # ★ 每个菜单项的回车都要有意义 —— 这是 sing-box-core 的做法, 也是
         #   "按回车就能往下走" 的前提。

@@ -148,7 +148,7 @@ tag 引用。漏掉任何一处，表现都是"改名后分享链接指向一个
 场景——要走 Cloudflare 就得用 WS，局域网内用 SS+无加密就够了，为此去读某个
 脚本的源码找参数名不现实。这里反过来：先选组合，每个组合附一句"为什么选它"。
 
-预置表在 `conf/lib/preset.sh`，28 条覆盖 vless / trojan / vmess / shadowsocks
+预置表在 `conf/lib/preset.sh`，29 条覆盖 vless / trojan / vmess / shadowsocks
 / hysteria2 / socks / http。REALITY 组合在选完当场校验——表是手维护的，加错
 一行不该等到生成配置时才炸，更不该等到用户连不上。
 

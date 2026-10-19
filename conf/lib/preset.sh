@@ -306,7 +306,8 @@ vless:6 core
 vless:7 compat
 vless:8 compat
 vless:9 compat
-vless:10 special
+vless:10 core
+vless:11 cdn
 trojan:1 core
 trojan:2 cdn
 trojan:3 compat
@@ -373,7 +374,8 @@ X_PRESETS=(
     "vless|ws|tls|⑦ WS + TLS（官方已弃用）|⚠ 官方文档顶部已挂 danger: \"推荐换用 XHTTP\". 迁移目标 XHTTP H2 & H3 — 只有在服务端/CDN 明确只吃 WS 时才选它"
     "vless|grpc|tls|⑧ gRPC + TLS|gRPC 走 HTTP/2. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP stream-up — 新装优先选 ④"
     "vless|httpupgrade|tls|⑨ HTTPUpgrade + TLS|比 WS 更轻的 HTTP 升级. ⚠ 官方已标为**弃用**(非移除), 迁移目标 XHTTP — 新装优先选 ④"
-    "vless|tcp|tls|⑩ 裸 TCP + TLS|最简单但最易被识别; 只在确认不需要抗 DPI 时用|"
+    "vless|tcp|tls|⑩ VLESS TCP + TLS + Vision（mack-a 推荐）|裸 TCP + TLS + XTLS Vision：mack-a/v2ray-agent 的 0 号推荐组合，不需要 REALITY 也能吃满 Vision 的 TLS-in-TLS 处理；仍建议优先 ①/②|vision"
+    "vless|xhttp|reality|⑪ VLESS + REALITY + XHTTP（mack-a 12）|REALITY 的 XHTTP 形态，mode=auto（合流），CDN 可用；与 ⑥ 的上下行分离不同，按需选|xhttp-auto|none"
     # ---------- Trojan ----------
     "trojan|tcp|reality|① 隐匿优先 · REALITY + Vision|裸 TCP + REALITY; Trojan 侧最抗 DPI 的组合"
     "trojan|xhttp|tls|② CDN 友好 · XHTTP + TLS|★ 官方主推传输; 可走 Cloudflare 橙云 (与 VLESS 口径一致)"
