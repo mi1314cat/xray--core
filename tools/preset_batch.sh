@@ -40,6 +40,12 @@ DEPLOY_PY="$(_lib deploy.py)" || exit 1
 #   而 _lib_dir 指的是 conf/ —— 于是 [[ -r ]] 判断一直为假, 文件从没被
 #   source, 端口账本和 nginx 自动配置两个功能**都静默没生效**, 而屏幕上
 #   一切正常。加载失败必须看得见。
+# 每次直接运行 preset_batch.sh 时给 reset 一个唯一 id，避免沿用上一次的
+# .batch-used.reset marker 导致本次不重置。
+if [[ "${X_BATCH_RESET_PORTS:-0}" == "1" && -z "${X_BATCH_RESET_ID:-}" ]]; then
+    export X_BATCH_RESET_ID="$(date +%s%N)-$$"
+fi
+
 CD_AUTO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/cdn_auto.sh"
 if [[ ! -r "$CD_AUTO" ]]; then
     _y "  找不到 cdn_auto.sh, nginx 自动配置与端口账本不生效"
@@ -256,6 +262,9 @@ for spec in "${SPECS[@]}"; do
 
   node_no=$((node_no+1))
   tag="${proto}-${tr}-${sec}-${use_port}"
+  # 分离组合必须带模式后缀：只靠端口虽然当下能区分，但端口重置/复用时
+  # 会生成同一个 tag，后一个直接覆盖前一个（实测 6 个预设只剩 2 个文件）。
+  [[ -n "$SPLIT" ]] && tag="${tag}-$(printf '%s' "$SPLIT" | tr ':' '-')"
 
   # 凭据: 非交互自动生成
   cred_json=$(MK_PROTO="$proto" python3 - <<'PY'

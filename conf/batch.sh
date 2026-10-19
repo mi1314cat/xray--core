@@ -631,6 +631,14 @@ batch_main() {
 
     backup_conf_out
     rm -f "$CONF_DIR/.batch-ports"
+    # ★ 端口范围重置只在**批次开始**做一次。主协议和随后 xHTTP/CDN 预置
+    #   共用同一个 .batch-used 游标；如果预置子进程也带 reset=1，它会把
+    #   主协议刚占用的端口重新领一遍（实测 Reality 36028、xhttp 36028，
+    #   Trojan 36029、reality-xhttp 36029 —— 端口/入站互相打架）。
+    if [[ "${X_BATCH_RESET_PORTS:-0}" == "1" ]]; then
+        : > "$XRAY_BASE/.batch-used" 2>/dev/null || true
+        printf '%s' "${X_BATCH_RESET_ID:-$(date +%s%N)-$$}" > "$XRAY_BASE/.batch-used.reset" 2>/dev/null || true
+    fi
 
     # 每协议: 已有节点 → 跳过(幂等); 否则 X_BATCH=1 调用现有协议脚本
     local proto frag file
@@ -841,9 +849,25 @@ batch_main() {
             print_info "  域名: ${X_BATCH_DOMAIN:-未设置}${X_BATCH_DL_DOMAIN:+ / 下行 ${X_BATCH_DL_DOMAIN}}"
             print_info "  直连下行地址: ${X_BATCH_DL_ADDRESS:-未设置}"
             printf "${CYAN}• %-12s${RESET} %s\n" "presets" "${_preset_specs[*]}" >&2
+            # 主协议和预置用的是两套端口账本（.batch-ports vs .batch-used），
+            # 直接让预置从原 START_PORT 开始会撞主协议端口（实测 Reality
+            # 35766 + xhttp 35766）。这里把预置起点抬到主协议最大端口之后，
+            # 并给它自己的 reset id，只重置一次。
+            _preset_start="$(python3 - "$CONF_DIR" <<'PY' 2>/dev/null || echo "${X_BATCH_PORT_START:-20000}"
+import glob,json,os,sys
+m=0
+for f in glob.glob(os.path.join(sys.argv[1],"*.json")):
+    try: d=json.load(open(f))
+    except Exception: continue
+    for ib in d.get("inbounds",[]):
+        try: m=max(m,int(ib.get("port") or 0))
+        except Exception: pass
+print(m+1 if m else 20000)
+PY
+)"
             X_BATCH_NO_RELOAD=1 X_NO_RELOAD=1 \
-            X_BATCH_PORT_START="${X_BATCH_PORT_START:-}" X_BATCH_PORT_END="${X_BATCH_PORT_END:-}" \
-            X_BATCH_RESET_PORTS=1 \
+            X_BATCH_PORT_START="$_preset_start" X_BATCH_PORT_END="$((_preset_start + 2000))" \
+            X_BATCH_RESET_PORTS=1 X_BATCH_RESET_ID="$(date +%s%N)-$$-preset" \
                 timeout "$BATCH_PROTO_TIMEOUT" bash "$TOOLS_DIR/preset_batch.sh" \
                     "${_preset_specs[@]}" </dev/null \
                     >"$LOG_DIR/x-batch-split.log" 2>&1

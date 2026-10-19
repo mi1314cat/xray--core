@@ -304,7 +304,17 @@ cd_batch_take_port() {
     # 不被上一次批次留下的 .batch-used 游标带跑（实测：请求 36600-36800，
     # 实际从 25430 开始，用户完全看不出来）。
     if [[ "${X_BATCH_RESET_PORTS:-0}" == "1" ]]; then
-        : >"$used" 2>/dev/null || true
+        # 只重置**一次**：这个函数每个预设调用一次，原来每次都 : > 文件，
+        # 于是 6 个预设全拿到同一个端口/同一个 tag，后一个覆盖前一个。
+        # 用 marker 记住本次批次的 reset id；后续调用按正常游标递增。
+        local rid="${X_BATCH_RESET_ID:-1}"
+        if [[ "$(cat "$used.reset" 2>/dev/null || true)" != "$rid" ]]; then
+            : >"$used" 2>/dev/null || true
+            printf '%s' "$rid" >"$used.reset" 2>/dev/null || true
+        fi
+        [[ -s "$used" ]] && n=$(( $(tail -1 "$used" 2>/dev/null || echo 0) + 1 ))
+        # 刚重置时 n 应回到范围起点，而不是 tail 的旧值；文件为空时保持 s
+        [[ -s "$used" ]] || n=$s
     else
         [[ -s "$used" ]] && n=$(( $(tail -1 "$used" 2>/dev/null || echo 0) + 1 ))
     fi
