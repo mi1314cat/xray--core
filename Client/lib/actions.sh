@@ -43,13 +43,18 @@ cmd_install() {
     [ -f "$dist/VERSION" ] && cp "$dist/VERSION" "$XBD_PREFIX/VERSION"
     # CLI 入口
     install -m 0755 "$dist/bin/xbd" "$XBD_PREFIX/bin/xbd" 2>/dev/null || true
-    # 脚本以 xbd-dist 为根定位 lib（见 scripts/run-*.sh）
-    mkdir -p "$XBD_DIST"
-    cp -a "$dist/lib/." "$XBD_LIBDIR/" 2>/dev/null || true
-    cp -a "$dist/bin/." "$XBD_DIST/bin/" 2>/dev/null || true
-    cp -a "$dist/VERSION" "$XBD_DIST/VERSION" 2>/dev/null || true
     ok "已拷贝项目文件"
   fi
+
+  # xbd-dist 只做路径别名，指向同一份 lib/bin/tools，避免双份真相。
+  mkdir -p "$XBD_DIST"
+  local _d
+  for _d in lib bin tools; do
+    [ -d "$XBD_PREFIX/$_d" ] || continue
+    rm -rf "$XBD_DIST/$_d"
+    ln -sfn "../$_d" "$XBD_DIST/$_d"
+  done
+  [ -f "$XBD_PREFIX/VERSION" ] && cp "$XBD_PREFIX/VERSION" "$XBD_DIST/VERSION" 2>/dev/null || true
 
   # 权限：显式设定，避免 umask 造成的 203/EXEC
   chmod 0755 "$XBD_SCRIPTS"/*.sh "$XBD_LIB"/*.py "$XBD_DIST/lib"/*.py 2>/dev/null || true
@@ -217,8 +222,9 @@ CHROMIUM_EXTRA_ARGS="--no-sandbox"
 # headless 已在本机验证可用；需要图形环境时改成 xvfb 并安装 xvfb
 CHROMIUM_MODE=headless
 CHROMIUM_DISPLAY=:99
-# Chromium 的 ECH 依赖 Secure DNS（现代 Chromium 已移除相关命令行开关）
-XBD_DOH=https://dns.alidns.com/dns-query
+# Chromium 的 ECH 依赖 Secure DNS（现代 Chromium 已移除相关命令行开关）。
+# export 是必须的：run-chromium.sh 的 python heredoc 通过 os.environ 读它。
+export XBD_DOH=https://dns.alidns.com/dns-query
 EOF
 
   if [ ! -f "$XBD_CONF/panel.env" ]; then
@@ -1165,6 +1171,14 @@ cmd_node_use() {
       _xbd_sync_xray_with_node || warn "Xray 重启失败，请手动执行: xbd restart"
     fi
   fi
+  if [ "$want" = "yes" ]; then
+    if _xbd_wait_dialer_connected 20; then
+      ok "浏览器已接上（$(conn_count "$(_xbd_dialer_addr)") 条 WS），可以开始使用"
+    else
+      warn "Chromium 还没接上 Dialer 通道 —— 首次请求可能挂起"
+      info "  再等几秒，或执行: xbd dialer on / xbd ports verify"
+    fi
+  fi
 }
 
 # 每个节点自己的"是否用浏览器完成 TLS"开关。
@@ -1551,7 +1565,7 @@ cmd_start() {
     systemctl enable --now "$XBD_U_TIMER" >/dev/null 2>&1 || true
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
-      unit_active "$XBD_U_CHROMIUM" && [ "$(conn_count '127.0.0.1:18081')" -gt 0 ] && break
+      unit_active "$XBD_U_CHROMIUM" && [ "$(conn_count "$(_xbd_dialer_addr)")" -gt 0 ] && break
       sleep 1
     done
     if unit_active "$XBD_U_CHROMIUM"; then
@@ -1662,6 +1676,22 @@ cmd_dialer() {
 #
 # 这是**每个节点各自的属性**，不是全局模式：以前做成全局开关时，一关就让所有
 # 依赖浏览器的节点一起失效（实测踩过），而只是某个节点想省内存时不该牵连别人。
+# Xray ↔ Chromium 的内部通道地址。所有 UI/诊断都必须读同一个值，
+# 硬编码 18081 在改过端口（xbd port channel）后会全部显示错误。
+_xbd_dialer_addr() { cfg_get "$XBD_CONF/ports.env" DIALER_ADDR "127.0.0.1:18081"; }
+
+# 等 Chromium 真正连上 Xray 的 dialer 通道。Xray 重启后 dialer listener 才出现，
+# Chromium 需要几秒重连；不等就返回会让用户第一次请求撞上 dialTask 无超时的挂起。
+_xbd_wait_dialer_connected() {   # [秒数]
+  local i n="${1:-20}" addr
+  addr=$(_xbd_dialer_addr)
+  for ((i = 0; i < n; i++)); do
+    [ "$(conn_count "$addr")" -gt 0 ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
 _xbd_node_needs_dialer() {
   # 判定只有一个来源：compat.py want-bd（与 run-xray.sh、health-check.sh 共用）。
   # 以前这里自己写了一套 python，三处语义容易走偏 —— 而走偏的后果是节点永久挂住。
@@ -1700,7 +1730,7 @@ xbd_dialer_status() {
   printf '  SOCKS5 入口:      %s:%s（全部节点）\n' "$la" "$(cfg_get "$XBD_CONF/ports.env" PORT_NORMAL 1080)"
   printf '  HTTP  入口(LAN):  %s:%s（全部节点）\n' "$la" "$(cfg_get "$XBD_CONF/ports.env" PORT_LAN_HTTP 10809)"
   printf '  HTTP  入口(本机): 127.0.0.1:%s\n' "$(cfg_get "$XBD_CONF/ports.env" PORT_HTTP 10808)"
-  printf '  浏览器连接数:     %s\n' "$(conn_count '127.0.0.1:18081')"
+  printf '  浏览器连接数:     %s\n' "$(conn_count "$(_xbd_dialer_addr)")"
   if _xbd_node_needs_dialer; then
     if unit_active "$XBD_U_CHROMIUM"; then
       printf '  当前节点:         依赖浏览器拨号 —— Chromium 在线，可用 ✓\n'
@@ -1728,7 +1758,7 @@ xbd_dialer_on() {
   systemctl enable --now "$XBD_U_TIMER" >/dev/null 2>&1 || true
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    unit_active "$XBD_U_CHROMIUM" && [ "$(conn_count '127.0.0.1:18081')" -gt 0 ] && break
+    unit_active "$XBD_U_CHROMIUM" && [ "$(conn_count "$(_xbd_dialer_addr)")" -gt 0 ] && break
     sleep 1
   done
 
@@ -2117,7 +2147,7 @@ cmd_diagnose() {
   local cactive=0; unit_active "$XBD_U_CHROMIUM" && cactive=1
   if _xbd_node_needs_dialer; then
     _d "Chromium: RUNNING" "$([ "$cactive" -eq 1 ] && echo PASS || echo FAIL)" "$cprocs 个进程（当前节点依赖浏览器拨号）"
-    _d "浏览器↔Dialer" "$([ "$(conn_count '127.0.0.1:18081')" -gt 0 ] && echo PASS || echo WARN)" "$(conn_count '127.0.0.1:18081') 条 WS"
+    _d "浏览器↔Dialer" "$([ "$(conn_count "$(_xbd_dialer_addr)")" -gt 0 ] && echo PASS || echo WARN)" "$(conn_count "$(_xbd_dialer_addr)") 条 WS"
   else
     _d "Chromium: RUNNING" "$([ "$cactive" -eq 1 ] && echo PASS || echo WARN)" \
       "$cprocs 个进程$([ "$cactive" -eq 0 ] && echo '（当前节点不需要，不影响）')"
@@ -2179,10 +2209,20 @@ cmd_update() {
   need_root
   step "更新本项目组件"
   dim "  系统 Xray / xray.service / mihomo 不会被更新或重启"
+  # 标准安装布局里没有"另一份新代码"可同步：xbd-dist 现在只是 lib/bin/tools
+  # 的符号链接。真正的版本更新必须重新从 GitHub 拉发布包，否则这个命令会
+  # 显示成功却什么也没换（HEAD 就是这样）。l.sh 已在安装时落到 PREFIX。
+  if [ -x "$XBD_PREFIX/l.sh" ] && [ "${XBD_UPDATE_LOCAL:-0}" != "1" ]; then
+    info "  从 GitHub 拉取最新发布包（节点与 config 保留）"
+    XBD_PREFIX="$XBD_PREFIX" bash "$XBD_PREFIX/l.sh" --yes || {
+      warn "  GitHub 更新失败；本次未改动现有安装"
+      return 1
+    }
+    return 0
+  fi
   local dist; dist=$(xbd_dist_dir)
   if [ "$(cd "$dist" && pwd)" != "$(cd "$XBD_PREFIX" && pwd)" ]; then
     cp -a "$dist/lib/." "$XBD_LIB/" 2>/dev/null || true
-    cp -a "$dist/lib/." "$XBD_LIBDIR/" 2>/dev/null || true
     cp -a "$dist/service/." "$XBD_SERVICE/" 2>/dev/null || true
     cp -a "$dist/scripts/." "$XBD_SCRIPTS/" 2>/dev/null || true
     cp -a "$dist/docs/." "$XBD_PREFIX/docs/" 2>/dev/null || true
@@ -2190,8 +2230,16 @@ cmd_update() {
     install -m 0755 "$dist/bin/xbd" "$XBD_PREFIX/bin/xbd" 2>/dev/null || true
     ok "已同步项目文件"
   else
-    ok "已在目标目录内运行，跳过自我拷贝"
+    info "当前已经是安装目录：代码文件不在这里自我覆盖"
+    info "  更新版本请重跑 GitHub 一键安装（会保留 nodes/ 与 config/）"
   fi
+  mkdir -p "$XBD_DIST"
+  local _d
+  for _d in lib bin tools; do
+    [ -d "$XBD_PREFIX/$_d" ] || continue
+    rm -rf "$XBD_DIST/$_d"
+    ln -sfn "../$_d" "$XBD_DIST/$_d"
+  done
   chmod 0755 "$XBD_SCRIPTS"/*.sh "$XBD_LIB"/*.py "$XBD_DIST/lib"/*.py 2>/dev/null || true
   local u
   for u in "$XBD_U_XRAY" "$XBD_U_SHARE" "$XBD_U_CHROMIUM" "$XBD_U_PANEL" "$XBD_U_HEALTH" "$XBD_U_TIMER"; do

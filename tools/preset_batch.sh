@@ -162,6 +162,7 @@ if [[ "${1:-}" == "--recommended" || "${1:-}" == "--default" ]]; then
         done
     done
     echo
+    exit 0
 fi
 [[ $# -eq 0 && -z "${SPECS[*]:-}" ]] && { usage; exit 1; }
 [[ $# -gt 0 ]] && SPECS=("$@")

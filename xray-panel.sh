@@ -563,7 +563,7 @@ show_menu() {
     ui_menu 4 "分享管理        生成 / 列表 / 启停 / 改次数 / 改有效期 / 服务状态"
     echo >&2
     ui_sec "站点与证书"
-    ui_menu 5 "证书管理        申请 / 续期 / 同步 / 信任链体检"
+    ui_menu 5 "证书管理        校验 / 迁移 / 回收 / 引用查询（签发待接入 ACME）"
     ui_menu 6 "Nginx 站点管理  列出 / 校验 / 摘除 / CDN 回源"
     echo >&2
     ui_sec "内核与服务"
@@ -914,6 +914,66 @@ _xray_preset_total() {
     printf '%s' "$_XRAY_PRESET_TOTAL"
 }
 
+# 预置档位批量生成（菜单 14）。
+#
+# 以前这一项是 `tools/preset_batch.sh --help` —— 点进去只打印帮助，用户
+# 永远建不出节点。现在把 preset 的三种入口真正接上：
+#   ① 推荐全协议（preset.sh 的 core+cdn 档位，自动展开，含 VMess）
+#   ② 手动输入（vless:5 trojan:2:nginx …）
+#   ③ 查看全部预置
+# REALITY 密钥与域名从 install_info.env 复用，缺的时候交互补。
+_preset_batch_menu() {
+    local specs="" dom choice
+    _srv_clear
+    ui_title "预置档位批量生成"
+    ui_hint "预置表 = 协议 × 传输 × 加密层；推荐档是 core+cdn"
+    echo >&2
+    ui_menu 1 "推荐全协议（自动展开 core+cdn）"
+    ui_menu 2 "手动输入 spec（如 vless:5 trojan:2:nginx）"
+    ui_menu 3 "查看全部预置"
+    ui_menu 0 "返回"
+    echo >&2
+    read -r -p "  ${_CYN}请选择 [0-3]${_RST}: " choice || return 0
+    case "$choice" in
+        1)
+            specs=$(xray_run tools/preset_batch.sh --recommended 2>/dev/null) || {
+                ui_invalid "推荐档展开失败"; ui_pause; return 1; }
+            ;;
+        2)
+            specs=$(ui_ask "spec（空格分隔）" "vless:1") || return 0
+            ;;
+        3)
+            xray_run tools/preset_batch.sh --list
+            ui_pause
+            return 0
+            ;;
+        0|"") return 0 ;;
+        *) ui_invalid "$choice"; return 1 ;;
+    esac
+    [[ -n "${specs// /}" ]] || { ui_invalid "没有可生成的 spec"; ui_pause; return 1; }
+
+    # 域名：TLS/REALITY 节点都需要；留空则 TLS 档会明确失败，不会静默建半截。
+    dom=$(ui_ask "TLS 域名（留空=跳过 TLS 档）" "${X_BATCH_DOMAIN:-}") || return 0
+    export X_BATCH_DOMAIN="$dom"
+    # 复用面板已有的 REALITY 密钥/短 ID，避免每建一个节点手抄一次。
+    local info="${XRAY_BASE:-/root/catmi/xray}/install_info.env"
+    if [[ -r "$info" ]]; then
+        local pk pb sid
+        pk=$(sed -n 's/^PRIVATE_KEY=["'"'"']*\([^"'"'"']*\)["'"'"']*.*/\1/p' "$info" | tail -1)
+        pb=$(sed -n 's/^PUBLIC_KEY=["'"'"']*\([^"'"'"']*\)["'"'"']*.*/\1/p' "$info" | tail -1)
+        sid=$(sed -n 's/^short_id=["'"'"']*\([^"'"'"']*\)["'"'"']*.*/\1/p' "$info" | tail -1)
+        [[ -n "$pk" ]] && export X_BATCH_REALITY_PRIVATE_KEY="$pk"
+        [[ -n "$pb" ]] && export X_BATCH_REALITY_PUBLIC_KEY="$pb"
+        [[ -n "$sid" ]] && export X_BATCH_REALITY_SHORT_ID="$sid"
+    fi
+    ui_kv "域名" "${dom:-（空，TLS 档会跳过）}"
+    ui_kv "spec" "$specs"
+    echo >&2
+    xray_run tools/preset_batch.sh $specs
+    share_refresh_hook
+    ui_pause
+}
+
 add_node_menu() {    local c
     while :; do
         _srv_clear
@@ -1011,7 +1071,7 @@ add_node_menu() {    local c
             ;;
 
         13) xray_run conf/mknode.sh ;;
-        14) xray_run tools/preset_batch.sh --help ;;
+        14) _preset_batch_menu ;;
         15) xray_run tools/split_menu.sh ;;
         16) xray_run tools/xhttp_doctor.sh "${XRAY_BASE:-/root/catmi/xray}/log/access.log" ;;
         *)

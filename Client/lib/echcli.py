@@ -307,11 +307,31 @@ def port_open(port, host="127.0.0.1"):
         return s.connect_ex((host, port)) == 0
 
 
+def configured_doh() -> str:
+    """生产 Chromium 用的 DoH；与 run-chromium.sh 读同一个配置文件。
+
+    以前诊断硬编码 DEFAULT_DOH，用户在 chromium.env 里改了 DoH 后，
+    面板/诊断仍报旧值，出现「面板显示 A、浏览器实际用 B」的假结论。
+    """
+    envf = os.path.join(PREFIX, "config", "chromium.env")
+    try:
+        with open(envf, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("XBD_DOH="):
+                    v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if v:
+                        return v
+    except OSError:
+        pass
+    return DEFAULT_DOH
+
+
 def main(argv):
     as_json = "--json" in argv
     quick = "--quick" in argv
     keep = "--keep" in argv
-    doh = DEFAULT_DOH
+    doh = configured_doh()
     if "--doh" in argv:
         doh = argv[argv.index("--doh") + 1]
     domain = "" if quick else DEFAULT_DOMAIN

@@ -49,6 +49,12 @@ if [ "$HERE" != "$PREFIX" ]; then
     [ -d "$HERE/$d" ] && mkdir -p "$PREFIX/$d" && cp -a "$HERE/$d/." "$PREFIX/$d/" 2>/dev/null || true
   done
   [ -f "$HERE/VERSION" ] && cp "$HERE/VERSION" "$PREFIX/VERSION"
+  # l.sh / 卸载脚本也放进安装目录：xbd update 需要它从 GitHub 重装，
+  # 用户想卸载时也不必再找仓库。
+  for f in l.sh uninstall-xray-client.sh RUN.md; do
+    [ -f "$HERE/$f" ] && cp -a "$HERE/$f" "$PREFIX/$f" 2>/dev/null || true
+  done
+  chmod 0755 "$PREFIX/l.sh" "$PREFIX/uninstall-xray-client.sh" 2>/dev/null || true
   ok "文件已复制到 $PREFIX"
 fi
 
@@ -67,13 +73,19 @@ chmod 0755 "$PREFIX"/scripts/*.sh "$PREFIX"/lib/*.sh 2>/dev/null || true
 find "$PREFIX/lib" -name '*.py' -exec chmod 0755 {} + 2>/dev/null || true
 find "$PREFIX/tools" -name '*.sh' -exec chmod 0755 {} + 2>/dev/null || true
 
-# xbd 需要从 xbd-dist 找到 lib（与自解压版目录约定一致）
+# xbd 需要从 xbd-dist 找到 lib（与自解压版目录约定一致）。
+#
+# ★ 必须是**符号链接**，不能是第二份拷贝。以前这里 cp 了一份，于是
+#   /opt/xray-browser-dialer/lib 与 xbd-dist/lib 会各自演化：CLI 改了前者，
+#   systemd 服务读后者，出现「命令行说支持、服务实际按旧规则跑」的鬼故事。
+#   符号链接让两个路径永远指向同一份文件。
 mkdir -p "$PREFIX/xbd-dist"
-cp -a "$PREFIX/lib/." "$PREFIX/xbd-dist/lib/" 2>/dev/null || true
-cp -a "$PREFIX/bin/." "$PREFIX/xbd-dist/bin/" 2>/dev/null || true
-cp -a "$PREFIX/tools/." "$PREFIX/xbd-dist/tools/" 2>/dev/null || true
+for d in lib bin tools; do
+  [ -d "$PREFIX/$d" ] || continue
+  rm -rf "$PREFIX/xbd-dist/$d"
+  ln -sfn "../$d" "$PREFIX/xbd-dist/$d"
+done
 [ -f "$PREFIX/VERSION" ] && cp "$PREFIX/VERSION" "$PREFIX/xbd-dist/VERSION"
-find "$PREFIX/xbd-dist" -name '*.py' -exec chmod 0755 {} + 2>/dev/null || true
 
 # 让 xbd 在任意位置可用。只在默认前缀时创建：
 # 自定义 prefix（测试或多实例）不应覆盖全局命令。

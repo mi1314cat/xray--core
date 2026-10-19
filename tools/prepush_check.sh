@@ -160,6 +160,53 @@ else
     [ "$diff_n" -eq 0 ] && ok "$((n_files - ex_n)) 个文件逐字一致$([ "$ex_n" -gt 0 ] && printf ', %d 个按名豁免' "$ex_n")"
 fi
 
+# ---------------------------------------------------------------- 4b. 发布包
+head1 "客户端发布包是否由当前源码构建"
+PKG="$CAND/Client/xbd-client.tar.gz"
+if [[ ! -f "$PKG" ]]; then
+    bad "缺 Client/xbd-client.tar.gz（先跑 bash Client/tools/make-release.sh）"
+else
+    _pk_tmp=$(mktemp -d)
+    tar tzf "$PKG" > "$_pk_tmp.list" 2>/dev/null || true
+    if tar xzf "$PKG" -C "$_pk_tmp" 2>/dev/null; then
+        _pk_bad=0; _pk_n=0
+        # 包里的每个文件都必须与工作区逐字节一致；否则就是"测的是新代码、
+        # 装的是旧包"（2.8.10 收尾时真实发生过）。
+        while IFS= read -r rel; do
+            [[ "$rel" == */ ]] && continue
+            [[ -f "$CAND/Client/$rel" ]] || continue
+            _pk_n=$((_pk_n+1))
+            if ! cmp -s "$_pk_tmp/$rel" "$CAND/Client/$rel"; then
+                bad "包内 $rel 与源码不一致"; _pk_bad=$((_pk_bad+1))
+            fi
+        done < <(tar tzf "$PKG" 2>/dev/null)
+        # 源码里应该进包的文件不能漏（新增脚本忘了打包，测试也不会报）
+        _src_missing=0
+        for _p in RUN.sh RUN.md l.sh uninstall-xray-client.sh bin lib service scripts docs tools VERSION README.md; do
+            [[ -e "$CAND/Client/$_p" ]] || continue
+            while IFS= read -r f; do
+                rel="${f#"$CAND/Client/"}"
+                grep -qxF -- "$rel" "$_pk_tmp.list" || {
+                    bad "源码文件没进包: $rel"; _src_missing=$((_src_missing+1)); }
+            done < <(find "$CAND/Client/$_p" -type f ! -name '*.pyc' ! -path '*__pycache__*' 2>/dev/null)
+        done
+        _pk_ver=$(cat "$_pk_tmp/VERSION" 2>/dev/null || echo '?')
+        _src_ver=$(cat "$CAND/Client/VERSION" 2>/dev/null || echo '?')
+        [[ "$_pk_ver" == "$_src_ver" ]] || bad "包 VERSION=$_pk_ver，源码 VERSION=$_src_ver"
+        for _sfx in gz xz; do
+            _sha="$CAND/Client/xbd-client.tar.$_sfx.sha256"
+            [[ -f "$_sha" ]] || { bad "缺 $(basename "$_sha")"; continue; }
+            _want=$(tr -d ' \n\r' < "$_sha")
+            _got=$(sha256sum "$CAND/Client/xbd-client.tar.$_sfx" | awk '{print $1}')
+            [[ "$_want" == "$_got" ]] || bad "xbd-client.tar.$_sfx 的 sha256 不匹配"
+        done
+        [[ "$_pk_bad$_src_missing" -eq 0 ]] && ok "包内 $_pk_n 个文件与源码一致，版本/校验和正确"
+    else
+        bad "发布包解压失败"
+    fi
+    rm -rf "$_pk_tmp" "$_pk_tmp.list"
+fi
+
 # ---------------------------------------------------------------- 5. 测试套件
 head1 "测试套件 tools/check_libs.sh"
 if [ -f "$TESTED/tools/check_libs.sh" ]; then

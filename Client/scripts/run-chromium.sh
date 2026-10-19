@@ -10,6 +10,9 @@ CHROMIUM_MODE="headless"
 CHROMIUM_DISPLAY=":99"
 CHROMIUM_EXTRA_ARGS="--no-sandbox"
 [ -f "$ENVF" ] && . "$ENVF"
+# XBD_DOH 必须 export：下面 python3 heredoc 用 os.environ 读取，仅 source
+# 只会得到 shell 变量，自定义 DoH 永远不生效（实测）。默认值仍由 python 兜底。
+export XBD_DOH="${XBD_DOH:-https://dns.alidns.com/dns-query}"
 
 # 地址来源：ports.env 的 DIALER_ADDR —— 与 run-xray.sh 读的是同一个值。
 # 之前这里写死了 127.0.0.1:18081，导致改了 ports.env 之后

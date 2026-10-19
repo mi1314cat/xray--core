@@ -199,7 +199,7 @@ srv_service()   { systemctl is-active xrayls 2>/dev/null || echo "inactive"; }
 #   用户表现为"菜单打出来就卡住, 什么都点不动"。菜单必须能离线用。
 _remote_version() {
     local f; f=$(mktemp) || return 1
-    _fetch "Client/VERSION" "$f" >/dev/null 2>&1 || { rm -f "$f"; return 1; }
+    _fetch "VERSION" "$f" >/dev/null 2>&1 || { rm -f "$f"; return 1; }
     head -1 "$f" 2>/dev/null | tr -d '[:space:]'
     rm -f "$f"
 }
@@ -208,7 +208,7 @@ check_update() {
     local rv
     printf '\n'
     if rv=$(_remote_version) && [[ -n "$rv" ]]; then
-        ok "远端版本: $rv"
+        ok "远端面板版本: $rv"
     else
         warn "查不到远端版本 (镜像链不通或超时) —— 本机已有的功能不受影响"
     fi
@@ -572,7 +572,7 @@ run_update() {
 # ---------------------------------------------------------------- 卸载
 run_uninstall() {
     printf '\n  卸载哪一个?\n'
-    printf '    1) 服务端面板 (停 xrayls, 配置目录保留)\n'
+    printf '    1) 服务端面板 (停 xrayls；默认备份后删除，选项里可保留节点)\n'
     printf '    2) 客户端\n'
     printf '    0) 返回\n'
     printf '  选择: '
@@ -582,11 +582,17 @@ run_uninstall() {
             printf '  确认卸载服务端? 输入 yes: '
             local a; read -r a || true
             [[ "$a" == "yes" ]] || { say "已取消"; return 0; }
+            local keep=""
+            printf '  保留节点配置 conf/ 与产物 out/? [Y/n]: '
+            read -r keep || true
             TMP="${TMP:-$(mktemp -d)}"
             local u="$TMP/uninstall_xray.sh"
             _get "uninstall_xray.sh" "$u" \
                 || die "本机没有卸载脚本、远端也取不到 (镜像链全不通?)"
-            bash "$u"
+            case "$keep" in
+                n|N|no|NO) bash "$u" ;;
+                *)         bash "$u" --keep-data ;;
+            esac
             ;;
         2)
             if [[ -x "$CLI_PREFIX/uninstall-xray-client.sh" ]]; then

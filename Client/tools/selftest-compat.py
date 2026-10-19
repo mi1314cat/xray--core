@@ -16,8 +16,12 @@ import os
 import sys
 
 PREFIX = os.environ.get("XBD_PREFIX", "/opt/xray-browser-dialer")
-for cand in (os.path.join(PREFIX, "xbd-dist", "lib"), os.path.join(PREFIX, "lib"),
-             os.path.join(os.path.dirname(__file__), "..", "lib")):
+# ★ 源码目录优先: 以前 /opt 已装副本排在最前，开发机上跑自检会测到**旧代码**，
+#   于是"自检通过"证明不了当前要发布的这份。安装后 __file__ 就在 PREFIX 下，
+#   这个顺序仍然正确。
+for cand in (os.path.join(os.path.dirname(__file__), "..", "lib"),
+             os.path.join(PREFIX, "lib"),
+             os.path.join(PREFIX, "xbd-dist", "lib")):
     cand = os.path.abspath(cand)
     if os.path.exists(os.path.join(cand, "compat.py")):
         LIB = cand
@@ -70,14 +74,17 @@ check("实测失败时显式选 BD 也不许用（会挂住）",
       c.want_browser_dialer(node(use_browser=True, browser_probe={"ok": False})), False)
 check("非 ws/xhttp 传输 → 不用", c.want_browser_dialer(node(transport="raw")), False)
 check("reality → 不用", c.want_browser_dialer(node(security="reality")), False)
-# ECH 只能由 Xray 自己完成 TLS：交给 Chromium 后 tlsSettings.echConfigList
-# 不生效，节点会直接连不上（实测 2.8.8 生产上就是栽在这里）。
-_ech_node = node(ech={"config": "cloudflare-ech.com+https://dns.alidns.com/dns-query"})
-check("ECH → 不用浏览器", c.want_browser_dialer(_ech_node), False)
-check("ECH → can_use_dialer 也是 False", bd(_ech_node), False)
+# Browser Dialer 的 ECH 由 Chromium + Secure DNS 完成（Xray 的 echConfigList
+# 在 dialer 模式下不参与）。所以 ECH 节点必须**允许**走浏览器。
+_ech_node = node(ech="cloudflare-ech.com+https://dns.alidns.com/dns-query")
+check("ECH → 允许浏览器（Chromium Secure DNS 提供 ECH）",
+      c.want_browser_dialer(_ech_node), True)
+check("ECH → can_use_dialer 也是 True", bd(_ech_node), True)
 _ech_render = c.render({"node": _ech_node, **c.check_all(_ech_node)})
-check("ECH → 面板/CLI 渲染显示 Browser Dialer 不支持",
-      "Browser Dialer：\n  ✗ 不支持" in _ech_render, True)
+check("ECH → 面板/CLI 渲染显示 Browser Dialer 支持",
+      "Browser Dialer：\n  ✓ 支持" in _ech_render, True)
+check("ECH → 说明 ECH 来自 Chromium Secure DNS",
+      "Secure DNS" in _ech_render, True)
 for _n in (node(), node(transport="websocket"), node(security="reality"),
            node(transport="raw"), node(protocol="vmess"),
            node(browser_probe={"ok": False}), node(browser_probe={"ok": True}),

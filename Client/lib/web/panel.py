@@ -1026,7 +1026,9 @@ def act_diagnose():
 
 
 def act_ech():
-    rc, out, err = sh(["python3", os.path.join(DIST, "lib", "echcli.py"), "--quick"], timeout=120)
+    # --quick 只查 DNS 就返回，永远到不了 netlog 的 ECH 判据；面板既然提供
+    # 「验证 ECH」按钮，就必须跑完整诊断（会临时起 Chromium，耗时约 20-40s）。
+    rc, out, err = sh(["python3", os.path.join(PREFIX, "lib", "echcli.py")], timeout=180)
     return rc == 0, (out or err)
 
 
@@ -2174,10 +2176,10 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
   <div class="hint">只更新本项目自己的副本（$PREFIX/bin/xray），不碰系统 Xray。下载后会校验官方 SHA256。</div>
   <div class="bar">
     <button onclick="runSelftest(this)">运行内置自检</button>
-    <button onclick="updateScripts(this)">更新项目脚本</button>
+    <button onclick="updateScripts(this)">重新应用配置</button>
   </div>
   <div class="hint">自检覆盖解析器 / 能力判定 / 配置生成（命令行等价写法: <code>xbd selftest</code>）；
-    更新脚本会同步 <code>xbd</code> 与各模块并重启服务。</div>
+    版本更新请重跑 GitHub 一键安装；这里只重新生成运行配置。</div>
   <pre id="selftest-out" style="display:none"></pre>
 </div>
     </section>
@@ -3120,8 +3122,8 @@ async function runSelftest(btn){
 }
 
 async function updateScripts(btn){
-  if (!confirm('更新项目脚本？会同步 xbd 与各模块并重启服务（配置与节点不动）。')) return;
-  post('config_update', {}, '正在更新项目脚本…', btn);
+  if (!confirm('重新生成运行配置并重启？节点与配置目录不动。')) return;
+  post('config_update', {}, '正在重新应用配置…', btn);
 }
 
 async function loadConn(btn){
