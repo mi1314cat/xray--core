@@ -2985,7 +2985,7 @@ Xray Client Web Manager v$XBD_VERSION
   状态与诊断
     status [--quick]                       状态（含当前节点实际走哪条 TLS 路径）
     diagnose [--quick]                     全面诊断
-    panel [status|restart|stop|passwd]     网页面板：地址/登录密码 / 重启 / 停掉 / 改密码
+    panel [status|restart|stop|passwd]     网页面板：地址/登录账号 / 重启 / 停掉 / 改密码
     export                                 导出连接配置到 generated/（方便复制）
     cert <编号|--missing>                  取服务端证书指纹并固定（自签证书节点用；--missing 批量补齐）
     ech                                    验证 Chromium 原生 ECH

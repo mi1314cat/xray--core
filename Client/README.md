@@ -85,13 +85,28 @@ xbd node list               # 节点列表（含两种能力判定）
 xbd node use <编号>          # 切换节点
 xbd node latency            # 测延时（真实请求）
 xbd dialer on|off           # 启用/关闭 Browser Dialer
-xbd panel                   # 面板地址与令牌
+xbd panel                   # 面板地址 / 登录用户名 / 密码
 xbd diagnose                # 全面诊断
 xbd export                  # 导出连接配置
 xbd cert <编号>              # 取服务端证书指纹（自签节点）
 xbd xray check|update       # Xray 内核版本 / 更新
 xbd uninstall               # 安全卸载（也可用上面的独立删除脚本）
 ```
+
+---
+
+## Web 面板登录
+
+装完后直接访问 `http://<本机IP>:18090/` 即可，**不需要再找 `?token=` 路径**：
+
+- 用户名/密码保存在 `config/panel.env`（0600），首次安装随机生成；
+- `xbd panel` 会显示地址、用户名、密码；
+- 改密码：`xbd panel passwd`（或 `xbd panel passwd <用户名> <新密码>`）；
+- 登录后浏览器会记住会话（HttpOnly Cookie，7 天滑动续期）；
+- 旧的 `?token=` 链接仍兼容，但日常用用户名密码即可。
+
+测速页的「一键测速」默认并发 4 路，逐节点更新；Browser Dialer 节点会标成
+「需BD」（TLS 在 Chromium 里，临时 Xray 探测不适用），不会误报成节点坏了。
 
 ---
 
@@ -142,7 +157,7 @@ xbd dialer on               # 启动 Chromium（Browser Dialer 的运行时依�
 xbd dialer off              # 停掉 Chromium（Xray 继续运行，需要浏览器的节点会暂时不可用）
 xbd diagnose                # 全面诊断
 xbd ech                     # 验证 Chromium 原生 ECH
-xbd panel                   # 面板地址与令牌
+xbd panel                   # 面板地址 / 登录用户名 / 密码
 ```
 
 ## 架构要点

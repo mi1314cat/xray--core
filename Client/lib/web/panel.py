@@ -2959,7 +2959,7 @@ function visibleFiles(){
 }
 async function batchTest(btn){
   const files = selectedOrVisible();
-  if (!files.length) return say('当前分组没有节点；先选分组或勾选节点', 'err');
+  if (!files.length) return say('节点还在加载，或当前分组为空；稍后再点一次', 'err');
   const total = files.length;
   files.forEach(f => { LAT[f] = {loading:true}; });
   renderNodes();
@@ -2983,9 +2983,14 @@ async function batchTest(btn){
   };
   // 4 路并发：每个节点都要起一个临时 Xray，开太多反而抢 CPU。
   // 7 个直连节点大约两轮就能测完，BD 节点会立即返回“需BD”，不再拖住整批。
-  await Promise.all(Array.from({length: Math.min(4, total)}, worker));
-  renderNodes();
-  if (btn){ btn.disabled = false; btn.textContent = old; }
+  try {
+    await Promise.all(Array.from({length: Math.min(4, total)}, worker));
+  } finally {
+    // 即使某个请求/重画抛异常，按钮也必须恢复；否则用户看到的就是
+    // “点了一次测速后按钮永远灰着、页面没反应”。
+    renderNodes();
+    if (btn){ btn.disabled = false; btn.textContent = old; }
+  }
   const tail = (bd?`，${bd} 个由浏览器完成 TLS（需BD）`:'') + (bad?`，${bad} 个失败`:'');
   say(`测速完成：成功 ${ok}/${total}${tail}`, bad ? 'err' : 'good');
 }
@@ -3023,7 +3028,14 @@ function renderBulkbar(){
 function batchClear(){ VIEW.sel.clear(); renderNodes(); }
 
 function selectedOrVisible(){
-  return VIEW.sel.size ? [...VIEW.sel] : visibleFiles();
+  if (VIEW.sel.size) return [...VIEW.sel];
+  const vis = visibleFiles();
+  if (vis.length) return vis;
+  // 页面刚加载/轮询重画时 DOM 可能短暂为空，此时点“一键测速”会误报
+  // “没有节点”（用户感受就是点了没反应）。回退到状态里的当前分组节点。
+  const q = (($('nq') && $('nq').value) || '').trim().toLowerCase();
+  const gk = (typeof SUBUI !== 'undefined' && SUBUI.group) ? SUBUI.group : '__all__';
+  return (ST.nodes || []).filter(n => passFilter(n, q, gk)).map(n => n.file);
 }
 
 // 只禁用"被点的那个按钮"并显示进度 —— 以前是全局禁用所有按钮，
@@ -3686,7 +3698,11 @@ async function testLatency(file, btn){
   try {
     const j = await actionQuiet('node_latency', {ident:file});
     setLatResult(file, j);
-    say(j.ok ? ('✓ ' + (j.message||'测速完成')) : ((j.message||'测速失败')), j.ok?'good':'err');
+    const needBD = !j.ok && /浏览器|需BD|Browser Dialer/.test((j&&j.message)||'');
+    say(j.ok ? ('✓ ' + (j.message||'测速完成'))
+             : (needBD ? '该节点由浏览器完成 TLS，已标记为需BD；请直接切换验证'
+                       : (j.message||'测速失败')),
+        j.ok ? 'good' : (needBD ? '' : 'err'));
   } finally {
     if (btn){ btn.disabled = false; btn.textContent = old; }
   }

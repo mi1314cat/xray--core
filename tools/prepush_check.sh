@@ -207,6 +207,20 @@ else
     rm -rf "$_pk_tmp" "$_pk_tmp.list"
 fi
 
+# ---------------------------------------------------------------- 4c. 面板登录
+head1 "面板登录/会话自检"
+if [ -f "$CAND/Client/tools/selftest-panel-auth.py" ]; then
+    if python3 "$CAND/Client/tools/selftest-panel-auth.py" >/tmp/pp_auth 2>&1; then
+        tail -1 /tmp/pp_auth | sed 's/^/  /'
+        ok "直接端口登录/会话/登出通过"
+    else
+        bad "面板登录自检失败"
+        sed -n '1,20{s/^/        /;p}' /tmp/pp_auth
+    fi
+else
+    warn "找不到 Client/tools/selftest-panel-auth.py"
+fi
+
 # ---------------------------------------------------------------- 5. 测试套件
 head1 "测试套件 tools/check_libs.sh"
 if [ -f "$TESTED/tools/check_libs.sh" ]; then
