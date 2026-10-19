@@ -628,6 +628,13 @@ def ech_param(n, host=None, meta=None):
     # 以前这里完全不看元数据，于是订阅链接把 ech 整段丢掉，客户端也就
     # 不会写 tlsSettings.echConfigList —— ECH 静默失效。
     # 只在连接目标是域名时用：连源站 IP 却塞 CDN 的 ECH 会握手失败。
+    # 优先**实时** HTTPS RR：Cloudflare 的 ECHConfigList 会轮换，元数据里
+    # 的静态值一旦过期，客户端会出现 x509(cloudflare-ech.com) / server rejected ECH。
+    # 元数据只作 DNS 取不到时的兜底。
+    if (meta or {}).get("ech") and host and not is_ip_literal(host):
+        live = ech_discover(host)
+        if live:
+            return live
     mc = str((meta or {}).get("ech_config") or "").strip()
     if mc and host and not is_ip_literal(host):
         return mc

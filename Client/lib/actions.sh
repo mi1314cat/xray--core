@@ -607,23 +607,60 @@ _xbd_port_open() { # <host> <port>
   timeout 3 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null
 }
 
+# 同名节点查找。订阅重新导入时，服务端同名节点往往端口/UUID 都变了；
+# 如果按"永远新增"落盘，会留下 node-001-x / node-002-x 两份同名节点：
+#   · 列表里出现重复项，用户分不清；
+#   · xbd node use <编号> 按文件名取，列表又按名字排，编号会指到旧节点
+#     （实测：新版 Trojan 在 25757，旧版在 37001，use 4 实际选中旧的那份）。
+# 因此同名节点必须**原地替换**，文件名/current 链接都保留。
+_xbd_node_existing_by_name() { # <json 文件>，输出已有路径或空
+  python3 - "$XBD_NODES" "$1" <<'PY' 2>/dev/null || true
+import json, os, sys
+ndir, probe = sys.argv[1], sys.argv[2]
+try:
+    want = (json.load(open(probe)).get("name") or "").strip()
+except Exception:
+    sys.exit(0)
+if not want:
+    sys.exit(0)
+for f in sorted(os.listdir(ndir)):
+    if not f.endswith(".json"):
+        continue
+    try:
+        d = json.load(open(os.path.join(ndir, f)))
+    except Exception:
+        continue
+    if (d.get("name") or "").strip() == want:
+        print(os.path.join(ndir, f))
+        break
+PY
+}
+
 # 把一份节点 JSON 落盘。与导入路径共用同一套：编号、slug、导入即固定证书、
 # 首个节点自动选中。抽出来是为了"简易节点"和"粘贴链接"两条路不会漂。
 _xbd_node_save_json() { # <json 文件>
-  local tmp="$1" slug dest idx=1
+  local tmp="$1" slug dest idx=1 updated=0
   slug=$(python3 -c '
 import json,sys,re
 d=json.load(open(sys.argv[1]))
 s=re.sub(r"[^A-Za-z0-9._-]+","-",(d.get("name") or d.get("address") or "node")).strip("-").lower()
 print(s[:40] or "node")' "$tmp")
-  while :; do
-    dest="$XBD_NODES/$(printf 'node-%03d' "$idx")-$slug.json"
-    [ -e "$dest" ] && { idx=$((idx+1)); continue; }
-    break
-  done
+  dest="$(_xbd_node_existing_by_name "$tmp")"
+  if [ -n "$dest" ]; then
+    updated=1
+  else
+    while :; do
+      dest="$XBD_NODES/$(printf 'node-%03d' "$idx")-$slug.json"
+      [ -e "$dest" ] && { idx=$((idx+1)); continue; }
+      break
+    done
+  fi
   _xbd_autopin_cert "$tmp"
   install -m 0644 "$tmp" "$dest"
   print_node_card "$dest"
+  if [ "$updated" -eq 1 ]; then
+    ok "已更新同名节点: $(basename "$dest")"
+  fi
   if [ ! -e "$XBD_NODES/current" ]; then
     ln -sfn "$(basename "$dest")" "$XBD_NODES/current"
     ok "已设为当前节点: $(basename "$dest")"
@@ -640,17 +677,22 @@ cmd_node_import_one() {  # 解析一个节点并落盘；成功返回 0
   fi
 
   # 落盘 + 能力检查结果
-  local slug dest idx=1
+  local slug dest idx=1 updated=0
   slug=$(python3 -c '
 import json,sys,re
 d=json.load(open(sys.argv[1]))
 s=re.sub(r"[^A-Za-z0-9._-]+","-",(d.get("name") or d.get("address") or "node")).strip("-").lower()
 print(s[:40] or "node")' "$tmp")
-  while :; do
-    dest="$XBD_NODES/$(printf 'node-%03d' "$idx")-$slug.json"
-    [ -e "$dest" ] && { idx=$((idx+1)); continue; }
-    break
-  done
+  dest="$(_xbd_node_existing_by_name "$tmp")"
+  if [ -n "$dest" ]; then
+    updated=1
+  else
+    while :; do
+      dest="$XBD_NODES/$(printf 'node-%03d' "$idx")-$slug.json"
+      [ -e "$dest" ] && { idx=$((idx+1)); continue; }
+      break
+    done
+  fi
   # 顺序很重要：**先在临时文件上补指纹，再落盘**。
   # 旧顺序是先 install 再补 —— 而补的过程可能要编译证书探针（冷构建实测 114 秒），
   # 面板导入动作的超时是 120 秒：一旦被杀，磁盘上就留下一个"已导入但没有指纹"的
@@ -658,6 +700,9 @@ print(s[:40] or "node")' "$tmp")
   # 现在最坏情况只是"没导入成功"，用户重试即可，不会再产生半成品。
   _xbd_autopin_cert "$tmp"    # v2.2: 导入即固定证书指纹，免除手动 xbd cert
   install -m 0644 "$tmp" "$dest"; rm -f "$tmp"
+  if [ "$updated" -eq 1 ]; then
+    ok "已更新同名节点: $(basename "$dest")"
+  fi
 
   local caps
   # 注意：compat.py 在"两种模式都不可用"时退出码为 1（这是有效结论，不是失败），
