@@ -926,8 +926,17 @@ def build_share_link(n, meta=None, notes=None):
             ech = ech_param(n, host, meta)
             if ech:
                 q["ech"] = ech
+            q["fp"] = meta.get("fingerprint") or n.get("fingerprint") or "chrome"
             if n.get("network") == "ws":
                 q["host"] = meta.get("host_header", "")
+            # xhttp + TLS：mack-a/v2ray-agent 的客户端链接显式带
+            # alpn=h2 / fp=chrome / host=域名；不写虽然多数客户端会取默认，
+            # 但 NekoBox/v2rayN 某些版本会丢掉 ALPN 或 HTTP Host。
+            if n.get("network") == "xhttp":
+                q["alpn"] = n.get("alpn") or meta.get("alpn") or "h2"
+                _h = meta.get("host_header") or meta.get("host") or sni
+                if _h and not is_ip_literal(_h):
+                    q["host"] = _h
         # ★ path 原来**只写在 tls 分支里** —— 于是 REALITY + ws/xhttp/grpc/
         #   httpupgrade 这四种组合的分享链接**不带 path**。客户端导入后按
         #   "/x" 去连, 服务端却是 "/real" 之类的路径, 直接 404, 而且**没有任何
