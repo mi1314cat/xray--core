@@ -69,6 +69,8 @@ cmd_install() {
 
   step "写入配置（幂等，不覆盖已有内容）"
   xbd_write_default_configs
+  info "面板登录: 用户名 ${XBD_PANEL_USER:-admin}  密码 ${XBD_PANEL_PASSWORD:-（见 config/panel.env）}"
+  info "  直接打开: http://$(cfg_get "$XBD_CONF/panel.env" PANEL_HOST "$(detect_lan_ip)"):$(cfg_get "$XBD_CONF/panel.env" PANEL_PORT 18090)/"
 
   # 自定义前缀只用于测试/多实例：systemd 单元名是全系统共享的，
   # 照常安装会把**生产**单元覆盖成指向测试目录 —— 实测踩过。
@@ -237,6 +239,32 @@ PANEL_TOKEN=$(openssl rand -hex 12 2>/dev/null || head -c 12 /dev/urandom | od -
 EOF
     chmod 0600 "$XBD_CONF/panel.env"
   fi
+
+  # 面板登录：用户名 + 密码。老安装只有 PANEL_TOKEN，这里做一次幂等迁移；
+  # 新安装生成随机密码。密码只写 0600 的 panel.env，不写日志。
+  xbd_ensure_panel_auth
+}
+
+# 确保 panel.env 里有登录用户名/密码。幂等：已有值绝不覆盖。
+# 返回 0；若本次新生成了密码，把密码放到 XBD_PANEL_NEW_PASSWORD 供安装器提示一次。
+xbd_ensure_panel_auth() {
+  local f="$XBD_CONF/panel.env" u p
+  mkdir -p "$XBD_CONF"
+  [ -f "$f" ] || : > "$f"
+  u=$(cfg_get "$f" PANEL_USER "")
+  if [ -z "$u" ]; then
+    cfg_set "$f" PANEL_USER "admin"
+    u="admin"
+  fi
+  p=$(cfg_get "$f" PANEL_PASSWORD "")
+  if [ -z "$p" ]; then
+    p=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    cfg_set "$f" PANEL_PASSWORD "$p"
+    XBD_PANEL_NEW_PASSWORD="$p"
+  fi
+  chmod 0600 "$f" 2>/dev/null || true
+  XBD_PANEL_USER="$u"
+  XBD_PANEL_PASSWORD="$p"
 }
 
 menu_xray_ensure() {
@@ -2083,19 +2111,40 @@ xbd_panel_service() {
 
 cmd_panel() {
   # 更名说明: `xbd panel` 原来是"只打印地址"。现在多一个管理入口
-  # （status/restart/stop），但**不带参数时必须还是打印地址** —— 脚本里
-  # 到处都在 `xbd panel | grep` 取地址，改了行为等于把它们全弄坏。
-  case "${1:-}" in
-    restart|stop) xbd_panel_service "$1"; return $? ;;
+  # （status/restart/stop/passwd），但**不带参数时必须还是打印地址** ——
+  # 脚本里到处都在 `xbd panel | grep` 取地址，改了行为等于把它们全弄坏。
+  local sub="${1:-}"
+  case "$sub" in
+    restart|stop) xbd_panel_service "$sub"; return $? ;;
+    passwd)
+      xbd_ensure_panel_auth
+      local u="${2:-$XBD_PANEL_USER}" p="${3:-}"
+      if [ -z "$p" ]; then
+        [ -t 0 ] || die "非交互模式请用: xbd panel passwd <用户名> <新密码>"
+        printf '新密码（至少 6 位）: '; read -r -s p || die "已取消"; echo
+        printf '再输一次: '; read -r -s p2 || die "已取消"; echo
+        [ "$p" = "$p2" ] || die "两次密码不一致"
+      fi
+      [ "${#p}" -ge 6 ] || die "密码至少 6 位"
+      cfg_set "$XBD_CONF/panel.env" PANEL_USER "$u"
+      cfg_set "$XBD_CONF/panel.env" PANEL_PASSWORD "$p"
+      chmod 0600 "$XBD_CONF/panel.env" 2>/dev/null || true
+      systemctl restart "$XBD_U_PANEL" 2>/dev/null || true
+      ok "面板登录已更新: 用户名 $u（密码不打印）"
+      return 0
+      ;;
     status) ;;
     "") ;;
-    *) info "用法: xbd panel [status|restart|stop]"; return 1 ;;
+    *) info "用法: xbd panel [status|restart|stop|passwd]"; return 1 ;;
   esac
   xbd_load_ports
+  xbd_ensure_panel_auth
   info "面板地址: http://$XBD_PANEL_HOST:$XBD_PANEL_PORT/"
-  [ -n "$XBD_PANEL_TOKEN" ] && { info "访问令牌: $XBD_PANEL_TOKEN"; info "完整链接: http://$XBD_PANEL_HOST:$XBD_PANEL_PORT/?token=$XBD_PANEL_TOKEN"; }
+  info "登录用户名: ${XBD_PANEL_USER:-admin}"
+  info "登录密码:   ${XBD_PANEL_PASSWORD:-（未设置）}"
+  info "直接打开上面的地址即可，登录后浏览器会记住会话；不用再找 token 路径"
   [ "$XBD_PANEL_HOST" = "127.0.0.1" ] && dim "  当前只允许本机访问；要局域网访问把 PANEL_HOST 改成 $(detect_lan_ip)"
-  info "配置: $XBD_CONF/panel.env"
+  info "配置: $XBD_CONF/panel.env   （改密码: xbd panel passwd）"
 }
 
 cmd_diagnose() {
@@ -2209,6 +2258,7 @@ cmd_update() {
   need_root
   step "更新本项目组件"
   dim "  系统 Xray / xray.service / mihomo 不会被更新或重启"
+  xbd_ensure_panel_auth
   # 标准安装布局里没有"另一份新代码"可同步：xbd-dist 现在只是 lib/bin/tools
   # 的符号链接。真正的版本更新必须重新从 GitHub 拉发布包，否则这个命令会
   # 显示成功却什么也没换（HEAD 就是这样）。l.sh 已在安装时落到 PREFIX。
@@ -2935,7 +2985,7 @@ Xray Client Web Manager v$XBD_VERSION
   状态与诊断
     status [--quick]                       状态（含当前节点实际走哪条 TLS 路径）
     diagnose [--quick]                     全面诊断
-    panel [status|restart|stop]            网页面板：地址与令牌 / 重启 / 停掉
+    panel [status|restart|stop|passwd]     网页面板：地址/登录密码 / 重启 / 停掉 / 改密码
     export                                 导出连接配置到 generated/（方便复制）
     cert <编号|--missing>                  取服务端证书指纹并固定（自签证书节点用；--missing 批量补齐）
     ech                                    验证 Chromium 原生 ECH

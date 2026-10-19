@@ -126,7 +126,8 @@ def classify(err: str, code: int | None = None) -> str:
     return "error"
 
 
-def measure(node_path: str, url: str, timeout: int, tls_mismatch_ok: bool = True) -> dict:
+def measure(node_path: str, url: str, timeout: int, tls_mismatch_ok: bool = True,
+            fast: bool = False) -> dict:
     """返回 {ok, latency_ms, error, exit_ip}"""
     work = tempfile.mkdtemp(prefix="xbd-lat-")
     port = free_port()
@@ -184,11 +185,11 @@ def measure(node_path: str, url: str, timeout: int, tls_mismatch_ok: bool = True
                 return {"ok": False, "latency_ms": None, "error": "xray_not_up"}
 
             # 预热一次，避免把 DNS/建连开销算进"延时"
-            sh(["curl", "-s", "-o", "/dev/null", "--max-time", "20",
+            sh(["curl", "-s", "-o", "/dev/null", "--max-time", "8" if fast else "20",
                 "--socks5-hostname", f"127.0.0.1:{port}", url], timeout=30)
 
             best, detail, fail_code = None, "", None
-            for _ in range(3):
+            for _ in range(2 if fast else 3):
                 rc, out, err = sh([
                     "curl", "-s", "-o", "/dev/null", "--max-time", str(timeout),
                     "--socks5-hostname", f"127.0.0.1:{port}",
@@ -213,7 +214,10 @@ def measure(node_path: str, url: str, timeout: int, tls_mismatch_ok: bool = True
                         "error": classify(detail, fail_code),
                         "detail": (detail or "")[:160] or "请求失败"}
 
-            # 顺便取出口 IP，便于确认真的走了节点
+            # 批量测速不需要出口 IP：多一次请求就多 1-3 秒，而用户要的是
+            # "一键把全部节点测完"。单测仍保留，便于确认真的走了节点。
+            if fast:
+                return {"ok": True, "latency_ms": round(best * 1000), "exit_ip": ""}
             rc, ip, _ = sh(["curl", "-s", "--max-time", "15",
                             "--socks5-hostname", f"127.0.0.1:{port}",
                             "https://api.ipify.org"], timeout=25)
@@ -236,6 +240,8 @@ def main() -> int:
     ap.add_argument("--url", default=TEST_URL)
     ap.add_argument("--timeout", type=int, default=15)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--fast", action="store_true",
+                    help="批量用：少一次重试、不查出口 IP（显著缩短总时间）")
     args = ap.parse_args()
 
     results = {}
@@ -244,7 +250,7 @@ def main() -> int:
         if not os.path.exists(path):
             results[name] = {"ok": False, "latency_ms": None, "error": "not_found"}
             continue
-        r = measure(path, args.url, args.timeout)
+        r = measure(path, args.url, args.timeout, fast=args.fast)
         results[name] = r
         if not args.json:
             if r["ok"]:

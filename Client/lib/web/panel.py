@@ -14,15 +14,19 @@
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
+from html import escape
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -52,6 +56,16 @@ BALANCER = "xbd-bal"
 
 BIND_HOST = "127.0.0.1"
 BIND_PORT = 18090
+
+# 登录会话：内存里保存随机 sid -> 过期时间。面板重启会要求重新登录，
+# 这是有意的（不把长期凭据写到磁盘）。Cookie 只是 sid，不是密码。
+SESSION_TTL = 7 * 24 * 3600
+SESSIONS: dict[str, float] = {}
+_SESS_LOCK = threading.Lock()
+_LOGIN_FAILS: dict[str, list] = {}
+_LOGIN_LOCK = threading.Lock()
+LOGIN_MAX_FAILS = 8
+LOGIN_LOCK_SECONDS = 60
 
 
 # --------------------------------------------------------------------- 工具 ----
@@ -740,13 +754,20 @@ def act_node_remove(ident):
     return rc == 0, (out or err)
 
 
-def act_node_latency(ident):
-    """真实请求测延时。走临时 Xray 实例，不占用常驻服务。"""
+def act_node_latency(ident, fast=False):
+    """真实请求测延时。走临时 Xray 实例，不占用常驻服务。
+
+    fast=True 用于“一键测速全部”：每个节点少一次重试、不查出口 IP，
+    再由前端并发跑多个节点；单测仍保留完整口径。
+    """
     path = node_path(ident)
     if not path:
         return False, "找不到该节点"
-    rc, out, err = sh(["python3", os.path.join(DIST, "lib", "latency.py"),
-                       path, "--json", "--timeout", "12"], timeout=120)
+    args = ["python3", os.path.join(DIST, "lib", "latency.py"),
+            path, "--json", "--timeout", "8" if fast else "12"]
+    if fast:
+        args.append("--fast")
+    rc, out, err = sh(args, timeout=120 if fast else 120)
     if rc != 0 and not out:
         return False, f"测速失败: {err or '未知错误'}"
     try:
@@ -758,7 +779,9 @@ def act_node_latency(ident):
         return True, f"延时 {res['latency_ms']} ms（出口 {res.get('exit_ip') or '未知'}）"
     labels = {"timeout": "超时", "tls": "TLS 握手失败", "dns": "域名解析失败",
               "refused": "连接被拒绝", "unreachable": "无法连接", "no_response": "服务端无响应",
-              "proxy_error": "代理错误", "config_failed": "配置生成失败", "xray_not_up": "临时实例未启动"}
+              "proxy_error": "代理错误", "config_failed": "配置生成失败",
+              "xray_not_up": "临时实例未启动",
+              "need_browser": "需浏览器完成 TLS（请直接切换验证）"}
     return False, f"测速失败：{labels.get(res.get('error'), res.get('error') or '未知')}"
 
 
@@ -1374,7 +1397,7 @@ DISPATCH = {
     "node_use_as": lambda p: act_node_use_as(p.get("ident", ""), p.get("mode", "normal")),
     "node_remove": lambda p: act_node_remove(p.get("ident", "")),
     "node_check": lambda p: act_node_check(p.get("ident", "")),
-    "node_latency": lambda p: act_node_latency(p.get("ident", "")),
+    "node_latency": lambda p: act_node_latency(p.get("ident", ""), bool(p.get("fast"))),
     "xray_version": lambda p: act_xray_version(),
     "xray_upgrade": lambda p: act_xray_upgrade(),
     "takeover": lambda p: act_takeover(str(p.get("mode", ""))),
@@ -1399,6 +1422,44 @@ DISPATCH = {
 
 
 # ---------------------------------------------------------------------- 页面 ----
+LOGIN_PAGE_TMPL = r"""<!DOCTYPE html><html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · Xray Client</title>
+<style>
+:root{--bg:#0f1115;--card:#171b22;--line:#2a303b;--fg:#e7ebf0;--dim:#8b95a5;--acc:#4c8dff;--bad:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1000px 500px at 50% -10%,#1b2638,var(--bg));color:var(--fg);
+font:15px/1.6 -apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif}
+.card{width:min(92vw,380px);background:var(--card);border:1px solid var(--line);border-radius:16px;padding:28px 26px 24px;box-shadow:0 24px 80px rgba(0,0,0,.45)}
+.logo{width:40px;height:40px;border-radius:12px;background:var(--acc);display:grid;place-items:center;font-weight:800;font-size:20px;color:#fff;margin-bottom:16px}
+h1{font-size:19px;margin:0 0 4px}p.sub{color:var(--dim);font-size:12.5px;margin:0 0 20px}
+label{display:block;font-size:12px;color:var(--dim);margin:12px 0 6px}
+input{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--line);background:#0f131a;color:var(--fg);font:inherit;outline:none}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(76,141,255,.16)}
+button{width:100%;margin-top:20px;padding:11px;border:0;border-radius:9px;background:var(--acc);color:#fff;font:600 14px inherit;cursor:pointer}
+button:hover{filter:brightness(1.06)}
+.err{margin:0 0 14px;padding:9px 11px;border:1px solid rgba(255,107,107,.45);background:rgba(255,107,107,.10);color:#ffb3b3;border-radius:8px;font-size:12.5px}
+.foot{margin-top:16px;color:var(--dim);font-size:11.5px;text-align:center}
+</style></head><body>
+<form class="card" method="post" action="/login">
+  <div class="logo">X</div>
+  <h1>Xray Client</h1>
+  <p class="sub">登录后即可管理节点与代理服务</p>
+  __ERROR__
+  <label for="u">用户名</label>
+  <input id="u" name="username" autocomplete="username" autofocus required>
+  <label for="p">密码</label>
+  <input id="p" name="password" type="password" autocomplete="current-password" required>
+  <button type="submit">登录</button>
+  <div class="foot">直接访问本机端口即可，无需再记令牌路径</div>
+</form></body></html>"""
+
+
+def login_page(error: str = "") -> str:
+    block = f'<div class="err">{escape(error)}</div>' if error else ""
+    return LOGIN_PAGE_TMPL.replace("__ERROR__", block)
+
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1949,6 +2010,7 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
       <span class="sub" id="stamp">加载中…</span>
       <button id="btn-theme" class="sm" onclick="themeCycle()" title="主题">◐</button>
       <button class="sm" onclick="load()">刷新</button>
+      <button class="sm" onclick="location.href='/logout'" title="退出登录">退出</button>
     </div>
     <div id="msg"></div>
 
@@ -1981,7 +2043,7 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
         <option value="list">紧凑</option>
       </select>
       <button class="sm" onclick="batchAll(this)">全选</button>
-      <button class="sm" onclick="batchTest()">测速</button>
+      <button class="sm" onclick="batchTest(this)" title="未勾选时测当前分组全部节点；4 路并发">一键测速</button>
       <button class="sm" onclick="batchDelete()">删除</button>
     </div>
   </div>
@@ -1990,7 +2052,7 @@ select:focus-visible,textarea:focus-visible{outline:2px solid var(--acc);
     <select id="bulk-move" class="nli" style="flex:0 0 auto" onchange="pickMoveTarget(this)">
       <option value="">移动到分组…</option>
     </select>
-    <button class="sm" onclick="batchTest()">批量测速</button>
+    <button class="sm" onclick="batchTest(this)">一键测速</button>
     <button class="sm" onclick="batchDelete()">批量删除</button>
     <button class="sm" onclick="batchClear()">取消选择</button>
   </div>
@@ -2324,10 +2386,30 @@ function latText(file){
   const v = LAT[file];
   if (!v) return '<span class="lat"><span class="d"></span>未测</span>';
   if (v.loading) return '<span class="lat busy"><span class="d"></span>测试中</span>';
+  if (v.bd) return `<span class="lat warn" title="${escAttr(v.msg||'需 Browser Dialer')}"><span class="d"></span>需BD</span>`;
   if (!v.ok) return `<span class="lat bad" title="${escAttr(v.msg||'失败')}"><span class="d"></span>失败</span>`;
   const ms = v.ms;
   const cls = ms < 300 ? 'ok' : ms < 800 ? 'warn' : 'bad';
   return `<span class="lat ${cls}"><span class="d"></span>${ms} ms</span>`;
+}
+
+// 只刷新一个延时单元格；批量测速时不整块 renderNodes()，否则每完成一个节点
+// 都重画整个列表，节点多时比测速本身还慢。
+function paintLat(file){
+  const c = document.getElementById('lat-'+file);
+  if (c) c.innerHTML = latText(file);
+}
+function setLatResult(file, j){
+  if (j && j.ok){
+    const m = /(\d+)\s*ms/.exec(j.message||'');
+    LAT[file] = {ok:true, ms:m ? parseInt(m[1],10) : 0, echo:(j.message||'').trim()};
+  } else if (/浏览器|需BD|Browser Dialer/.test((j&&j.message)||'')){
+    // 不是节点坏了：BD 节点的 TLS 在 Chromium 里，临时 Xray 探测不适用。
+    LAT[file] = {ok:false, bd:true, msg:((j&&j.message)||'需浏览器完成 TLS').replace(/^✗\s*/,'')};
+  } else {
+    LAT[file] = {ok:false, msg:(((j&&j.message)||'测速失败')).replace(/^✗\s*/,'')};
+  }
+  paintLat(file);
 }
 
 function dot(on, text){ return `<span class="dot ${on?'ok':'bad'}"></span>${ESC(text)}`; }
@@ -2875,18 +2957,37 @@ function visibleFiles(){
   });
   return out;
 }
-async function batchTest(){
+async function batchTest(btn){
   const files = selectedOrVisible();
-  if (!files.length) return say('先用勾选挑节点，或先点「全选」');
-  say(`正在测速 ${files.length} 个节点…`);
-  let ok = 0;
-  // 批量里必须用不刷新状态的那条路: post() 每次都 load() 整个面板,
-  // 三十个节点就是三十次全量重拉, 比测速本身还慢。
-  for (const f of files){
-    if (await postQuiet('node_latency', {ident:f})) ok++;
-  }
+  if (!files.length) return say('当前分组没有节点；先选分组或勾选节点', 'err');
+  const total = files.length;
+  files.forEach(f => { LAT[f] = {loading:true}; });
   renderNodes();
-  say(`测速完成：${ok}/${files.length}`);
+  const old = btn ? btn.textContent : '';
+  if (btn){ btn.disabled = true; btn.textContent = `测速 0/${total}`; }
+  say(`一键测速：0/${total}（并发 4 路）…`);
+  let done = 0, ok = 0, bd = 0, bad = 0;
+  const queue = files.slice();
+  const worker = async () => {
+    while (queue.length){
+      const f = queue.shift();
+      const j = await actionQuiet('node_latency', {ident:f, fast:true});
+      setLatResult(f, j);
+      done++;
+      if (j && j.ok) ok++;
+      else if (LAT[f] && LAT[f].bd) bd++;
+      else bad++;
+      if (btn) btn.textContent = `测速 ${done}/${total}`;
+      say(`一键测速：${done}/${total} · 成功 ${ok}` + (bd?` · 需BD ${bd}`:'') + (bad?` · 失败 ${bad}`:''));
+    }
+  };
+  // 4 路并发：每个节点都要起一个临时 Xray，开太多反而抢 CPU。
+  // 7 个直连节点大约两轮就能测完，BD 节点会立即返回“需BD”，不再拖住整批。
+  await Promise.all(Array.from({length: Math.min(4, total)}, worker));
+  renderNodes();
+  if (btn){ btn.disabled = false; btn.textContent = old; }
+  const tail = (bd?`，${bd} 个由浏览器完成 TLS（需BD）`:'') + (bad?`，${bad} 个失败`:'');
+  say(`测速完成：成功 ${ok}/${total}${tail}`, bad ? 'err' : 'good');
 }
 async function batchDelete(){
   const files = selectedOrVisible();
@@ -2934,6 +3035,7 @@ async function post(action, payload, label, btn){
   try{
     const r = await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(Object.assign({action}, payload||{}))});
+    if (r.status === 401) { location.href = '/login'; return {ok:false, message:'登录已失效'}; }
     const j = await r.json();
     say((j.ok?'✓ ':'✗ ') + (j.message||''), j.ok?'good':'err');
     return j;
@@ -2952,11 +3054,23 @@ async function postQuiet(action, payload){
   try{
     const r = await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(Object.assign({action}, payload||{}))});
+    if (r.status === 401) { location.href = '/login'; return false; }
     const j = await r.json();
     if (!j.ok) { say(j.message || '操作失败', 'err'); return false; }
     return j;
   }catch(e){ say('请求失败：'+e, 'err'); return false; }
 }
+// 测速专用：不吞掉失败原因（要区分“需浏览器”和真正的失败），也不 load()
+// 整个面板。批量测速时由前端并发调度，返回原始 JSON。
+async function actionQuiet(action, payload){
+  try{
+    const r = await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(Object.assign({action}, payload||{}))});
+    if (r.status === 401) { location.href = '/login'; return {ok:false, message:'登录已失效'}; }
+    return await r.json();
+  }catch(e){ return {ok:false, message:'请求失败：'+e}; }
+}
+
 async function toggleMain(){
   const on = ST.services && ST.services.xray && ST.services.xray.active;
   await post('service', {op: on?'stop':'start'}, on?'正在停止 Xray…':'正在启动 Xray…');
@@ -3565,21 +3679,17 @@ function submitPull(){
 // 元素不存在了，函数留着只会在将来某次调用时炸成 null.value。
 async function testLatency(file, btn){
   LAT[file] = {loading:true};
-  const paint = () => {
-    const c = document.getElementById('lat-'+file);
-    if (c) c.innerHTML = latText(file);
-  };
-  paint();
-  // 关键：把结果写回该行的延时单元格。
-  // 以前 load() 会重建表格把结果冲掉，且 post() 的全局禁用在异常时永不恢复。
-  const j = await post('node_latency', {ident:file}, '正在测速（真实请求，约 3-10 秒）…', btn);
-  if (j.ok) {
-    const m = /(\d+)\s*ms/.exec(j.message||'');
-    LAT[file] = {ok:true, ms: m ? parseInt(m[1],10) : 0, echo:(j.message||'').trim()};
-  } else {
-    LAT[file] = {ok:false, msg:(j.message||'').replace(/^✗\s*/,'')};
+  paintLat(file);
+  let old = '';
+  if (btn){ old = btn.textContent; btn.disabled = true; btn.textContent = '测速中…'; }
+  say('正在测速（真实请求，约 3-10 秒）…');
+  try {
+    const j = await actionQuiet('node_latency', {ident:file});
+    setLatResult(file, j);
+    say(j.ok ? ('✓ ' + (j.message||'测速完成')) : ((j.message||'测速失败')), j.ok?'good':'err');
+  } finally {
+    if (btn){ btn.disabled = false; btn.textContent = old; }
   }
-  paint();
 }
 
 async function checkNode(f, btn){
@@ -3602,7 +3712,10 @@ setInterval(load, 5000);
 class Handler(BaseHTTPRequestHandler):
     server_version = "XBD-Panel"
     token = ""
+    username = "admin"
+    password = ""
     cookie_name = "xbd_token"
+    session_cookie = "xbd_session"
 
     def log_message(self, *a):
         pass
@@ -3614,55 +3727,160 @@ class Handler(BaseHTTPRequestHandler):
             import traceback
             traceback.print_exc()
 
-    def _authed(self):
-        if not self.token:
-            return True
-        if self.headers.get("X-Panel-Token") == self.token:
-            return True
+    # ---------------------------------------------------------- auth ----
+    def _cookies(self):
         raw = self.headers.get("Cookie", "")
-        if raw:
-            try:
-                jar = SimpleCookie()
-                jar.load(raw)
-                if jar.get(self.cookie_name) and jar[self.cookie_name].value == self.token:
-                    return True
-            except Exception:
-                pass
-        given = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("token", [""])[0]
-        if given == self.token:
-            self._set_cookie = True
+        if not raw:
+            return {}
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+            return {k: m.value for k, m in jar.items()}
+        except Exception:
+            return {}
+
+    def _session_ok(self):
+        sid = self._cookies().get(self.session_cookie, "")
+        if not sid:
+            return False
+        now = time.time()
+        with _SESS_LOCK:
+            exp = SESSIONS.get(sid)
+            if not exp or exp < now:
+                SESSIONS.pop(sid, None)
+                return False
+            # 滑动续期：每天用就一直在，七天不用才失效。
+            SESSIONS[sid] = now + SESSION_TTL
+        return True
+
+    def _authed(self):
+        # 什么都没配 = 老行为：不拦（首次安装/纯本机场景）。
+        if not self.password and not self.token:
             return True
+        if self._session_ok():
+            return True
+        if self.token:
+            if hmac.compare_digest(self.headers.get("X-Panel-Token", ""), self.token):
+                return True
+            if hmac.compare_digest(self._cookies().get(self.cookie_name, ""), self.token):
+                return True
+            given = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query).get("token", [""])[0]
+            if given and hmac.compare_digest(given, self.token):
+                self._set_cookie = True
+                return True
         return False
 
-    def _send(self, code, body, ctype="application/json"):
+    def _send(self, code, body, ctype="application/json", cookies=None, headers=None):
         data = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (headers or []):
+            self.send_header(k, v)
+        for c in (cookies or []):
+            self.send_header("Set-Cookie", c)
         if getattr(self, "_set_cookie", False):
-            self.send_header("Set-Cookie", f"{self.cookie_name}={self.token}; Path=/; SameSite=Strict")
+            self.send_header("Set-Cookie",
+                             f"{self.cookie_name}={self.token}; Path=/; HttpOnly; SameSite=Strict")
             self._set_cookie = False
         self.end_headers()
         self.wfile.write(data)
 
-    def _deny(self):
-        body = ("<!DOCTYPE html><meta charset=utf-8><title>需要令牌</title>"
-                '<body style="font:15px -apple-system,Segoe UI,Roboto,sans-serif;'
-                'background:#0f1115;color:#e7ebf0;padding:40px">'
-                "<h2>需要访问令牌</h2>"
-                "<p>请在地址后加上 <code>?token=你的令牌</code></p>"
-                '<p style="color:#8b95a5">令牌保存在服务器的 '
-                "<code>/opt/xray-browser-dialer/config/panel.env</code></p></body>")
-        self._send(401, body, "text/html")
+    def _redirect(self, location, cookies=None):
+        self._send(303, b"", "text/plain", cookies=cookies,
+                   headers=[("Location", location)])
 
+    def _deny(self):
+        if urllib.parse.urlparse(self.path).path.startswith("/api/"):
+            return self._send(401, json.dumps(
+                {"ok": False, "message": "登录已失效，请重新登录"}, ensure_ascii=False))
+        return self._send(401, login_page("请先登录"))
+
+    def _check_login(self, user, password, ip):
+        now = time.time()
+        with _LOGIN_LOCK:
+            rec = _LOGIN_FAILS.get(ip)
+            if rec and rec[1] > now:
+                return False, f"尝试次数过多，请 {int(rec[1] - now)} 秒后再试"
+            if rec and rec[1] and rec[1] <= now:
+                _LOGIN_FAILS.pop(ip, None)
+        ok = hmac.compare_digest(str(user), str(self.username)) and \
+             hmac.compare_digest(str(password), str(self.password))
+        if ok:
+            with _LOGIN_LOCK:
+                _LOGIN_FAILS.pop(ip, None)
+            return True, ""
+        with _LOGIN_LOCK:
+            rec = _LOGIN_FAILS.get(ip, [0, 0])
+            rec[0] += 1
+            if rec[0] >= LOGIN_MAX_FAILS:
+                rec = [0, now + LOGIN_LOCK_SECONDS]
+            _LOGIN_FAILS[ip] = rec
+        return False, "用户名或密码不正确"
+
+    def _handle_login(self):
+        if not self.password:
+            return self._redirect("/")
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > 8192:
+            return self._send(400, login_page("请求不合法"))
+        raw = self.rfile.read(n).decode("utf-8", "replace")
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        if "application/json" in ctype:
+            try:
+                data = json.loads(raw or "{}")
+            except ValueError:
+                data = {}
+        else:
+            data = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+        user = str(data.get("username", ""))
+        password = str(data.get("password", ""))
+        ok, why = self._check_login(user, password, self.client_address[0])
+        if not ok:
+            return self._send(401, login_page(why))
+        sid = secrets.token_urlsafe(32)
+        with _SESS_LOCK:
+            SESSIONS[sid] = time.time() + SESSION_TTL
+        cookie = (f"{self.session_cookie}={sid}; Path=/; HttpOnly; "
+                  f"SameSite=Strict; Max-Age={SESSION_TTL}")
+        wants_json = ("application/json" in ctype
+                      or "application/json" in (self.headers.get("Accept") or ""))
+        if wants_json:
+            return self._send(200, json.dumps({"ok": True}, ensure_ascii=False),
+                              cookies=[cookie])
+        return self._redirect("/", cookies=[cookie])
+
+    def _handle_logout(self):
+        sid = self._cookies().get(self.session_cookie, "")
+        if sid:
+            with _SESS_LOCK:
+                SESSIONS.pop(sid, None)
+        cookie = f"{self.session_cookie}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        wants_json = "application/json" in (self.headers.get("Accept") or "")
+        if wants_json:
+            return self._send(200, json.dumps({"ok": True}), cookies=[cookie])
+        return self._redirect("/login", cookies=[cookie])
+
+    # ---------------------------------------------------------- routes ----
     def do_GET(self):
-        if not self._authed():
-            return self._deny()
         path = urllib.parse.urlparse(self.path).path or "/"
+        if path == "/login":
+            if self._authed():
+                return self._redirect("/")
+            return self._send(200, login_page(), "text/html")
         if path in ("/", "/index.html"):
+            if not self._authed():
+                return self._send(200, login_page(), "text/html")
             return self._send(200, PAGE, "text/html")
+        if path == "/logout":
+            return self._handle_logout()
         if path == "/api/state":
+            if not self._authed():
+                return self._deny()
             state = build_state()
             state["panel_host"] = cfg_get(os.path.join(CONF, "panel.env"), "PANEL_HOST", "")
             state["panel_port"] = cfg_get(os.path.join(CONF, "panel.env"), "PANEL_PORT", "")
@@ -3670,9 +3888,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, "<!DOCTYPE html><meta charset=utf-8><h3>404</h3>", "text/html")
 
     def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path or "/"
+        if path == "/login":
+            return self._handle_login()
+        if path == "/logout":
+            return self._handle_logout()
         if not self._authed():
             return self._deny()
-        if urllib.parse.urlparse(self.path).path != "/api/action":
+        if path != "/api/action":
             return self._send(404, json.dumps({"ok": False, "message": "not found"}))
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -3694,11 +3917,13 @@ def load_panel_env():
     env = os.path.join(CONF, "panel.env")
     return (cfg_get(env, "PANEL_HOST", BIND_HOST),
             int(cfg_get(env, "PANEL_PORT", str(BIND_PORT)) or BIND_PORT),
-            cfg_get(env, "PANEL_TOKEN", ""))
+            cfg_get(env, "PANEL_TOKEN", ""),
+            cfg_get(env, "PANEL_USER", "admin"),
+            cfg_get(env, "PANEL_PASSWORD", ""))
 
 
 def main():
-    host, port, token = load_panel_env()
+    host, port, token, user, password = load_panel_env()
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -3709,11 +3934,18 @@ def main():
             port = int(args[i + 1]); i += 2; continue
         if a == "--token" and i + 1 < len(args):
             token = args[i + 1]; i += 2; continue
+        if a == "--user" and i + 1 < len(args):
+            user = args[i + 1]; i += 2; continue
+        if a == "--password" and i + 1 < len(args):
+            password = args[i + 1]; i += 2; continue
         i += 1
     Handler.token = token
+    Handler.username = user or "admin"
+    Handler.password = password
     srv = ThreadingHTTPServer((host, port), Handler)
     scope = "仅本机" if host in ("127.0.0.1", "localhost") else f"局域网可达 {host}"
-    print(f"面板 http://{host}:{port} ({scope})" + ("，需要令牌" if token else ""), flush=True)
+    auth = "用户名密码登录" if password else ("需要令牌" if token else "未设登录（建议设置密码）")
+    print(f"面板 http://{host}:{port} ({scope})，{auth}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
