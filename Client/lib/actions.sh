@@ -943,15 +943,13 @@ PY
             | python3 -c 'import json,sys;print((json.load(sys.stdin) or {}).get("stamped",0))' 2>/dev/null)
     _xbd_updated_report
     local _upd; _upd=$(_xbd_updated_count)
-    local _sk=$((n - c - ${_upd:-0}))
     ok "新增 $c 个节点，归入分组「${gname:-$sub_name}」(${bound:-0} 个)"
-    [ "$_sk" -gt 0 ] && info "  其余 $_sk 个已存在或内核不支持，未重复导入（订阅共 $n 个）"
+    _xbd_sub_skip_report "$n" "$c" "${_upd:-0}"
   else
     _xbd_updated_report
     local _upd; _upd=$(_xbd_updated_count)
-    local _sk=$((n - c - ${_upd:-0}))
     ok "新增 $c 个节点"
-    [ "$_sk" -gt 0 ] && info "  其余 $_sk 个已存在或内核不支持，未重复导入（订阅共 $n 个）"
+    _xbd_sub_skip_report "$n" "$c" "${_upd:-0}"
   fi
   rm -f "$before"
 }
@@ -979,6 +977,49 @@ import json
 for rec in json.load(open("/tmp/.xbd_updated.json"))[:5]:
     print("    · %s" % str(rec[0])[:56])
 ' 2>/dev/null || true
+  }
+
+  # 订阅导入的跳过项要分两类报：重复（节点已经在了）和内核不支持（这个协议
+  # Xray 跑不了）。以前合成一句"已存在或内核不支持"，用户看不出到底哪种 ——
+  # 实测 10 个节点导进去显示"9 新增 / 1 已存在或内核不支持"，其实是同一条
+  # Hysteria 重复，Xray 协议本身完全支持。
+  _xbd_sub_skip_report() {   # $1=订阅总数 $2=新增 $3=原地更新
+    local d=0 u=0 rest=0
+    read -r d u <<< "$(python3 -c '
+import json
+d = u = 0
+try:
+    recs = json.load(open("/tmp/.xbd_skipped.json"))
+except Exception:
+    recs = []
+for r in recs:
+    why = str(r[1] if len(r) > 1 else "")
+    if "重复" in why:
+        d += 1
+    else:
+        u += 1
+print(d, u)
+' 2>/dev/null || echo "0 0")"
+    [ "${d:-0}" -gt 0 ] && info "  其余 $d 个已存在（同协议/地址/端口/凭据的重复节点），未重复导入（订阅共 $1 个）"
+    if [ "${u:-0}" -gt 0 ]; then
+      warn "  另有 $u 个节点 Xray 内核不支持，未导入（订阅共 $1 个）："
+      python3 -c '
+import json
+shown = 0
+for r in json.load(open("/tmp/.xbd_skipped.json")):
+    why = str(r[1] if len(r) > 1 else "")
+    if "重复" in why:
+        continue
+    shown += 1
+    if shown <= 5:
+        print("    · %-34s %s" % (str(r[0])[:32], why))
+if shown > 5:
+    print("    · ……其余 %d 个同类" % (shown - 5))
+' 2>/dev/null || true
+    fi
+    rest=$(( $1 - $2 - ${3:-0} - ${d:-0} - ${u:-0} ))
+    [ "$rest" -gt 0 ] && info "  其余 $rest 个未能新增（导入失败或已存在），详见上面的提示"
+    return 0
   }
 
   # 刷新订阅: 拉取 → 去重 → 增量落盘。

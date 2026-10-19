@@ -333,6 +333,10 @@ def plan(protocol, transport, security, opts=None, tier=None):
             print(f"[警告] ECH 配置取值失败: {_e}", file=sys.stderr)
         if _cl:
             meta["ech_config"] = _cl
+            # CDN 边缘终结 ECH（没有服务端 echServerKeys）时，Xray 分享链接
+            # 用动态 DoH 形式，Cloudflare 轮换 key 也不会拿到旧值。
+            if not ech_keys:
+                meta["ech_dynamic"] = "cloudflare-ech.com+https://dns.alidns.com/dns-query"
             print(f"[信息] ECH 已启用, 配置串已写进客户端产物 ({len(_cl)} 字符, 来源: {_src})",
                   file=sys.stderr)
         else:

@@ -70,6 +70,11 @@ check("实测失败时显式选 BD 也不许用（会挂住）",
       c.want_browser_dialer(node(use_browser=True, browser_probe={"ok": False})), False)
 check("非 ws/xhttp 传输 → 不用", c.want_browser_dialer(node(transport="raw")), False)
 check("reality → 不用", c.want_browser_dialer(node(security="reality")), False)
+# ECH 只能由 Xray 自己完成 TLS：交给 Chromium 后 tlsSettings.echConfigList
+# 不生效，节点会直接连不上（实测 2.8.8 生产上就是栽在这里）。
+_ech_node = node(ech={"config": "cloudflare-ech.com+https://dns.alidns.com/dns-query"})
+check("ECH → 不用浏览器", c.want_browser_dialer(_ech_node), False)
+check("ECH → can_use_dialer 也是 False", bd(_ech_node), False)
 for _n in (node(), node(transport="websocket"), node(security="reality"),
            node(transport="raw"), node(protocol="vmess"),
            node(browser_probe={"ok": False}), node(browser_probe={"ok": True}),
@@ -169,6 +174,7 @@ check("未知加密方案 → 不支持",
 # --- 6. Xray 原生路径的判定 -------------------------------------------------
 print("\n[6] Xray 原生路径")
 check("vless+reality 原生可用", xray(node(security="reality", reality_public_key="k")), True)
+check("ECH → 原生仍可用", xray(_ech_node), True)
 check("hysteria2 原生可用", xray({"protocol": "hysteria2", "transport": "quic",
                                   "address": "h.example", "port": 443, "password": "p"}), True)
 check("hysteria2 浏览器不可用", bd({"protocol": "hysteria2", "transport": "quic",

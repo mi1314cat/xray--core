@@ -628,9 +628,14 @@ def ech_param(n, host=None, meta=None):
     # 以前这里完全不看元数据，于是订阅链接把 ech 整段丢掉，客户端也就
     # 不会写 tlsSettings.echConfigList —— ECH 静默失效。
     # 只在连接目标是域名时用：连源站 IP 却塞 CDN 的 ECH 会握手失败。
-    # 优先**实时** HTTPS RR：Cloudflare 的 ECHConfigList 会轮换，元数据里
-    # 的静态值一旦过期，客户端会出现 x509(cloudflare-ech.com) / server rejected ECH。
-    # 元数据只作 DNS 取不到时的兜底。
+    # 动态 DoH 形式（Xray 26.x 的 echConfigList 支持）：
+    #   cloudflare-ech.com+https://dns.alidns.com/dns-query
+    # 客户端每次用 DoH 查当前 HTTPS RR，Cloudflare 轮换 key 后不会拿到旧值。
+    # 这是分享链接的首选；Mihomo 的 ech-opts 仍用下面 ech_config 的 base64。
+    md = str((meta or {}).get("ech_dynamic") or "").strip()
+    if md and host and not is_ip_literal(host):
+        return md
+    # 其次实时 HTTPS RR；元数据只作 DNS 取不到时的兜底。
     if (meta or {}).get("ech") and host and not is_ip_literal(host):
         live = ech_discover(host)
         if live:
@@ -1231,6 +1236,12 @@ def compare_payload_link(link, product):
 
     for key in CRITICAL_FIELDS:
         a, b = _field(pu, key), _field(pr, key)
+        if key == "ech" and a and b and a != b \
+                and ("://" in a) != ("://" in b):
+            # 动态 DoH 形式 vs 固定 ECHConfigList（旧产物 / 另一代生成器）：
+            # 两种都是 Cloudflare ECH 的有效表达，不能因此拒发。
+            notes.append("ech: 一侧为动态 DoH 形式, 另一侧为固定 ECHConfigList —— 均有效")
+            continue
         if key == "ech" and cdn_pair:
             # ECH 与端点绑定: 连源站时不该带 CDN 的 ECH 配置。
             if a:

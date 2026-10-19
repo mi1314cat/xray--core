@@ -248,10 +248,12 @@ import share_payload as P
 # 先放"正确"的 per-node 产物 (与节点自身一致)
 open(os.path.join(d, "out", "vless-xhttp_share-direct.txt"), "w").write(
     "vless://uuid-n-direct@203.0.113.9:29601?encryption=none&security=tls"
-    "&sni=a.example&type=ws&path=/p1&ech=%s#n-direct\n" % urllib.parse.quote(want, safe=""))
+    "&sni=a.example&type=ws&path=/p1&fp=chrome&ech=%s#n-direct\n" % urllib.parse.quote(want, safe=""))
+# xhttp+TLS 的链接现在固定带 alpn=h2 / fp=chrome（见 4361b94），产物必须
+# 与同一代生成器同步；否则一致性校验会把**正确的新链接**当成坏链接拒发。
 open(os.path.join(d, "out", "vless-xhttp-share-cdn.txt"), "w").write(
     "vless://uuid-n-cdn@cdn.example:443?encryption=none&security=tls"
-    "&sni=a.example&type=xhttp&path=/p2"
+    "&sni=a.example&type=xhttp&path=/p2&fp=chrome&alpn=h2"
     "&ech=cloudflare-ech.com%2Bhttps%3A%2F%2Fdns.alidns.com%2Fdns-query#n-cdn\n")
 payload, missing, nometa, bad, refused, notes, inc = P.build_payload(
     ["n-direct", "n-cdn"], full=True)
@@ -315,7 +317,7 @@ items = [
   ("n-cdn",    "vless://uuid-n-cdn@203.0.113.9:8443?encryption=none"
                "&security=tls&type=xhttp&path=/p2&sni=203.0.113.9#n-cdn"),  # sni 写成 IP
   ("n-ok",     "vless://uuid-n-direct@203.0.113.9:29601?encryption=none"
-               "&security=tls&sni=a.example&type=ws&path=/p1&ech=%s#n-direct"
+               "&security=tls&sni=a.example&type=ws&path=/p1&fp=chrome&ech=%s#n-direct"
                % urllib.parse.quote(want, safe="")),               # 正确的那条
 ]
 kept, refused, checked, unchecked = N.verify_against_products(items, prod)
@@ -1461,18 +1463,52 @@ grep -q 'ui_ask "新的次数上限 (0=不限)" "1"' "$SH" \
 #   真的在 health 时吐东西。老桩是"退出 0 但什么都不吐", 于是沙盒恒显示
 #   「分享服务 : 未运行」, 而真实服务明明跑着 (用户以为新状态显示坏了)。
 #   真实客户端与修好的桩都通过这一条; 老桩会红。
-_HEALTH_OUT=$(SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" health 2>/dev/null)
-if [[ -n "$_HEALTH_OUT" ]]; then
-    ok "share_client.py health 有输出 (状态判据依赖它)"
-    echo "$_HEALTH_OUT" | grep 'status' >/dev/null \
-        && ok "health 输出含 status 字段" || bad "health 输出不像健康响应"
-else
-    # ★ 没有 share_client.py 的干净检出也走这里 —— 那不算失败, 但要说明。
-    if [[ -f "$ROOT/conf/share_client.py" ]]; then
-        bad "share_client.py health 没有输出 —— 面板会把运行中的服务显示成「未运行」"
+# 开发机/CI 上通常没有公共服务。不能因此判客户端坏 —— 那会把"环境没装服务"
+# 误报成代码缺陷。这里起一个**本地假健康端点**，把客户端真正走一遍 HTTP/JSON
+# 解析；服务不可达的场景不在这一条里验（那是部署问题，不是 health 客户端问题）。
+if [[ -f "$ROOT/conf/share_client.py" ]]; then
+    _HP="$TMP/share-health-port"
+    rm -f "$_HP"
+    python3 - "$_HP" <<'PY' &
+import http.server, json, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"status": "ok", "provider": "xray"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_port))
+srv.handle_request()
+PY
+    _HPID=$!
+    for _ in $(seq 1 50); do [[ -s "$_HP" ]] && break; sleep 0.05; done
+    _HPORT=$(cat "$_HP" 2>/dev/null || true)
+    # ★ 必须把端口写进**端口文件**，不能只给 SHARE_PORT 环境变量:
+    #   actual_port() 会先读 /etc/proxy-share-service/env，开发机上那份
+    #   存在时会把环境变量盖掉，于是客户端去连 9443 而假服务在随机端口 ——
+    #   测试自己挂死 (实测踩过)。
+    _HPFILE="$TMP/share-health-actual"
+    printf '%s\n' "${_HPORT:-1}" > "$_HPFILE"
+    _HEALTH_OUT=$(SHARE_PORT_FILE="$_HPFILE" SHARE_ETC="$TMP/no-share-etc" \
+                  SHARE_PROVIDER=xray python3 "$ROOT/conf/share_client.py" health 2>/dev/null)
+    # 客户端没连上时服务还在 accept 里等；先杀掉再 wait，避免测试永久挂住。
+    kill "$_HPID" 2>/dev/null || true
+    wait "$_HPID" 2>/dev/null || true
+    rm -f "$_HP" "$_HPFILE"
+    if [[ -n "$_HEALTH_OUT" ]]; then
+        ok "share_client.py health 有输出 (状态判据依赖它)"
+        echo "$_HEALTH_OUT" | grep 'status' >/dev/null \
+            && ok "health 输出含 status 字段" || bad "health 输出不像健康响应"
     else
-        printf '  (跳过: conf/share_client.py 不存在)\n'
+        bad "share_client.py health 没有输出 —— 面板会把运行中的服务显示成「未运行」"
     fi
+else
+    printf '  (跳过: conf/share_client.py 不存在)\n'
 fi
 
 # ---------------------------------------------------------------- 客户端产物菜单
@@ -4524,19 +4560,14 @@ group "服务器标识 (旗帜 + 默认值)"
 
 NM="$TMP/nm"; mkdir -p "$NM"
 
-# ★ 默认值必须是 **旗帜 + hostname**, 不能是光一个 "X"。
-#   两台机器都跑同一个 Xray 面板, 前缀都是 "X" 时, 用户什么都没做也分不出
-#   哪个节点属于哪台 —— 是默认值让他分不出来的, 所以默认值本身要带区分度。
+# ★ 2026-10-18 统一约定 (用户要求): 默认值 = 内核标识，不是 hostname。
+#   X / M / SB 分别代表三套内核，机器区分交给用户自定义前缀 (RN / HK)；
+#   以前默认取 hostname，三台机器看起来不像同一约定的产物。
 DN=$(XRAY_BASE="$NM" python3 "$LIB/naming.py" default 2>/dev/null)
-HN=$(hostname 2>/dev/null | tr -d '\r\n')
-[[ -z "$HN" ]] && HN=$(tr -d '\r\n' < /proc/sys/kernel/hostname 2>/dev/null)
-if [[ -n "$HN" ]]; then
-    case "$DN" in
-        *"$HN"*) ok "默认服务器标识含主机名: $DN" ;;
-        *) bad "默认服务器标识应含主机名 (得到 '$DN', 主机名 '$HN')" ;;
-    esac
+if [[ "$DN" == "X" ]]; then
+    ok "默认服务器标识是内核代号 X（统一约定）"
 else
-    ok "默认服务器标识可生成: ${DN:-(空)}"
+    bad "默认服务器标识应为 X (得到 '$DN')"
 fi
 
 # 改名字时旗帜不能丢 —— 旗帜是**服务器的属性**, 不是名字的一部分
@@ -4645,7 +4676,11 @@ else:
                  os.path.basename(cands[0])[:-5]).get("host") or "")
 PYX
 )
-assert_eq "$RHL" "e.com" "REALITY 的 meta 里带上了 host"
+if [[ -n "$RHL" && "$RHL" != "e.com" ]]; then
+    ok "REALITY 的 meta 里带上了对外地址: $RHL (不是伪装域名)"
+else
+    bad "REALITY 的 meta 缺对外地址 (得到 '$RHL') → 节点能跑却分享不出去"
+fi
 
 # 内核的 inbound id 是 hysteria (version 2), 分享 scheme 却是 hysteria2://。
 # 匹配时漏了 "hysteria" 的话, 内核实机跑出来的 hysteria2 节点一个都生成不出
@@ -7409,7 +7444,7 @@ else
 fi
 
 # ②a5 汇总不许写死"三个组合" —— 真建了几个就报几个
-_cnt_msg=$(awk '/printf/ && /已生成 %d 个组合/' "$ROOT/conf/batch.sh")
+_cnt_msg=$(awk '/printf/ && /已生成 %d (个组合|项)/' "$ROOT/conf/batch.sh")
 _hard_msg=$(awk '!/^[[:space:]]*#/ && /三个组合已生成/' "$ROOT/conf/batch.sh")
 if [ -n "$_cnt_msg" ] && [ -z "$_hard_msg" ]; then
     ok "分离组合的汇总按实际数量报 (不写死三个)"
@@ -7521,7 +7556,7 @@ fi
 # 补发布必须在**分离那一段之前** —— 订阅链接是在那段里建的, 补晚了那条订阅
 # 就只包含"当时有元数据"的几个节点 (实测 9 个里只进了 5 个, 屏幕上看不出来)
 _bk_line=$(awk '/^[[:space:]]*backfill_share_meta "/{print NR; exit}' "$ROOT/conf/batch.sh")
-_split_line=$(awk '/xHTTP 上下行分离 \(/{print NR; exit}' "$ROOT/conf/batch.sh")
+_split_line=$(awk '/for _sp in \$\(x_split_modes\)/{print NR; exit}' "$ROOT/conf/batch.sh")
 if [[ -n "$_bk_line" && -n "$_split_line" && "$_bk_line" -lt "$_split_line" ]]; then
     ok "补发布跑在订阅创建之前 (订阅才会覆盖全部节点)"
 else

@@ -516,7 +516,8 @@ def capability_tags(node: dict, xray: dict, dialer: dict) -> list[str]:
         tags.append("Xray")
     else:
         tags.append("Xray 不可用")
-    tags.append("Browser Dialer" if dialer["overall"] in (OK, WARN) else "Browser Dialer 不可用")
+    tags.append("Browser Dialer" if (dialer["overall"] in (OK, WARN) and not node.get("ech"))
+                else "Browser Dialer 不可用")
     return tags
 
 
@@ -575,6 +576,11 @@ def want_browser_dialer(node: dict) -> bool:
     proto = (node.get("protocol") or "").lower()
     transport = canon_transport(node.get("transport") or "")
     security = (node.get("security") or "none").lower()
+    # ECH 是 Xray 客户端自己的 TLS 能力：切换成 Chromium 完成 TLS 后，
+    # tlsSettings.echConfigList 根本不生效，ECH 节点会直接连不上。
+    # 所以带 ECH 的节点必须走原生 Xray，不允许 Browser Dialer。
+    if node.get("ech"):
+        return False
     if proto != "vless" or transport not in DIALER_TRANSPORTS or security == "reality":
         return False
     # XHTTP 只支持 packet-up (见 bd_xhttp_mode_ok 的源码依据)。
@@ -601,7 +607,8 @@ def check_all(node: dict) -> dict:
     proto = (node.get("protocol") or "").lower()
     transport = canon_transport(node.get("transport") or "")
     security = (node.get("security") or "none").lower()
-    may = (proto == "vless" and transport in DIALER_TRANSPORTS and security != "reality")
+    may = (proto == "vless" and transport in DIALER_TRANSPORTS
+           and security != "reality" and not node.get("ech"))
     # 把实测结论也带出来，面板/CLI 可以显示"实测可用/失败"而不是只凭推断
     dialer["probe_ok"] = (node.get("browser_probe") or {}).get("ok")
     return {
@@ -611,7 +618,7 @@ def check_all(node: dict) -> dict:
         "tags": capability_tags(node, xray, dialer),
         # 两种用法互相独立：这里给 UI 直接用
         "can_use_xray": xray["overall"] in (OK, WARN),
-        "can_use_dialer": dialer["overall"] in (OK, WARN),
+        "can_use_dialer": (not node.get("ech")) and dialer["overall"] in (OK, WARN),
         "protocol_may_dialer": may,
     }
 
