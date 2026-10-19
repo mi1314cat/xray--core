@@ -124,7 +124,9 @@ def main() -> int:
     for i, n in enumerate(nodes, 1):
         caps = n.get("compat") or {}
         x = (caps.get("xray") or {}).get("overall", "UNKNOWN")
-        b = (caps.get("dialer") or {}).get("overall", "UNKNOWN")
+        # ECH 节点协议层面支持浏览器 TLS，但实际不行 —— 列表必须显示
+        # 实际结论 (can_use_dialer)，否则用户看到"支持"再去点 BD 必失败。
+        b = "SUPPORTED" if caps.get("can_use_dialer") else "NOT_SUPPORTED"
         mark = "*" if n.get("current") else " "
         name = (n.get("name") or "?")[:28]
         h = health.get(n.get("file") or "")

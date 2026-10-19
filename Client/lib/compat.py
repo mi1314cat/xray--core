@@ -611,6 +611,14 @@ def check_all(node: dict) -> dict:
            and security != "reality" and not node.get("ech"))
     # 把实测结论也带出来，面板/CLI 可以显示"实测可用/失败"而不是只凭推断
     dialer["probe_ok"] = (node.get("browser_probe") or {}).get("ok")
+    if node.get("ech"):
+        # overall 表示"协议层面浏览器能不能做 TLS"，ECH 节点在协议层面仍写
+        # vless+xhttp+tls，所以 overall 还是 SUPPORTED —— 但实际不能用浏览器
+        # （tlsSettings.echConfigList 不生效）。把原因挂到 notes，UI 才不会
+        # 只显示一个"支持"却解释不了为什么 can_use_dialer=false。
+        dialer = dict(dialer)
+        dialer["notes"] = list(dialer.get("notes") or []) + [
+            "节点带 ECH：必须由 Xray 完成 TLS，Browser Dialer 不可用"]
     return {
         "node": node,
         "xray": xray,
@@ -634,8 +642,11 @@ def render(result: dict) -> str:
     L.append(f"  {mark}")
     L.append("")
     L.append(f"Browser Dialer：")
+    # 用 can_use_dialer 而不是 protocol overall：ECH 节点协议层面支持，
+    # 但实际必须走 Xray，两者不同。
+    _bd = "SUPPORTED" if result.get("can_use_dialer") else "NOT_SUPPORTED"
     mark = {"SUPPORTED": "✓ 支持", "SUPPORTED_WITH_WARNING": "⚠ 支持（有注意项）",
-            "NOT_SUPPORTED": "✗ 不支持", "UNKNOWN": "? 未知"}[result["dialer"]["overall"]]
+            "NOT_SUPPORTED": "✗ 不支持", "UNKNOWN": "? 未知"}[_bd]
     L.append(f"  {mark}")
     notes = (result["xray"].get("notes") or []) + (result["dialer"].get("notes") or [])
     if notes:

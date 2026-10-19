@@ -838,7 +838,8 @@ def act_node_check(ident):
         return False, "能力检查失败"
     lines = []
     x = caps.get("xray", {}).get("overall", "?")
-    b = caps.get("dialer", {}).get("overall", "?")
+    # ECH 节点协议层面支持浏览器 TLS，但实际必须走 Xray。
+    b = "SUPPORTED" if caps.get("can_use_dialer") else "NOT_SUPPORTED"
     labels = {"SUPPORTED": "✓ 支持", "SUPPORTED_WITH_WARNING": "⚠ 支持（有注意项）",
               "NOT_SUPPORTED": "✗ 不支持", "UNKNOWN": "? 未知"}
     lines.append(f"Xray：{labels.get(x, x)}")

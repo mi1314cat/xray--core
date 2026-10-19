@@ -732,7 +732,8 @@ except Exception:
     pass
 c = _c
 x = (c.get("xray") or {}).get("overall", "UNKNOWN")
-b = (c.get("dialer") or {}).get("overall", "UNKNOWN")
+# 实际能不能用浏览器，不是协议层面 overall —— ECH 节点必须原生 Xray。
+b = "SUPPORTED" if c.get("can_use_dialer") else "NOT_SUPPORTED"
 tagmap = {"SUPPORTED": "✓ 支持", "SUPPORTED_WITH_WARNING": "⚠ 支持（有注意项）",
           "NOT_SUPPORTED": "✗ 不支持", "UNKNOWN": "? 未知"}
 print()

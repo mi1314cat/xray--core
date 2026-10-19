@@ -75,6 +75,9 @@ check("reality → 不用", c.want_browser_dialer(node(security="reality")), Fal
 _ech_node = node(ech={"config": "cloudflare-ech.com+https://dns.alidns.com/dns-query"})
 check("ECH → 不用浏览器", c.want_browser_dialer(_ech_node), False)
 check("ECH → can_use_dialer 也是 False", bd(_ech_node), False)
+_ech_render = c.render({"node": _ech_node, **c.check_all(_ech_node)})
+check("ECH → 面板/CLI 渲染显示 Browser Dialer 不支持",
+      "Browser Dialer：\n  ✗ 不支持" in _ech_render, True)
 for _n in (node(), node(transport="websocket"), node(security="reality"),
            node(transport="raw"), node(protocol="vmess"),
            node(browser_probe={"ok": False}), node(browser_probe={"ok": True}),
