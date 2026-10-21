@@ -492,6 +492,11 @@ if domain: o["domain"] = domain
 if cert_file and key_file:
     o["cert_file"] = cert_file
     o["key_file"] = key_file
+    # mack-a 的两个 TLS 加固项：OCSP stapling 省一次查询；拒绝未知 SNI
+    # 让主动探测拿不到“这个端口跑的是一个万能 TLS 代理”的确定结论。
+    if tier != "nginx":
+        o["reject_unknown_sni"] = True
+        o["ocsp_stapling"] = 3600
 o.update(json.loads(cred))
 o.update(json.loads(extra))
 

@@ -164,10 +164,24 @@ def _stream_settings(transport, security, opts):
     if security == "tls":
         tls = {"serverName": opts.get("sni") or opts.get("domain", "")}
         if opts.get("cert_file"):
-            tls["certificates"] = [{
+            _cert = {
                 "certificateFile": opts["cert_file"],
                 "keyFile": opts["key_file"],
-            }]
+            }
+            # mack-a 的 TLS 入站带 OCSP stapling；它不改变协议，只让
+            # 客户端少一次单独的 OCSP 查询（省 RTT，也少一个隐私泄漏面）。
+            if opts.get("ocsp_stapling"):
+                try:
+                    _cert["ocspStapling"] = int(opts["ocsp_stapling"])
+                except (TypeError, ValueError):
+                    pass
+            tls["certificates"] = [_cert]
+        # mack-a 的 rejectUnknownSni：只有 serverName 明确时才开，
+        # 否则会把所有不带 SNI 的客户端拒掉。
+        if opts.get("reject_unknown_sni") and tls.get("serverName"):
+            tls["rejectUnknownSni"] = True
+        if opts.get("tls_min_version"):
+            tls["minVersion"] = str(opts["tls_min_version"])
         if opts.get("alpn"):
             tls["alpn"] = opts["alpn"]
         # hysteria2 走 QUIC, ALPN 必须是 h3。不设的话内核不报配置错,

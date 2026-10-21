@@ -700,6 +700,10 @@ if d: opts["domain"] = d
 _cf = os.environ.get("MK_CERT_FILE", ""); _kf = os.environ.get("MK_KEY_FILE", "")
 if _cf and _kf:
     opts["cert_file"] = _cf; opts["key_file"] = _kf
+    # mack-a 的 TLS 加固：只在 Xray 自己终结 TLS 时加。
+    if os.environ["MK_SECURITY"] == "tls" and os.environ.get("MK_TIER") != "nginx":
+        opts["reject_unknown_sni"] = True
+        opts["ocsp_stapling"] = 3600
 # 自签: pin 只发给**客户端** (分享链接 / mihomo YAML), 不写进服务端片段的
 # tlsSettings —— 那里没有这个语义, 写了是噪音。
 _fb = os.environ.get("MK_FALLBACK_PORT", "").strip()
