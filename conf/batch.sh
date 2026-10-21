@@ -926,9 +926,10 @@ batch_main() {
             fi
         fi
 
-        # mack-a/v2ray-agent 的两档推荐配置：
-        #   0  = VLESS TCP/TLS + Vision   -> preset ⑩
-        #   12 = VLESS Reality + XHTTP    -> preset ⑪
+        # mack-a/v2ray-agent 推荐配置的接入策略：
+        #   0  = VLESS TCP/TLS + Vision   -> preset ⑩（443 直连形态，菜单14按需）
+        #   12 = VLESS Reality + XHTTP    -> preset ⑪（不依赖证书/443，纳入本批）
+        #   8  = VLESS Reality + gRPC     -> preset ⑫（特殊用途，菜单14手选）
         # 已存在同形态时跳过；clean 重建后会真正生成。
         if [[ "${X_BATCH_MACKA:-1}" == "1" ]]; then
             # mack-a 0 (VLESS TCP/TLS+Vision) 是 443 直连形态，放到随机高位
