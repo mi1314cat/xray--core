@@ -128,9 +128,17 @@ run_case() {
     kill -0 "$spid" 2>/dev/null || { bad "$name — 服务端进程起不来"; head -3 "$WORK/srv.log" | sed 's/^/        /'; kill "$cpid" 2>/dev/null; return 1; }
     kill -0 "$cpid" 2>/dev/null || { bad "$name — 客户端进程起不来"; head -3 "$WORK/cli.log" | sed 's/^/        /'; kill "$spid" 2>/dev/null; return 1; }
 
-    got=$(curl -fsS -m 12 --socks5-hostname "127.0.0.1:$sock" \
-              "http://127.0.0.1:$ORIGIN_PORT/probe.txt" 2>"$WORK/curl.err")
-    rc=$?
+    # REALITY 的 target 是公网 TLS（www.cloudflare.com）。这台机器上偶发
+    # 一次 curl rc=28，第二次就通；这是外网抖动，不是链路代码坏了。
+    # 只对“没有拿到 token”重试一次，避免把真实失败也掩盖成成功。
+    got=""; rc=1
+    for _attempt in 1 2 3; do
+        got=$(curl -fsS -m 20 --socks5-hostname "127.0.0.1:$sock" \
+                  "http://127.0.0.1:$ORIGIN_PORT/probe.txt" 2>"$WORK/curl.err")
+        rc=$?
+        [[ $rc -eq 0 && "$got" == "$TOKEN" ]] && break
+        sleep 2
+    done
     kill "$spid" "$cpid" 2>/dev/null; wait "$spid" "$cpid" 2>/dev/null
 
     if [[ $rc -eq 0 && "$got" == "$TOKEN" ]]; then
