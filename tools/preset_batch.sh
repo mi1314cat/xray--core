@@ -465,7 +465,7 @@ import json, os, sys
  direct_addr, vision_on, enh, cert_file, key_file) = sys.argv[1:28]
 o = {"protocol":proto,"transport":tr,"security":sec,"tag":tag,
      "port":int(port),"tier":tier}
-# mack-a 的 VLESS TCP/TLS + Vision：flow 只在裸 TCP 上有效。
+# VLESS TCP/TLS + Vision：flow 只在裸 TCP 上有效。
 if vision_on == "yes" and proto == "vless" and tr in ("raw", "tcp") \
         and sec in ("tls", "reality"):
     o["flow"] = "xtls-rprx-vision"
@@ -485,14 +485,14 @@ if tr == "xhttp":
         o["xhttp_mode"] = _mode
     else:
         o["xhttp_mode"] = "stream-up" if sec == "reality" else "auto"
-    # mack-a 12 的 REALITY+XHTTP 用 auto（合流），不是 split 的 stream-up。
+    # REALITY+XHTTP 用 auto（合流），不是 split 的 stream-up。
     if "xhttp-auto" in enh:
         o["xhttp_mode"] = "auto"
 if domain: o["domain"] = domain
 if cert_file and key_file:
     o["cert_file"] = cert_file
     o["key_file"] = key_file
-    # mack-a 的两个 TLS 加固项：OCSP stapling 省一次查询；拒绝未知 SNI
+    # 两个 TLS 加固项：OCSP stapling 省一次查询；拒绝未知 SNI
     # 让主动探测拿不到“这个端口跑的是一个万能 TLS 代理”的确定结论。
     if tier != "nginx":
         o["reject_unknown_sni"] = True
@@ -624,6 +624,10 @@ PY
   if out=$(python3 "$DEPLOY_PY" --config-json "$opts_json" \
              --conf-dir "$CONF_DIR" --share-dir "$SHARE_DIR" --apply 2>&1); then
     _g "端口 $use_port ✓"
+    # deploy.py 会把单节点 vless:// 链接打在输出里；这里把它带出来，
+    # 否则菜单 14 建完只看到文件路径，用户还得去订阅里找。
+    _one_link=$(printf '%s\n' "$out" | sed -n '/客户端链接 (vless:\/\/):/{n;s/^[[:space:]]*//;p;q;}')
+    [[ -n "$_one_link" ]] && _o "    $_one_link"
     ok=$((ok+1))
   else
     _e "端口 $use_port 失败"

@@ -15,8 +15,8 @@
 | 预置档位（协议 × 传输 × 加密） | **30** 档 |
 | 推荐度分档 | 4 档（core / cdn / compat / special） |
 | 预置批量推荐档（菜单14）默认取 | `core` + `cdn`（共 12 档） |
-| 菜单12 全协议生成 | 4 个协议脚本 + xHTTP 扩展 + mack-a 12 + 分离组合（缺什么补什么） |
-| 本次新增 | mack-a 0（VLESS TCP/TLS+Vision）、mack-a 12（REALITY+XHTTP）预置；预置批量补 ECH/Vision 标记 |
+| 菜单12 全协议生成 | 4 个协议脚本 + xHTTP 扩展 + REALITY+XHTTP + 分离组合（缺什么补什么） |
+| 本次新增 | VLESS TCP/TLS+Vision、REALITY+XHTTP、REALITY+gRPC 预置；预置批量补 ECH/Vision 标记 |
 
 ### 每个协议有多少种选择
 
@@ -79,9 +79,9 @@
 | ⑦ | ws | tls | compat | — | 官方已弃用，仅兼容 |
 | ⑧ | grpc | tls | compat | — | 官方已弃用 |
 | ⑨ | httpupgrade | tls | compat | — | 官方已弃用 |
-| ⑩ ★ | tcp | tls | core | vision | mack-a 0：VLESS TCP/TLS + XTLS Vision |
-| ⑪ | xhttp | reality | cdn | xhttp-auto | mack-a 12：REALITY + XHTTP（mode=auto） |
-| ⑫ | grpc | reality | special | — | mack-a 8：REALITY + gRPC（默认注释，按需） |
+| ⑩ ★ | tcp | tls | core | vision | VLESS TCP/TLS + XTLS Vision |
+| ⑪ | xhttp | reality | cdn | xhttp-auto | REALITY + XHTTP（mode=auto） |
+| ⑫ | grpc | reality | special | — | REALITY + gRPC（特殊用途，按需） |
 | ⑩ | tcp | tls | special | — | 最易被识别 |
 
 ### Trojan（5 档）

@@ -3907,9 +3907,9 @@ assert_ne0 "$(grep -c '_bt_pick_nginx_site' "$ROOT/conf/batch.sh" 2>/dev/null)" 
 assert_ne0 "$(grep -c 'list-sites' "$ROOT/conf/lib/nginx_apply.py" 2>/dev/null)" \
     "nginx_apply 提供 --list-sites 供交互选择"
 assert_ne0 "$(grep -c 'xhttp-auto' "$ROOT/conf/lib/preset.sh" "$ROOT/tools/preset_batch.sh" 2>/dev/null | awk -F: '{s+=$2} END{print s}')" \
-    "mack-a 12 preset（xhttp-auto）已接入 preset_batch"
+    "REALITY+XHTTP 预置（xhttp-auto）已接入 preset_batch"
 assert_ne0 "$(grep -c 'vision' "$ROOT/conf/lib/preset.sh" 2>/dev/null)" \
-    "mack-a 0（VLESS TCP/TLS + Vision）已进预置表"
+    "VLESS TCP/TLS + Vision 预置已进表"
 
 assert_eq "$(grep -c 'dl_domain' "$ROOT/conf/batch.sh" 2>/dev/null)" "1" \
     "收集器认双域名的下行域名 (两段都要摘)"
@@ -4659,7 +4659,7 @@ bash -n "$ROOT/conf/mknode.sh" 2>/dev/null && ok "mknode.sh 语法" || bad "mkno
 group "分享链接覆盖 (REALITY 也要能分享)"
 PK=$(python3 -c "print('a'*43)"); PB=$(python3 -c "print('b'*43)")
 LN="$TMP/links"; mkdir -p "$LN"
-XRAY_CONF_DIR="$LN/c" XRAY_SHARE_DIR="$LN/s" X_BATCH_DOMAIN=e.com \
+XRAY_CONF_DIR="$LN/c" XRAY_SHARE_DIR="$LN/s" X_BATCH_DOMAIN=e.com X_BATCH_DL_ADDRESS=1.2.3.4 \
 X_BATCH_REALITY_PRIVATE_KEY="$PK" X_BATCH_REALITY_PUBLIC_KEY="$PB" X_BATCH_PORT_START=25000 \
   bash "$ROOT/tools/preset_batch.sh" vless:1 trojan:1 >/dev/null 2>&1
 RL=$(python3 - "$LIB" "$LN" <<'PYX'
@@ -5708,7 +5708,7 @@ for p in Reality Trojan Shadowsocks hysteria2; do
     printf '#!/bin/bash\necho "stub $p fail" >&2\nexit 3\n' > "$BT/$p.sh"
 done
 printf '#!/bin/bash\ncase "${1:-}" in check) exit 0;; restart) exit 0;; esac\nexit 0\n' > "$BT/verify.sh"
-BOUT=$(XRAY_BASE_DIR="$BT" X_BATCH_LOG_DIR="$BT" bash "$BT/batch.sh" --auto 2>&1); BRC=$?
+BOUT=$(XRAY_BASE_DIR="$BT" X_BATCH_LOG_DIR="$BT" X_BATCH_XHTTP=0 X_BATCH_SPLIT=0 X_BATCH_MACKA=0 bash "$BT/batch.sh" --auto 2>&1); BRC=$?
 assert_eq "$BRC" "1" "4 个协议全失败时 batch 退出码非 0（不再掩盖失败）"
 printf '%s\n' "$BOUT" > "$BT/out.txt"
 grep '失败(详情在日志末尾)' "$BT/out.txt" >/dev/null && ok "失败清单被打印" || bad "失败清单没有打印"
@@ -5719,7 +5719,7 @@ for p in Reality Trojan Shadowsocks hysteria2; do
 done
 printf '#!/bin/bash\necho "{\\"inbounds\\":[{\\"tag\\":\\"x\\",\\"port\\":1,\\"protocol\\":\\"vless\\"}]}" > "%s/conf/stub.json"\nexit 0\n' "$BT" > "$BT/Reality.sh"
 cp "$BT/Reality.sh" "$BT/Trojan.sh"; cp "$BT/Reality.sh" "$BT/Shadowsocks.sh"; cp "$BT/Reality.sh" "$BT/hysteria2.sh"
-XRAY_BASE_DIR="$BT" X_BATCH_LOG_DIR="$BT" bash "$BT/batch.sh" --auto >/dev/null 2>&1
+XRAY_BASE_DIR="$BT" X_BATCH_LOG_DIR="$BT" X_BATCH_XHTTP=0 X_BATCH_SPLIT=0 X_BATCH_MACKA=0 bash "$BT/batch.sh" --auto >/dev/null 2>&1
 assert_eq "$?" "0" "全部成功时 batch 退出码仍是 0"
 
 # ---------------------------------------------------------------- P0-3 分享链接发布

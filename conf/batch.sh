@@ -128,6 +128,13 @@ TOOLS_DIR=""
 #   全协议里的 xHTTP/CDN/上下行分离整段 127 失败（真机实测）。
 #   这里单独保证：缺什么补什么，补到 $SCRIPT_DIR/../tools。
 ensure_tools() {
+    # 只要不生成 xHTTP/分离/推荐档，就不需要 preset_batch/cdn_auto。
+    # 测试夹具只放 4 个协议 stub 时，没必要为了“可能用到”去联网下载。
+    if [[ "${X_BATCH_XHTTP:-1}" == "0" && "${X_BATCH_SPLIT:-1}" == "0" \
+          && "${X_BATCH_MACKA:-1}" == "0" ]]; then
+        TOOLS_DIR="$SCRIPT_DIR/../tools"
+        return 0
+    fi
     local tooldir="$SCRIPT_DIR/../tools"
     if ! mkdir -p "$tooldir" 2>/dev/null; then
         tooldir="${X_BATCH_TMP_DIR:-/tmp/x-batch-scripts}/tools"
@@ -926,15 +933,15 @@ batch_main() {
             fi
         fi
 
-        # mack-a/v2ray-agent 推荐配置的接入策略：
+        # 推荐配置的接入策略：
         #   0  = VLESS TCP/TLS + Vision   -> preset ⑩（443 直连形态，菜单14按需）
         #   12 = VLESS Reality + XHTTP    -> preset ⑪（不依赖证书/443，纳入本批）
         #   8  = VLESS Reality + gRPC     -> preset ⑫（特殊用途，菜单14手选）
         # 已存在同形态时跳过；clean 重建后会真正生成。
         if [[ "${X_BATCH_MACKA:-1}" == "1" ]]; then
-            # mack-a 0 (VLESS TCP/TLS+Vision) 是 443 直连形态，放到随机高位
+            # VLESS TCP/TLS+Vision 是 443 直连形态，放到随机高位
             # 端口在橙云域名下连不上；它放在预置表/菜单 14 里按需建。
-            # 这里只加 mack-a 12 (REALITY+XHTTP)，它不依赖证书/443。
+            # 这里只加 REALITY+XHTTP，它不依赖证书/443。
             _bt_has_form vless xhttp reality || _preset_specs+=("vless:11")
         fi
         for _sp in $(x_split_modes); do

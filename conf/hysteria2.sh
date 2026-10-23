@@ -381,9 +381,9 @@ scan_certs() {
     fi
     search_dirs+=(/root/catmi); labels+=(catmi-root)
 
-    # 2) v2ray-agent TLS 目录
+    # 2) 旧环境 TLS 目录（历史兼容路径）
     if [[ -d /etc/v2ray-agent/tls ]]; then
-        search_dirs+=(/etc/v2ray-agent/tls); labels+=(v2ray-agent)
+        search_dirs+=(/etc/v2ray-agent/tls); labels+=(旧环境 TLS)
     fi
 
     # 3) acme.sh 默认证书目录
@@ -644,7 +644,7 @@ get_next_index() {
 }
 
 # ================================
-# 端口跳跃（借鉴 v2ray-agent addPortHopping, iptables 实现）
+# 端口跳跃（iptables 实现）
 # 默认不开启
 # 输出: HOP_RANGE (如 30000-31000), 空字符串 = 不启用
 # ================================

@@ -638,7 +638,11 @@ mk_run() {
     #   不像的 (浏览器、扫描器) 转去你的网站。所以那个网站**必须真的在跑**,
     #   否则探测者会拿到一个 502 的"网站", 比不开还显眼。
     local fallback_port=""
-    if [[ "$sec" == "tls" && ( "$proto" == "vless" || "$proto" == "trojan" ) ]]; then
+    # Nginx 档位下 TLS 由 nginx 终结，Xray 入站是明文 127.0.0.1；
+    # 此时问 Xray fallback 毫无意义（没有 TLS 可回落），抗探测由 nginx
+    # 站点自己承担。只有 CDN 直连、Xray 自己终结 TLS 时才问。
+    if [[ "$sec" == "tls" && "$tier" != "nginx" \
+          && ( "$proto" == "vless" || "$proto" == "trojan" ) ]]; then
         echo >&2
         _y "  回落 (fallbacks) —— 不像本协议的流量转到哪?"
         _o "    效果: 普通浏览器/扫描器打这个端口, 看到的是你的**真实网站**;"
@@ -700,7 +704,7 @@ if d: opts["domain"] = d
 _cf = os.environ.get("MK_CERT_FILE", ""); _kf = os.environ.get("MK_KEY_FILE", "")
 if _cf and _kf:
     opts["cert_file"] = _cf; opts["key_file"] = _kf
-    # mack-a 的 TLS 加固：只在 Xray 自己终结 TLS 时加。
+    # TLS 加固：只在 Xray 自己终结 TLS 时加。
     if os.environ["MK_SECURITY"] == "tls" and os.environ.get("MK_TIER") != "nginx":
         opts["reject_unknown_sni"] = True
         opts["ocsp_stapling"] = 3600
@@ -739,7 +743,7 @@ if proto in ("vless", "vmess"):
     #   (它只查 flow 这个名字合不合法), 于是用户拿到一个"配好了、校验通过、
     #   就是慢/连不上"的节点。sing-box 面板专门写了 sb_flow_conflict() 拦这个
     #   组合, 这里对齐。
-    # 预置表第 6 列 enh=vision：mack-a 的 VLESS TCP/TLS+Vision 也要 flow。
+    # 预置表第 6 列 enh=vision：VLESS TCP/TLS+Vision 也要 flow。
     # 仍然只在裸 TCP 上加（XHTTP/gRPC 上 Vision 自相矛盾）。
     _enh = os.environ.get("MK_ENH", "")
     if (proto == "vless" and opts["transport"] in ("raw", "tcp")

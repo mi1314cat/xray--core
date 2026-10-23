@@ -782,6 +782,21 @@ def _write_plan(r, conf_dir, share_dir):
     print(f"已写入分享元数据: {share_dir}/{tag}.json", file=sys.stderr)
     print(f"监听: {ib['listen']}:{ib['port']}", file=sys.stderr)
     print(f"对外: {r['meta']['host']}:{r['meta']['port']}  ({r['meta']['tier']})", file=sys.stderr)
+    # 直接给客户端用的分享链接。以前只打印 out/*.yaml 路径，用户建完节点
+    # 还得去订阅里找，或者自己拼 vless://；这里把链接直接打出来。
+    # 失败不影响节点创建（片段/元数据已经落盘），只少一行提示。
+    try:
+        import nodes as _nodes
+        _nl, _ = _nodes.collect(conf_dir)
+        _n = next((x for x in _nl if x.get("tag") == tag), None)
+        _link = _nodes.build_share_link(_n, r["meta"]) if _n else None
+        if _link:
+            print("客户端链接 (vless://):", file=sys.stderr)
+            print(f"  {_link}", file=sys.stderr)
+        else:
+            print("[提示] 未生成单节点链接（缺对外地址/元数据）；可看上面的客户端产物", file=sys.stderr)
+    except Exception as _e:                                  # noqa: BLE001
+        print(f"[提示] 生成单节点链接失败（节点本身已建好）: {_e}", file=sys.stderr)
     _emit_products(r, conf_dir, share_dir, tag)
 
     if r.get("nginx"):

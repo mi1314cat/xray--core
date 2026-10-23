@@ -168,7 +168,7 @@ def _stream_settings(transport, security, opts):
                 "certificateFile": opts["cert_file"],
                 "keyFile": opts["key_file"],
             }
-            # mack-a 的 TLS 入站带 OCSP stapling；它不改变协议，只让
+            # TLS 入站的 OCSP stapling 加固；它不改变协议，只让
             # 客户端少一次单独的 OCSP 查询（省 RTT，也少一个隐私泄漏面）。
             if opts.get("ocsp_stapling"):
                 try:
@@ -176,7 +176,7 @@ def _stream_settings(transport, security, opts):
                 except (TypeError, ValueError):
                     pass
             tls["certificates"] = [_cert]
-        # mack-a 的 rejectUnknownSni：只有 serverName 明确时才开，
+        # rejectUnknownSni 加固：只有 serverName 明确时才开，
         # 否则会把所有不带 SNI 的客户端拒掉。
         if opts.get("reject_unknown_sni") and tls.get("serverName"):
             tls["rejectUnknownSni"] = True

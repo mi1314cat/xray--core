@@ -934,7 +934,7 @@ def build_share_link(n, meta=None, notes=None):
             q["fp"] = meta.get("fingerprint") or n.get("fingerprint") or "chrome"
             if n.get("network") == "ws":
                 q["host"] = meta.get("host_header", "")
-            # xhttp + TLS：mack-a/v2ray-agent 的客户端链接显式带
+            # xhttp + TLS：客户端链接显式带
             # alpn=h2 / fp=chrome / host=域名；不写虽然多数客户端会取默认，
             # 但 NekoBox/v2rayN 某些版本会丢掉 ALPN 或 HTTP Host。
             if n.get("network") == "xhttp":
