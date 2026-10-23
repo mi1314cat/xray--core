@@ -220,8 +220,8 @@ PUB=$(printf '%s\n' "$KEYS" | sed -n 's/^.*PublicKey)\?: *//p' | head -1)
 SID="0123456789abcdef"
 if [[ -n "$PBK" && -n "$PUB" ]]; then
     run_case "vless+tcp+reality" \
-     "cfgs.reality_server(p, U, '$PBK', 'www.cloudflare.com:443', ['www.cloudflare.com'], '$SID')" \
-     "cfgs.reality_client(sock, p, U, '$PUB', 'www.cloudflare.com', '$SID')"
+     "cfgs.reality_server(p, U, '$PBK', 'www.apple.com:443', ['www.apple.com'], '$SID')" \
+     "cfgs.reality_client(sock, p, U, '$PUB', 'www.apple.com', '$SID')"
 else
     bad "vless+tcp+reality — xray x25519 取不到密钥对"
 fi
